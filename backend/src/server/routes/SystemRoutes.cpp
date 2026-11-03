@@ -20,10 +20,11 @@
 #include "server/HttpServer.h"
 #include "server/RestRouter.h"
 #include "server/AppSettings.h"
+#include "common/DetachedProcess.h"
 #include "server/AuthManager.h"
 #include "server/Provisioning.h"
 #include "network/InternetAccessManager.h"
-#include "network/UPNPClient.h"
+#include "network/RouterPortAllocator.h"
 #include "backend/ComputerManager.h"
 #include "backend/GamepadDriver.h"
 #include "backend/VirtualDisplay.h"
@@ -34,12 +35,15 @@
 #include "backend/streambackend/NativeProbeService.h"
 #include "streaming/ConsoleSession.h"
 #include "mw/native/Capabilities.h"
+#include "mw/native/HostKeyboardLayout.h"
+#include "mw/native/VideoPipeline.h"
 #include "Autostart.h"
 #include "DisplaySleep.h"
 #include "LatencyFlag.h"
 #include "common/DesktopSession.h"
 #include "common/Edition.h"
 #include "common/Logger.h"
+#include "common/RunFlags.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -49,15 +53,53 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkInterface>
+#include <QPointer>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QThread>
 #include <QTimer>
 
+#include <memory>
+
 // Exit code the restart endpoint leaves with so the service supervisor treats it
 // as "come back": NSSM's `AppExit Default Restart` respawns on any code it hasn't
 // been told to Exit on, and only 0 is mapped to a real stop (install-service.bat).
 static constexpr int kServiceRestartExitCode = 79;
+
+// Whether the admin's picture-chain choice means anything on this machine: a
+// Windows host that offers itself, with a GPU whose encoder has a D3D12 route —
+// NVENC, AMF or oneVPL. A Snapdragon's Media Foundation encoder has none, nor
+// has a machine with no GPU encoder at all, and the admin hides the choice
+// there rather than offer a switch that changes nothing.
+static bool nativeVideoPipelineSupported()
+{
+#if defined(Q_OS_WIN)
+    if (!NativeHostBackend::isEnabled()) return false;
+    const mw::native::Capabilities caps = NativeProbeService::instance().snapshot();
+    for (const mw::native::GpuInfo& gpu : caps.gpus)
+        for (mw::native::EncoderApi api : gpu.encoders)
+            if (api == mw::native::EncoderApi::Nvenc || api == mw::native::EncoderApi::Amf ||
+                api == mw::native::EncoderApi::Vpl)
+                return true;
+#elif defined(MW_NATIVE_LINUX_VULKAN)
+    // Linux: VA-API or the Vulkan chain (plan Phase 13), wherever the engine
+    // streams off a GPU. Vulkan is taken only on its pixel proof, and refused
+    // by name otherwise — the choice never breaks a stream.
+    if (!NativeHostBackend::isEnabled()) return false;
+    return !NativeProbeService::instance().snapshot().gpus.empty();
+#endif
+    return false;
+}
+
+/// The values the admin offers, this OS's chains only.
+static QJsonArray nativeVideoPipelineOptions()
+{
+#if defined(Q_OS_WIN)
+    return {QStringLiteral("auto"), QStringLiteral("d3d11"), QStringLiteral("d3d12")};
+#else
+    return {QStringLiteral("auto"), QStringLiteral("vaapi"), QStringLiteral("vulkan")};
+#endif
+}
 
 void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthManager& authManager,
                           InternetAccessManager& internetAccess, ComputerManager& computerManager,
@@ -113,28 +155,56 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
     // tells a headless operator whether opening the server to the internet will
     // configure itself or needs a manual port forward on the router.
     //
-    // Blocks for up to the M-SEARCH timeout (~2 s) on the main thread. That is
-    // why it is localhost-only and never polled: it is an explicit operator
-    // action (`moonlightweb --status`, the admin page), not a background check.
-    server.router()->get("/api/internet/upnp-probe", [&](const HttpRequest& req) {
-        if (!req.isLocal) return HttpResponse::error(403, "Only available from localhost");
-        if (mw::edition::lanOnly()) return HttpResponse::error(409, mw::edition::lanOnlyRefusal());
-
-        UPNPClient* upnp = internetAccess.upnpClient();
-        // Re-using a live IGD avoids re-running discovery under an active
-        // Internet Access session (and avoids disturbing its mappings).
-        const bool available = upnp->isAvailable() || upnp->discover(2000);
-
-        QJsonObject obj;
-        obj["available"] = available;
-        if (available) {
-            obj["gateway"] = upnp->gatewayAddress().toString();
-            obj["lan_ip"] = QString::fromStdString(upnp->lanAddress());
-            const std::string ext = upnp->getExternalIPAddress();
-            if (!ext.empty()) obj["external_ip"] = QString::fromStdString(ext);
-        }
-        return HttpResponse::json(obj);
-    });
+    // The router-port allocator's discovery — the process's only one — read
+    // back, or asked for again after a miss and waited on (the M-SEARCH takes
+    // ~2 s, on the allocator's thread). Localhost-only and never polled: it is
+    // an explicit operator action (`moonlightweb --status`, the admin page).
+    server.router()->getAsync(
+        "/api/internet/upnp-probe",
+        [&internetAccess](const HttpRequest& req, ResponseCallback respond) {
+            if (!req.isLocal) {
+                respond(HttpResponse::error(403, "Only available from localhost"));
+                return;
+            }
+            if (mw::edition::lanOnly()) {
+                respond(HttpResponse::error(409, mw::edition::lanOnlyRefusal()));
+                return;
+            }
+            QPointer<RouterPortAllocator> ports = internetAccess.routerPorts();
+            if (!ports) {
+                respond(HttpResponse::json(QJsonObject{{"available", false}}));
+                return;
+            }
+            auto answer = [ports]() {
+                QJsonObject obj;
+                const bool available =
+                    ports && ports->gatewayState() == RouterPortAllocator::GatewayState::Ready;
+                obj["available"] = available;
+                if (available) {
+                    obj["gateway"] = ports->gatewayAddress();
+                    obj["lan_ip"] = ports->lanIp();
+                    if (!ports->publicIp().isEmpty()) obj["external_ip"] = ports->publicIp();
+                }
+                return HttpResponse::json(obj);
+            };
+            ports->discover();
+            if (ports->gatewayState() != RouterPortAllocator::GatewayState::Discovering) {
+                respond(answer());
+                return;
+            }
+            // One answer, whichever comes first: the router's, or the deadline.
+            auto* waiter = new QObject(ports);
+            auto done = std::make_shared<bool>(false);
+            auto finish = [waiter, done, answer, respond]() {
+                if (*done) return;
+                *done = true;
+                respond(answer());
+                waiter->deleteLater();
+            };
+            QObject::connect(ports, &RouterPortAllocator::gatewayReady, waiter, finish);
+            QObject::connect(ports, &RouterPortAllocator::gatewayMissing, waiter, finish);
+            QTimer::singleShot(4000, waiter, finish);
+        });
 
     // API route: enable/configure Internet Access
     // onInternetAccessToggled captured BY VALUE: the parameter dies when this
@@ -617,7 +687,7 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
     // As a service the answer is the console-session probe snapshot, so this
     // also reports where the desktop is and who is on it, which is the whole
     // difference between "no encoder" and "nobody is logged in yet".
-    server.router()->get("/api/native/status", [](const HttpRequest& req) {
+    server.router()->get("/api/native/status", [&appSettings](const HttpRequest& req) {
         const bool local = req.isLocal && !req.viaTunnel;
 
         // Switched off in settings.json: the honest answer is "not offered",
@@ -664,6 +734,15 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         if (!local) return HttpResponse::json(obj); // availability only, for a remote caller
 
         obj["capture"] = QString::fromUtf8(mw::native::toString(caps.capture));
+#if defined(Q_OS_WIN) || defined(Q_OS_LINUX)
+        // The picture chain: the admin's setting here, and for each display
+        // below what Auto means for the GPU that would encode it — what a
+        // session started now would ask for, before anything its build refuses
+        // (on Linux, Vulkan also waits for its pixel proof).
+        obj["video_pipeline"] = appSettings.nativeVideoPipeline();
+#else
+        (void)appSettings;
+#endif
         QJsonArray displays;
         for (const mw::native::DisplayInfo& d : caps.displays) {
             QJsonObject o;
@@ -684,6 +763,10 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
                         break;
                     }
             if (gpu) o["gpu"] = QString::fromStdString(gpu->name);
+            // The driver, which a regression report needs before anything else.
+            if (gpu && gpu->driverVersion)
+                o["gpu_driver"] =
+                    QString::fromStdString(mw::native::driverVersionText(gpu->driverVersion));
             // What would actually encode this display. A GPU with an encoder
             // answers for itself; when no GPU in the machine has one, the
             // machine-level fallback tier does — and it must be NAMED, because
@@ -707,6 +790,28 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
                 o["encoder_hardware"] = fallback->hardware;
                 o["encoder_is_fallback"] = true;
             }
+#if defined(Q_OS_WIN) || defined(Q_OS_LINUX)
+            if (gpuEncodes) {
+#if defined(Q_OS_LINUX)
+                // Linux's table goes by vendor: Vulkan Video on AMD (§32.28).
+                mw::native::VideoPipeline autoPipeline =
+                    mw::native::autoLinuxPipeline(gpu->vendorId);
+#else
+                mw::native::VideoPipeline autoPipeline =
+                    mw::native::autoVideoPipeline(gpu->encoders.front());
+#endif
+                // A driver the D3D12 route stays off keeps D3D11, and says why.
+                const std::string excluded =
+                    autoPipeline == mw::native::VideoPipeline::D3d12
+                        ? mw::native::d3d12DriverExcluded(gpu->vendorId, gpu->driverVersion)
+                        : std::string();
+                if (!excluded.empty()) {
+                    autoPipeline = mw::native::VideoPipeline::D3d11;
+                    o["video_pipeline_excluded"] = QString::fromStdString(excluded);
+                }
+                o["video_pipeline_auto"] = QString::fromUtf8(mw::native::toString(autoPipeline));
+            }
+#endif
             QString codecs;
             for (mw::native::Codec c : codecList)
                 codecs += (codecs.isEmpty() ? QString() : QStringLiteral(", ")) +
@@ -888,7 +993,7 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
             QString appPath = QCoreApplication::applicationFilePath();
             QStringList args = QCoreApplication::arguments();
             if (!args.isEmpty()) args.removeFirst(); // argv[0]; startDetached re-adds it
-            QProcess::startDetached(appPath, args);
+            mw::startDetached(appPath, args);
         }
         Logger::info(QStringLiteral("[System] Restart requested over loopback (%1)")
                          .arg(supervised ? QStringLiteral("supervisor respawn")
@@ -950,8 +1055,8 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
 
     // — Admin settings (localhost only, server config) —
 
-    server.router()->get("/api/admin/settings", [&server, &appSettings,
-                                                 &authManager](const HttpRequest& req) {
+    server.router()->get("/api/admin/settings", [&server, &appSettings, &authManager,
+                                                 &computerManager](const HttpRequest& req) {
         QJsonObject obj;
         obj["http_port"] = static_cast<int>(server.httpPort());
         // Report the persisted (canonical) HTTPS port, not the
@@ -967,6 +1072,37 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         obj["cert_auth_enabled"] = authManager.certAuthEnabled();
         // Whether the desktop is told when someone streams this screen.
         obj["stream_notifications"] = appSettings.streamNotifications();
+        // Whether the stream's packets ask the Wi-Fi for its video queue.
+        obj["packet_marking"] = appSettings.packetMarking();
+        // Whether the other displays go off while a stream runs on the virtual
+        // display — a Windows choice, offered once the display is installed.
+#ifdef Q_OS_WIN
+        obj["virtual_display_exclusive_supported"] = VirtualDisplay::probe().installed;
+#else
+        obj["virtual_display_exclusive_supported"] = false;
+#endif
+        obj["virtual_display_exclusive"] = appSettings.virtualDisplayExclusive();
+        // This PC's keyboard layout for the touch keyboard's text: offered when
+        // this machine names a layout (Linux only, see HostKeyboardLayout) and a
+        // host runs here other than the native one, which types text itself.
+        // The layout is named on the box, for the owner to check it.
+        {
+            const auto layout = mw::native::HostKeyboardLayout::detect();
+            bool hostHere = false;
+            const QJsonArray hosts = computerManager.getHostsJson();
+            for (const QJsonValue& v : hosts) {
+                const QJsonObject h = v.toObject();
+                if (h.value("backendType").toString() == QLatin1String("native")) continue;
+                if (h.value("isLocalHost").toBool()) {
+                    hostHere = true;
+                    break;
+                }
+            }
+            obj["keyboard_host_layout_offered"] = layout != nullptr && hostHere;
+            obj["keyboard_host_layout_detected"] =
+                layout ? QString::fromStdString(layout->name()) : QString();
+            obj["keyboard_host_layout"] = appSettings.keyboardHostLayout();
+        }
         // Start at login. Two facts, because the page has two decisions to
         // make: whether to show the box at all (a desktop session with a
         // login-item mechanism — never under a service supervisor), and
@@ -984,6 +1120,12 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         obj["instance_name"] = appSettings.instanceName();
         obj["default_instance_name"] = AppSettings::machineName();
         obj["instance_name_max"] = AppSettings::kInstanceNameMaxLength;
+        // The diagnostic modes (Advanced): each box shows the mode in force,
+        // and is locked on when the command line turned it on for this run.
+        obj["debug_mode"] = mw::run::debug();
+        obj["debug_mode_cli"] = mw::run::debugFromCli();
+        obj["verbose_logs"] = mw::run::verbose();
+        obj["verbose_logs_cli"] = mw::run::verboseFromCli();
         // Host machine only: the current host key, so the
         // admin page can carry its session over to the
         // public-domain URL after Internet activation. Not
@@ -1021,6 +1163,59 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
             bool enabled = body["stream_notifications"].toBool();
             appSettings.setStreamNotifications(enabled);
             obj["stream_notifications"] = enabled;
+            hadChange = true;
+        }
+
+        // ── Network priority ─────────────────────────────────────────────
+        // Read by each stream as it opens (PacketMarking::apply), so the next
+        // stream follows; one already running keeps its marks.
+        if (body.contains("packet_marking")) {
+            bool enabled = body["packet_marking"].toBool();
+            appSettings.setPacketMarking(enabled);
+            obj["packet_marking"] = enabled;
+            hadChange = true;
+        }
+
+        // ── Other displays off while streaming the virtual display ──────
+        // Read as the next activation starts (VirtualDisplayJob), so the next
+        // stream follows; one already running keeps its displays as they are.
+        if (body.contains("virtual_display_exclusive")) {
+            const bool enabled = body["virtual_display_exclusive"].toBool();
+            appSettings.setVirtualDisplayExclusive(enabled);
+            obj["virtual_display_exclusive"] = enabled;
+            hadChange = true;
+        }
+
+        // ── This PC's keyboard layout for the touch keyboard ────────────
+        // Read by each stream as it opens (StreamSession::applyKeyboardMode),
+        // so the next stream follows; one already running keeps its keys.
+        if (body.contains("keyboard_host_layout")) {
+            const bool enabled = body["keyboard_host_layout"].toBool();
+            appSettings.setKeyboardHostLayout(enabled);
+            obj["keyboard_host_layout"] = enabled;
+            hadChange = true;
+        }
+
+        // ── Diagnostic modes ─────────────────────────────────────────────
+        // In force at once: pages read debug from /api/health when they load,
+        // the log switches level on the spot, and the next stream worker is
+        // told through its config line. Echoed back as the mode in force,
+        // which --debug / --verbose may be holding on whatever the box says.
+        if (body.contains("debug_mode")) {
+            const bool enabled = body["debug_mode"].toBool();
+            appSettings.setDebugMode(enabled);
+            mw::run::setDebugSetting(enabled);
+            Logger::info(QStringLiteral("Debug mode %1 from the admin page")
+                             .arg(enabled ? QStringLiteral("on") : QStringLiteral("off")));
+            obj["debug_mode"] = mw::run::debug();
+            hadChange = true;
+        }
+        if (body.contains("verbose_logs")) {
+            const bool enabled = body["verbose_logs"].toBool();
+            appSettings.setVerboseLogs(enabled);
+            mw::run::setVerboseSetting(enabled);
+            mw::run::applyVerboseLogging();
+            obj["verbose_logs"] = mw::run::verbose();
             hadChange = true;
         }
 
@@ -1114,6 +1309,11 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         obj["transport_mode"] = transportMode;
         obj["media_track_only_h264"] =
             (transportMode == "webrtc-media-udp" || transportMode == "webrtc-media-tcp");
+        // The picture chain of a native session (admin → Advanced), whether
+        // this machine has a choice to make at all, and which.
+        obj["native_video_pipeline"] = appSettings.nativeVideoPipeline();
+        obj["native_video_pipeline_supported"] = nativeVideoPipelineSupported();
+        obj["native_video_pipeline_options"] = nativeVideoPipelineOptions();
         obj["auto_ip_detection"] = appSettings.autoIpDetection();
         obj["stream_bitrate"] = appSettings.streamBitrate();
         obj["stream_height"] = appSettings.streamHeight();
@@ -1146,6 +1346,9 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         obj["latency_flag_active"] = LatencyFlag::isEnabled();
         obj["latency_flag_supported"] = LatencyFlag::isSupported();
         obj["latency_flag_reason"] = QString::fromUtf8(LatencyFlag::unsupportedReason());
+        // The screens kept free of the flag (LatencyFlag.h): a bench checks that
+        // the one its client sits on is among them.
+        obj["latency_flag_skip"] = qEnvironmentVariable("MW_LATENCY_FLAG_SKIP");
         // Debug build flag: the UI exposes the enhancement algo selector only in
         // debug builds (Qt Creator); production forces 'auto'.
 #ifdef QT_DEBUG
@@ -1153,6 +1356,9 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
 #else
         obj["debug_build"] = false;
 #endif
+        // Debug mode (--debug, or its box in the admin page) shows the same
+        // options on any build.
+        obj["debug_mode"] = mw::run::debug();
         return HttpResponse::json(obj);
     });
 
@@ -1167,6 +1373,18 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
 
         QJsonObject obj;
         bool hadChange = false;
+
+        // First, so that a bad value refuses the whole request before any of
+        // its other keys is written. Refused rather than stored: a typo saved
+        // would read back as "auto" and hide behind the default.
+        if (body.contains("native_video_pipeline")) {
+            if (!appSettings.setNativeVideoPipeline(body["native_video_pipeline"].toString()))
+                return HttpResponse::error(
+                    400, "native_video_pipeline must be auto, d3d11, d3d12, vaapi or vulkan");
+            obj["native_video_pipeline"] = appSettings.nativeVideoPipeline();
+            obj["status"] = "saved";
+            hadChange = true;
+        }
 
         if (body.contains("video_codec")) {
             VideoCodec codec = AppSettings::videoCodecFromString(body["video_codec"].toString());

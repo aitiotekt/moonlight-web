@@ -43,6 +43,19 @@ struct EncoderOutput
     /// fixed bitrate, a lower QP is a sharper picture. H.264/HEVC report a QP
     /// (0–51); AV1 reports a q-index (0–255) — same direction, other scale.
     int avgQp = -1;
+
+    /// What the GPU spent on the conversion and the encode behind this frame,
+    /// timed on the D3D12 queues when asked (EncoderTuning::gpuTiming); -1
+    /// otherwise, and always on D3D11. Passed on as EncodedFrame's.
+    int64_t gpuConvertUs = -1;
+    int64_t gpuEncodeUs = -1;
+
+    /// When the GPU started and finished the conversion, on the engine's
+    /// steady clock (QueryPerformanceCounter's, on Windows), when gpuTiming
+    /// could place them there; 0 otherwise. Against the moment the list was
+    /// executed, the first says what the conversion waited for in the queue.
+    int64_t gpuConvertStartUs = 0;
+    int64_t gpuConvertEndUs = 0;
 };
 
 } // namespace mw::native::encode

@@ -138,8 +138,9 @@ Trois points de justesse invisibles hors exécution :
 
 ### Linux / macOS
 
-Linux : KMS/DRM d'abord (§19.3–19.5), le portail PipeWire en repli reste à écrire ;
-le son par PipeWire (§19.7).
+Linux : KMS/DRM d'abord (§19.3–19.5), le portail PipeWire en repli ; l'écran
+virtuel fait par le compositeur (Mutter, KWin, portail) et les apps dans leur
+propre gamescope (§35) ; le son par PipeWire (§19.7).
 macOS : ScreenCaptureKit, qui écrit directement le NV12 de l'encodeur (§20).
 
 ---
@@ -170,6 +171,19 @@ l'étape `convert` et résumé en fin de session (« cross-GPU copy: N frames of
 session le dit en warning au démarrage : sur ce chemin, toutes les promesses
 zéro-copie de ce document sont hors jeu. Avant cette date la session refusait
 de démarrer.
+
+**Depuis le 21/09/2026, la relecture passe par le moteur de copie**
+(`acdcda49`). Un `CopyResource` D3D11 part dans la file 3D du GPU source, où
+il attend derrière l'image d'un jeu. Sous Resident Evil Requiem sur l'Arc,
+la relecture d'une image 1440p y prenait 15 ms en moyenne et 64 au p99, pour
+1,6 ms de copie. Le pont ouvre désormais la surface capturée en D3D12 par son
+handle NT, et la relit sur une file COPY de ce GPU. Cette file tourne sur le
+moteur DMA, que le jeu n'utilise pas : 1,6 ms en moyenne, 2,3 au p99, sous la
+même charge, avec des pixels identiques. Si une étape est refusée (surface sans
+handle partagé, GPU sans D3D12), la relecture reprend le chemin D3D11, et le
+journal le dit une fois. `MW_BRIDGE_DMA=off` force le chemin D3D11, pour
+l'avant/après. La chaîne D3D12 (§32) ne prend pas ce pont : une session qui
+copie entre GPU reste en D3D11.
 
 ---
 
@@ -320,6 +334,22 @@ rafraîchissement resterait indéfiniment sur une image corrompue. Côté backen
 — jamais celles du démarrage de session, où il n'y a aucune référence à
 rattraper. Côté navigateur, la suppression est bornée par un chien de garde de
 2,5 s : passé ce délai sans trame contiguë, on redemande une keyframe.
+
+**Pas de demande depuis une plateforme Apple (28/09/2026).** Le pari suppose un
+décodeur qui décode un delta dont la référence n'est jamais arrivée, en
+rapiéçant le trou : c'est ce que font les décodeurs de Windows, sur lesquels il
+a été mesuré. VideoToolbox, qui décode tout flux H.264 et HEVC de WebCodecs sous
+macOS, iOS et iPadOS, le refuse (« Decoding error »). Vu au test C5.7 du plan
+D3D12 (Chrome sur un Mac, par Internet, hôte Arc en oneVPL avec intra-refresh) :
+trois calages du lien en trois minutes, chacun suivi d'une erreur du décodeur,
+d'un décodeur neuf et d'une keyframe — 60 à 110 ms d'image figée, et la keyframe
+que le pari devait éviter arrivait quand même, une erreur plus tard. Aucune API
+ne distingue les deux décodeurs : `decoderRidesOutGaps` (`BrowserDetect.js`) lit
+l'agent utilisateur, et le navigateur ne demande pas `ride_out_loss` sur une
+plateforme Apple. L'hôte encode alors sans vague et récupère à l'ancienne —
+deltas jetés pendant le calage, keyframe dès que le lien se vide —, le chemin
+qui tournait déjà sans erreur sur ce Mac en D3D12 au même test. Ailleurs, rien
+ne change.
 
 Le flag traverse le processus worker (`cfg["rideOutLoss"]`) : le moteur média
 vit dans l'enfant, le poser sur la session du parent ne l'atteindrait jamais.
@@ -506,12 +536,13 @@ Rien n'attend jamais sur le thread de capture. La grille avance d'un intervalle
 à chaque présent admis (jamais « maintenant + intervalle », sinon la cadence
 dérive — mesuré 56 fps pour 60) ; un présent qui arrive un peu **avant**
 l'échéance, dans le quart d'intervalle qui la précède, passe aussi, plutôt que
-d'attendre une période d'écran entière pour le suivant. La grille n'est
-**ré-ancrée** sur le présent admis que s'il est en retard de plus d'une
-période d'écran, c'est-à-dire qu'un présent manquait là où la grille en
-attendait un : écran resté fixe, boucle bloquée, ou jeu tournant au fps du
-stream mais déphasé — auquel cas la grille se verrouille sur lui au lieu de
-battre contre lui (une image sautée une fois, pas à chaque intervalle).
+d'attendre une période d'écran entière pour le suivant. La grille n'était
+**ré-ancrée** sur le présent admis que s'il était en retard de plus d'une
+période d'écran, pris pour un présent manquant : écran resté fixe, boucle
+bloquée, ou jeu tournant au fps du stream mais déphasé — auquel cas la grille
+se verrouillait sur lui au lieu de battre contre lui. Cette règle prenait
+aussi pour manquant le présent d'un contenu plus lent que l'écran ; elle est
+remplacée depuis le 09/10 par des fenêtres (§9.6.1).
 
 **Première version, abandonnée le 02/09 au soir.** Elle faisait l'inverse :
 retenir le *dernier* présent de chaque intervalle et l'encoder à l'échéance,
@@ -560,6 +591,368 @@ encode 3,38 / 4,10 / 4,61 · queue 0,16 / 0,38 / 0,96 · send 0,33 / 0,70 /
 1,02 · total 4,19 / 5,63 / 6,66 ms` (moyenne / p95 / p99). La session
 précédente, avec rétention, sur le même banc : total **7,70 / 20,48 / 24,58**.
 Le p99 hôte a été divisé par presque quatre pour le même débit sur le fil.
+
+### 9.6.1 La porte porte le débit demandé : des fenêtres au lieu du recalage (09/10/2026)
+
+Le banc Android TV (B, 08/10) l'a trouvé : un flux à **50 i/s** d'un contenu à
+60 i/s, sur un écran à 144 Hz, ne portait que **40 i/s** (« 606 not carried
+(20/s) »). Le contenu présente toutes les 16,7 ms. Avec une grille de 20 ms,
+la première présentation après un tic est souvent en retard de plus d'une
+période d'écran (6,9 ms), alors qu'aucune ne manque. La porte recalait alors
+la grille sur elle, la suivante tombait trop tôt et sautait : deux images sur
+trois. Rejoué sur RE9 (77 i/s) sur l'écran virtuel à 240 Hz, réglage par
+défaut depuis le 30/09 : 48,4 i/s portées pour 60, 40,7 pour 50. La même règle
+coupait aussi un tiers des images d'une mire à 60 i/s sur un écran à 120 Hz,
+flux à 60 (N4 du même banc). Chaque image tombe un rafraîchissement trop tôt
+ou trop tard : la porte se recalait sur les tardives et sautait les précoces.
+
+**La règle (`FrameCadence::admit()`).** Chaque tic possède une fenêtre, d'un
+quart d'intervalle avant lui à un quart avant le suivant. La première
+présentation de la fenêtre est encodée à l'instant où elle arrive, aussi tard
+soit-elle dans la fenêtre, et la grille avance d'un intervalle sans changer de
+phase. Seule une fenêtre restée vide déplace la grille :
+- la présentation qui suit arrive dans l'intervalle suivant (un jeu au débit
+  du flux qui a glissé hors de sa fenêtre, un contenu un peu plus rapide avec
+  un trou plus long que d'habitude) : elle compte pour le tic manqué, et la
+  fenêtre suivante s'ouvre sur elle ;
+- deux fenêtres vides ou plus (écran fixe, boucle bloquée) : la grille repart
+  d'elle, un intervalle plus loin, comme avant.
+
+Les quatre exigences tiennent :
+- rien n'est jamais retenu ;
+- le premier changement après une pause part aussitôt, et le suivant un
+  intervalle plus tard ;
+- aucun rattrapage en rafale : un seul tic manqué est rattrapé au plus, et
+  seulement tant que le contenu continue ;
+- un jeu au débit du flux se cale : sa présentation la plus tardive tombe en
+  fin de fenêtre, les autres dedans.
+
+Le plafond (`ceiling()`, flux au débit de l'écran ou au-dessus) garde sa
+règle, à l'identique.
+
+**La piste écartée.** Avancer la grille d'un nombre entier d'intervalles
+depuis le tic manqué, sans jamais changer sa phase, rend le débit au contenu
+plus rapide. Mais un jeu au débit du flux, à un rafraîchissement près, bat
+alors contre la grille : en simulation, il descend jusqu'à 45 i/s pour 60 sur
+un écran à 120 Hz. Elle rattrape aussi après une pause : deux images coup sur
+coup.
+
+**Hors ligne.** Tests natifs (`test_frame_cadence.cpp`) : 60 i/s sous 50 à
+144 et 240 Hz, et 77 i/s sous 60 à 240 Hz, à ±1 % ; un jeu à 60 sous un flux
+à 60, sur des écrans à 120, 144, 165 et 240 Hz, au rafraîchissement près, avec
+une dérive de ±0,1 % : au plus 4 images écartées en 20 s ; la pause, la
+rafale, le plafond. L'ancienne règle échoue à 493 vérifications de ces tests,
+l'avance par intervalles entiers à 227. Rejeu des passes du plan « attente »
+(`scripts/bench/clickpath/gatesim.py`, `--before` pour l'ancienne porte) :
+
+| Scène de RE9, écran virtuel à 240 Hz | flux 60 | flux 50 | flux 30 |
+|---|---|---|---|
+| avant | 48,4 | 40,7 | 29,6 |
+| après | 59,6 | 49,7 | 29,8 |
+
+Les passes de l'outil à 240 i/s (flux 120 sur l'écran à 240 Hz) gagnent
+0,1 à 0,3 i/s ; celles où le flux est un plafond ne changent pas. Deux images
+admises à moins d'un demi-intervalle l'une de l'autre restent rares : moins
+de 3 % sur les traces de RE9 et de l'outil, aucune à moins d'un quart.
+
+**Banc A/B (09/10, 10:07-10:46).** Hôte DualRTX, écran virtuel du produit à
+240 Hz rendu par la RTX, HEVC sur DDA, transport SCTP du produit ; client
+Chrome de l'UM790Pro (Windows) au câble. Bras « avant » : `build\` du 08/10,
+sans le correctif ; bras « après » : `build\` à `cb425f85`. Contenus :
+`mw-click-target --fps 60 --react frame` (un jeu à 60, 60 clics par passe) et
+la scène de RE9 (la copie propre, muette, aucun clic), qui ne rendait ici que
+~62 i/s, GPU à 98 %. I/s portées (relais, dans la scène ou la passe moins 3 s
+à chaque bout) :
+
+| Contenu, flux | avant | après |
+|---|---|---|
+| outil à 60 i/s, flux 60 | 59,3 · 59,2 | 60,0 · 60,0 |
+| outil à 60 i/s, flux 50 | 40,9 · 40,9 | 50,0 · 50,0 |
+| RE9 (~62 i/s), flux 60 | 54,6 | 59,5 |
+| RE9 (~62 i/s), flux 50 | 41,3 | 49,7 |
+
+Le critère (débit du flux à ±2 %) tient partout : −0,8 % au pire. Le rejeu
+de `gatesim.py` sur les captures de chaque passe, avec la règle de son bras,
+retrouve le compte du relais à 4 images près. L'âge de l'image ne bouge pas
+(p50 de 5,2 à 6,2 ms avant, 5,2 à 5,7 après sur l'outil ; 6,6-7,1 et 6,7-7,0
+sur RE9), le clic non plus (p50 9,6 à 12,4 ms avant, 10,0 à 11,4 après ; p90
+26 à 29 ms de part et d'autre, une passe « avant » à 43). Une passe RE9
+« après » à 50 a été jetée : le jeu a planté au chargement, écran fixe ; elle
+a été refaite. Le contenu à ~77 i/s n'a pas été reproduit au banc (RE9 à ~62
+ce jour) ; il est couvert par le rejeu et les tests.
+
+**La limite vue le 14/10** (banc §8w.8) : la grille glisse le long des
+présentations, et ses bords en croisent une toutes les ~2 min. Sous Windows,
+quand le flux tient un nombre entier de rafraîchissements de l'écran, la porte
+se cale maintenant sur l'écran (§9.6.3). Ailleurs, la règle ci-dessus reste
+entière.
+
+### 9.6.2 Une fenêtre d'admission après chaque appui (13/10/2026, clé de banc)
+
+**Le problème** (banc §8v.5). À 60 i/s sur l'écran virtuel à 240 Hz, la porte
+n'encode qu'une présentation sur quatre. L'image qui porte un clic n'est en
+général pas la première de sa fenêtre : elle attend la suivante, ~10 ms en
+médiane. Pour cette seule raison, le clic de v0.4.0 ne gagnait rien sur v0.3.1
+à 60 i/s.
+
+**La règle** (`core/InputAdmit.h`). Pendant 33 ms après chaque appui, chaque
+présentation que la porte saute part quand même, 3 au plus. La porte est
+consultée d'abord, sur chaque présentation, et n'apprend rien de ces images :
+sa grille garde sa phase, ses fenêtres restent servies, rien n'est retenu.
+- **Ce qui ouvre une fenêtre** (`PressFilter`) : une touche, un bouton de souris
+  ou de manette qui s'enfonce, une gâchette qui passe le quart de sa course.
+  Jamais la répétition auto, les événements `resync` du battement des touches
+  tenues, les relâchements, le mouvement, la molette ni les sticks.
+- **La fenêtre suit l'heure de présentation** de chaque image, pas l'instant où
+  la boucle la prend : une image composée avant l'appui ne peut pas le porter.
+  Les appuis reçus entre deux tours de boucle comptent ensemble. Un appui dans
+  une fenêtre ouverte la prolonge sans jeton.
+- **Seulement sur une vraie présentation** : ni le chemin du pointeur seul, ni
+  les renvois. Sinon, viser en tirant dépenserait les fenêtres sur le curseur.
+- **Un seau de fenêtres** : 3 d'avance, 2 de plus par seconde. Une fenêtre
+  s'ouvre entière ou pas du tout. Au pire, ~6 images de plus par seconde (10 %
+  à 60 i/s), et un appui refusé attend exactement comme sans la règle.
+- **La garde du lien** : une image de fenêtre ne part que si le gouverneur est
+  au débit réglé, reçoit les rapports du client et n'y a rien vu d'inquiétant
+  depuis 2 s (`RateGovernor::calm()`), et si le modèle du lien
+  (`LinkOccupancy`) n'a pas plus de K+1 intervalles de retard. La garde vit
+  dans la boucle, car `bufferedAmount` ne voit rien avant que la mémoire
+  d'envoi d'usrsctp soit pleine.
+- **La garde de l'encodeur** : rien quand le p95 d'encodage dépasse un
+  rafraîchissement de l'écran (4,2 ms à 240 Hz), cas d'AMF et de QSV. La boucle
+  synchrone encode sur le fil de capture : les images de la fenêtre
+  pousseraient celles de la grille.
+- **Un client qui peint au vsync, moins de deux fois plus vite que le flux**
+  (un écran à 60 Hz pour un flux à 60) : deux images admises restent à un
+  demi-intervalle l'une de l'autre (`gapFor()`). Sans cet écart, l'image du clic
+  arrive en avance sur la grille du client, et les doubles pas doublent au
+  rejeu. Mesuré le 14/10 (banc §8w.9), l'écart ne suffit pas.
+  - En vsync, à 60 comme à 120 Hz, la fenêtre ajoute des doubles pas autour des
+    clics, sur 11,7 et 20,8 % des clics, sans gain démontré.
+  - Au double du flux, elle ne fait pas de dégât, mais le client absorbe aussi
+    son gain.
+  - Le défaut l'y laisse donc éteinte (ci-dessous).
+- **Inerte** sous un plafond (flux au débit de l'écran ou au-dessus : tout passe
+  déjà), sous une cadence de banc (`cadence=`), sous PyroWave (~267 Ko par
+  image) et hors Windows.
+
+**Le coût.** NVENC compte en images, pas en temps : chaque image de plus coûte
+ses octets, et le budget par image ne bouge pas. Au banc : 3 images de plus par
+clic, +3,3 % de débit à un clic par seconde, +10 à +12 % sous une rafale.
+
+**Qui l'a, par défaut** (décision de Bruno, 14/10/2026) : un client dont le
+tearing est réel et qui ne peint pas au vsync en ce moment
+(`InputAdmit::forClient()`).
+- Le navigateur le dit au /start : `client_tearing_real`
+  (`CANVAS_TEARING_IS_REAL`, `BrowserDetect.js`), vrai pour Chromium sous
+  Windows. Il arrive à `SessionConfig::clientTearingReal`.
+- `client_vsync` suit, au /start puis par `clientrefresh` : un client qui passe
+  au vsync en cours de session la perd. Le /start ne dit que la case « Autoriser
+  le tearing » ; le rendu, une fois fait, dit le vsync réel. WebGPU, donc tout le
+  HDR, et l'élément `<video>` peignent au vsync, case cochée ou non (§9.11).
+- Chromium sous macOS déchire dans un compositeur qui attend quand même le
+  vsync, et Linux n'a pas été mesuré : la règle y reste éteinte. Un frontend
+  plus ancien n'envoie pas le champ, et n'a pas la règle.
+- Le journal du worker dit au démarrage si la règle sert ce client, et
+  pourquoi pas.
+
+**La clé** : `inputadmit=0` l'éteint, `inputadmit=1` l'allume pour tout client
+(le banc), dans `MW_NATIVE_TUNING` ou dans `native_tuning` du `settings.json`
+(banc §9). Les sous-clés : `inputadmitms=` (T, 8-100 ms),
+`inputadmitburst=`, `inputadmitrate=`, `inputadmitmax=` (K) et `inputadmitgap=`
+(l'écart imposé, en ms).
+- Le journal du worker dit la règle au démarrage, et fait le compte en fin de
+  session : appuis, fenêtres, images de plus, et ce qu'ont retenu le plafond,
+  l'écart, le lien et l'encodeur.
+- `clicktrace=1` ajoute à la trace des lignes `admit` (`press`, `grid`,
+  `window`), que `hostpath.py` lit.
+- Tests : `test_input_admit.cpp`, groupe `input_admit`. `gatesim.py
+  --inputadmit` et `inputsim.py` en gardent une copie pour le rejeu.
+
+**Banc du 13/10 (§8w).** À 60 i/s, le clic → drapeau passe de 24,0 à 18,2 ms
+en médiane (−5,8 ms), et 72 % des clics passent sous 20 ms, contre 18 %.
+Aucune perte, aucune image clé, et la grille n'est pas touchée.
+
+**Banc du 14/10 (§8w.9).**
+- Sur un client à 60 Hz qui déchire, le gain est le même : −7,6 ms.
+- Sur un client en vsync, il n'y a aucun gain démontré, et des doubles pas
+  apparaissent sous deux fois le débit.
+- Au rejeu (§8w.10), le gain de la jambe `present` baisse quand le débit monte :
+  −4,1 ms à 75 i/s, −3,7 à 90, −2,9 à 120, −1,2 à 145. Le coût reste d'environ
+  3 images par clic.
+
+Le défaut, décidé par Bruno sur ces chiffres, est ci-dessus.
+
+**Sous la porte calée** (§9.6.3), la fenêtre ne change pas : elle ajoute des
+« oui » par-dessus la grille, et lit l'intervalle réglé du flux, jamais N
+périodes de l'écran.
+
+### 9.6.3 La porte calée sur l'écran, et l'écran virtuel au multiple du client (14-16/10/2026)
+
+**Le défaut** (banc §8w.8). `FrameCadence` arrondit son intervalle à la
+microseconde : 16 666 µs à 60 i/s. Sur l'écran virtuel à 240 Hz, la grille
+glisse donc d'environ 36 µs par seconde le long des présentations.
+- Toutes les ~2 min, pendant ~30 s, le bord d'une fenêtre tombe sur une
+  présentation. La porte alterne alors des écarts de 12,5 et 20,8 ms au lieu de
+  16,7. Une grille neuve s'ancre sur ce bord : chaque flux commence par 10 à
+  30 s d'écarts irréguliers.
+- Un client en vsync le voit : 6,8 % des rafraîchissements à 60 Hz, 7,4 % à
+  120 Hz pour un flux à 120.
+- La cadence alignée sur un client en vsync (§9.11) prend son intervalle exact.
+  Elle glisse plus lentement, mais une grille posée sur un bord peut y rester
+  des minutes.
+
+**Le treillis des présentations** (`core/PresentLattice.h`, pur, fil de
+capture).
+- **Sa période T** vient du mode que lit la duplication à chaque ouverture
+  (`ModeDesc.RefreshRate`, un rationnel, en ns, `IWindowsCapture::refreshPeriodNs()`),
+  à défaut de `m_DisplayMilliHz`. La ligne « duplication started » dit le mode
+  (« mode at 239.744 Hz »).
+- **Il se nourrit** de l'heure DXGI de chaque vraie présentation, sautée ou non,
+  avant que la porte décide. Jamais d'un pointeur seul, d'une attente vide ni
+  d'un renvoi.
+- **Une boucle de phase du premier ordre** : la phase suit 1/32 de chaque écart,
+  borné à ±T/4. Les divisions arrondissent vers le bas, comme dans la copie
+  Python.
+- **La netteté**, moyenne de |écart|/T : simple sur les 64 premières
+  présentations, puis glissante (1/64). Le treillis s'engage sous 0,10 et se
+  relâche au-dessus de 0,20. Mesuré : 0,045 à 0,06 sur l'écran virtuel en
+  contenu dense, 0,16 sous le portail de Mutter et sous ScreenCaptureKit, 0,25
+  sans grille.
+- **La phase repart** sur la présentation après une pause de plus de 10 s, ou de
+  plus d'1 s quand l'écart dépasse T/4.
+- **Il est neuf** à chaque reprise de la capture (mode, HDR, perte de D3D12,
+  bascule DDA/WGC), et survit aux changements de porte (écran du client, palier
+  de « Auto »).
+
+**La porte calée** (`FrameCadence::admit(now, present, view)`). Elle s'applique
+quand toutes ces conditions tiennent :
+- la capture est Desktop Duplication (WGC n'a pas été rejoué) ;
+- la cadence est celle du produit, ni `host`, ni `host-guarded`, ni `deadline` ;
+- la porte n'est pas un plafond ;
+- l'intervalle vaut N périodes de l'écran à 0,2 % près, N entier ≥ 2
+  (`lockRatio()`) : 60, 80 ou 120 i/s sur 240 Hz. Une cadence alignée sur un
+  client en vsync qui tombe sur N périodes cède alors à N·T ;
+- le treillis est engagé.
+
+Sa règle :
+- toute décision se prend sur l'heure de présentation (`stamps.presentUs`) :
+  une seule échelle de temps ;
+- l'intervalle vaut exactement N périodes, et chaque fenêtre commence à
+  mi-chemin entre deux présentations du treillis ;
+- après une fenêtre servie, la suivante s'ouvre au milieu le plus proche, un
+  intervalle plus loin. C'est là que la boucle corrige ;
+- après une fenêtre vide, la suivante s'ouvre une demi-période après la place
+  de la présentation sur le treillis ;
+- après une pause, elle s'ouvre un intervalle moins une demi-période après la
+  présentation : l'image d'après vient un intervalle juste après.
+
+Sinon, la porte est celle du §9.6.1, à l'image près. `intervalUs()`,
+`nextDueUs()` et `skipped()` gardent leur sens.
+
+**Inerte** sous Linux et macOS, sous un plafond, aux rapports non entiers (50,
+72, 75, 90, 145 i/s sur 240 Hz), sous une cadence de banc, sous WGC, et quand
+le treillis n'est pas net (écran VRR, jeu qui présente hors grille).
+
+**La clé** `cadencelock` : −1 le produit (`kCadenceLockProduct`, allumé depuis
+la porte G2 du 14/10, `5b74d41d`), 0 éteint, 1 allumé. Le treillis est tenu et
+journalisé même à 0.
+- Au départ, à chaque nouvelle porte et à chaque nouvelle capture : `[native]
+  cadence lock: on — 4 periods of 4166666 ns a picture, …`, ou pourquoi pas.
+- Les engagements, relâches et recalages : les 5 premiers, puis un sur 20.
+- En fin de session : `[native] cadence lock: period <ns> ns, interval <ns> ns,
+  N periods a picture; …`, avec la part des appels calés, le premier engagement
+  et la netteté. `gatesim.py --lock` relit cette ligne.
+- `clicktrace=1` ajoute les colonnes `locked` et `latticeUs` aux lignes `admit`.
+- Tests : `test_cadence_lock.cpp`, groupe `cadence_lock`, avec un train d'or
+  porté ligne pour ligne de `gatesim.py --selftest`.
+
+**Mesuré** (banc §8x.3-8x.4). Les sauts que fait la porte elle-même tombent de
+6 à 7 % à 0,00-0,05 % en contenu dense, et de 4,3 à 0,2 % sous RE9. Un client
+en vsync voit ~1 % de pas hors du rythme au lieu de 4 à 6 %. Débit, attente et
+clic ne bougent pas.
+
+**L'écran virtuel au multiple du client** (`vddmatch`, 15-16/10/2026). Le
+calage laisse un battement quand l'écran du client ne tourne pas à sa fréquence
+ronde.
+- Le M27Q « à 120 Hz » de l'UM790Pro tourne à 119,872 Hz. À 240,000 Hz, la
+  porte calée sort 120,000 i/s, et le client perd une image toutes les 7,8 s.
+- L'âge de l'image suit une dent de scie : il croît d'environ 1 ms par seconde,
+  puis retombe d'un rafraîchissement.
+
+Ce que fait `vddmatch` :
+- **La règle** (`VirtualDisplay::matchedRefreshMilliHz`). L'écran virtuel
+  tourne à k fois la fréquence mesurée du client, au milli-hertz, pour le plus
+  grand k entier qui tient sous le plafond : 239,744 Hz pour 119,872 ; 287,694
+  pour 143,847 ; 330 pour 165.
+  - Il faut que le flux tourne au rythme du client ou à un diviseur entier, à
+    0,2 % près (la tolérance de la porte).
+  - Il faut aussi que k fois ce diviseur vaille 1 ou soit pair, pour que le pas
+    ×2 d'Auto (`CadenceStepper.js`) divise encore l'écran : 59,94 Hz donne
+    239,76, pas 299,7.
+  - Sinon, l'écran reste à 240 Hz : un flux Auto à 120 pour un écran à 144 Hz,
+    un client pas encore mesuré.
+- **Le plafond** est de 330 Hz (`kMatchedRateMaxHz`), deux fois un écran à
+  165 Hz. `vddmatchmax=` le change au banc, jusqu'aux 500 Hz du pilote.
+- **La mesure du client** (`util/RefreshRate.js`).
+  - Une fois la page visible, le rAF est suivi 12 s de plus. La période est la
+    pente de ses heures contre l'indice du rafraîchissement, si bien qu'une
+    image sautée ne saute qu'un indice.
+  - Cette mesure remplace la mesure rapide quand les deux s'accordent. Elle
+    reste dans ce navigateur (`localStorage`) pour la page suivante.
+  - Rien ne s'en voit, et une TV garde sa première mesure.
+- **Le taux reste au milli-hertz jusqu'au pilote**.
+  - Il est écrit en décimal dans `vdd_settings.xml` (« 239.744 »), et passe à
+    Windows en rationnel exact (29968/125, `rateFraction`).
+  - Windows n'applique aucun mode que le pilote ne liste pas : une demande à
+    240/1 d'un écran qui liste 239,744 échoue en silence.
+  - L'hôte ajoute donc le mode à la liste du pilote, puis redémarre son nœud,
+    par la tâche élevée.
+- **Un écran déjà allumé** à un taux donné par ce processus le garde : un autre
+  flux peut y être.
+- **Le repli ×1** (`core/CaptureHold.h`).
+  - Chaque session juge si la capture a tenu, sur ses seules secondes de
+    contenu dense : au moins 1,5 présentation par image du flux, et 20 s au
+    moins.
+  - Le verdict échoue dans quatre cas : plus de 1 % des présentations repliées
+    entre deux acquisitions, une boucle occupée plus de 70 % du temps, moins de
+    97 % des images du flux portées, ou un treillis calé sur moins de 90 % des
+    appels.
+  - Le worker envoie ce verdict (`captureHold`) juste avant `ended`.
+  - Le serveur garde un refus au-dessus de 240 Hz, sur l'écran virtuel du
+    propriétaire, dans `settings.json` (`vdd_match_refused` : GPU, taux,
+    version, 8 au plus).
+  - Au /start suivant, le plafond passe 2 % sous le plus bas refus de cette
+    version, sur un GPU que la machine a encore (`matchCapAfterRefusals`). Un
+    écran à 165 Hz refusé à 330 reçoit alors 165 (×1), et un écran à 144 Hz
+    sur le même hôte essaie encore 288.
+  - Le mode ne change jamais sous un flux qui tourne, et une mise à jour
+    réessaie.
+- **Le défaut** (décision de Bruno, 16/10/2026, `b3451a38`) : allumé sous
+  Windows (`kVddMatchProduct`). Il reste éteint sous Linux, dont le moniteur du
+  portail suit la règle du flux, et sous macOS, qui n'est pas mesuré.
+  `vddmatch=0` et `vddmatch=1` passent outre, pour le banc.
+- **Le journal**.
+  - Au /start : « [Session] virtual display at 239.744 Hz for a 120 fps stream
+    (vddmatch: 2 x the client's 119.872 Hz) », ou pourquoi rien ne tient. Après
+    un refus, le motif gagne « , under N Hz: the capture did not hold more on
+    this host ».
+  - En fin de session, le worker écrit « capture hold at X Hz: held / not held
+    (why) over N s of dense content », et le serveur « [Session] capture held /
+    did not hold … ».
+- **Mesuré** (banc §8x.7-8x.9).
+  - À 120 i/s en vsync, la dent de scie de l'âge disparaît, et les images
+    envoyées jamais montrées passent de 6,9 à 1,7 par minute. À 144 Hz, elles
+    passent de 20,7 à 0.
+  - La RTX de DualRTX tient 330 Hz avec une large marge.
+  - À l'aveugle, vddmatch est préféré 2 fois sur 2.
+- **Pas mesuré** : un hôte modeste, dont les seuils du repli sont les marges de
+  la RTX, à revoir ; RE9 à 288 et 330 Hz.
+- **Piste : choisir la phase.** Pour N périodes par image, la porte calée a N
+  phases possibles : 2 à 120 i/s sur 239,744 Hz, 4 à 60 i/s. La phase reste fixe
+  tout le flux. Dans une passe de V2, elle tombait près de l'échéance du client,
+  et l'âge sautait d'un rafraîchissement (12,5 ↔ 20 ms) sur 1,6 % des
+  rafraîchissements. La choisir d'après l'arrivée chez le client l'éviterait.
 
 ### 9.7 Écran verrouillé : la session attend, le stream reste vivant (02/09/2026)
 
@@ -728,6 +1121,46 @@ decoding on », « reference invalidated: frame 222 never reached the receiver,
 healing with a delta », aucune IDR demandée, aucune erreur de décodeur, 53
 images/s et 5,2 ms pendant l'exercice (NVENC).
 
+**Un client qui refuse les réparations (25/10/2026).** Il le dit à `/start`
+(`ref_invalidation:false`) : Apple depuis `c0bcdfd8`, la Freebox Player POP.
+Jusque-là, l'hôte se contentait d'une seule référence
+(`refuseReferenceRepairs`). AMF, oneVPL, D3D12 et Vulkan s'arrêtent là, mais
+NVENC et VA-API gardent l'invalidation avec une référence, et `/start`
+répondait `true`. Le Mac décodait donc par-dessus chaque trou, et VideoToolbox
+rejetait les deltas orphelins : 32 erreurs de décodeur dans un A/B, chacune
+une reconstruction du décodeur et l'attente d'une keyframe. Désormais,
+`NativeMediaEngine` retient le refus :
+- `referenceInvalidation()` répond faux (`healsByReference`, `EncoderTuning.h`) ;
+- `invalidateReference()` devient une demande de keyframe ;
+- le relais répond à un `invalidateref` reçu quand même par une seule keyframe.
+
+Les évictions (§9.10.2) et l'image jetée au calage posent la même question au
+moteur et suivent. Le client fait le même ET de son côté (`decodesThroughGaps`,
+`5baa0f42`).
+
+Bancs du 25/10 avec `mw_drop_test`, chacun en deux bras : R, un client qui
+refuse (`mw_ref_repairs=off`), et C, le témoin.
+
+| Encodeur, hôte | R : trous → keyframes | C : trous réparés par delta | Erreurs |
+|---|---|---|---|
+| NVENC, DualRTX | 12 → 12 | 13 | 0 |
+| AMF, DualRTX (`gpu=2`) | 14 → 14 | 13 | 0 |
+| VA-API H.264, UM790Pro | 2 → 2 | 2 | 0 |
+| NVENC, lien bridé par `netem` à 4 Mbit/s | 123 → 123 | 63 | 0 |
+| oneVPL, N95 | 2 → 2 | 2 | 0 |
+
+- Dans chaque bras R, `/start` répond `false`, et aucune réparation n'est
+  tentée. Sans ce correctif, NVENC et VA-API répondaient `true`.
+- Sur un vrai Mac, le M3 (HEVC 1080p60 HDR, NVENC) : 15 trous donnent 15
+  demandes de keyframe « frame gap », 0 « Decoding error », 0 reconstruction du
+  décodeur, et moins de 3 deltas retenus par trou.
+- Ce matin-là, le même M3 faisait 13 à 32 « Decoding error ».
+- Seul effet du crochet de debug : le régulateur lit chaque trou provoqué comme
+  une perte, et baisse le débit pendant 3 à 4 s.
+- Les « decoder error » qui restent sur un appareil Apple suivent un gel du lien
+  sans trou d'image : c'est une autre affaire, le décodeur HEVC d'Apple après un
+  arrêt, encore ouverte.
+
 ### 9.10.1 AMF : la même réparation par références long terme (06/09/2026)
 
 ⚠️ **plan corrigé** : le plan disait « pas d'équivalent AMF (AMF n'a pas
@@ -833,6 +1266,83 @@ comme toujours. Pour tout autre moteur, le comportement d'avant est intact
 (demande de keyframe sauf ride-out), garanti par le drapeau `nameEvictions`.
 Ceci vaut pour NVENC comme pour AMF depuis que ce dernier a l'invalidation.
 
+**Le même geste au calage du lien, derrière un interrupteur (29/09/2026, §9-25
+du plan D3D12).** Il restait une image jetée sans nom : celle que le relais
+écarte quand le lien ne se vide plus (`SendBacklog`, « Dropped delta frame (link
+not draining) »). Elle part **avant** d'avoir reçu un id de fil, donc le client
+ne voit aucun trou.
+- En ride-out, le delta suivant prédit de cette image. VideoToolbox refuse ce
+  delta orphelin (d'où `50b2b574` : Apple ne demande plus le ride-out).
+  Windows le rapièce jusqu'au passage de la vague d'intra-refresh.
+- Sans ride-out, le relais jette tout jusqu'à une keyframe demandée au
+  dégorgement.
+
+Avec `namedrops=1` (`MW_NATIVE_TUNING`, clé lue par le relais par
+`NativeMediaEngine::nameLinkDrops`), un moteur qui répare par invalidation
+reçoit le numéro de l'image jetée à l'instant. Le delta suivant prédit d'une
+image que le client a déjà : ni keyframe, ni vague à attendre. Un calage plus
+long que la portée des références finit en keyframe, que la session demande
+d'elle-même.
+
+En envoi direct, le relais tourne sur le fil de capture. L'invalidation
+précède donc l'encodage de l'image suivante, et aucun delta déjà codé ne
+prédit de l'image jetée. Avec `pipelined=1`, une image peut déjà être codée
+quand la remise arrive : ce cas n'est pas couvert. Le compteur
+`sctpDeltaNamed` de la ligne « Drop counters » compte ces images nommées.
+
+Le défaut dépend de l'encodeur, d'après les bancs ci-dessous.
+
+**Le banc Linux, fait le 29/09** (banc §8n.27 : Chrome de l'UM790Pro, coupures
+et bridages par `netem`, un détecteur de dégâts lu sur le canvas du stream) :
+- NVENC et AMF perdent 93 à 96 % de leurs images abîmées. Presque toutes
+  venaient des bridages du lien, et les gels ne changent pas.
+- D3D12 VE, qui attend déjà des images clés, y gagne un peu.
+- **oneVPL se bloque** : après des réparations enchaînées depuis la même
+  référence longue, un encodage ne se termine jamais, et la session finit
+  10 s plus tard. Trois passes sur trois, jamais vu en production.
+  `namedrops` ne doit donc jamais valoir pour oneVPL.
+- **Cause trouvée le même jour** (banc §8n.30, reproduit hors ligne) : une
+  réparation par référence longue **pendant une vague d'intra-refresh** bloque
+  l'encodeur HEVC d'Intel. Vagues bout à bout, la première réparation suffit ;
+  sans vague, 176 réparations passent. H.264 et AV1 ne se bloquent pas. Les
+  pertes que le client signale prennent le même chemin : la v0.3.1 y est
+  exposée sur Intel.
+- **Corrigé le même jour** (option A de Bruno, §21.6b) : en HEVC sous
+  intra-refresh, oneVPL ne répare plus par référence longue, et chaque perte
+  coûte une image clé. Rejoué sur le banc du §8n.30 : plus aucun blocage.
+
+**Les bancs Windows et Mac, faits le 29/09** (banc §8n.28, le lien bridé côté
+hôte par WinDivert) :
+- Chrome sous Windows (N95) confirme Linux : NVENC perd 85 % de ses images
+  abîmées, AMF 46 %, D3D12 VE ne bouge pas, et les gels non plus.
+- Sur le Mac, `namedrops` est neutre. VideoToolbox n'affiche pas d'image fausse,
+  et l'image clé évitée coûte peu en LAN : sur NVENC, deux fois moins d'images
+  clés demandées, pour les mêmes gels.
+
+**Le défaut, décidé par Bruno le 29/09 : NVENC et AMF en D3D11**, là où les
+bancs montrent un gain (`nameLinkDropsByDefault`, `EncoderTuning.h`).
+
+**NVENC en entrée D3D12 le prend aussi, le même jour** (banc §8n.29) : sur le
+Chrome du N95, il perd 87 % de ses images abîmées, comme NVENC en D3D11. C'est
+la chaîne que le réglage D3D12 donne à une carte NVIDIA. La règle lit donc
+l'encodeur de la route D3D12 (`SessionInfo::videoEncoder12`) : sur une carte
+NVIDIA, D3D12 Video Encode reste sans.
+
+Ailleurs, rien ne change :
+- oneVPL, jamais : son HEVC s'y bloquait, et il ne répare plus du tout sous
+  intra-refresh (§21.6b) ;
+- D3D12 Video Encode : neutre ;
+- AMF en entrée D3D12 : neutre au banc §8n.29, et seule une clé de banc le
+  fait tourner ;
+- VA-API et Vulkan Video sous Linux : pas mesurés ; VideoToolbox n'a pas
+  d'invalidation.
+
+La clé l'emporte sur le défaut : `namedrops=0` l'éteint, `namedrops=1` l'allume
+ailleurs. Le relais lit la chaîne qui tourne (`NativeMediaEngine::nameLinkDrops`) :
+une chaîne D3D12 retombée en D3D11 en cours de session suit la règle de D3D11.
+Quand le nommage est actif, la ligne « streaming » du journal de session porte
+`[link drops named]`.
+
 ### 9.11 La cadence s'aligne sur le rafraîchissement du client (04/09/2026)
 
 Un client qui peint sur son vsync — *tearing* coupé, ou un navigateur qui ne
@@ -884,6 +1394,21 @@ sur le canal d'input et l'hôte re-choisit **entre deux images**, sans rien
 relancer (`Session::setClientRefresh`, natif seulement, `qobject_cast` sur les
 deux relais). Le message est traité comme `framefloor` : accepté par
 `InputPolicy`, inerte pour tout host GameStream.
+
+**Le vsync du rendu** (14/10/2026). `client_vsync = !tearing` ne dit que la case
+« Autoriser le tearing ». Un rendu qui passe par le compositeur peint au vsync,
+case cochée ou non : WebGPU, donc tout le HDR, et l'élément `<video>` (le puits
+HDR, une TV, le transport `webrtc-media`).
+- Une fois son rendu fait, le client envoie son vsync réel par `clientrefresh`,
+  avec le taux que l'hôte a déjà (`presentsOnVsync()`,
+  `stream/renderers/createRenderer.js`).
+- L'hôte garde les deux valeurs (`storeClientRefresh()`, `core/CadenceAlign.h`).
+  Un `&&` entre les deux échanges perdait le vsync quand le taux changeait, sur
+  les trois plates-formes.
+- Linux et macOS reprennent l'écran du /start à l'ouverture, comme Windows. Un
+  décodeur qui demande moins d'images fait re-choisir la cadence, et ce re-choix
+  partait d'un écran inconnu qui déchire.
+- Couvert par les tests unitaires, pas encore vu au banc.
 
 Vérifié le 04/09 sur l'instance dev (client Chrome dédié, *tearing* coupé, écran
 165 Hz) : `/start` porte 164 972 mHz, l'hôte ouvre à **55 fps, un
@@ -1081,7 +1606,7 @@ quelle — dans exactement ces cas :
 | Condition | Détail |
 |---|---|
 | Pas d'API de capture | DDA **et** WGC échouent |
-| Aucun display attaché | machine headless — depuis le 18/09/2026 la carte reste, avec « MoonlightWeb Virtual Display » comme unique app (Windows : VDD by MTT embarqué dans l'installeur, nœud nommé et désactivé par défaut, tâche élevée `--vdisplay-apply` pour l'allumer/éteindre ; macOS : `CGVirtualDisplay` créé par le process serveur, `mw::native::vdisplay`) ; ouvrir la carte allume l'écran, le rend primaire et le diffuse ; voir `backend/src/backend/VirtualDisplay.h` |
+| Aucun display attaché | machine headless — depuis le 18/09/2026 la carte reste, avec « MoonlightWeb Virtual Display » comme unique app (Windows : VDD by MTT embarqué dans l'installeur, nœud nommé et désactivé par défaut, tâche élevée `--vdisplay-apply` pour l'allumer/éteindre ; macOS : `CGVirtualDisplay` créé par le process serveur, `mw::native::vdisplay` ; Linux Wayland, depuis le 01/10/2026 : créé par le compositeur au démarrage du stream, Mutter sous GNOME, KWin sous KDE Plasma 6, §35) ; ouvrir la carte allume l'écran, le rend primaire et le diffuse ; voir `backend/src/backend/VirtualDisplay.h` |
 | Pas d'encodeur utilisable | aucun GPU avec encodeur **et** codec |
 | Pas de session interactive | service Windows en session 0 |
 | OS trop ancien | Windows < 10 2004 |
@@ -1122,22 +1647,27 @@ libre de redevance)**. D'où la préférence AV1 quand les deux bouts suivent.
 
 ## 13. État
 
+Tableau remis à jour le 29/09/2026, à la clôture du plan D3D12 (§32.19).
+
 | Livré et mesuré | Reste |
 |---|---|
-| Module isolé + garde de licence | HDR (P010 + PQ) |
-| **Audio** : WASAPI loopback → cadenceur 5 ms → libopus, thread « Pro Audio » (04/09/2026 ; le son reste audible sur l'hôte, à couper en v0.3.0) | |
+| Module isolé + garde de licence | |
+| **Audio** : WASAPI loopback → cadenceur 5 ms → libopus, thread « Pro Audio » (04/09/2026) | |
 | `IMediaEngine`, relais découplés | |
-| Sonde displays/GPU + association | WGC en repli |
-| Capture DXGI (0,06 ms) | Lanceur de session console (service Windows) |
-| Conversion NV12 + AYUV 4:4:4 | UI (grille d'écrans, ligne GPU/encodeur) |
-| NVENC (3,46 ms), AMF (3,70 ms), oneVPL (écrit, non exécuté) | Retrait de Sunshine de l'installeur |
-| Intra-refresh sur les trois encodeurs + ride-out client | Linux, macOS |
-| Curseur composé, plancher sur écran immobile choisi par le client (§9.1) | Benchmarks : NVENC et AMF (iGPU) mesurés le 04/09/2026 (`docs/bench-native-host.md`) ; RX 7600 et Intel attendent leur GPU ; l'application du réglage attend l'A/B |
-| Copie inter-GPU (§5, 04/09/2026) : un écran dont le GPU n'encode pas streame quand même | |
-| Six étapes mesurées par frame, p95/p99 dans les stats et le log (§4, point 4) | |
+| Sonde displays/GPU + association ; WGC en repli, et retour à DDA dès que le bureau de l'utilisateur revient (§32.10) | |
+| Capture DXGI (0,06 ms) ; worker SYSTEM pour le bureau sécurisé (§31) ; Ctrl+Alt+Suppr appuyé par le service lanceur, sous la stratégie que l'installeur pose ; un stream qui démarre sur l'écran de sécurité ; l'invite UAC cliquée depuis le client ; les gestes de Bruno depuis son iPhone, poste verrouillé compris (§31.7) | |
+| Conversion NV12 + AYUV 4:4:4 ; HDR (P010 + BT.2020 PQ) | |
+| NVENC (3,46 ms), AMF (3,70 ms), oneVPL (mesuré sur l'Arc et le N95) | |
+| **Chaîne D3D12** (§32) : conversion D3D12, D3D12 Video Encode en HEVC, H.264 et AV1, contrôle de débit maison ; **par défaut sur Intel** (§32.9) ; NVENC et AMF en entrée D3D12 derrière le réglage (§32.12) ; l'encodeur gardé à travers un redémarrage de capture (§32.18) et deux images en vol sur un GPU Intel à mémoire propre (§32.20), par défaut depuis le 29/09 | NVIDIA et AMD restent en D3D11, plus rapides chez eux |
+| Intra-refresh sur les trois encodeurs + ride-out client (sauf plateformes Apple) | |
+| Curseur composé, plancher sur écran immobile choisi par le client (§9.1) | |
+| Copie inter-GPU (§5) : un écran dont le GPU n'encode pas streame quand même ; la relecture passe par la file COPY depuis le 21/09 | |
+| Six étapes mesurées par frame, p95/p99 dans les stats et le log (§4, point 4) ; temps GPU de la conversion et de l'encodeur au banc (`gputiming=1`) | |
 | Clavier/souris (`SendInput`), manette (ViGEm) + rumble | |
-| Installeur : ViGEmBus en silencieux | |
-| Banc de shaders de réduction `mw-scaler-bench` + passe Lanczos-2 séparable en lumière linéaire dans `ColorConvert`/`GlConvert`, letterbox, `MW_SCALER` (§28, 17/09/2026) | L'A/B sur un vrai flux par encodeur (`MW_SCALER`), le visuel client 1:1 |
+| Installeur : ViGEmBus en silencieux ; plus de Sunshine | |
+| Banc de shaders de réduction `mw-scaler-bench` + passe Lanczos-2 séparable en lumière linéaire dans `ColorConvert`/`GlConvert`, letterbox, `MW_SCALER` (§28, 17/09/2026) ; ce qu'elle coûte, GPU par GPU (§8n.25 du banc) | L'A/B sur un vrai flux par encodeur (`MW_SCALER`), le visuel client 1:1 |
+| **Linux** : KMS ou portail → GL → VA-API ; route scindée Vulkan compute → VA-API par défaut sur AMD (§32.8) ; chaîne Vulkan Video derrière le réglage, prise sur la preuve au pixel (§32.7) ; OpenH264 en repli | G5 : Counter-Strike 2 et l'endurance sous un jeu ; NVIDIA et Intel sous Linux, quand leurs cartes seront sur le banc |
+| **macOS** : ScreenCaptureKit → VideoToolbox | |
 
 **Le chemin est complet côté serveur**, et jouable : le host natif apparaît sans
 pairing, un clic sur un écran construit un `NativeMediaEngine` qui alimente le
@@ -1198,6 +1728,30 @@ construction, disqualifié avant toute mesure. La variable d'environnement
 `MW_NATIVE_TUNING` accepte les mêmes clés sur une **vraie session** (log
 « MW_NATIVE_TUNING in effect »), pour l'A/B à l'œil que le banc ne peut pas
 faire. Campagne du 04/09/2026 et recommandation : `docs/bench-native-host.md`.
+
+**Depuis le 27/09/2026, la chaîne d'image elle-même** (plan D3D12, §32) :
+- Sous Windows : `pipeline=auto|d3d11|d3d12`, `conv12=direct|compute`,
+  `enc12=ve|nvenc|amf`, `rc12=driver|qp`, `reencode=0|1`, `refit=0|1`,
+  `interfloor=<k>|off`, `prio12=normal|high|realtime`,
+  `creator12=own|default`, `ddasync=gpu|none|cpu`, `gputiming=0|1`,
+  `strict12=0|1`, `pipelined=0|1` (§32.17 ; par défaut 1 sur un GPU Intel à
+  mémoire propre, 0 ailleurs, depuis le 29/09), `keep12=0|1` (§32.18, 1 par
+  défaut depuis le 29/09) et `capture=auto|dda|wgc` (§17.5, 22/10 : la
+  capture devant la chaîne, `auto` = la duplication puis WGC en repli).
+- Sous Linux : `pipeline=auto|vaapi|vulkan`, `convert=gl|vulkan`,
+  `priovk=normal|high`.
+- Sur une vraie session seulement (`MW_NATIVE_TUNING`) : `namedrops=0|1`,
+  l'image jetée au calage du lien nommée à l'encodeur (§9.10.2, §32.20 ; 1 par
+  défaut depuis le 29/09 pour NVENC, en entrée D3D11 ou D3D12, et pour AMF en
+  D3D11 ; 0 ailleurs).
+- Les clés du banc lui-même : `dump=<fichier>` (le flux tel qu'il sort),
+  `lose=<N>` (une perte signalée toutes les N images) et
+  `ramp=<kbps>[@<s>]` (le débit alterne, comme le gouverneur le ferait).
+- En variables d'environnement : `MW_D3D12_FAULT` (une panne injectée,
+  §32.10) et `MW_DDA_REFUSE` (un refus de la duplication).
+
+Sur une clé inconnue, `--native-bench` imprime la liste de toutes les clés,
+avec leur sens.
 
 Par frame, une ligne CSV : numéro, keyframe, capturée ou ré-émise, octets,
 **QP moyen** (`frameAvgQP` côté NVENC, `StatisticsFeedbackAvgQP` côté AMF — un
@@ -1688,6 +2242,23 @@ d'abord, à chaque ouverture **et à chaque redémarrage** : un changement de mo
 un redémarrage de pilote est exactement le moment où le bon backend change, et
 rejouer le choix ne coûte qu'une tentative DDA ratée.
 
+**Et en plein stream (28/09/2026, plan D3D12 C8.3 bis).** Un redémarrage ne
+vient que d'une capture perdue, et WGC ne se perd pas. Un worker qui n'est pas
+SYSTEM, repassé sur WGC après un refus de la duplication (le bureau sécurisé,
+`0x80070005`), y restait donc jusqu'à la fin, en D3D11. Désormais, après un refus
+qui peut passer, la boucle cherche la duplication. `DxgiDuplication::refusalMayPass`
+tient pour passager tout refus, sauf `DXGI_ERROR_UNSUPPORTED` et l'absence
+d'`IDXGIOutput1`.
+- Toutes les demi-secondes, un regard sur le bureau d'entrée. Sans SYSTEM, le
+  bureau sécurisé ne se lit même pas : rien n'est tenté tant qu'il est là.
+- Ensuite, une duplication ouverte à côté. Tant qu'elle échoue, les essais
+  s'espacent de 1 à 30 s.
+- Dès qu'elle s'ouvre, le redémarrage ordinaire la reprend, et la chaîne D3D12
+  revient avec elle.
+
+`MW_DDA_REFUSE=[<à>+]<secondes>` simule ce refus au banc, là où il faudrait
+sinon un écran verrouillé que quelqu'un déverrouille.
+
 ⚠️ **Pas de chiffre de comparaison ici.** Deux mesures au banc sur le même écran
 se sont contredites (DDA 0,19 ms puis 2,19 ms de moyenne d'`acquire`, WGC 1,81
 puis 1,05), parce qu'un bureau immobile ne présente presque rien : avec 16 trames
@@ -1763,6 +2334,77 @@ dans les tests la relecture des pixels — **luma NV12 19..234**, donc une vraie
 image et pas un écran noir, ce que « la session a démarré » n'aurait jamais
 prouvé. La branche WGC des tests s'exécute sur **toute** machine, pas seulement
 sur celles qui en ont besoin.
+
+### 17.5 WGC devant la chaîne D3D12, et la clé `capture=` (route B, 22/10/2026)
+
+Plan « Gels du lien » : sous charge, sur l'iGPU d'un N95 sans HAGS, les appels
+du runtime D3D11 de la duplication (`AcquireNextFrame`, `ReleaseFrame`, le
+`Flush` de la poignée de main) attendent le planificateur 10 à 90 ms par image
+(banc §8y). La parade à mesurer est l'autre capture devant la **même** chaîne.
+Jusqu'ici `VideoPipelineChoice` refusait D3D12 derrière WGC : les textures de
+son pool n'ont pas de handle NT, et D3D12 ne pouvait pas les ouvrir.
+
+**La copie partagée (B1).** `DdaInterop::open` prend désormais le contexte de
+la capture. Une surface qui a un handle s'ouvre comme avant (la duplication) ;
+une surface qui n'en a pas est **copiée sur le contexte de la capture** dans
+une texture à nous, `SHARED | SHARED_NTHANDLE`, que D3D12 a ouverte une fois.
+La copie est mise en file **avant** le signal de la fence A, donc la lecture
+D3D12 l'attend comme elle attend l'écriture du compositeur ; deux textures se
+relaient, et la copie suivante dans la même texture est mise en file **après**
+l'attente de la fence B posée avant la libération de l'image (ReleaseFrame /
+`Close`), donc après la lecture D3D12. Les surfaces trouvées sans handle sont
+retenues par pointeur : un handle refusé par tampon du pool, puis une copie par
+image. Mesuré par la sonde `mw-d3d12-lab wgc` (banc §8y.1) : la lecture égale à
+l'image livrée dans tous les cas, copie + ouverture + signal 0,11 ms sur la RTX.
+Vérifié dans `test_dda_interop` sur WARP : la texture sans handle refusée par
+l'`open` à deux arguments, copiée par celui à trois, lue derrière les fences, et
+la troisième image réécrite dans la première texture **après** la lecture.
+
+**B2, écarté.** Le pool sur un device D3D11On12 porté par la file de la chaîne
+(zéro copie) livre deux images puis plus rien, comme la duplication sur 11on12
+(§8y, essai A) : les surfaces du compositeur ne passent pas par ce device.
+
+**La clé `capture=auto|dda|wgc`** (`EncoderTuning::capture`, lue dans
+`openCapture`). `auto`, le moteur : la duplication, WGC quand elle refuse
+l'écran. `wgc` : WGC d'abord, et la duplication **avec une ligne de journal**
+quand WGC n'existe pas ou ne démarre pas — une passe étiquetée wgc ne doit pas
+passer pour une passe WGC ; les stats disent de toute façon quelle capture
+répond. `dda` : la duplication seule, sans repli, comme sur une machine sans
+WGC — une passe étiquetée dda n'est jamais une passe WGC. `MW_CAPTURE=wgc`
+garde son sens de forçage (échec de la session si WGC ne démarre pas). Sous
+`wgc`, la boucle ne cherche pas le retour de la duplication (elle n'a pas été
+refusée) ; sous `auto`, le retour à la duplication après un refus passager
+(§17.1) reste, pour le réveil sur le présent que WGC n'a pas.
+
+**⚠️ WGC n'existe pas pour SYSTEM.** La sonde lancée par une tâche SYSTEM et
+relancée dans la session console sur le même jeton — ce que fait le service
+Worker pour le worker du stream — voit `IsSupported` échouer avec `0x80070424`
+(ERROR_SERVICE_DOES_NOT_EXIST) : WGC s'appuie sur le service **par
+utilisateur** CaptureService, sans instance pour la session d'ouverture de
+SYSTEM ; l'usurpation du jeton de l'utilisateur par le fil n'y change rien.
+Le serveur lit donc la seule clé dont le lancement dépend (`CaptureKey.h`,
+`capture=wgc` dans `native_tuning` ou `MW_NATIVE_TUNING`) **avant** de choisir
+la voie du worker (`StreamWorkerHost::start`) : la tâche élevée, sinon un
+enfant ordinaire, jamais le service lanceur — le worker est alors au jeton de
+l'utilisateur, et l'écran sécurisé hors de sa portée pour ce stream. Journal :
+« capture=wgc: the worker runs on the user's token ». Rien ne change sans la
+clé.
+
+**Mesuré le 22/10 (jour 3, banc §8y.3).** Au repos sur DualRTX (NVENC fed D3D12
+pictures, 1440p), la chaîne marche derrière WGC avec la même latence hôte que
+derrière la duplication (3,0-3,3 ms présent → bitstream), mais **WGC ne livre
+que ~56 images/s sur un écran 120 Hz** quel que soit le contenu (la duplication
+en voit 106-120) et la porte calée est perdue. Sur le N95 sous charge, avec la
+chaîne complète, **WGC ne réduit pas les à-coups** : p99 présent → bitstream
+doublé en D3D12 (35-36 ms contre 17-20), autant de trous > 50 ms (19-20 contre
+10-18), parce que sa copie et son Flush attendent le même planificateur que les
+appels de la duplication. **Le défaut reste `auto`, la duplication** ;
+`capture=wgc` reste une clé de banc, et le worker au jeton de l'utilisateur ne
+sert qu'à elle. Le 15 contre 94 trous du 21/10 opposait deux chaînes (WGC en
+D3D11, la duplication en D3D12), pas deux captures. **Décision de Bruno (22/10,
+~08:50) : la duplication reste le défaut, WGC n'est qu'un secours par la clé
+`capture=wgc` ; la vérification visuelle de WGC (bordure, pointeur) est
+abandonnée.**
 
 ## 18. oneVPL : audit sans matériel (04/09/2026)
 
@@ -1939,7 +2581,9 @@ Deux faits mesurés valent d'être retenus :
   délai aller simple sur (arrivée − présent).
 - **radeonsi 23.2 n'offre pas d'intra-refresh** par colonnes
   (`VAConfigAttribEncIntraRefresh` non supporté) : sur Linux AMD la récupération
-  reste par keyframe, et `intraRefreshEnabled()` le dit.
+  reste par keyframe, et `intraRefreshEnabled()` le dit. **Revu le 29/09/2026
+  (§32.24)** : sous Mesa 26.2.3, radeonsi l'offre, en H.264 comme en HEVC, et
+  `VaapiEncoder` la prend.
 
 Les en-têtes SPS/PPS sont **écrits par le pilote** depuis les paramètres de
 séquence, VUI comprise (`bitstream_restriction` — la leçon B8 — et timing). Les
@@ -2249,6 +2893,14 @@ Selector ait choisi, et la session bascule sur la paire CPU en le disant — don
 **H.264 seulement**. GNOME 42 fait exactement ça sur le banc. `SessionInfo`
 rapporte l'encodeur **réel**, pas celui choisi, pour que le client ne se voie pas
 promettre un codec qu'il ne recevra pas.
+
+**Corrigé le 29/09/2026 (C13.3 bis, §32.21)** : GNOME donnait de la mémoire
+partagée parce que ce moteur ne lui demandait rien d'autre. Un compositeur ne
+donne un DMA-BUF qu'à un client qui annonce les modificateurs qu'il importe. La
+session les annonce maintenant (`PortalCapture::offerDmabuf`), et GNOME 46
+donne un DMA-BUF : la paire GPU tourne par le portail comme par le scanout. La
+mémoire partagée reste le repli d'un compositeur qui n'en prend aucun, et la
+conversion Vulkan sait la lire (§32.22).
 
 #### 19.15.1 ⚠️ Le codec doit suivre la paire (08/09/2026)
 
@@ -2583,6 +3235,25 @@ levé la capacité par thread dans le serveur, sans qu'elle soit effective aille
 `release.yml`, plateforme `linux`, après le push) — la seule différence avec le
 banc est Qt 6.11 à la place de 6.6.3 ; et le **premier flux navigateur** depuis cet
 hôte (§19.6), qui est la prochaine étape.
+
+**Une seconde capacité, `CAP_SYS_NICE` (28/09/2026, plan D3D12 §9-9 et §9-18).**
+Sous un jeu qui sature le GPU, la conversion attend deux images du jeu : 46 ms sur
+le 780M (banc §8o.1). Un contexte GPU au-dessus de la priorité normale passe devant
+l'image suivante (23 ms en GLES), et amdgpu, i915 et xe ne le créent que pour un
+processus qui tient `CAP_SYS_NICE` — Sunshine la porte déjà (`cap_sys_admin,
+cap_sys_nice=p`). Elle suit exactement la route de l'autre : `setcap
+cap_sys_admin,cap_sys_nice+p` sur le lanceur, levée ambiante des deux, confinement
+des deux au démarrage (permitted et inheritable gardés, effective retiré, ambiant
+abaissé), rendue au seul worker natif. Le moteur la lève sur son thread le temps
+de créer le contexte (`platform/linux/ScopedCapability.h`, partagé désormais avec
+`KmsCapture`) ; la priorité est fixée à la création, rien ne la garde ensuite.
+`GlConvert` ne demande HIGH (`EGL_IMG_context_priority`) que s'il la tient :
+Mesa 23.2 relit « HIGH » pour un contexte que le noyau a refusé, la réponse du
+pilote ne prouve rien. `mw-native-tests linux_pipeline` sur le banc : « priority
+normal (no CAP_SYS_NICE…) » avec `cap_sys_admin+p`, « priority high
+(CAP_SYS_NICE) » avec les deux, 61/61 dans les deux cas. Un paquet installé avant
+ne pose que `CAP_SYS_ADMIN` : la conversion y tourne à la priorité normale, et le
+log dit pourquoi.
 
 ---
 
@@ -3471,6 +4142,18 @@ HEVC 1080p de l'hôte Intel — cinq pertes nommées, cinq réparations
 (« oneVPL healed frame 205 with a delta against frame 204 »), **zéro IDR
 demandée, zéro erreur de décodeur**, flux vivant à 16,8 ms. Coût mesuré à
 l'encodage : nul (10,99 ms contre 11,22 sans).
+
+⚠️ **Jamais en HEVC sous intra-refresh (29/09/2026).** Une réparation qui tombe
+pendant une vague bloque l'encodeur HEVC d'Intel pour de bon : l'image ne
+sort jamais du runtime, sans TDR, et le stream meurt (banc §8n.30). H.264, AV1
+et le HEVC sans vague font les mêmes réparations sans broncher. Un tel stream
+ne marque donc aucune référence longue (`longTermRepairsSafe`, `VplSession.h`),
+et `/start` répond `ref_invalidation:false`. Le client ne nomme plus ses
+pertes : il demande une image clé, comme face à tout encodeur sans
+invalidation. C'est l'option A de Bruno, le 29/09 : une image clé au lieu d'un
+delta, dans ce seul cas. Le journal le dit à l'ouverture : « no reference
+invalidation (a repair during an intra-refresh sweep hangs HEVC: keyframes
+instead) ».
 
 ### 21.7 Ce qui est prouvé, et ce qui ne l'est pas
 
@@ -4649,6 +5332,15 @@ principal fait exactement ça, cf. §29.6). On perdrait ce bras de fer cinq fois
 par seconde pour toute la session, avec un pointeur qui clignote entre les deux
 écrans. Le compteur repart à zéro dès que le pointeur est revu sur cet écran.
 
+**Au démarrage seulement (05/10).** Ramené toute la session, le pointeur ne
+pouvait plus partir sur l'autre écran de l'hôte : la personne devant l'hôte le
+voyait revenir au milieu de l'écran streamé à chaque essai (test manuel du flux
+commun, S9). Décision de Bruno : « seulement au démarrage partout ». Dès que le
+pointeur est vu sur l'écran capturé, quel que soit le mode, le démarrage est
+fini et plus rien ne le ramène. Les 5 tentatives épuisées finissent aussi le
+démarrage. L'exception des jeux qui détachent le pointeur (Roblox bouton droit
+tenu sur le Mac, `CgInput::postRelative`) est une autre affaire et ne change pas.
+
 ### 29.6 Mode bureau + jeu qui recentre le pointeur : la visée tournait
 
 Cinquième signalement, le même jour, et le plus grave : Counter-Strike (GoldSrc)
@@ -4764,6 +5456,30 @@ plus deux souris : pendant le glissement c'est celle de l'hôte qui commande, la
 sienne s'efface, et elle revient dès qu'on relâche ; et la forme du curseur ne
 change plus toute seule quand quelqu'un touche la souris de la machine.
 
+### 29.8 La bascule de mode sur un bureau immobile : la capture rouverte (23/10/2026)
+
+En mode jeu, l'hôte Windows redessine le pointeur, sur un mouvement seul, à
+partir d'une copie du bureau. Cette copie n'est faite que si le pointeur est
+dessiné et sur cet écran : le mode bureau n'en paie pas le prix, 0,9 ms par
+image sur le N95 (banc §8y.5). Juste après une bascule vers le mode jeu, ou au
+retour du pointeur depuis un autre écran, il n'y avait donc pas de copie. Sur un
+bureau immobile, le pointeur restait absent de l'image jusqu'à ce que l'écran
+change, et une copie d'avant pouvait ramener un écran périmé.
+
+Choix de Bruno du 23/10 : rien en régime établi. La copie est lâchée par la
+première image convertie sans elle. Quand le pointeur doit être dessiné sans
+copie disponible (`desktopWanted()`), la capture rend le bureau à nouveau
+(`IWindowsCapture::retake`), sur le même périphérique : le convertisseur,
+l'encodeur et l'interop D3D12 restent en place. Une nouvelle duplication DXGI
+livre d'abord le bureau entier. On lâche l'ancienne avant (une seule par sortie
+et par processus) ; la chaîne a lâché avant elle ses vues et ses surfaces
+ouvertes (`forgetCaptured`). Côté WGC, la reprise est un `start()` sur le même
+périphérique. Coût mesuré : 13 à 16 ms par bascule en DXGI, ~180 ms en WGC (banc
+§8y.6). Au retour en mode bureau, le même chemin redessine la copie sans le
+pointeur : celui du mode jeu ne reste plus figé dans l'image, à côté de celui
+du client. Linux et macOS gardent leur dernière image dans les deux modes et
+n'avaient pas le défaut.
+
 ## 30. Le worker natif élevé : les fenêtres administrateur répondent (22/09/2026)
 
 Le serveur démarre par la tâche de logon `\MoonlightWeb`, au niveau **non élevé**,
@@ -4865,6 +5581,12 @@ de Sunshine. Elle est réduite à ce que la fonction exige :
   **ce même exe** ;
 - le worker vérifie la même chose dans l'autre sens avant de lire un octet de
   config ;
+- le serveur vérifie aussi le worker (son image, avant de croire les tubes).
+  Il ne le peut que parce que le service donne au worker une DACL à lui :
+  SYSTEM et les administrateurs comme d'habitude, et l'utilisateur qui l'a
+  demandé avec `PROCESS_QUERY_LIMITED_INFORMATION`, `SYNCHRONIZE` et
+  `PROCESS_TERMINATE` — ce qu'il a déjà sur son worker élevé, rien qui touche
+  la mémoire, les threads ou le jeton (28/09, voir §31.7) ;
 - la DACL du tube de contrôle est `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019f;;;IU)`
   — la DACL par défaut d'un tube laisserait entrer toutes les sessions
   d'ouverture de la machine.
@@ -4912,8 +5634,8 @@ répond faux hors SYSTEM, donc le moteur se comporte exactement comme avant.
 
 Ce n'est pas une combinaison de touches : Windows la réserve dans le noyau et
 aucune entrée injectée ne la fabrique. Elle passe par `SendSAS` (`sas.dll`),
-réservé à SYSTEM. Chaîne complète : bouton `C+A+Suppr` de la barre d'outils
-tactile → message `secureattention` → les trois relais →
+réservé à SYSTEM. Chaîne complète : Ctrl et Alt verrouillés puis `Del`, sur la
+barre de touches tactile → message `secureattention` → les trois relais →
 `IMediaEngine::sendSecureAttention()`. Côté natif, un
 `InputEvent::Type::SecureAttention` qui finit sur le thread suiveur — donc sur
 le bureau qui vient d'apparaître. Côté GameStream, `MoonlightShim` envoie les
@@ -4921,9 +5643,13 @@ trois touches réelles : sur un hôte dont le propre service sait lever le burea
 sécurisé, c'est ce qu'il faut ; ailleurs ce sont trois touches ordinaires, ce
 qui reste plus utile qu'un refus.
 
-Le bouton n'existe pas seulement pour le tactile : le système d'exploitation du
-spectateur avale la combinaison avant que la page ne la voie, sur toutes les
-plateformes. Un bouton est le **seul** chemin.
+La barre de touches est le **seul** chemin : le système d'exploitation du
+spectateur avale la combinaison physique avant que la page ne la voie, sur
+toutes les plateformes. Jusqu'au 29/09/2026, une touche `C+A+Suppr` dédiée la
+portait. Bruno l'a fait retirer : le geste sert trop rarement pour une touche à
+lui, et Ctrl, Alt puis `Del` est celui du clavier. La barre reconnaît ce `Del`
+et envoie le message à la place des trois touches, qu'aucun Windows
+n'accepterait.
 
 ### 31.5 La dégradation
 
@@ -4949,10 +5675,10 @@ l'utilisateur), et le journal comme les minidumps du worker SYSTEM atterrissent
 `moonlightweb-worker-service.log`, sous l'AppData de SYSTEM — le seul endroit
 où un processus LocalSystem est certain de pouvoir écrire.
 
-Conséquence assumée : le worker SYSTEM lit `AppSettings` depuis le profil de
-SYSTEM, donc aux valeurs par défaut. Sans effet en pratique — toute la
-configuration de session arrive par stdin, et il ne reste que le bouton de
-débogage clavier.
+Le worker SYSTEM lit aussi les réglages de l'utilisateur par ce chemin (vu le
+28/09 : `keyboard_debug`, posé à la main, y est actif). Toute la configuration
+de session arrive de toute façon par stdin ; il ne reste que le bouton de
+débogage clavier, qui se tait sur le bureau sécurisé (§31.7).
 
 ### 31.7 Vérifié
 
@@ -4966,11 +5692,2686 @@ déverrouillage au mot de passe tapé depuis le client ; (3) le bouton
 arrêté (`sc stop "MoonlightWeb Worker"`), qui doivent retomber sur le niveau 1 —
 stream normal, fenêtres admin toujours pilotables, bureau sécurisé noir.
 
+**Le 28/09, première vraie installation (C8.4 du plan D3D12) : le niveau 2
+n'avait jamais servi.** Le service était installé et démarré, mais chaque
+session le refusait (« pipe client is "" (pid N), not this executable ») et
+tombait sur la tâche élevée : REALTIME, mais ni duplication (`0x80070005`) ni
+`SendInput` (erreur 5) sur `Winlogon`. Verrouillé depuis le stream, l'écran du
+PIN ne prenait ni souris ni clavier. La cause : le serveur vérifie l'image du
+worker, et un processus créé avec un jeton SYSTEM hérite de la DACL par défaut
+de ce jeton, qui n'admet que SYSTEM et les administrateurs ; le serveur, non
+élevé, lisait une image vide. Toute la v0.3.1 en est là (journaux de la prod
+depuis le 26/09). Correctif `f1e8e8e3` : la DACL du worker du §31.2. **Vérifié
+par Bruno** depuis son Mac, par Internet : verrouillage, PIN tapé dans le
+stream, déverrouillage. Le journal dit « SYSTEM (launcher service) »,
+« GPU scheduling class REALTIME (token SYSTEM) », « now on the "Winlogon"
+desktop », une duplication rouverte sur `Winlogon` et la chaîne D3D12 de l'Arc
+reconstruite des deux côtés de la bascule, sans passer par WGC ni D3D11.
+
+Trouvé au même test : `keyboard_debug`, posé à la main sur ce poste, a écrit le
+PIN touche par touche dans le journal du worker. Les diagnostics clavier se
+taisent désormais sur le bureau sécurisé, quoi que dise le réglage
+(`1887b2ea` : `NativeHost::secureDesktopHasInput()`, demandé à chaque touche
+par `Win32Input` et par une sonde du codec d'entrée) ; les lignes déjà écrites
+ont été effacées et le réglage coupé sur ce poste.
+
+**Le 29/09, `C+A+Suppr` essayé de bout en bout : il n'ouvre rien.** Un Chrome
+de l'UM790Pro, en mode tactile émulé (la barre n'existe que sur un appareil
+tactile), streame l'écran principal de DualRTX par l'édition dev installée
+(`0.3.1-f1e8e8e3-dev`, worker SYSTEM).
+- Toute la chaîne répond : le journal du worker dit « input: Ctrl+Alt+Suppr
+  sent », `SendSAS(FALSE)` est appelé par le processus SYSTEM, sans erreur.
+- Mais l'écran de sécurité ne vient pas : la duplication n'est pas perdue, et
+  l'image reste le bureau.
+- La cause probable est la stratégie « générer une séquence d'attention
+  sécurisée par logiciel » (`SoftwareSASGeneration`, dans
+  `HKLM\…\Policies\System`), absente sur ce poste. Sans elle, Windows ignore
+  `SendSAS`, même venant d'un service.
+
+Le produit ne touche pas à cette stratégie (§31.4). La poser à « services »
+(1), dans l'installeur ou au moment de l'appel, est une décision de Bruno. Tant
+qu'elle n'est pas posée, le bouton est sans effet. Le verrouillage (Win+L) et le
+déverrouillage, eux, marchent (vérifié le 28/09).
+
+**Le même jour, la vraie cause, et le correctif (`456acb1e`).** Bruno a choisi
+l'installeur. Mais la stratégie posée à la main n'a rien changé : même journal,
+et toujours aucun écran.
+- Un service jetable, LocalSystem en session 0, a fait le même appel. L'écran
+  de sécurité est apparu en moins d'une seconde : `LogonUI` lancé dans la
+  session de l'utilisateur.
+- **Windows n'honore `SendSAS` que venant d'un service en session 0.** Il
+  l'ignore, sans un mot, venant d'un processus SYSTEM de la session console, ce
+  qu'est le worker.
+
+Le correctif :
+- **Le worker demande l'appui au service lanceur**, sur son tube de contrôle,
+  par la requête `sas!`. Aucun nom de tube ne peut prendre cette forme.
+- Le service vérifie l'appelant comme pour un worker : même exécutable, session
+  console. Il lit la stratégie, pour qu'un refus s'écrive au journal avec sa
+  raison, puis il appuie (`WorkerService::requestSecureAttention`,
+  `NativeHost::setSecureAttentionSender`).
+- Seul un worker SYSTEM demande : lui seul peut suivre l'écran qui s'ouvre, et
+  recevoir l'Échap qui le ferme. `sas.dll` est chargée depuis System32
+  seulement.
+- **L'installeur pose la stratégie** (1, les services) quand personne ne l'a
+  posée.
+  - Chaque édition qui s'appuie sur une valeur posée par l'un de nos
+    installeurs est inscrite sous `HKLM\SOFTWARE\MoonlightWeb\SoftwareSASGeneration`.
+  - Une désinstallation ne retire la valeur que si elle vient de nous, qu'aucune
+    autre édition ne s'en sert, et qu'elle vaut toujours 1.
+  - Une valeur posée par un tiers (un administrateur, une stratégie de groupe,
+    un autre bureau à distance) reste telle quelle.
+
+**Trouvé au passage : un stream ne démarrait pas si l'écran de sécurité était
+déjà affiché**, et donc pas davantage sur un poste verrouillé (`0x80070005`).
+- La duplication s'ouvrait depuis le fil de l'appelant, le fil Qt du worker. Ce
+  fil possède une fenêtre, et `SetThreadDesktop` refuse de le déplacer
+  (erreur 170) : il duplique `Default`, que Windows refuse pendant que
+  `Winlogon` a la main.
+- Elle s'ouvre désormais depuis un fil à elle, qui ne possède rien et suit le
+  bureau d'entrée. Le fil de capture rejoint ce bureau avant de lire.
+
+**Vérifié le 29/09 sur DualRTX**, avec l'édition dev `0.3.1-456acb1e-dev`
+installée par son installeur, qui a posé la stratégie et s'est inscrit comme
+propriétaire. Le Chrome de l'UM790Pro, en tactile émulé, pilote le stream :
+- **`C+A+Suppr`** : l'écran de sécurité s'affiche dans le stream (« now on the
+  "Winlogon" desktop », duplication rouverte), et **Échap** le referme.
+- **Un stream lancé sur l'écran de sécurité** démarre dessus (« the capture
+  opens from a thread on the "Winlogon" desktop »), prend l'Échap, puis revient
+  au bureau.
+
+Captures : `bench-out\d3d12v2\sas`.
+
+**Les gestes de Bruno, faits le 29/09 vers 09:15** depuis son iPhone en 5G, sur
+l'édition dev `0.3.1-81c55309-dev`, qui n'a plus de touche dédiée (§31.4) :
+- **Ctrl, Alt puis `Del`** sur la barre de touches : « Ctrl+Alt+Suppr sent »,
+  l'écran de sécurité s'ouvre dans le stream. Bruno y choisit Verrouiller.
+- **Deux streams relancés sur le poste verrouillé**, l'un sur l'Arc, l'autre
+  sur la RTX, démarrent sur l'écran de verrouillage (« the capture opens from a
+  thread on the "Winlogon" desktop »).
+- Son code, tapé au clavier de l'iPhone, rend le bureau (« now on the "Default"
+  desktop », 09:15:30).
+
+**L'invite UAC, vérifiée le même jour sur DualRTX**, avec la même édition et le
+même client, qui streame cette fois l'écran principal (la RTX). Aucun poste du
+banc n'affiche l'invite : Bruno a remis lui-même l'UAC à son réglage par défaut
+le temps du test, puis l'a redescendu.
+- Win+R, `cmd` puis Ctrl+Shift+Entrée, tapés dans le stream : l'invite
+  « Windows Command Processor » s'affiche dans le stream (« now on the
+  "Winlogon" desktop », duplication rouverte).
+- **Le clic sur « Yes »**, à la souris depuis le client, ouvre « Administrator:
+  C:\WINDOWS\system32\cmd.exe », et le worker revient sur `Default`. L'invite
+  élevée a été refermée par un `exit` tapé dans le stream.
+- C'est la première preuve de la **souris** sur le bureau sécurisé. Les essais
+  précédents n'y envoyaient que le clavier (le PIN, Échap).
+
+Captures : `bench-out\d3d12v2\uac`. Un piège du banc, pas du produit : l'hôte
+tape la touche physique selon **sa** disposition. Un client qui simule des
+touches doit donc envoyer la position AZERTY (le « m » est `Semicolon`) : avec
+`KeyM`, « cmd » est arrivé en « c,d ».
+
 **Concrètement, pour l'utilisateur** : le stream ne s'arrête plus devant une
 porte. Quand Windows demande une autorisation administrateur, l'invite apparaît
 à l'écran distant et le bouton « Oui » se clique comme n'importe quel autre ;
 si la machine se verrouille, on tape son mot de passe depuis le client au lieu
-de regarder un écran noir en attendant ; et le bouton Ctrl+Alt+Suppr de la barre
-de touches ouvre l'écran de sécurité, ce qu'aucune combinaison au clavier n'a
+de regarder un écran noir en attendant ; et Ctrl, Alt puis `Del` sur la barre de
+touches ouvrent l'écran de sécurité, ce qu'aucune combinaison au clavier n'a
 jamais pu faire depuis un navigateur. Si le service n'est pas installé ou a été
 arrêté, rien ne casse : on retrouve exactement le comportement précédent.
+
+## 32. Pipeline vidéo D3D12, deuxième essai (ouvert le 26/09/2026)
+
+> Ébauche, complétée à chaque porte du chantier (branche `feat/d3d12-pipeline`).
+> D3D11 reste le défaut partout où le banc et Bruno n'en ont pas décidé
+> autrement : Intel passe en D3D12 le 28/09 (§32.9).
+
+### 32.1 Ce que la première tentative a appris (21/09)
+
+La v1 n'a fait tourner dans le produit qu'un **hybride** : la conversion passait
+en D3D12, sur une file COMPUTE de priorité HIGH, et l'image revenait à D3D11
+pour les encodeurs d'aujourd'hui. Aucun encodeur D3D12 n'a tourné dans le
+produit. L'hybride a perdu partout, et `84524e7f` l'a retiré :
+
+| GPU | Condition | D3D11 (total hôte moy. / p99) | Hybride |
+|---|---|---|---|
+| Arc A380 | RE9, stream réel | 19,8 / 61,4 ms | 30,5 / 90,1 ms : la file COMPUTE est préemptée par le jeu |
+| Arc A380 | banc 1080p120 | 5,4 ms | 11-13 ms : 3,5 ms de travail + 2,5 ms d'attente de file |
+| iGPU AMD | charge synthétique | 16,8 / 41 ms | 117 / 249 ms, 8 i/s : la file COMPUTE est affamée |
+| RTX 5060 Ti | RE9 | 5,2 / 13,3 ms | 6,6 / 14,3 ms, 9 % d'images en moins |
+
+Toutes ces mesures datent d'avant la classe GPU REALTIME (`ee7de92b`) et le
+worker élevé. Deux sondes, en revanche, ont gagné : sur l'Arc sous RE9, D3D12
+Video Encode encode en 2,3 ms (p99 3,6) là où oneVPL prend 7,2 ms (p99 15,4) ;
+et la lecture par la file COPY est devenue `CrossGpuBridge` (`acdcda49`).
+
+Les pièges relevés, gardés pour la v2 :
+- un timestamp pris sur une file préemptée compte la préemption ;
+- le `convert_us` de D3D11 ne mesure que la soumission CPU : le travail GPU de
+  la conversion est facturé à `encode_us` ;
+- le pilote Arc plante sur un `CopyTextureRegion` d'une texture planaire
+  **partagée** dans une liste COMPUTE ;
+- binding tier 1 : il faut des descripteurs nuls en bouche-trous ; pas d'UAV
+  sRGB ;
+- les BOOL rendus par le pilote Intel ne valent pas toujours 1 (tester `!= 0`) ;
+- D3D12 Video Encode n'écrit que les slices : un PPS faux se décode en bouillie
+  **sans erreur** ;
+- le 4:4:4 (AYUV) est refusé partout en D3D12 Video Encode ;
+- les surfaces de Desktop Duplication s'ouvrent en D3D12 par handle NT, pas
+  celles de Windows.Graphics.Capture.
+
+### 32.2 Pourquoi recommencer peut marcher
+
+1. **Plus de renvoi à D3D11** : l'encodeur est lui aussi en D3D12. Ce qui a tué
+   l'hybride, rendre l'image à D3D11 pour qu'un encodeur se resynchronise sur la
+   file 3D, disparaît.
+2. **La conversion sur la file DIRECT**, avec les mêmes pixel shaders que D3D11
+   (sortie identique à l'octet), au lieu d'une file COMPUTE que l'Arc préempte et
+   que l'iGPU AMD affame.
+3. **Des priorités de file mesurées** : sous HAGS, les files DIRECT/COMPUTE d'un
+   même créateur sont groupées et leur priorité de création est ignorée ; la file
+   HIGH de la v1 ne valait sans doute rien sur la RTX. Un `CreatorID` propre et la
+   priorité `GLOBAL_REALTIME` (le worker élevé ou SYSTEM des §30-31 tient le
+   privilège) n'ont jamais été essayés.
+4. **Sur Intel, l'encodeur est la vraie cible** : oneVPL est lent, sans
+   invalidation de référence effective, et ne peut pas monter au-dessus de son
+   débit de départ. L'Arc a le delta QP : un contrôle de débit maison devient
+   possible sans reconfigurer l'encodeur.
+5. **Le vrai jeu dès la première mesure** (RE9), jamais la charge synthétique
+   seule.
+
+### 32.3 La chaîne visée
+
+Une image, un thread, aucune file ni tampon ajouté :
+
+1. `AcquireNextFrame` sur le device D3D11 de capture ;
+2. le contexte de capture signale une fence partagée (A) ;
+3. la file de conversion D3D12 l'attend, convertit (mise à l'échelle, curseur,
+   tone map) dans l'entrée de l'encodeur, puis signale une fence (B) ;
+4. le contexte de capture attend B **sur le GPU**, puis `ReleaseFrame` : Desktop
+   Duplication ne réécrit pas la surface trop tôt, et la CPU n'attend pas ;
+5. la file d'encodage attend B, encode, puis signale C ;
+6. la CPU attend C : c'est la seule attente CPU de l'image ;
+7. le bitstream part, en-têtes compris sur une IDR.
+
+Les étapes horodatées gardent leur sens : le total hôte se compare tel quel à
+D3D11.
+
+### 32.4 Ce qui protège D3D11
+
+- Un réglage `native_video_pipeline` (`auto`, `d3d11`, `d3d12`) et un choix
+  « Avancé » dans l'admin ; `auto` suit une ligne par vendeur, qui ne bouge que
+  sur décision de Bruno : D3D11 partout au départ, Intel en D3D12 depuis le
+  28/09 (§32.9).
+- Un refus à la construction (pont inter-GPU, 4:4:4, étage logiciel, codec pas
+  encore fait… ; Windows.Graphics.Capture jusqu'au 22/10, §17.5) repasse en
+  D3D11 pour cette construction, avec la raison au journal. Un échec en cours de stream repasse en
+  D3D11 pour la session, en une image clé, sans couper le stream.
+- Le chemin D3D11 passe d'abord derrière une interface (`WindowsVideoPipeline`)
+  **sans changement de comportement**, prouvé au banc avant toute ligne D3D12
+  (porte G0).
+
+### 32.5 Les portes
+
+G0 (refactor sans régression), G1 (sondes : files, poignée de main DDA,
+encodeurs), G2 (bout en bout avec D3D12 Video Encode), G3 (contrôle de débit
+maison), G4 (NVENC et AMF en entrée D3D12). Chaque porte donne un rapport
+chiffré et une recommandation ; Bruno tranche. Les résultats seront consignés
+ici, porte par porte.
+
+**Concrètement, pour l'utilisateur** : rien ne change tant qu'un type de GPU n'a
+pas été basculé. Ensuite, sur un PC Intel, le plus répandu, l'image doit partir
+plus vite de l'hôte quand un jeu charge la carte, le débit pouvoir remonter
+au-dessus de celui du départ, et une perte réseau se réparer sans l'à-coup d'une
+image clé, ce qui se sent surtout par Internet. Sur NVIDIA, l'objectif est de ne
+rien perdre face à un chemin déjà très bon ; sur AMD, la mesure dira. Si quelque
+chose échoue, le stream repasse seul en D3D11 sans se couper, et l'overlay comme
+le journal disent quel chemin tourne et pourquoi.
+
+### 32.6 Linux : la route scindée, et la règle qui encadre Vulkan (28/09/2026)
+
+Phase 13 du plan : la même forme de chaîne sous Linux, en Vulkan. Les sondes
+(banc §8o) ont réordonné le travail. Sous un jeu qui sature le 780M, la
+conversion GL d'aujourd'hui attend deux images du jeu (46 ms) ; une file compute
+Vulkan tourne à côté du jeu (10,6 ms sans privilège, 8,0 en HIGH). Le gain tient
+à la file, pas à l'encodeur. D'où la **route scindée**, décidée le 28/09 (plan
+§9-17) : la conversion passe en Vulkan compute, l'encodeur reste le VA-API
+d'aujourd'hui.
+
+**Les deux bouts, prouvés avant d'écrire le moteur.**
+- L'entrée : le tampon KMS (DCC d'AMD en trois plans) s'importe dans Vulkan avec
+  son modificateur, sa barrière implicite attendue en `sync_file`, et se lit au
+  pixel près comme EGL le lit (§8o.2).
+- La sortie : la surface d'entrée de VA-API est linéaire sur AMD ; Vulkan écrit
+  ses deux plans en images de stockage R8 et RG8, et VA-API relit exactement ce
+  qui a été écrit (§8o.4). Ni copie, ni changement de propriétaire de la surface.
+
+**Le code.**
+- `platform/linux/vulkan/VulkanDevice` : le chargeur ouvert par `dlopen`, le
+  périphérique du GPU trouvé par son nœud de rendu (`VK_EXT_physical_device_drm`),
+  une file compute, en HIGH seulement si le processus tient `CAP_SYS_NICE` et
+  qu'une soumission le prouve — une file d'encodage en HIGH se crée sur le 780M
+  et le noyau refuse sa première soumission (§8o.3).
+- `convert/linux/VulkanConvert` : le jumeau de `GlConvert`, même interface,
+  shaders transcrits ligne à ligne (`shaders/vk_scale.comp`, `vk_nv12.comp`,
+  compilés en SPIR-V par `glslangValidator` au build). Sur le 780M, les deux
+  écrivent la même image à une valeur près au plus, en 1:1, en Lanczos-2 et en
+  bilinéaire (`test_vulkan_convert`).
+- `core/LinuxRouteChoice.h` : le choix de la chaîne, pur et testé, à chaque
+  construction. La clé de banc, puis le réglage, puis une table par vendeur ; la
+  table dit GL partout tant qu'un banc et Bruno n'ont pas bougé une ligne (AMD
+  l'a été le 28/09, §32.8). La clé `convert=vulkan` prend la route scindée.
+
+**La règle (Bruno, 28/09) : jamais Vulkan forcé.** Ce qui ne peut pas tourner
+est refusé, nommé, et la chaîne descend d'un cran — Vulkan Video → VA-API → CPU,
+Vulkan compute → GL. Une conversion Vulkan qui ne démarre pas (pas de chargeur,
+pas de Vulkan 1.3, un modificateur qu'elle n'importe pas) laisse GL convertir dès
+le départ ; une qui lâche en plein stream (périphérique perdu, tampon refusé) est
+remplacée par GL sur l'image même, avec une image clé, pour le reste de la
+session. La route, sa raison et le refus éventuel vont au journal et dans
+`SessionInfo` (overlay, banc). Pour l'encodeur Vulkan à venir, le banc a montré
+que ni le numéro du micrologiciel ni la version de Mesa ne disent « fiable »
+(§8o.3) : il ouvrira sur une preuve au pixel et, s'il l'échoue, laissera VA-API.
+
+**Concrètement, pour l'utilisateur** : rien ne change par défaut sous Linux tant
+que le banc n'a pas mesuré la route et que Bruno n'a pas basculé AMD. Ensuite, sur
+un PC Linux AMD, l'image n'attendra plus derrière le jeu pour être convertie. Et
+si la carte ou son pilote ne s'y prêtent pas, le stream reste sur le chemin
+d'aujourd'hui, sans coupure.
+
+### 32.7 Linux : la chaîne Vulkan Video, prise sur la parole du pixel (28/09/2026)
+
+C13.5 du plan : la chaîne entière en Vulkan, sur un seul périphérique. La capture
+KMS est convertie en compute directement dans l'image d'entrée de l'encodeur,
+puis encodée en HEVC par Vulkan Video. Une copie par image, le flux.
+
+**Le code.**
+- `encode/linux/VulkanHevcEncoder` : le jumeau Linux de `VideoEncode12`.
+  - Il possède son entrée : une image NV12 aux dimensions codées (des CTB
+    entiers, la leçon de C5.3) et deux vues de plan, R8 et RG8, que la
+    conversion écrit en stockage. Entre deux images, elle reste en
+    `VIDEO_ENCODE_SRC`. Les rangées et colonnes hors de l'image sont noires,
+    écrites une fois.
+  - L'encodage attend la conversion sur le GPU, par le sémaphore de la
+    dernière soumission (`VulkanDevice::afterLast`) : c'est lui qui rend
+    visibles les écritures de la file compute. La CPU n'attend que le flux.
+  - Nos en-têtes en structures StdVideo, les octets ceux du pilote
+    (`vkGetEncodedVideoSessionParametersKHR`), posés juste devant les
+    tranches : une IDR sort d'un seul tenant. Les premières tranches sont
+    relues avec ces en-têtes (la garde de `VideoEncode12`).
+  - **La profondeur de transformée complète** (CtbLog2SizeY − MinTbLog2SizeY) :
+    le micrologiciel d'AMD découpe jusque-là quoi que dise le SPS, et à 2 toutes
+    les P qui bougeaient étaient fausses sur le 780M (banc §8o.3).
+  - `HevcDpb` : quatre images gardées, une perte guérie par un delta. Le CBR du
+    pilote avec le VBV commun (`RateControl.h`), changé en vol par une commande
+    de contrôle, sans remise à zéro.
+  - La file d'encodage reste à la priorité par défaut : en HIGH, le noyau 6.8
+    refuse sa première soumission (§8o.3).
+  - Depuis le 29/09, les balayages d'intra-refresh remplacent les images clés
+    pour le client qui traverse les pertes (C13.9, §32.24), et le bourrage du
+    CBR de RADV est retiré avant le lien (§32.23).
+- `encode/linux/VulkanHevcDecoder` : les yeux de la preuve. Un décodeur HEVC
+  Vulkan Video juste assez large pour les flux du moteur (I et P, ensembles de
+  références propres à la tranche, ni tuiles ni listes de quantification). Tout
+  le reste est refusé par son nom. Sur VCN 4, la sortie est distincte du DPB,
+  et RADV lit l'unité d'accès entière (lu dans Mesa, sous licence MIT).
+- `encode/linux/VulkanHevcProof` : la preuve au pixel.
+  - Une courte séquence qui bouge (les images du labo, celles qui avaient
+    attrapé la faute) passe par l'encodeur du produit, à la taille du stream.
+    En route, les images 4 et 5 sont perdues et guéries depuis la 3, et une
+    image clé est demandée.
+  - Le décodeur Vulkan du même GPU relit le tout, comparé image par image et
+    rangée de CTB par rangée de CTB.
+  - Juste : au moins 22 dB par image et 18 dB par rangée. Un flux juste en
+    donne 37 à 40, les P fausses du §8o.3 en donnaient 5.
+- `core/LinuxRouteChoice.h` : la preuve ne tourne que là où la chaîne serait
+  prise (`linuxRouteWantsVulkanVideo`). La table des vendeurs dit VA-API
+  partout, donc personne n'est obligé de prouver quoi que ce soit.
+
+**Un import par conversion.** RADV 26 envoie toute la mémoire du périphérique
+avec chaque soumission : sa liste de BO est globale. Un tampon d'affichage gardé
+importé (le cache de `VulkanConvert` en gardait jusqu'à quatre) faisait attendre
+chaque soumission, encodage compris, que le compositeur finisse l'image suivante
+du jeu : 15 ms d'encodage sous charge au lieu de 2. Le tampon n'est donc plus
+gardé d'une image à l'autre. Il est importé pour la conversion et relâché dès
+la fin de l'attente, pour 0,02 à 0,04 ms (banc §8o.6).
+
+**Le verdict, gardé.** Une preuve coûte 70 à 260 ms sur le 780M. Le verdict va
+dans le cache de l'utilisateur (`$XDG_CACHE_HOME/MoonlightWeb/vulkan-video-proofs.txt`).
+Il est rangé sous ce qui pourrait le changer : le GPU (UUID), le pilote et sa
+version, le noyau, le micrologiciel VCN (lisible par tous sous amdgpu), la
+taille, la révision de l'encodeur du moteur, et la version de l'app (depuis le
+09/10/2026, décision de Bruno : chaque mise à jour repose la preuve, un échec
+surtout, même quand la révision ne bouge pas). Seule une comparaison est
+gardée ; une preuve qui n'a pas pu tourner est reposée la fois suivante.
+
+**La règle de Bruno, appliquée au bout.**
+- Un pilote qui ne montre pas d'encodeur (le Mesa 23.2 d'Ubuntu 22.04) est
+  refusé par son nom, sans même ouvrir de périphérique.
+- Un pilote qui code autre chose que son SPS échoue la preuve.
+  `MW_VK_ENCODE_DEPTH=2` rejoue la faute du §8o.3 pour les tests.
+- Une chaîne qui ne démarre pas laisse VA-API encoder dès le départ.
+- Une chaîne qui lâche en plein stream, à la conversion comme à l'encodage,
+  cède la place à VA-API sur l'image même, avec une image clé, pour le reste de
+  la session.
+
+La raison est chaque fois dans le journal et dans `SessionInfo`. Testé sur le
+780M avec les deux pilotes (`test_vulkan_hevc`, `test_linux_session`).
+
+**Concrètement, pour l'utilisateur** : rien ne change par défaut. La chaîne
+Vulkan n'est prise que si on la demande (réglage, clé de banc), en attendant
+que le banc tranche par vendeur. Même demandée, elle ne sert que sur une carte
+dont le pilote a prouvé, image à l'appui, qu'il encode juste. Sinon le stream
+part sur VA-API comme aujourd'hui, et la raison est écrite dans le journal.
+
+### 32.8 Linux : la route scindée par défaut sur AMD (décision de Bruno, 28/09/2026)
+
+Plan §9-20, sur la foi du banc §8o.5. Sous un jeu qui sature le 780M, la
+conversion GL attendait le jeu : 16 images captées par seconde sur 45, et 38 ms
+de la présentation à l'image encodée. La file compute de Vulkan tournait à côté
+du jeu : 44 images, 8 ms. Au repos, elle gagnait encore 0,3 ms.
+
+**Ce qui change.** La ligne AMD de la table des vendeurs
+(`autoLinuxConversion`) passe à Vulkan compute devant VA-API. L'encodeur reste
+VA-API : la chaîne Vulkan Video reste derrière le réglage jusqu'à G5 (§9-21),
+et `auto` ne la prend jamais.
+
+**Ce qui ne change pas.**
+- Intel et NVIDIA gardent GL.
+- Le portail garde GL, même sur AMD. Seul l'import du tampon KMS a été mesuré
+  au pixel (§8o.2) ; les tampons de PipeWire attendent leur banc (C13.3).
+  **Levé le 29/09 (§32.21)** : le portail en DMA-BUF a eu son banc (§8o.11),
+  et la route scindée y gagne aussi.
+- `vaapi` choisi dans l'admin, ou `pipeline=vaapi` au banc, reprend la chaîne
+  d'avant, GL devant VA-API. C'est le retour arrière, sans clé de banc.
+- La clé `convert=gl|vulkan` passe devant tout, pour les bancs.
+
+**Le repli, en deux marches au besoin.** Une conversion Vulkan qui ne démarre
+pas (pas de chargeur, pas de Vulkan 1.3) laisse GL convertir dès le départ.
+Une qui lâche en plein stream (périphérique perdu, tampon refusé) cède la place
+à GL sur l'image même. Nouveau depuis cette décision : sur AMD, la chaîne
+Vulkan Video qui lâche descend d'abord sur la route scindée, qui peut refuser
+le même tampon. La session redescend alors jusqu'à GL, toujours sur la même
+image, au lieu de couper le stream (`convertPicture`). La raison est au
+journal ; `refused` dit qu'une conversion demandée n'a pas pu tourner.
+
+**Concrètement, pour l'utilisateur** : sur un PC Linux à carte AMD, rien à
+régler. Sous un jeu qui occupe tout le GPU, le stream capte toutes les images
+du jeu au lieu d'une sur trois, avec 8 ms de retard au lieu de 38. Si la carte
+ou son pilote ne s'y prêtent pas, le stream reprend l'ancien chemin sans
+coupure, et « VA-API » dans l'admin y revient à la main.
+
+### 32.9 Windows : Intel en D3D12 par défaut (décision de Bruno, 28/09/2026)
+
+Plan §9-23, sur la foi de G3 (§8n.6 à §8n.10 du banc) et du test de Bruno
+(C5.7). Sur l'Arc, par Internet depuis un Mac, le bureau passe de 12,0 à 6,0 ms
+sur l'hôte, et de 63,6 à 47,7 ms du clic au photon (médianes). Sous RE9, le jeu
+tient 30 à 35 i/s dans le stream en D3D12, contre 25 à 30 en D3D11, qui saute en
+plus des images. Sur le N95, D3D12 est plus rapide au repos (9,5 ms contre
+13,2) et égal sous une charge qui sature l'iGPU.
+
+**Ce qui change.** La ligne Intel (oneVPL) de la table des vendeurs
+(`autoVideoPipeline`) passe à D3D12 : conversion sur la file DIRECT, D3D12
+Video Encode HEVC, contrôle de débit maison. L'overlay lit « D3D12 VE
+(Intel) ».
+
+**Ce qui ne change pas.**
+- NVIDIA et AMD gardent D3D11. Sur la RTX, VE met 21 ms là où NVENC en met
+  environ 2 ; l'iGPU AMD perd 6,7 à 8,1 ms au repos (G2). Leur voie D3D12
+  passe par leurs SDK en entrée D3D12 (phase 7, G4).
+- `d3d11` choisi dans l'admin, ou `pipeline=d3d11` au banc, reprend la chaîne
+  d'avant. C'est le retour arrière, sans clé de banc.
+- Ce que la route D3D12 ne porte pas encore reste en D3D11, pour la
+  construction concernée : H.264 (un navigateur sans HEVC), AV1, 4:4:4,
+  pont inter-GPU (Windows.Graphics.Capture aussi, jusqu'à la copie partagée
+  du 22/10, §17.5). Le journal dit pourquoi, et
+  l'overlay lit « oneVPL (D3D11) » : `refused` vaut aussi quand c'est la table
+  qui a demandé D3D12.
+
+**Windows 10.** Sans `ID3D12VideoDevice3`, il n'y a pas de D3D12 Video Encode.
+La première construction le découvre avant de faire la conversion, et le
+processus s'en souvient, un worker étant une session. Les constructions
+suivantes choisissent D3D11 d'emblée, au lieu de faire puis défaire une chaîne
+D3D12 à chaque reconstruction.
+
+**Mesuré sous charge le 22/10/2026 (banc §8y.4).** Sur le N95 chargé (un clip
+1080p60 et le pointeur en mouvement pendant le stream), six passes de 70 s par
+chaîne en bras alternés, la duplication des deux côtés : la chaîne D3D11
+(oneVPL) fait moins de trous > 50 ms entre deux bitstreams dans les six manches
+(15,3 ± 4,9 contre 22,0 ± 1,8 par passe), mais chaque image part plus tard
+(présent → bitstream p50 7,1 contre 5,5 ms, l'encodage 7,0 contre 4,5) et son
+p99 est un peu plus haut (23,3 contre 21,1). Les blocages changent d'appel sans
+disparaître (oneVPL et ReleaseFrame en D3D11, Signal + Flush en D3D12) ; l'autre
+moitié des trous vient de la duplication, surtout un AcquireNextFrame bloqué
+alors que le bureau présente, deux fois plus souvent derrière la chaîne D3D12.
+**Décision de Bruno (22/10, ~13:05) : D3D12 reste le défaut sur Intel, y compris
+sous charge ; « D3D11 » reste le choix manuel dans l'administration. Rien ne
+change dans le code.**
+
+**Concrètement, pour l'utilisateur** : sur un PC à carte ou à puce graphique
+Intel, rien à régler. L'image part plus vite de l'hôte (deux fois plus vite
+sur une Arc), et un jeu garde sa cadence dans le stream ; par Internet, le clic
+arrive à l'écran environ 16 ms plus tôt. Si le PC ne s'y prête pas (Windows 10, un navigateur
+sans HEVC), le stream prend l'ancien chemin sans coupure, et « D3D11 » dans
+l'admin y revient à la main.
+
+### 32.10 Windows : la robustesse, mise à l'épreuve (phase 8, 28/09/2026)
+
+Depuis §32.9, D3D12 porte les streams d'Intel par défaut. La phase 8 vérifie
+sa promesse avant la fusion de la branche, sur l'Arc et le N95.
+
+**Les pannes injectées (C8.1).** `MW_D3D12_FAULT=<panne>@N`, dans
+l'environnement du banc ou d'un worker, provoque une panne à la N-ième
+conversion de la chaîne :
+- `encode` : l'image est jetée comme une erreur du pilote ;
+- `convert` : la liste est refusée ;
+- `timeout` : la file attend une fence que personne ne signale, jusqu'à ce que
+  la chaîne abandonne ;
+- `removed` : `ID3D12Device5::RemoveDevice`, comme un TDR ;
+- `open` : la N-ième chaîne du processus ne s'ouvre pas.
+
+Même raison d'être que `MW_CAPTURE=wgc` (§17) : un chemin de secours jamais
+parcouru pourrit. Au banc de l'Arc (§8n.11 du banc), chaque panne finit en
+D3D11 sur une keyframe, la seule hors de la première, avec la panne et la
+chaîne choisie au journal. Le flux ne compte aucune erreur de décodage. Le
+trou sans image dure 0,6 s : la duplication rouverte, puis l'encodeur D3D11
+ouvert. Il dure 3,6 s pour `timeout`, dont les 3 s qui séparent un GPU perdu
+d'un GPU occupé. `open` donne D3D11 dès le départ, raison à l'appui. Le banc
+écrit la chaîne de chaque image dans son CSV, et résume la bascule.
+
+**Le retour à la duplication (C8.3 bis).** Un worker qui n'est pas SYSTEM
+passe sur WGC, donc en D3D11, quand la duplication est refusée derrière un
+écran verrouillé. Il y restait pour la fin de la session (G2). Il revient
+maintenant à DDA dès que le bureau de l'utilisateur est de retour, et à D3D12
+avec (§17.1). Au banc de l'Arc, avec `MW_DDA_REFUSE=3+4` : la duplication est
+perdue à 3 s, WGC prend le relais en D3D11 (0,7 s sans image), puis D3D12
+revient 0,4 s après la fin du refus (0,5 s sans image). Chaque bascule se fait
+sur une keyframe, sans erreur de décodage (§8n.12 du banc).
+
+**Le pilote, et les pilotes exclus (C8.3).** La sonde lit la version du
+pilote de chaque GPU. Elle utilise `IDXGIAdapter::CheckInterfaceSupport` sur
+`IDXGIDevice` : depuis WDDM 2.3, les parts D3D9, D3D11 et D3D12 d'un paquet
+de pilote partagent un même numéro. La version s'affiche à trois endroits :
+- la ligne de session du journal (« on Intel(R) Arc(TM) A380 Graphics
+  (driver 32.0.101.7088) ») ;
+- `/api/native/status` (`gpu_driver`) ;
+- le JSON de la sonde en session console.
+
+Une liste par vendeur et par plage de versions (`d3d12DriverExclusions`, dans
+`VideoPipeline.h`) tient la route D3D12 à l'écart d'un pilote fautif. Le choix
+de chaîne le refuse alors comme les autres cas, raison à l'appui, et
+`video_pipeline_auto` lit `d3d11` avec `video_pipeline_excluded`. La liste est
+vide : une ligne n'y entre qu'avec une panne que les gardes de la route
+n'attrapent pas déjà (garde d'en-têtes, délai des fences, retour en D3D11), et
+avec sa preuve.
+
+**Les scénarios (C8.2).** Le banc capture un écran virtuel rendu par l'Arc
+pendant que son mode et son HDR changent (§8n.13 du banc) :
+- quatre modes, dont un en 4:3 ;
+- le HDR activé puis coupé sous une session SDR (le bureau passe en FP16, la
+  conversion D3D12 fait le tone mapping) ;
+- le HDR coupé puis réactivé sous une session HDR (elle se reconstruit en SDR) ;
+- deux sessions à la fois sur deux écrans de l'Arc, en deux processus comme
+  deux workers.
+
+Tout reste en D3D12 : chaque redémarrage de capture reconstruit la chaîne sur
+une keyframe, et aucun flux n'a d'erreur de décodage. Le passage de la
+duplication à WGC et retour est celui de C8.3 bis. Pendant 30 min sous RE9,
+sur l'Arc : 42 053 images en D3D12, sans perte ni repli, et une mémoire plate
+(221 Mo privés, 50 Mo de VRAM, du début à la fin).
+
+**Ce que la phase 8 a trouvé : le HDR de l'UHD d'un N95.** Une session HDR en
+D3D12 y perdait le périphérique dès sa première image (`DEVICE_HUNG`). Le
+repli l'a rattrapée : D3D11, HDR compris, sans erreur. Mais le GPU se
+réinitialisait à chaque session. La cause est `ClearRenderTargetView` sur un
+plan de P010 : le pilote 32.0.101.7088 le prend mal, alors que le dessin dans
+ce même plan passe. Le convertisseur D3D12 dessine donc son noir, par un
+`PsFill` qui rend les mêmes octets partout (§8n.14 du banc). Le test
+`color_convert12_gpu` rejoue ces étapes sur chaque vrai GPU, et plus seulement
+sur WARP.
+
+**Le test de Bruno (C8.4), sur l'édition dev installée.** Écran verrouillé
+depuis le stream, puis déverrouillé en tapant le PIN dans le stream, et un
+stream HDR sur l'écran virtuel : l'overlay reste sur « D3D12 VE (Intel) ». Le
+premier essai a d'abord montré que le worker SYSTEM n'avait jamais servi, en
+v0.3.1 non plus (§31.7, `f1e8e8e3`). Une fois corrigé, la duplication se
+rouvre sur le bureau `Winlogon` et la chaîne D3D12 se reconstruit des deux
+côtés de la bascule, sans passer par WGC ni D3D11 (§8n.15 du banc).
+
+**Les deux dernières passes, après la fusion dans `main` (§8n.17 du banc).**
+- Dans un vrai Chrome, la bascule D3D12 → D3D11 ne coupe pas le stream. Le
+  décodeur du navigateur repart sur la keyframe de l'encodeur D3D11, 0,6 s
+  après la panne, sans erreur ni demande de keyframe.
+- 30 min sous RE9 dans la classe du worker installé (REALTIME) : 40 131 images
+  en D3D12, sans perte ni repli, et une mémoire plate. De la présentation à
+  l'image encodée, 6,7 ms en moyenne, contre 24,3 en classe HIGH.
+
+**Concrètement, pour l'utilisateur** : si la carte graphique décroche en
+plein stream (pilote qui plante ou se met à jour, GPU bloqué), l'image se fige
+une demi-seconde, trois secondes et demie au pire, puis repart d'elle-même
+par l'ancien chemin, sans rien à relancer : le navigateur suit sans erreur.
+Une longue partie tient aussi : 30 minutes sous un vrai jeu, sans une image
+perdue ni mémoire qui grimpe. Un PC verrouillé se déverrouille depuis le
+stream, comme avec Parsec, ce que la v0.3.1 promettait sans le tenir. Et là où
+le worker ne tourne pas en SYSTEM (banc, `--dev`), un écran verrouillé ne fait
+plus perdre le chemin rapide jusqu'à la fin du stream.
+
+### 32.11 Le scaler matériel d'Intel, mesuré et écarté (§9-15, 28/09/2026)
+
+Sur un iGPU Intel saturé par un jeu, la conversion attend le jeu, l'encodeur
+non : il tourne sur le moteur vidéo (§8n.8 du banc). D3D12 Video Process met
+le scaler de ce moteur (SFC) à portée, et la sonde `queues` du labo l'a mesuré
+sur le N95 (§8n.16 du banc).
+
+Il ne tient pas sa promesse. Sa file attend le jeu comme la nôtre, environ
+10 ms sous charge, même en `GLOBAL_REALTIME`, et sa latence n'est pas meilleure
+que celle de nos shaders en bilinéaire (11,2 contre 10,9 ms). Au repos, il est
+plus lent (4,0 contre 2,9 ms). Il rend quelques images au jeu, mais plus dès
+que le pointeur est composé : la composition à deux flux repasse par le moteur
+3D. Il ne sait pas le HDR, ni le pointeur en inversion. Sa réduction, en
+gamma, tient entre notre bilinéaire et notre Lanczos-2.
+
+Pas de route SFC, donc : la condition posée par Bruno (« seulement si la sonde
+ne voit plus le jeu ») n'est pas remplie. La sonde reste au labo (`vp`,
+`vp-pointer`, `--picture`, `-Set vp` dans la campagne) pour un autre GPU ou un
+autre pilote.
+
+**Concrètement, pour l'utilisateur** : rien ne change. Sur un PC portable à
+puce Intel où un jeu occupe toute la carte graphique, l'image du stream reste
+préparée par le même chemin, parce que le circuit spécialisé d'Intel, mesuré,
+fait la queue derrière le jeu tout autant et n'irait pas plus vite.
+
+### 32.12 G4 : NVENC et AMF en D3D12 ne battent pas leur chemin D3D11 (28/09/2026)
+
+La phase 7 a donné aux SDK des fabricants une entrée D3D12. NVENC prend une
+image D3D12 depuis `NvencEncoder12`, AMF depuis `AmfEncoder12`. Leur
+configuration est partagée avec le chemin D3D11 (`NvencConfig`,
+`AmfConfig`), et une empreinte prouve qu'elle est identique d'un chemin à
+l'autre. G4 les a mesurés face à D3D11, sous RE9 et au repos (§8n.18 du banc).
+
+Aucune ne passe : NVENC en D3D12 coûte 0,2 à 0,3 ms et 16 à 24 % au p99, AMF
+0,7 à 1,2 ms et 4 ms au p99. D3D11 ne perdait déjà rien sur ces GPU (G2).
+Leur interface D3D12 ajoute des fences, une attente CPU (NVENC), une file pont
+et une remise d'état (AMF).
+
+Les lignes NVIDIA et AMD de la table restent donc D3D11. Les routes restent
+joignables par le réglage et par `enc12=` au banc. Sur l'iGPU AMD, AMF en
+D3D12 bat VE de 5 à 7 ms : c'est lui qu'il faudrait si la route D3D12 devait
+un jour servir sur AMD (C12.1, à Bruno).
+
+**Concrètement, pour l'utilisateur** : rien ne change sur un PC à carte
+NVIDIA ou AMD. Le stream reste sur le chemin qui s'est montré le plus rapide
+au banc, sous un jeu comme sur le bureau.
+
+### 32.13 Le H.264 par D3D12 Video Encode (C9.1, 28/09/2026)
+
+VE codait le HEVC seul. Il code maintenant le H.264, dans la forme que VA-API
+envoie depuis toujours : profil High, une image gardée, fenêtre glissante,
+`frame_num` sur 16 bits, POC de type 2. Le pilote écrit les tranches ; nous
+écrivons SPS et PPS, placés devant l'IDR comme les en-têtes HEVC.
+
+- **Négociation** (`H264EncodeNegotiation`). On prend CABAC et la
+  transformée 8×8 là où le pilote les code : l'iGPU AMD n'a pas la 8×8, et le
+  PPS le dit. Un pilote qui ne filtre pas tous les bords n'a pas d'encodeur :
+  le PPS le promet. Pour le reste, l'échelle de régulation et la règle
+  d'intra-refresh sont celles du HEVC, et le niveau vient du pilote, 5.1 à
+  défaut.
+- **Planification.** `HevcDpb`, à une image de capacité : la précédente,
+  toujours utilisée. Une perte coûte donc une keyframe, comme en VA-API.
+  Invalider une référence demanderait des opérations de gestion mémoire dans
+  chaque tranche, que D3D12 laisse à l'appelant. C'est un pas pour plus tard,
+  si une porte le demande.
+- **Garde** (`H264SliceParser`). Les tranches des six premières images sont
+  relues avec nos SPS et PPS. La garde vérifie le type d'image, `frame_num`,
+  une référence gardée par la fenêtre glissante et une seule référence
+  prédite. Un pilote qui écrit autre chose renvoie la session en D3D11 avant
+  qu'un client voie du bruit.
+- **Table.** La ligne D3D12 d'Intel a été mesurée en HEVC seulement
+  (`autoD3d12Codec`). En Auto, le H.264 d'Intel reste donc en D3D11 ; le
+  réglage et la clé de banc atteignent la nouvelle route.
+
+Sur les trois GPU de DualRTX, les flux se décodent sans erreur, et chaque
+image est bien la sienne (§8n.19 du banc).
+
+**Concrètement, pour l'utilisateur** : rien ne change par défaut. Un
+utilisateur qui choisit « D3D12 » dans l'admin et dont le navigateur ne lit
+que le H.264 garde maintenant la route D3D12. Avant, il retombait en D3D11.
+
+### 32.14 L'AV1 par D3D12 Video Encode (C9.2, 28/09/2026)
+
+En AV1, D3D12 laisse au pilote la tuile et à l'application tout le reste.
+Après l'image, les métadonnées résolues disent où est la tuile et quelles
+valeurs d'en-tête le pilote a choisies : quantificateur, filtre de boucle,
+CDEF, segmentation. `Av1Obu.h` écrit alors, d'après la spécification, le
+délimiteur temporel, l'en-tête de séquence (devant chaque image clé) et
+l'en-tête de `OBU_FRAME`. Le reste :
+- **Négociation** (`Av1EncodeNegotiation`). On prend les fonctions que le
+  pilote exige, plus CDEF et les order hints quand il les a. Un outil exigé
+  que nos en-têtes ne savent pas dire (outils d'écran, super-résolution,
+  copie intra, carte de segments fournie) veut dire pas d'encodeur. Une
+  seule tuile : jusqu'à 4096 de large et 4096×2304 de surface. Le niveau
+  vient de la taille et de la cadence, pas du pilote : l'Arc propose 6.0
+  pour du 1080p60, et un décodeur peut refuser un niveau qu'il n'atteint
+  pas.
+- **Références.** Chaque image rafraîchit les huit emplacements, qui
+  gardent donc tous l'image précédente. C'est `HevcDpb` à une image, comme
+  en H.264 : une perte coûte une image clé.
+- **Régulation.** Celle du pilote seulement, sur l'échelle qindex de l'AV1
+  (0 à 255). Notre régulation parle le QP du HEVC et du H.264.
+- **Ce que les pilotes ne disent pas.** Une fonction exigée doit aussi être
+  allumée sur chaque image (la segmentation automatique de la RTX). L'Arc
+  écrit son AV1 au début du tampon, quel que soit le décalage de début de
+  trame. La tuile est donc prise là, puis déplacée derrière les en-têtes, en
+  quelques microsecondes.
+- **Table.** Le réglage et la clé de banc atteignent la route ; en Auto,
+  rien ne bouge.
+
+Sur la RTX et l'Arc, dav1d décode sans erreur, et chaque image est bien la
+sienne (§8n.20 du banc). L'iGPU AMD n'a pas d'AV1 en D3D12.
+
+**Concrètement, pour l'utilisateur** : rien ne change par défaut. Un
+utilisateur qui choisit « D3D12 » dans l'admin et dont le navigateur demande
+l'AV1 garde maintenant la route D3D12 sur une carte NVIDIA ou Intel Arc.
+Avant, il retombait en D3D11.
+
+### 32.15 G3 : la RTX en témoin du contrôle de débit maison (28/09/2026)
+
+Le contrôle de débit maison (`QpRateController`) a été réglé sur l'Arc, qui ne
+change pas de débit en cours de séquence. La RTX le sait, et fait donc tourner
+ce contrôle en témoin, sans rien y changer (`rc12=qp`, §8n.21 du banc). Il
+tient G3 sur ce second fabricant :
+- 7 fenêtres de 2 s sur 9 dans ±10 % de la cible, et les ratés sont sous la
+  cible ;
+- un p95 de taille d'image de 1,23 à 1,96 budget ;
+- des marches de débit suivies en 3 images ;
+- un écran fixe amené à QP 18 ;
+- des pertes réparées sans image clé.
+
+Il fait mieux que le débit du pilote NVIDIA par la même voie : le pilote
+reste sous la cible sur le clip et met jusqu'à 27 images à suivre une marche
+montante. Le pilote code le QP demandé sur chaque image, comme celui de l'Arc.
+
+Le témoin ne change pas la table. Sur la RTX au repos, VE encode une image en
+environ 8 ms, NVENC par D3D11 en 2 ms, et NVENC tient mieux le budget que les
+deux.
+Le résultat vaut pour plus tard : si VE devait porter un GPU qui ne
+reconfigure pas son débit, ou la chaîne Vulkan de Linux (§32.7), le même
+contrôle s'y branche tel quel.
+
+**Concrètement, pour l'utilisateur** : rien ne change sur un PC NVIDIA. Ce
+banc confirme que la régulation qui fait tenir son débit aux PC Intel n'est
+pas un réglage propre à une carte.
+
+### 32.16 G3 : le profil « Internet » sur un vrai stream (28/09/2026)
+
+Un Chrome sous Linux a reçu l'écran de l'Arc à travers un lien dégradé :
+40 ms d'aller-retour, 0,3 puis 2 % de pertes, une marche de 30 à 8 Mb/s et
+retour (§8n.22 du banc). Le gouverneur, le relais et les réparations
+jouaient tous.
+
+**La chaîne D3D12 tient.** Notre contrôle de débit suit le gouverneur, de
+20 à 4 Mb/s en 4 s, puis vers le haut quand les pertes cessent. L'hôte reste
+à 4 ms dans toutes les phases, et les pertes se réparent par un delta. Sur le
+même profil, la chaîne D3D11 d'avant ne tient pas 60 i/s sur l'Arc, avec
+23 ms d'hôte, et gèle deux fois plus.
+
+**Le transport, lui, plafonne.** Le canal de données lit chaque perte comme
+une congestion. À 0,3 % de pertes et 40 ms d'aller-retour, il ne porte
+qu'environ 5 Mb/s, quelle que soit la capacité du lien. Sa file monte à
+0,5-0,8 s pendant les pertes, et leur arrivée coûte un gel de 2,4 s. C'est
+vrai pour les deux chaînes : aucun réglage de l'encodeur n'y touche. C'est la
+mesure qui manquait au chantier du transport sous pertes (plafond du canal de
+données, correction d'erreurs), prévu après celui-ci.
+
+**Concrètement, pour l'utilisateur** : sur un PC Intel, par Internet, le
+stream D3D12 reste fluide et réactif là où l'ancien chemin perdait des images.
+Sur une connexion qui perd des paquets, l'image reste plus sobre (vers
+5 Mb/s) et peut geler un instant quand les pertes commencent. C'est le
+prochain chantier, côté transport.
+
+### 32.17 Deux images en vol : mesuré, gardé en clé de banc (phase 10, 29/09/2026)
+
+La chaîne D3D12 encode une image à la fois : le fil de capture convertit une
+image, attend son bitstream, puis revient acquérir la présentation suivante.
+Là où la conversion et l'encodage dépassent ensemble l'intervalle d'image,
+des présentations sont perdues.
+
+`pipelined=1` (clé de banc, `ee2c326e`) change cette forme :
+- L'encodage et la remise à l'envoi passent sur un fil à eux, à la classe
+  MMCSS du fil de capture.
+- Le convertisseur écrit deux sorties à tour de rôle. La capture convertit
+  l'image suivante dans celle que l'encodeur ne lit pas.
+- Une image convertie qui attend encore quand une plus récente est prête est
+  jetée : au plus deux images en vol, jamais de file.
+- Ce qui suit une remise à l'envoi (modèle du lien, gardes d'encodage et de
+  rééchantillonnage, compte de la cadence) reste sur le fil de capture, à
+  partir d'un relevé laissé par le fil d'encodage.
+- Un débit posé pendant un encodage part avec l'image suivante. Tout autre
+  usage de l'encodeur (renvoi, reconstruction, redémarrage) attend d'abord
+  qu'il ne tienne plus rien.
+- Un échec sur ce fil prend le même chemin de retour vers D3D11 qu'un échec
+  sur le fil de capture.
+- D3D12 Video Encode seulement : les SDK des fabricants enregistrent une seule
+  entrée.
+
+**Mesuré** (banc §8n.23, classe REALTIME, A/B alternés) :
+- Là où l'encodage dépasse l'intervalle et où la conversion tourne sur un
+  autre moteur, le parallélisme paie. C'est l'iGPU AMD en VE à 120 i/s :
+  94,5 images/s au lieu de 79,4, et l'hôte plus court (−0,6 ms en moyenne,
+  −2,6 ms au p99).
+- Là où l'encodage tient dans l'intervalle, rien ne change : RTX et Arc au
+  repos, Arc sous RE9.
+- Sur un iGPU saturé, le N95 à 120 Hz, les conversions faites pendant
+  l'encodage disputent le GPU à l'encodeur : même cadence, p99 de l'hôte
+  +52 ms. À 60 Hz, le N95 gagne un peu (p99 38,9 → 25,6 ms).
+
+**Décision** : le défaut ne change pas (§9-26 du plan). Le seul cas qui gagne
+nettement, l'iGPU AMD en VE, n'est pas la route d'AMD (AMF en D3D11, §32.12),
+et Intel, dont c'est la chaîne par défaut, n'y gagne rien de sûr. La clé
+reste pour le plan « ultra-low latency », qui la reprendra si l'encodage d'une
+image y redevient plus long que l'intervalle.
+
+**Concrètement, pour l'utilisateur** : rien ne change. La chaîne sait
+désormais encoder une image pendant qu'elle convertit la suivante. Le banc
+dit que ce n'est utile que sur un couple GPU × cadence que le produit ne
+prend pas aujourd'hui.
+
+### 32.18 Phase 11 : la télémétrie, l'encodeur gardé, et trois études (29/09/2026)
+
+**Les shaders SM 6 en 16 bits (C11.1), mesurés avant d'être écrits.** Le but
+était un Lanczos-2 abordable sur le N95, sous le garde de rééchantillonnage
+(1,5 ms). La sonde `mw-d3d12-lab scale` (banc §8n.25) a d'abord cherché où
+passe le temps.
+- Sur Intel, la passe est liée à la mémoire. Précalculer les poids ou décoder
+  le sRGB une seule fois ne gagne rien, voire perd.
+- Le simple fetch bilinéaire prend déjà 1,46 ms sur le N95, le budget entier.
+- Sur le petit iGPU AMD, lié au calcul, les mêmes réécritures font −57 %, mais
+  2,5 ms restent au-dessus du budget.
+- `min16float` ne gagne rien, nulle part.
+
+**Pas de SM 6 ni de DXC dans le build** : aucune variante ne ferait changer
+un GPU de côté du garde.
+
+**Le temps GPU de l'encodeur (C11.2, `de0184b2`).** Avec `gputiming=1`, deux
+horodatages encadrent chaque soumission sur la file d'encodage. Leur somme
+remplit `gpu_encode_us`, re-encodages compris. Sur la RTX, VE passe 7,6 ms
+sur les 8,1 de l'étape d'encodage, et l'iGPU AMD 8,8 sur 13,1 : le reste est
+l'attente de la conversion. L'Arc écrit ses horodatages avant que l'image
+soit codée (20 µs pour 4 ms). Le moteur le voit sur les 30 premières images
+et ne rapporte rien plutôt qu'un chiffre faux. Les cartes de QP et de SATD
+demandent un Agility SDK plus récent que celui du build : hors périmètre.
+
+**L'encodeur gardé à travers un redémarrage de capture (C11.4, `df5187ef`).**
+Un changement de mode, un écran qui passe en HDR, un écran verrouillé :
+chacun reconstruisait toute la chaîne D3D12, encodeur compris. Pourtant, le
+flux codé reste le même, car la session garde la taille et la cadence
+négociées quoi que fasse le bureau. `keep12=1` met l'encodeur de côté au
+démontage, et le reprend si le flux (codec, taille, cadence, HDR,
+intra-refresh) n'a pas changé. Sur l'écran virtuel rendu par l'Arc, le trou
+avant l'image clé d'un redémarrage passe de 717 à 546 ms en médiane, sur
+12 redémarrages par bras, sans aucune erreur de décodage (banc §8n.24).
+**Par défaut depuis le 29/09** (§9-27 du plan, accepté par Bruno ; `keep12=0`
+le refait). Le flux ne change pas, il repart toujours sur une image clé, et il
+gagne 0,2 s par redémarrage sur la chaîne par défaut d'Intel. Un encodeur
+qu'une panne laisse derrière elle n'est jamais gardé.
+
+**ROI par carte de QP (C11.3, étude).** La sonde du 29/09 refait le constat
+du 26/09 sur les pilotes du jour :
+- la RTX applique les cartes delta et absolue (cases de 32 px) ;
+- l'Arc annonce la carte delta, mais `EncodeFrame` la refuse ;
+- l'iGPU AMD annonce la carte absolue (cases de 64 px), et `EncodeFrame` la
+  refuse aussi.
+
+Un ROI (pointeur net, texte net) n'a donc de GPU où servir dans la chaîne
+D3D12 que la RTX, dont le stream passe par NVENC en D3D11, qui a sa propre
+carte. **Pas de ROI dans la chaîne D3D12** tant qu'un pilote Intel ne
+l'applique pas. Un ROI sur NVENC (le pointeur composé, par exemple) serait
+une ligne à part de la liste du plan natif, à mesurer pour lui-même.
+
+**L'envoi par tranches (C11.5, étude).** Envoyer une image par tranches
+(slices), au fur et à mesure qu'elles sont codées, fait partir la première
+plus tôt :
+- NVENC le permet par sa lecture partielle (`enableSubFrameWrite` et
+  `reportSliceOffsets`, sur la route du fabricant).
+- D3D12 Video Encode ne le permet qu'avec les notifications de sous-régions
+  d'un Agility SDK en préversion, hors périmètre du plan.
+
+Le gain est borné par le plus petit de deux temps : le temps d'encodage qui
+reste après la première tranche, et le temps d'envoi de l'image.
+- Côté navigateur, WebCodecs décode une unité d'accès entière : le décodeur
+  attend le dernier octet de toute façon.
+- Sur un réseau local à 1 Gbit/s, une image de 40 Ko part en 0,3 ms : c'est
+  le gain maximal.
+- Par Internet à 20 Mbit/s, elle part en 16 ms : l'encodage de NVENC (2 ms)
+  s'y recouvre presque entier, soit 1,5 ms au mieux.
+
+Il faut payer ces 1,5 ms de 2 à 5 % de débit (en-têtes de tranche, prédiction
+coupée aux frontières), et d'une réparation par invalidation plus complexe.
+**Pas fait.** À rouvrir dans le plan « ultra-low latency », si son codec
+décode par blocs indépendants.
+
+**Concrètement, pour l'utilisateur** : un changement de résolution ou le
+retour d'un écran verrouillé rend l'image environ 0,2 s plus vite sur un PC
+Intel (par défaut depuis le 29/09). Le reste de la phase outille les bancs, et dit
+pourquoi deux idées (ROI, envoi par tranches) attendront.
+
+### 32.19 Clôture du plan : la chaîne par GPU (29/09/2026)
+
+Le plan `pipeline-video-d3d12-v2` s'achève sur une chaîne par type de GPU,
+chacune choisie au banc puis acceptée par Bruno. `Auto` prend la chaîne de la
+table ; le réglage `native_video_pipeline` (Avancé, dans l'admin) en force une
+autre. Un refus ou une panne ramène toujours à la chaîne d'avant, sans couper
+le stream.
+
+| GPU | `Auto` aujourd'hui | Pourquoi | Ce que le réglage offre en plus |
+|---|---|---|---|
+| Intel (Arc, iGPU Xe) | **D3D12** : conversion D3D12, D3D12 Video Encode en HEVC, contrôle de débit maison | Sous un jeu, l'hôte deux fois plus court sur l'Arc (G2) ; le débit tenu (G3) ; le clic → photon de Bruno (C5.7) | H.264 et AV1 par D3D12 Video Encode (en `Auto`, ils restent sur oneVPL) |
+| NVIDIA | D3D11 (NVENC) | NVENC y encode en 2 ms. VE en prend 5 à 8, et NVENC en entrée D3D12 ne fait pas mieux (G2, G4) | NVENC en entrée D3D12 |
+| AMD | D3D11 (AMF) | VE ajoute 7 à 8 ms, et AMF en entrée D3D12 ne fait pas mieux (G2, G4) | D3D12 Video Encode |
+| AMD sous Linux | **Vulkan compute → VA-API** (route scindée), par le scanout comme par le portail (§32.21) | Sous un jeu, 8 ms au lieu de 15 à 38 par GL (§8o.5, §8o.8) ; par le portail, 16 ms au lieu de 31 (§8o.11) | La chaîne Vulkan Video, prise sur la preuve au pixel (`vulkan`), ou GL (`vaapi`) |
+| Intel et NVIDIA sous Linux | GL → VA-API ; OpenH264 sur NVIDIA | Pas encore de carte au banc | La chaîne Vulkan Video, écrite d'après la spécification et les capacités lues |
+
+**Restaient à Bruno** (plan, §9), et ses réponses du 29/09 (§32.20) :
+- l'image jetée au calage du lien, nommée à l'encodeur (§9-25) : oui, derrière
+  un interrupteur d'abord (`namedrops`), puis par défaut pour NVENC et AMF en
+  D3D11 après les bancs, et pour NVENC en entrée D3D12 (§32.20) ;
+- `pipelined=1` (§9-26, §32.17) : par défaut sur un GPU Intel à mémoire propre
+  (§32.20) ;
+- `keep12=1` par défaut (§9-27, §32.18) : fait ;
+- G5 sous Counter-Strike 2 ; la file d'encodage HIGH sous le noyau 7.0 reste
+  refusée (banc §8o.10) ;
+- les tests manuels : le pompage de G3, **fait** (Bruno, 29/09, en 5G :
+  aucun pompage sur du texte ni sous RE9, à 10 et 5 Mb/s ; banc §8n.22) ;
+  l'invite UAC, **faite** (29/09, cliquée depuis le client, Bruno ayant remis
+  l'UAC par défaut le temps du test ; §31.7) ; Ctrl+Alt+Suppr (§9-28) : fait,
+  par le service lanceur et la stratégie de l'installeur (§31.7), et les
+  gestes de Bruno depuis son iPhone, **faits** (29/09 : Ctrl, Alt puis `Del`,
+  puis un stream relancé sur le poste verrouillé et son code) ;
+- la séance du 780M sous Windows (C10.2) : sans objet, la décision sur
+  `pipelined` ne touche pas AMD.
+
+**Concrètement, pour l'utilisateur** : sur un PC Intel, le stream part plus
+vite et reste net sous un jeu, avec un débit qui suit la connexion. Sur
+NVIDIA et AMD sous Windows, rien ne change : leur chemin était déjà le
+meilleur, et le banc l'a vérifié. Sous Linux avec un GPU AMD, l'image reste
+fluide quand un jeu sature le GPU. Partout, l'admin montre la chaîne qui
+tourne, et permet d'en choisir une autre.
+
+### 32.20 Les réponses du 29/09 : keep12, l'image jetée nommée, deux images en vol à 244 Hz
+
+**`keep12` par défaut** (§9-27, accepté). Le démontage d'une capture met
+D3D12 Video Encode de côté, sauf avec `keep12=0`, ou quand une panne l'a
+laissé derrière elle. Vérifié sans clé sur l'écran virtuel de l'Arc (banc
+§8n.26) : l'encodeur est gardé à 6 reconstructions sur 7, avec 471 ms de trou
+médian avant l'image clé, et 0 erreur de décodage.
+
+**L'image jetée au calage du lien, nommée à l'encodeur** (§9-25, accepté
+derrière un interrupteur). La clé `namedrops`, lue par le relais, est décrite
+au §9.10.2. Après les bancs sur lien bridé (banc §8n.27 et §8n.28), Bruno l'a
+mise par défaut pour NVENC et AMF en D3D11 : les images abîmées y fondent, et
+les gels ne bougent pas. Jamais pour oneVPL, dont le HEVC se bloquait sous les
+réparations (il ne répare plus sous intra-refresh, §21.6b) ; D3D12 Video Encode,
+neutre, reste sans. Un dernier banc (§8n.29) l'a étendue à NVENC en entrée
+D3D12, qui gagne autant ; AMF en entrée D3D12, neutre, reste sans.
+
+**Deux images en vol à haute fréquence** (§9-26, pas tranché). Bruno a demandé
+deux vérifications : un gros GPU à très haute fréquence y gagne-t-il, et
+l'encodeur d'Intel partage-t-il l'unité de calcul de la conversion ? Banc
+§8n.26 :
+- **L'encodeur d'Intel ne touche pas aux shaders** : moteur 3D à 0 % en
+  encodage seul sur le N95. Aucune priorité de file ne peut donc départager la
+  conversion et l'encodage : ils tournent sur deux moteurs.
+- Ce qui ralentit le N95 à 120 Hz, c'est la mémoire. Elle est à un canal,
+  commune avec le CPU, et un encodage y dure ~40 % de plus quand la conversion
+  tourne en même temps.
+- **À 244 Hz, l'Arc y gagne** 2 à 4,5 % d'images, avec un hôte presque
+  inchangé : il a sa propre mémoire.
+- **La RTX n'en a pas besoin** : NVENC en D3D11, sa chaîne par défaut, suit
+  240 i/s jusqu'en 1440p avec 1,6 à 2,8 ms d'hôte. Seul le 4K à 244 Hz le met
+  en limite (226 i/s, 4,24 ms par image pour 4,1 d'intervalle). Il faudrait
+  alors écrire les deux images en vol pour NVENC, qui n'enregistre qu'une
+  entrée.
+
+**Décision de Bruno (29/09), sur le tableau avant/après : par défaut sur un
+GPU Intel à mémoire propre** (`9814c606`). Seules les lignes de l'Arc changent :
+gain à haute fréquence, rien de mesurable ailleurs.
+- La règle `pipelinedByDefault` (vendeur Intel, pas de mémoire unifiée) entre
+  dans la table des vendeurs, avec ses tests. `D3d12Device` lit le vendeur et
+  le drapeau `UMA` de `D3D12_FEATURE_ARCHITECTURE` ; WARP se déclare en mémoire
+  unifiée, vérifié.
+- La ligne « D3D12 chain on … » du journal dit « memory of its own » ou « the
+  CPU's memory ».
+- Les iGPU (N95, Xe, AMD) restent à une image à la fois.
+- `pipelined=0` force une image à la fois sur l'Arc, `pipelined=1` deux images
+  partout où D3D12 Video Encode tourne.
+
+**Concrètement, pour l'utilisateur** : sur un PC Intel, un changement de
+résolution rend l'image ~0,2 s plus vite. Sur une carte Intel Arc à très haute
+fréquence (240 Hz), le stream tient quelques pour cent d'images de plus.
+L'image jetée nommée attend son banc.
+
+### 32.21 Linux : le portail en DMA-BUF, et la route scindée dessus (C13.3 bis, 29/09/2026)
+
+Plan C13.3 bis, « Go » de Bruno le 29/09 ; banc §8o.11.
+
+**Ce que le portail donnait.** De la mémoire partagée, toujours. Un compositeur
+ne donne un DMA-BUF qu'à un client qui annonce, format par format, les
+modificateurs qu'il sait importer : c'est la négociation DMA-BUF de PipeWire.
+`PortalCapture` n'annonçait rien, et GNOME 42 puis 46 choisissaient la mémoire
+partagée. La session encodait donc sur le CPU (§19.15).
+
+**Ce qui change.**
+- **L'offre.** La session demande à EGL, sur le render node de la carte, les
+  modificateurs qu'il importe pour les quatre formats d'un écran
+  (`GlConvert::importableModifiers`, sans ceux qu'EGL ne lit qu'en texture
+  externe). GL prend la relève de toutes les autres conversions : sa liste est
+  celle qu'un tampon doit tenir. `PortalCapture::offerDmabuf` les annonce avant
+  la mémoire partagée, marqués « à ne pas fixer » : le compositeur choisit
+  celui qu'il sait allouer. GNOME 46 fixe `0x200000010401b04` sur le 780M.
+- **Le GPU nommé.** La paire GPU recevait un render node vide sur cette route.
+  Le portail le reçoit de la session (`setRenderNode`).
+- **`dmabuf()` juste.** Il se lisait sur le premier tampon, arrivé après la
+  fin de `start()` : la session choisissait sa paire sur une réponse encore
+  fausse. `start()` attend maintenant ce premier tampon (une seconde au plus ;
+  un écran fixe en envoie un au démarrage).
+- **Le repli.** Si GL lui-même refuse un DMA-BUF du portail, aucune marche
+  Vulkan ne restant à descendre, la session rouvre le portail sans offre, sur
+  l'accord déjà donné (`leaveDmabuf`) : pas de dialogue, et le stream continue
+  en mémoire partagée.
+- **La table.** La ligne AMD (`autoLinuxConversion`) vaut pour le portail :
+  Vulkan compute devant VA-API. Au banc, la conversion y passe de 0,84 à 0,65 ms
+  au repos, et de 30,7 à 15,8 ms sous un jeu qui sature le 780M, avec 40 i/s
+  captées au lieu de 28.
+
+**Ce qui ne change pas.** Une capture par le scanout (le paquet, avec son
+lanceur) ne passe pas par le portail. `vaapi` dans l'admin reprend GL devant
+VA-API, portail compris. Le banc garde `convert=gl`, et `portaldmabuf=0`
+demande la mémoire partagée seule.
+
+**Concrètement, pour l'utilisateur** : avec l'AppImage sous GNOME, le stream
+n'encode plus sur le processeur. Il passe par le GPU, en HEVC si le navigateur
+le prend, et reste fluide sous un jeu (40 images par seconde captées au lieu de
+28 sur un 780M saturé). Le premier stream demande toujours une fois
+l'autorisation de partager l'écran ; les suivants, non.
+
+### 32.22 Linux : la mémoire partagée du portail, par la conversion Vulkan (C13.10, 29/09/2026)
+
+Plan C13.10, « Go » de Bruno le 29/09 ; banc §8o.12.
+
+**Pourquoi.** Un compositeur qui ne donne pas de DMA-BUF donne de la mémoire
+partagée. GL ne sait pas la lire : la session encodait sur le CPU, en H.264
+seulement, et un cœur y passait.
+
+**Ce que la conversion Vulkan fait d'une image en mémoire partagée**
+(`KmsFrame::mapped`).
+- Elle tente d'importer la mémoire là où elle est mappée
+  (`VK_EXT_external_memory_host`, activé où le pilote l'a) : le GPU la
+  copierait sans que le CPU touche un pixel.
+- **amdgpu refuse** : le noyau n'importe que de la mémoire anonyme, et celle
+  de PipeWire est un memfd. Le refus est retenu pour la session, et dit une
+  fois au journal.
+- Le repli : le CPU copie l'image dans un tampon visible du GPU, gardé d'une
+  image à l'autre. Le GPU la copie ensuite dans une image, puis la convertit
+  comme un DMA-BUF. Pas de barrière implicite ici : le compositeur a fini
+  d'écrire avant de rendre le tampon.
+
+**Qui la prend** (`LinuxRouteChoice.h`).
+- La mémoire partagée passe par la conversion Vulkan là où la table convertit
+  déjà en Vulkan (AMD) ou quand la clé `convert=vulkan` la demande. Elle mène
+  à VA-API, ou à la chaîne Vulkan Video si celle-ci est prise.
+- GL ne la lisant pas, tout ce qui mènerait à GL mène au CPU : la table
+  d'Intel et de NVIDIA, VA-API choisi par son nom dans l'admin, une conversion
+  Vulkan refusée. Le CPU reste la dernière marche, jamais GL.
+
+**Au banc** (780M, §8o.12) : 5 % d'un cœur au lieu de 71, la même latence, du
+HEVC au lieu du seul H.264, pour 8 % d'images en moins (le GPU est partagé
+avec la copie du compositeur).
+
+⚠️ **GNOME 46 n'enregistre aucune image d'une fenêtre en plein écran en
+mémoire partagée** : 0 image en 10 s, avec l'ancienne paire CPU comme avec la
+nouvelle (vu avec Chrome en kiosque). En DMA-BUF, le plein écran passe. Avant
+C13.3 bis, une AppImage sous GNOME 46 ne streamait donc rien d'une fenêtre en
+plein écran, un jeu y compris selon toute vraisemblance : l'offre DMA-BUF
+(§32.21) le corrige aussi.
+
+**Concrètement, pour l'utilisateur** : sur un bureau Linux dont le
+compositeur ne donne que de la mémoire partagée, l'AppImage n'occupe plus un
+cœur du processeur à encoder. Sur une carte AMD, l'image passe par le GPU, en
+HEVC si le navigateur le prend.
+
+### 32.23 Linux : le bourrage de RADV, retiré de la chaîne Vulkan Video (29/09/2026)
+
+Trouvé en relisant, unité par unité, les flux du banc d'intra-refresh ; banc
+§8o.13.
+
+**Ce que RADV écrit.** En CBR, le pilote complète chaque image jusqu'à son
+budget avec des unités de bourrage (*filler data*, type 38 en HEVC), placées
+après les tranches. Sunshine en reçoit autant sur ce pilote, et le shim les
+retire depuis `9ecc3abf`. Le chemin natif, lui, les envoyait :
+- une page qui défile, à 16 Mbit/s : 23 à 37 % des octets ;
+- un écran fixe : 122 Ko par image renvoyée, pour quelques centaines
+  d'octets d'image. Le raffinement de l'image fixe « coûtait » 610 Ko en
+  5 passes, et le lien en retenait 8 images (banc de C13.11).
+
+**Le correctif.** L'encodeur retire le bourrage sur place, dans son tampon de
+flux, avant que l'image parte (`stripHevcFiller`). La fonction vit à côté du
+découpage Annex-B de `HevcSliceParser.h` : le module natif ne peut pas inclure
+l'`AnnexBFiller.h` du shim. Le journal le dit à la première image, et donne le
+total à l'arrêt.
+
+**Ce qui ne change pas.**
+- Les images décodées sont les mêmes. La preuve au pixel garde son verdict,
+  sans nouvelle révision de l'encodeur.
+- Le bourrage n'était jamais devant la tranche d'une IDR : nos en-têtes sont
+  posés devant les tranches, lui vient après. Aucune image clé n'était donc
+  refusée, comme celles de Sunshine sur le Mac ; il ne coûtait que du débit.
+- Aucun des 75 flux Windows gardés des bancs D3D12 n'en contient (D3D12 Video
+  Encode, oneVPL, NVENC et AMF). VA-API le coupe (`disable_bit_stuffing`).
+
+**Concrètement, pour l'utilisateur** : avec la chaîne Vulkan Video, un bureau
+immobile ne coûte presque plus rien sur le réseau, et une image qui bouge
+passe avec un quart à un tiers d'octets en moins, pour la même image. Sur une
+connexion lente, chaque image met d'autant moins de temps à passer.
+
+### 32.24 Linux : l'intra-refresh de la chaîne Vulkan Video (C13.9, 29/09/2026)
+
+Plan C13.9, « Go » de Bruno le 29/09 ; banc §8o.14.
+
+**Pourquoi.** Le client qui traverse les pertes (`rideOutLoss`) demande un
+intra-refresh : l'image se répare par balayages, sans attendre d'image clé. La
+chaîne Vulkan Video n'en faisait pas. `/start` disait `intra_refresh: false`,
+et le client retombait sur les images clés.
+
+**Le code.**
+- `VulkanDevice` active `VK_KHR_video_encode_intra_refresh` et sa
+  fonctionnalité, là où le pilote les a, sur un périphérique ouvert pour
+  encoder (`encodesIntraRefresh`).
+- `VulkanHevcEncoder` crée la session avec son mode
+  (`VkVideoEncodeSessionIntraRefreshCreateInfoKHR`) : les colonnes d'abord,
+  parce qu'un défilement vertical reste dans sa bande, puis les rangées, puis
+  les blocs.
+- Chaque image d'un balayage porte le drapeau d'intra-refresh, la durée du
+  balayage et son rang (`VkVideoEncodeIntraRefreshInfoKHR`). Sa référence dit
+  combien de régions restent à rafraîchir (`VkVideoReferenceIntraRefreshInfoKHR`,
+  la durée moins le rang).
+- `encode/IntraRefreshSweep.h` tient le compte, sur la règle du moteur
+  (`RateControl.h`) : deux secondes d'images par balayage (120 à 60 i/s),
+  toutes les quatre périodes (480). La clé de banc `irdist=`, jusqu'ici à
+  oneVPL seul, vaut pour les deux (`EncoderTuning::intraRefreshDist`).
+- **Une réparation relance le balayage.** Pendant un balayage, seule l'image
+  précédente peut être en partie propre. Une réparation qui prédit depuis une
+  image plus ancienne (l'invalidation de référence de `HevcDpb`) repart donc
+  au rang 0, sa référence comptée sale en entier. Les réparations restent
+  permises : contrairement à oneVPL en HEVC (§21.6b), la preuve et le banc
+  passent sans blocage.
+- L'horizon annoncé au client (`intra_refresh_frames`) : l'écart plus un
+  balayage, 600 images à 60 i/s. C'est ce que le chien de garde du ride-out
+  attend avant de demander une image clé.
+
+**Les refus**, dits au journal ; le stream continue alors en images clés à la
+demande :
+- un pilote sans l'extension ;
+- aucun des trois modes ;
+- aucune référence permise pendant un balayage ;
+- des balayages de moins de 2 images ;
+- une session refusée avec l'intra-refresh : elle est recréée sans.
+
+**La preuve.** La révision 2 de l'encodeur rejoue les verdicts gardés. Son
+témoin balaie par 4 images dos à dos, à travers les pertes et l'image clé de la
+séquence : sur le 780M, 39,6 dB au pire par image (39,8 sans balayage).
+
+**Au banc** (780M, §8o.14), le bourrage retiré (§32.23) :
+- 0 erreur au décodage, perte pendant un balayage comprise ;
+- l'encodage ne bouge pas (1,62 ms) ;
+- sur une page qui défile, les balayages espacés ne coûtent rien de mesurable
+  (le même débit, 0,2 de QP) ; dos à dos, 5 % d'octets ;
+- sur une page fixe, un balayage coûte ~10 Ko par image. Espacés de quatre
+  périodes, les balayages y coûtent 0,7 Mbit/s ; dos à dos, 4,1 Mbit/s ;
+- réparer une perte par une image clé coûte moins d'octets mais adoucit
+  l'image : QP 27,5 sur la demi-seconde qui suit, contre 19 à 20.
+
+**VA-API, vu en passant.** Sous Mesa 26.2.3, VA-API balaie aussi sur le 780M
+(`VAConfigAttribEncIntraRefresh`), en H.264 comme en HEVC ; sous Mesa 23.2, il
+n'en avait pas (§19). Sa vague est continue, sans l'écart de quatre périodes.
+
+**Concrètement, pour l'utilisateur** : sous Linux avec une carte AMD et la
+chaîne Vulkan Video, le mode qui traverse les pertes marche comme sous
+Windows. Une image abîmée se répare d'elle-même, sans le gel de l'image clé
+attendue.
+
+### 32.25 Linux : l'écran fixe — la carte de QP écartée (C13.11), et VA-API sous Mesa 26 (29/09/2026)
+
+Plan C13.11, « Go » de Bruno le 29/09 ; banc §8o.15.
+
+**La carte de QP, mesurée et écartée.** L'idée : une carte de deltas de QP
+(`VK_KHR_video_encode_quantization_map`, cases de 64 px sur RADV) pour affiner
+plus vite l'écran fixe de la chaîne Vulkan Video. Le bourrage retiré (§32.23),
+le banc montre qu'il n'y a rien à affiner : la chaîne est déjà à QP 18 quand
+l'image s'arrête, et ses rafales de raffinement ne coûtent plus rien. Le
+« raffinement » de 610 Ko vu avant n'était que du bourrage. Pas de code.
+
+**VA-API ne se pose plus sur un bureau presque immobile.** Sur une page de
+texte où seul un carré de 48 px tourne, VA-API prend 32 Ko par image après 4 s,
+jusqu'au bout. Le débit est de 14,3 Mbit/s sur 20 par la route par défaut
+(Vulkan compute → VA-API) comme par GL, et de 20 avec sa vague d'intra-refresh.
+La chaîne Vulkan Video reste à 0,8 Mbit/s sur la même page. Sous Mesa 23.2, le
+22/09, VA-API y retombait sous 1 Ko par image. Ce sont de vraies données, pas
+du bourrage.
+
+**Ouvert, à Bruno** : la route par défaut sur AMD est touchée. En chercher la
+cause (le contrôle de débit du pilote, ou nos références), un plancher de QP
+pour VA-API, ou la chaîne Vulkan Video par défaut sur AMD. Rien n'est changé
+d'ici là. **Tranché le 05/10** : la chaîne Vulkan Video par défaut sur AMD, la
+cause cherchée à côté (§32.28).
+
+**Concrètement, pour l'utilisateur** : rien ne change pour l'instant. Sous
+Linux avec une carte AMD et un Mesa récent, un bureau presque immobile peut
+consommer presque tout le débit réglé. Ce n'est gênant que sur une connexion
+limitée, et c'est à régler.
+
+### 32.26 Linux : un bureau X11 sur deux GPU, et le portail du paquet (30/09/2026)
+
+Six défauts vus le 30/09 sur l'UM790Pro, quand le pilote NVIDIA de la GTX 1050
+y a fait passer GDM en X11 (deux écrans sur deux GPU). « Go » de Bruno pour
+chacun ; G5 au banc §8o.16.
+
+**Une fenêtre de la racine (5, `6465fbff`).** Sous X11, tous les écrans d'une
+carte lisent un seul tampon, la racine de X : l'écran de 1920×1080 est une
+fenêtre d'un tampon de 4480×1440. `KmsCapture` y voyait un changement de mode
+sans fin : 0 image. Il lit désormais le rectangle `SRC_X/Y/W/H` du plan
+primaire (`ScanoutWindow.h`), importe le tampon entier et ne convertit que ce
+rectangle (GL, Vulkan, CPU).
+
+**Une image recopiée (6, `f758982c`).** Un jeu en synchro coupée est recopié
+par X dans le même tampon : le tampon ne change pas, et la capture, réveillée
+par un nouveau tampon, livrait 1 image en 5 s. `X11Damage` écoute les
+« damage » de la racine (80 par seconde sous le jeu, aucun sur un bureau
+immobile) ; `KmsCapture` relit le même tampon au vblank quand il y en a eu.
+
+**Un écran que KMS ne montre pas (3, `1750eab9`).** Le pilote X de NVIDIA règle
+ses modes sans KMS : le M27Q de la GTX y est « 0×0 · 0 Hz (off) », était pourtant
+proposé, et son lancement échouait. Une sortie sans CRTC n'est plus proposée ;
+la sonde dit pourquoi, et la session compte les écrans par la même règle.
+
+**Le pointeur sur la disposition de X (2, `4ae134c7`).** X étale un pointeur
+absolu sur toute sa racine, écrans de tous les GPU compris ; la session ne
+connaissait que la carte capturée, et un puits PRIME lit son tampon depuis 0,0.
+Le centre de l'image de l'AMD visait donc 2241,720 au lieu de 3520,540.
+`X11Layout` lit RandR par `dlopen` : le rectangle de chaque sortie, son EDID, le
+connecteur KMS que publie le pilote, et la taille de la racine. L'écran capturé
+y est reconnu par son EDID, puis son connecteur, puis sa place, jamais par son
+nom : chaque pilote X nomme à sa façon (HDMI-A-1 du noyau = HDMI-A-0
+d'amdgpu). Mesuré de bout en bout avec le paquet de la CI : sur sept points
+visés depuis un client, le pointeur tombe à un pixel près (banc §8o.17).
+
+**Le portail du paquet (1, `470341ef`).** xdg-desktop-portal 1.18 identifie
+l'appelant par `/proc/<pid>/root`, que le noyau ne lui ouvre que si ses
+capacités couvrent celles de l'appelant. Le worker du paquet en porte
+(`CAP_SYS_ADMIN`, `CAP_SYS_NICE`), le portail aucune : toute route portail du
+`.deb` et du `.rpm` était refusée. Un processus qui porte des capacités demande
+désormais par un auxiliaire : le même binaire, relancé sans aucune capacité
+(`no_new_privs`), qui tient la session du portail et rend le descripteur
+PipeWire par une paire de sockets. La capture garde ses files en priorité haute.
+Sous X11, l'écran virtuel n'est plus proposé : seul le compositeur Wayland de
+GNOME sait en créer un (01/10/2026 : celui de KDE Plasma 6 aussi, §35).
+- Vérifié par la suite avec capacités, sous X11. Pas encore par le paquet sous
+  Wayland : l'UM790Pro n'y revient pas tant que le pilote NVIDIA y est (vu le
+  01/10/2026, l'UM790Pro repassé en Wayland : banc §8s.11).
+- Le thème GNOME de Qt lit ses réglages d'apparence par le même portail, au
+  démarrage de l'app et du worker. Il est refusé de la même façon, ce qu'écrit
+  une ligne « dbus reply error ». Sans effet sur le stream.
+
+**Les tests sur la mémoire partagée (4, `9e30b407`).** Sous X11, le portail de
+GNOME donne de la mémoire partagée, que GL ne lit pas : quand la conversion
+Vulkan lâche, c'est le CPU qui prend la suite, et un client HEVC seul est
+refusé. La suite supposait le DMA-BUF de Wayland (12 échecs) ; elle suit
+maintenant la raison de la route. Sans capacités, 6191/6191 ; avec, 6376/6376.
+
+**Concrètement, pour l'utilisateur** : sous Linux avec une carte NVIDIA à côté
+d'une autre, le bureau passe en X11, et il devient streamable : chaque écran de
+la carte qui le montre se capte, jeux en synchro coupée compris. La souris va
+là où on vise sur un bureau à plusieurs écrans. Un écran que le pilote NVIDIA
+tient hors de portée n'est plus proposé pour rien. Et le paquet installé n'est
+plus refusé par le portail, dont dépend l'écran virtuel sous Wayland.
+
+### 32.27 Linux : l'AV1 par Vulkan Video (C13.12, 04-05/10/2026)
+
+Plan C13.12 (`max`), « Go » de Bruno le 29/09, repris le 04/10 au soir ; banc
+§8o.18. Commits `6045301d` (l'encodeur, la preuve) et `72471fbf` (l'offre, la
+route, la session).
+
+**Pourquoi.** Sous Linux, l'hôte natif ne proposait jamais l'AV1 : le VA-API
+de Mesa liste le profil et ne décrit aucun encodeur (§19.13). RADV 26 en
+expose un par Vulkan Video, sur le même périphérique que la conversion.
+
+**L'encodeur** (`encode/linux/VulkanAv1Encoder`), le jumeau de
+`VulkanHevcEncoder` :
+- l'entrée NV12 écrite en place par la conversion, une soumission qui attend
+  la conversion sur le GPU, le CPU qui n'attend que l'encodage ;
+- l'en-tête de séquence est le nôtre en structure StdVideo, ses octets ceux du
+  pilote (`vkGetEncodedVideoSessionParametersKHR`), relus par
+  `av1::parseSequenceHeader` ;
+- devant chaque image un délimiteur temporel, et l'en-tête de séquence devant
+  une image clé, posés juste avant les octets du pilote : une image part d'un
+  seul tenant ;
+- les références : la tenue de `HevcDpb`, une image du pool pour un des huit
+  emplacements de l'AV1. Une image rafraîchit l'emplacement de sa texture,
+  jamais celui d'une image gardée, et ses sept noms de référence pointent
+  l'image dont elle prédit. Une perte laisse périmés, chez le récepteur, les
+  emplacements des images perdues ; rien ne les nomme plus avant qu'ils soient
+  rafraîchis, donc la réparation prédit d'une image que les deux côtés ont ;
+- les premiers en-têtes de trame sont relus (`av1::parseFrameHeader`, jusqu'à
+  `delta_q_present`) : type, numéro d'ordre, taille affichée, emplacement
+  rafraîchi, référence ;
+- l'intra-refresh comme en HEVC (§32.24).
+
+**⚠️ VBR, jamais CBR.** Le CBR de RADV demande au micrologiciel de bourrer
+chaque image, et en AV1 le VCN 4.0.2 ne revient pas de la première : anneau
+bloqué 22 s, réinitialisé par le noyau (8 fois sur 8). Le VBR, son pic au
+débit visé, tient le même budget sans bourrage. Plancher q-index 90 (le QP 18
+du moteur, la règle de D3D12 VE). Le quantificateur n'est pas rapporté : RADV
+écrit `base_q_idx` 127 et règle le débit par des deltas par superbloc.
+
+**⚠️ La taille : sur la grille du pilote, la même forme.** Le 780M code l'AV1
+par blocs de 64×16. Un cadre allongé jusqu'à la grille dit l'image dans la
+taille d'affichage de l'AV1, que Chrome ignore (WebCodecs, logiciel et
+matériel : 1920×1088 affichés pour 1080p). L'encodeur ramène donc l'image sur
+la grille en gardant sa forme exacte (`alignedToGrid`, à côté de
+`alignedToBlocks` qu'utilise déjà le HEVC de VA-API) : 1080p devient
+1792×1008, la conversion y met l'image à l'échelle (Lanczos-2), la session
+annonce cette taille. 720p, 1440p et 4K sont déjà sur la grille.
+
+**La preuve au pixel** (`proveVulkanAv1`, `vulkanAv1Verdict`) : la séquence
+de la preuve HEVC, relue par dav1d, le décodeur qu'utilise Chrome quand son
+GPU ne décode pas l'AV1. Ouvert à l'exécution (`libdav1d.so.7`, `.6` ou `.5`),
+jamais lié ; ses en-têtes au build seulement (`libdav1d-dev`, ajouté à la CI ;
+les paquets le recommandent). Les structures de la bibliothèque reçoivent une
+place plus large que toute version : seuls leurs premiers champs sont lus,
+stables depuis la 0.9 de la CI (Ubuntu 22.04). Verdict gardé dans le cache,
+sous une clé à part (`av1|…`, la version de dav1d comprise).
+
+**L'offre** (`platform::offerSessionCodecs`) : l'AV1 n'est ajouté aux codecs
+d'un GPU que pour une session dont la clé de banc ou le réglage demande la
+chaîne Vulkan Video, où le pilote Vulkan montre l'encodeur AV1 et où le build
+porte dav1d. La table des vendeurs n'en demandait aucune : **le défaut ne
+changeait pas** (jusqu'au 05/10 : AMD y prend la chaîne, §32.28). Windows et
+macOS n'ajoutent rien.
+
+**La route et la session** :
+- `LinuxRouteChoice` prend l'AV1 comme le HEVC, derrière sa preuve ;
+- refusé avant le stream (preuve, chaîne qui ne démarre pas), la session
+  prend le codec suivant du client que le GPU encode sans lui
+  (`ResolvedTarget::codecsWithoutOffer`), et refait le choix de route ;
+- refusé en cours de stream, la session s'arrête en le disant : rien d'autre
+  n'encode l'AV1 sous Linux, et un stream ne change pas de codec.
+
+**Le client qui recadre (05/10, `2bdda3a8`, accord de Bruno).** Un navigateur
+qui sait couper une image décodée le dit au `/start` (`crops_to_frame`,
+essayé une fois par `stream/FrameCrop.js`) ; la session reçoit
+`SessionConfig::clientCropsToFrame`, l'encodeur remplit alors le cadre
+jusqu'à la grille (1920×1088), l'image entière dans la taille d'affichage, et
+la session annonce 1920×1080. La vue coupe à la sortie du décodeur
+(`StreamView`, `VideoDecodeWorker`), en AV1 seulement, avant tout renderer :
+une `VideoFrame` sur la même image, `visibleRect` réduit, sans copie, et
+seulement si l'image dépasse la taille annoncée de moins d'un superbloc. Sans
+le drapeau (frontend ancien, invité), l'image reste sur la grille (1792×1008).
+La preuve au pixel code désormais le cadre rempli (révision 2, 48,6 dB).
+Vérifié : `linux_session` (1920×1080 annoncés sur un cadre 1920×1088), et
+Chrome headless, décodeurs logiciel et matériel — l'image coupée fait
+1920×1080, sa dernière rangée est la rangée 1079 de l'image.
+
+**Pas fait** : un stream AV1 vers un vrai client par WebRTC (la chaîne d'envoi
+est celle de l'AV1 de Windows) ; la conversion RVB du VCN
+(`VALVE_video_encode_rgb_conversion`), en sonde de labo seulement d'après le
+plan, à revoir sur RDNA4.
+
+**Concrètement, pour l'utilisateur** : sous Linux avec une carte AMD récente,
+choisir la chaîne Vulkan Video dans l'administration rend l'AV1 possible pour
+les navigateurs qui le préfèrent, le 1080p à pleine taille (1792×1008 agrandi
+seulement pour un frontend ancien). Avec le réglage par défaut, rien ne change.
+
+### 32.28 Linux : la chaîne Vulkan Video par défaut sur AMD (décision de Bruno, 05/10/2026)
+
+**La décision.** Bruno, le 05/10, sur le constat du §32.25 (VA-API à
+14,3 Mbit/s sur 20 sur un bureau presque immobile sous Mesa 26, la chaîne
+Vulkan Video à 0,8) :
+- (c) la chaîne Vulkan Video devient la route par défaut sur AMD sous Linux, là
+  où la sonde et la preuve au pixel la valident ; VA-API reste le repli
+  automatique, puis OpenH264 ;
+- (a) la cause est cherchée à côté (le contrôle de débit de radeonsi 26, ou nos
+  références), sans retenir (c).
+
+**Le code** (`LinuxRouteChoice.h`, `4e998380`) :
+- la ligne AMD de la table des vendeurs (`autoLinuxPipeline`) passe de VA-API à
+  Vulkan Video ; Intel et NVIDIA ne bougent pas ;
+- la table ne demande que ce que la chaîne peut porter. En H.264, que
+  l'encodeur Vulkan Video ne fait pas encore, et dans un build sans la chaîne,
+  VA-API tourne par la ligne de la table elle-même, sans refus : la route
+  scindée (Vulkan compute → VA-API) comme avant ;
+- ce que la preuve ou le stream ont appris reste un refus, dit comme tel
+  (« the vendor table for AMD asks for Vulkan Video, which cannot run: … ;
+  VA-API runs »), comme la table de Windows (`VideoPipelineChoice.h`) ;
+- la preuve au pixel ne tourne que là où la chaîne serait prise
+  (`linuxRouteWantsVulkanVideo`) : désormais toute session HEVC ou AV1 sur AMD,
+  une fois par taille, gardée dans le cache de l'utilisateur ;
+- l'AV1 est offert par défaut sur AMD (`offerSessionCodecs`), là où le pilote
+  montre l'encodeur ; un client ne le reçoit que s'il l'a choisi (le codec
+  « Auto » du client demande HEVC puis H.264) ;
+- le réglage « VA-API » de l'administration reste le chemin de retour : GL
+  devant VA-API, la chaîne telle qu'elle a toujours tourné.
+
+**Les tests** : `linux_route_choice` (table, H.264, build sans la chaîne,
+preuve refusée, mémoire partagée du portail, VA-API sans jeux de paramètres,
+retour par le réglage) ; `linux_session` dit la route de la session HEVC sans
+réglage et vérifie que, sur AMD, ce qui n'est pas la chaîne Vulkan Video est un
+refus ou un build sans elle.
+
+**(a) La cause, lue dans les sources** (Mesa 23.2.1 contre 26.2.3, sans banc) :
+- **La vague d'intra-refresh de VA-API, la part de 14 à 20 Mbit/s.**
+  - Mesa 23.2 forçait `RENCODE_INTRA_REFRESH_MODE_NONE`. Le rafraîchissement
+    par colonnes arrive avec Mesa 24.1 (MR 27101).
+  - `VaapiEncoder` le prend dès que le pilote l'offre et le balaie sans écart :
+    une colonne par image, 120 images, et ça recommence.
+  - Mesa élargit la bande d'une unité quand le filtre de boucle est actif : en
+    HEVC 1080p, 128 px de large ; en H.264, 32.
+  - Mesa n'applique pas `qp_delta_for_inserted_intra`, et le QP n'a pas de plancher.
+  - La chaîne Vulkan Video balaie, elle, une période sur quatre, avec un QP
+    plancher de 18 : la comparaison n'était pas à réglages égaux.
+  - Les autres clients VA-API (ffmpeg, OBS, GStreamer) n'envoient pas de
+    rafraîchissement par défaut.
+- **Le fond de 14,3 Mbit/s sans intra-refresh n'est pas expliqué par là**
+  (§8o.15, colonne « sans »). Écartés dans le code de Mesa : `min_qp`/`max_qp`
+  (même sens), VBAQ, pré-encodage et niveau de qualité (éteints sans tampon
+  `QualityLevel`), bourrage (coupé), saut d'images (codé à 0), remise à zéro du
+  contrôle de débit (seulement si le débit ou la cadence change), HRD.
+- **Reste en lice** :
+  - en HEVC sur VCN 2 à 4, le preset « speed » devient « balance » tant que le
+    SAO n'est pas coupé (Mesa 26, MR 40766) ;
+  - le micrologiciel VCN (1.24) et le noyau (7.0), qui ont changé avec Mesa.
+- **Bancs proposés**, sur la page de §8o.15 :
+  - H.264 contre HEVC par VA-API, sans intra-refresh (pas de changement de
+    preset en H.264) ;
+  - le SAO coupé en HEVC ;
+  - un plancher `min_qp` de 18 ;
+  - la vague espacée de quatre périodes, comme Vulkan Video.
+- **Touche le défaut restant** : le H.264 sur AMD passe toujours par VA-API.
+  Sa vague continue y prend tout le budget sur un écran fixe, pour un client qui
+  traverse les pertes. **Fait le 05/10, « ok » de Bruno** (`644f57e1`) : un
+  balayage toutes les quatre périodes, comme Vulkan Video, en H.264 comme en
+  HEVC, l'horizon annoncé au client étant l'écart plus un balayage ; `irdist=-1`
+  les remet dos à dos, et la clé `vaminqp=` mesure un plancher de QP.
+- **Le libellé** de l'administration devient « Vulkan », sans « (experimental) »
+  (décision de Bruno, `059a970e`) ; `/api/native/status` dit `vulkan` pour ce
+  qu'Auto prend sur AMD (`f7683e83`).
+
+**Au banc** (05/10 au soir, §8o.19 du banc) :
+- **Le défaut est validé.** Sans réglage, le HEVC sur le 780M prend Vulkan
+  Video, à 0,59 Mbit/s sur la page fixe, et à 1,0 avec l'intra-refresh espacé.
+- **La cause de VA-API est le QP, pas la vague.** Sans intra-refresh, VA-API
+  reste à 13,7 Mbit/s en HEVC et à 17,3 en H.264 : le preset HEVC est hors de
+  cause. Avec `vaminqp=18`, il tombe à 0,51 en HEVC et à 0,25 en H.264. Sous
+  Mesa 26, le contrôle de débit descend sous QP 18 et affine la page fixe
+  jusqu'à remplir le budget.
+- La vague espacée est juste mais ne change rien tant que ce fond remplit le
+  budget (17,5 contre 17,7 Mbit/s).
+
+**Le plancher de QP de VA-API** (décision de Bruno le 05/10 au soir,
+`d287dbb5`) : 18 par défaut, comme NVENC et AMF (`encode::kVaapiMinQp`).
+`vaminqp=` reste pour le banc (-1 : aucun). Au banc, ce plancher ramène le
+H.264 de 17,3 à 0,25 Mbit/s sur la page fixe. Le défaut compilé est vérifié
+sous Linux le 06/10 (§8o.20 du banc) : les ready de VA-API disent
+« QP >= 18 », et le H.264 sans réglage tombe de 17,2 à 0,51 Mbit/s sur la page
+fixe en 1440p.
+
+**Concrètement, pour l'utilisateur** : sous Linux avec une carte AMD récente,
+le HEVC et l'AV1 passent par Vulkan Video sans rien régler. Un bureau presque
+immobile ne prend plus presque tout le débit. Si le pilote ne prouve pas qu'il
+encode juste, le stream passe par VA-API de lui-même. Le réglage « VA-API »
+de l'administration ramène l'ancien chemin.
+
+## 33. Framerate « Hôte » : le stream à la cadence de l'écran de l'hôte (ouvert le 29/09/2026)
+
+Plan `framerate-hote.md` : l'essai « cadence de l'hôte » du POC Ultra, sorti en
+petit plan à part. Tout vit derrière des clés de banc ; aucun défaut ne change
+avant la décision de Bruno.
+
+### 33.1 Ce que coûte la cadence du client
+
+Le stream va aujourd'hui à la fréquence du **client**. « Auto » vaut celle de
+son écran, plafonnée à 120 (`util/RefreshRate.js`), et le navigateur l'envoie
+comme plafond (`stream_fps_max`). L'hôte y pose sa porte (§9.6, `FrameCadence`) :
+il n'encode que la première présentation de chaque intervalle du stream. Un
+changement tombé dans une présentation écartée attend la suivante admise.
+L'écran virtuel du produit tourne lui aussi à la fréquence du stream.
+
+Le modèle de l'attente entre un changement à l'écran et sa capture :
+- hôte à 165 Hz, client à 60 : ~8,3 ms en moyenne (au pire ~17) aujourd'hui,
+  ~3 ms (au pire ~6) si chaque présentation part ;
+- écran virtuel à 60 Hz : 8,3 ms en moyenne ; à 240 Hz, 2,1 ms, même pour un
+  jeu à 60 i/s, dont chaque image attend la composition suivante ;
+- à 500 Hz (le maximum du pilote), ~1 ms (au pire 2).
+
+Desktop Duplication ne livre que les présentations qui changent : un écran
+virtuel à 500 Hz sous un jeu à 60 i/s coûte 60 encodages par seconde, pas 500.
+C'est l'équivalent d'un VRR côté hôte.
+
+L'E2E par image ne voit pas ce gain : il part de l'instant de capture. Le
+critère est l'**âge du contenu** montré au client : l'instant où la page a
+dessiné ce que le client affiche, lu sur l'image elle-même (§33.3).
+
+### 33.2 Les clés
+
+- `MW_NATIVE_TUNING=cadence=host` : encodeur dimensionné pour la fréquence de
+  l'écran capturé, **aucune porte**. Chaque présentation que DDA livre est
+  convertie, encodée et remise à l'envoi. Ni alignement sur le client, ni
+  `stream_fps_max`, ni `clientfpscap` : reçus et journalisés, pas appliqués.
+- `cadence=host-ceiling` : la porte d'aujourd'hui posée sur la fréquence de
+  l'écran de l'hôte (`FrameCadence::ceiling`) : une source qui présente plus
+  vite que l'écran ne rafraîchit est tenue à sa fréquence.
+- `cadence=host-guarded` : `host` plus un **crédit de décodage**. Le client
+  dit quand sa file de décodage dépasse une image, et l'hôte saute des
+  présentations tant qu'elle n'est pas revenue. Sauter une présentation ne
+  coûte rien à l'hôte ; le client, lui, ne peut jeter une image P qu'en payant
+  une image clé. Le gouverneur de débit de décodage (`DecodeRateGovernor.js`)
+  réagit en trois secondes ; le crédit, en un aller-retour.
+- `MW_VDD_REFRESH=<Hz>` : la fréquence de l'écran virtuel du produit, jusqu'à
+  500 Hz (le maximum du pilote), pour la clé seulement. `kRateMax` (240) ne
+  change pas.
+
+Sur un encodeur débordé, la règle reste « la plus fraîche, jamais de file ».
+
+### 33.3 La mesure : l'âge du contenu
+
+La bande `?band=1` de `scripts/bench/content/scroll.html` porte le numéro de
+chaque image de la page. La page garde la table « numéro → instant du rAF »,
+calée sur l'horloge du backend par CDP. Le client relit le numéro sur l'image
+qu'il vient de dessiner (`probePixels`) et en déduit l'âge de ce qu'il montre,
+avec son horloge estimée contre celle de l'hôte par le ping/pong.
+
+### 33.4 La porte
+
+Le verdict se donne par couple hôte × client et par mode de peinture du
+client (tearing ou vsync). Une cadence est recommandée pour un couple si :
+- l'âge du contenu médian baisse d'au moins 2 ms (ou 20 %), avec un p99 pas pire ;
+- le clic → drapeau n'est pas pire ;
+- les images répétées et sautées par minute ne montent pas ;
+- les i/s du jeu restent à −3 % près ;
+- le client suit sans demander de plafond ni descendre l'échelle de qualité.
+
+Pour `host-guarded`, les sauts du crédit sont permis (c'est son rôle) et
+rapportés ; une file de décodage qui tient, ou une descente de l'échelle,
+invalide la passe. La recommandation au produit vise `host-guarded`, à la
+fréquence d'écran virtuel la plus haute qui garde les i/s du jeu à −3 % près.
+Bruno tranche.
+
+### 33.5 Ce qui est construit (29/09/2026)
+
+**Les clés** (Windows seulement ; Linux et macOS gardent leur copie du choix et
+ignorent la clé) :
+- Le choix de la cadence sort de `WindowsSession` pour `core/CadenceChoice.h`,
+  une fonction pure. Sans clé, c'est le même choix et la même ligne de journal,
+  mot pour mot (tests natifs). Avec `cadence=host…`, la ligne dit « the host's
+  rate » et nomme les plafonds reçus et non appliqués ; un plafond qui arrive
+  en cours de session est journalisé de même.
+- Le crédit (`core/DecodeCredit.h`) : le client dit la profondeur de sa file
+  (`decodequeue`, `DecodeQueueSignal.js`) dès qu'une deuxième image attend, la
+  redit toutes les 50 ms tant qu'elle reste pleine, et dit quand elle est
+  revenue à une. L'hôte retient la présentation qu'il allait encoder tant que
+  le dernier mot est « deux ou plus » et date de moins de 250 ms. L'image
+  retenue est toujours la plus fraîche ; elle part dès le retour du crédit,
+  sans attendre la présentation suivante (la boucle regarde alors toutes les
+  millisecondes).
+- Écart au plan : il voulait un signal « frais d'un aller-retour ». Or le
+  client ne redit sa file qu'à ses sorties de décodeur, à quelques
+  millisecondes d'écart au mieux : un crédit qui expire après un aller-retour
+  de LAN laisserait l'hôte envoyer entre deux sorties. D'où le « clear »
+  explicite, et le délai de 250 ms comme seul garde-fou (un « clear » perdu, une
+  page partie).
+- Modèle (tests natifs) : hôte à 500 présentations/s, décodeur à 100 i/s. Sans
+  crédit, 800 images en file après deux secondes. Avec, deux au plus sur un
+  LAN. À 10 ms dans chaque sens, neuf au plus, et 183 images décodées sur 200.
+  Les seuils 2/1 gardent le débit du décodeur au prix d'environ une image en
+  file ; des seuils 1/0 videraient la file pour ~9 % d'images en moins. À
+  trancher par la mesure si la file tient sur un décodeur lent.
+- `MW_VDD_REFRESH` : la garde de chaque requête porte désormais le plafond du
+  pilote (500) ; le plafond du produit (240) s'applique là où le produit
+  choisit la fréquence (`refreshForStream`). Vérifié sur l'Arc : l'écran
+  virtuel du produit en 2560×1440 à 240 puis à 500 Hz. Sur un XML qui n'est pas
+  le nôtre (le VDD de Bruno sur DualRTX), le produit y ajoute le mode demandé ;
+  le banc sauve le fichier avant et le remet après. Ajouter 240 et 500 à la
+  liste **globale** de ce fichier a empêché l'écran d'apparaître : ne pas le
+  refaire.
+
+**L'instrument** (`ContentAgeProbe.js`, `scripts/bench/content-age`) :
+- La bande de `scroll.html?band=time` porte l'horloge `steady_clock` de l'hôte
+  (QPC sous Windows). Le pilote la cale par CDP : `time.perf_counter_ns()` de
+  CPython lit le même compteur (vérifié, 0,002 ms d'écart), et le meilleur de
+  40 échanges laisse moins de 0,3 ms d'erreur.
+- Le client lit la bande dans l'image décodée (`VideoFrame.copyTo` du seul
+  rectangle, asynchrone), date le dessin de la même image (`afterDraw`), et
+  la met sur l'horloge de l'hôte par l'estimateur du ping/pong (le pong porte
+  désormais l'heure de l'hôte). Lire le canevas coûtait 13 à 14 ms de fil
+  principal par lecture sur l'iGPU AMD, à toute cadence : écarté.
+- Trois âges par image : **contenu** (dessin − heure de la page), **capture**
+  (dessin − présentation de l'image sur l'hôte, `backendTs`) et **avant la
+  capture** (leur différence : ne dépend que des horloges de l'hôte).
+- Et l'âge de ce qui est **affiché**, qui seul compare deux cadences : l'image à
+  l'écran vieillit jusqu'à la suivante (16,7 ms de plus à 60 i/s, 2 à 500).
+  `shown` l'échantillonne toutes les 0,5 ms, `atRefresh` à chaque
+  rafraîchissement du client.
+- Contrôle sur DualRTX (client sur la même machine, même compteur) :
+  l'estimateur tombe à 0,01-0,08 ms de l'horloge exacte ; 1 800 bandes lues sur
+  1 800 images, aucune invalide.
+
+### 33.6 Premiers résultats (29/09/2026 au soir, provisoires)
+
+Hôte DualRTX, écran virtuel du produit rendu par l'Arc (D3D12 Video Encode,
+HEVC), `scroll.html` à la fréquence de l'écran, 30 s par passe. Âge médian de
+ce qui est **affiché** (`shown`), en ms.
+
+**Client sur DualRTX** (iGPU AMD, écran à 60 Hz ; mise au point seulement : son
+rAF suit l'écran virtuel), une passe :
+
+| Écran virtuel | Auto (60 i/s) | host | host-ceiling | host-guarded |
+|---|---|---|---|---|
+| 60 Hz | 50,5 | 51,2 | 50,0 | 33,0 ¹ |
+| 240 Hz | 36,3 | 557 | 561 | 81,9 (51,1 avec `pending`) |
+| 500 Hz | 31,7 | 697 | 676 | 81,0 (42,3 avec `pending`) |
+
+¹ Le crédit n'a rien retenu ; la page était plus rapide à ce lancement
+(5 ms avant la capture, contre 22).
+
+**Client mw-mac** (M1, Chrome, 120 Hz, tearing, **Wi-Fi**), moyenne de deux
+passes alternées :
+
+| Écran virtuel | Auto (120 i/s) | host | host-ceiling | host-guarded |
+|---|---|---|---|---|
+| 120 Hz | 52,1 | 49,0 | 49,0 | 50,0 |
+| 240 Hz | 42,5 | **31,1** | 35,6 | 38,4 ² |
+| 500 Hz | 38,6 | 116 | 185 | 53,6 |
+
+² Le crédit n'a presque rien retenu (12 à 14 présentations par passe) : l'écart
+avec `host` est le Wi-Fi d'une passe à l'autre, après la capture.
+
+Lecture provisoire :
+- **L'écran virtuel rapide est le gros levier, même à la cadence
+  d'aujourd'hui.** Sa part se lit avant la capture : 22 → 8 → 4 ms (60 → 240 →
+  500 Hz) sur DualRTX, 17 → 8 → 4 ms (120 → 240 → 500 Hz) avec le Mac. Le flux
+  reste à la fréquence du client : ni débit ni décodage en plus.
+- **La cadence de l'hôte ne paie que si le client décode ce rythme.** Le Mac
+  suit 240 i/s (230 dessinées) : `host` y gagne ~11 ms sur Auto au même écran
+  virtuel, et c'est le meilleur couple mesuré (−21 ms contre l'écran virtuel à
+  la fréquence du client). À 500 Hz, le Mac comme l'iGPU AMD décrochent : 0,1
+  à 0,7 s de file.
+- **Le crédit évite le pire, sans rendre utile un flux plus rapide que le
+  décodeur.** Compter `decodeQueueSize` laisse une file dans le décodeur ;
+  compter les images soumises et pas sorties (`pending`) la divise par deux.
+- **Le Wi-Fi du Mac pèse ±10 ms d'une passe à l'autre**, après la capture : une
+  passe en Ethernet, et plus de répétitions, sont nécessaires avant la porte.
+
+**Ce que le crédit doit compter** (`host-guarded`, âge affiché médian, ms) :
+
+| Client, écran virtuel | `decodeQueueSize` | `pending` | `delay` | `host` |
+|---|---|---|---|---|
+| iGPU AMD local, 240 Hz | 81,9 | 51,1 | — | 557 |
+| iGPU AMD local, 500 Hz | 81,0 | 42,3 | — | 697 |
+| Mac M1, 240 Hz | 38,4 (2 passes) | 53,6 (2) | 37,8 (1) | 31,1 (2) |
+| Mac M1, 500 Hz | 53,6 (2) | 52,0 (2) | 42,5 (1, partielle) | 116 (2) |
+
+- `decodeQueueSize` (le plan) ne voit que ce qui attend devant le décodeur :
+  l'iGPU AMD en tenait huit de plus dedans.
+- `pending` (soumises, pas encore sorties) les voit, mais le M1 en garde plus
+  d'une en vol quand il suit : sous 240 Hz, le crédit retenait 48 à 90
+  présentations par seconde pour rien.
+- `delay` (`DecodeDelay`) compte le retard de la plus ancienne image dans le
+  décodeur au-delà du décodage habituel, en intervalles du flux : indifférent
+  à la profondeur propre du décodeur.
+
+Série du 29/09 à 22:30-23:15 (deux passes par case sur le Mac, les trois
+cadences intercalées ; une ou deux sur l'iGPU AMD) :
+
+| Client, écran virtuel | Auto | host | guarded `delay` | guarded `pending` | guarded `delay30` |
+|---|---|---|---|---|---|
+| Mac M1, 240 Hz | 46,5 | 40,3 | **38,6** | — | — |
+| Mac M1, 500 Hz | 39,0 | 147 | 45,9 | — | — |
+| iGPU AMD local, 240 Hz | — | — | 89,2 | **59,6** | 68,2 |
+| iGPU AMD local, 500 Hz | — | — | 93,5 | **49,4** | 95,7 |
+
+- Sur le Mac, `delay` ne coûte rien quand il suit (20 présentations retenues
+  par seconde à 240 Hz) et tient la file quand il décroche.
+- Sur l'iGPU AMD, un signal en temps s'y trompe, même sur 30 s
+  (`delay30`) : ce décodeur (D3D11 de Chrome) semble ne rendre une image qu'à
+  l'arrivée de la suivante, si bien que retenir allonge le décodage qu'on
+  mesure. Un compte (`pending`) ne s'y trompe pas.
+- Aucun signal ne gagne partout. Prochain essai : « `pending` ≥ 3 ou
+  `delay` ≥ 2 ».
+
+**Un défaut vu en passant, antérieur à ce plan** : quand l'activation de
+l'écran virtuel échoue (« the virtual display did not appear »), le nœud reste
+activé sans écran ; seul le démarrage suivant de l'instance l'éteint
+(`resetAtStartup`). Vu deux fois le 29/09 (un XML modifié à la main, puis
+1784×1160 à 500 Hz, refusé une fois après avoir été accepté).
+
+**Et une précaution de banc** : l'écran de la RTX de DualRTX a quitté Windows
+pendant une série de bascules de l'écran virtuel (21:41), et n'est pas revenu
+au rebranchement. Les séries sur l'écran virtuel se font quand Bruno n'est pas
+devant ses écrans.
+
+### 33.7 La nuit du 29 au 30/09 : Arc et RTX, client mw-mac
+
+Client mw-mac (M1, Chrome, 120 Hz, tearing, Wi-Fi), écran virtuel du produit à
+la taille du client (~1790×1160), `scroll.html`, signal du crédit `delay`.
+Arc : 4 passes par case (D3D12 Video Encode). RTX : 2 passes par case (NVENC,
+D3D11 ; l'écran virtuel rendu par la RTX). Âge affiché médian, en ms, moyenne
+des passes (entre parenthèses : avant la capture) :
+
+| Hôte, écran virtuel | Auto (120 i/s) | host | host-guarded |
+|---|---|---|---|
+| Arc, 120 Hz | 52,2 (16,3) | 51,1 | 53,3 |
+| Arc, 240 Hz | 41,2 (5,9) | 35,4 | **35,1** |
+| Arc, 500 Hz | 43,6 (2,5) | 188 | 51,0 |
+| RTX, 120 Hz | 36,1 (7,6) | 42,9 ³ | 34,7 |
+| RTX, 240 Hz | 34,9 (7,8) | 33,8 | **32,2** |
+| RTX, 500 Hz | 34,8 (3,8) | 182 | 115 ⁴ |
+
+³ Une passe où la page était lente (11,9 ms avant la capture) : bruit de la
+page, pas de la cadence (à 120 Hz, host et Auto encodent la même chose).
+⁴ Le crédit n'a pas tenu la file du Mac sous 450 présentations/s de la RTX
+(129 images dessinées par seconde, p99 d'une seconde).
+
+Lecture :
+- **240 Hz est le bon point**, pas 500. À 500 Hz l'hôte convertit chaque
+  présentation (450 par seconde) même quand il n'en encode que 120 : la
+  capture vieillit (Arc 30,8 → 36,5 ms, RTX 22,9 → 26,6 ms), ce qui mange le
+  gain d'attente avant la capture.
+- **Par rapport à aujourd'hui** (écran virtuel à la fréquence du client,
+  120 Hz, Auto) : l'Arc passe de 52,2 à 35,1 ms (−17 ms), la RTX de 36,1 à
+  32,2 ms (−4 ms). Le gros du gain sur l'Arc vient de l'attente avant la
+  capture (16,3 → 5,9 ms, écran virtuel à 240 Hz) : la page s'y rend plus
+  lentement que sur la RTX.
+- **La cadence de l'hôte ajoute 1 à 6 ms** à 240 Hz sur ce client, qui décode
+  240 i/s ; `host-guarded` fait aussi bien que `host` en ne retenant presque
+  rien (7 à 18 présentations par seconde).
+- **À 500 Hz, ni host ni host-guarded ne tiennent** sur le Mac. Un écran
+  virtuel à 500 Hz sous une cadence de l'hôte n'est pas un candidat.
+- Mesure : 54 passes sur 56 le premier coup ; deux échecs de l'écran virtuel à
+  500 Hz sur la RTX, puis toutes les fréquences, une fois que le XML
+  étranger avait accumulé un second mode à 500 Hz. Le banc repart désormais
+  d'un XML propre à chaque passe (`local_matrix.py`).
+
+**Le N95 (Intel UHD, Wi-Fi, écran à 60 Hz), même nuit, Arc** (banc §8p.4 bis) :
+Auto 66,4 ms à 60 Hz, **53,0 ms** à 240 Hz ; `host` à 240 Hz, plus d'une
+seconde ; `host-guarded` 169 (`delay`) et 144 ms (`pending`). Le crédit y
+ramène l'hôte à ce que le client dessine (~75 i/s) mais laisse 150 ms de file
+hors du décodeur, dans le transport ou le fil principal : aucun des deux
+signaux n'y regarde. Le délai aller du récepteur (`linkstats`, déjà envoyé à
+l'hôte) serait le signal à essayer pour cette file-là.
+
+**Ce que ça dit du produit, à ce stade** : l'écran virtuel à 240 Hz sous la
+cadence d'aujourd'hui gagne sur les trois clients (Mac −11 à −17 ms, N95
+−13 ms), sans rien demander au réseau ni au client. La cadence de l'hôte ne
+gagne que sur un client qui suit (Mac : 1 à 6 ms de plus), et son garde-fou ne
+voit pas encore toutes les files : elle ne peut pas être le défaut en l'état.
+
+**Le client DualRTX, sans le poids de la sonde** (banc §8p.4 ter) : à 240 Hz,
+Auto 31,1 ms ; `host` 55,6 ms alors que l'iGPU décode ses 233 images par
+seconde — à ce rythme chaque image passe plus longtemps dans le décodeur (57 ms
+de capture contre 20). Sur ce client, la cadence de l'hôte coûte de la latence
+même quand il suit. Elle n'a gagné que sur le Mac.
+
+**Un dernier signal, `e2e`** (30/09, ~02:30) : l'excès du retard depuis la
+capture sur l'hôte (`backendTs`) jusqu'à la sortie du décodeur, sur 10 s, pour
+voir aussi une file dans le transport ou devant le fil principal. Sur le N95 à
+240 Hz : 141 ms affiché (Auto : 53) ; le crédit retient 180 présentations par
+seconde, l'hôte n'envoie plus que ~40 images par seconde — moins qu'Auto — et
+l'âge reste haut : les retenues rendent la livraison saccadée, chaque image
+reste plus longtemps à l'écran. Sur l'iGPU AMD : 60,2 ms (Auto : 31,1).
+
+**Ce que ça tranche** : sur un client qui ne décode pas la cadence de l'hôte,
+aucun crédit, quel que soit ce qu'il compte, ne rend cette cadence meilleure
+qu'Auto. La cadence de l'hôte ne peut valoir que pour un client dont on sait
+d'avance qu'il suit ; c'est un choix à faire en amont, pas une file à
+rattraper.
+
+**Le premier client en Ethernet : l'UM790Pro sous Windows** (Radeon 780M,
+Chrome sur un écran à 120 Hz ; banc §8p.4 quinquies). Face à aujourd'hui
+(écran virtuel à 120 Hz, Auto : 35,6 ms en tearing, 39,0 en vsync), l'écran
+virtuel à 240 Hz donne −9,2 ms sous Auto, −11,8 sous `host`, **−13,8 ms sous
+`host-guarded` (21,8 ms, p99 31)** ; en vsync −5,6 (Auto) et −8,3 ms (`host`).
+Sur un client qui suit, en Ethernet, la cadence de l'hôte ajoute 2 à 5 ms à ce
+que l'écran virtuel rapide gagne seul.
+
+**Trois hôtes, le client en Ethernet** (banc §8p.4 sexies). Le gain de
+l'écran virtuel à 240 Hz suit le temps que l'hôte met à composer ce qui
+s'affiche : **−17 à −20 ms sur l'iGPU AMD** (45,5 → 25,9 ms), −9 à −14 ms sur
+l'Arc, rien de sûr sur la RTX (23,7 → 22,9 ms, dans la variation de la page
+d'un lancement à l'autre). C'est là que l'écran virtuel à la fréquence du
+client coûte le plus : un GPU faible compose la page en une à deux images de
+l'écran, et chacune dure 8 ms à 120 Hz contre 4 à 240.
+
+### 33.8 L'émission calée sur l'affichage du client (`cadence=deadline`, 30/09/2026)
+
+L'idée est de Bruno (décision H4, 30/09) ; elle remplace la cadence de l'hôte
+comme candidat au produit. L'hôte capture vite (écran virtuel à 240 ou
+500 Hz), mais n'envoie **qu'une image par rafraîchissement du client** : la
+plus fraîche qui peut encore y arriver.
+
+**Pourquoi c'est mieux que les deux précédentes.**
+- La cadence d'aujourd'hui décode une image par rafraîchissement, mais sa
+  grille tombe n'importe où dans ce rafraîchissement : l'image attend en
+  moyenne une demi-période de trop.
+- La cadence de l'hôte rattrape cette demi-période (le client prend la plus
+  fraîche) au prix de tout décoder : sur un client qui ne suit pas, aucun
+  crédit ne la sauve (§33.7).
+- L'émission calée vise la latence de la seconde avec les décodages de la
+  première.
+
+**Ce qui est construit.**
+- **Côté client** (`frontend/js/stream/VsyncGrid.js`, `77dc627d`) : période et
+  dernier rafraîchissement ajustés sur les horodatages de
+  `requestAnimationFrame`, mis sur l'horloge de l'hôte par l'estimateur
+  ping/pong (sorti de la sonde d'âge vers `util/ClockEstimator.js`). Toutes les
+  500 ms, un message `vsyncgrid` : période, un rafraîchissement, et l'**avance**
+  = médiane de « prise → prête » sur 2 s + une marge. Prête = dessinée quand le
+  canvas déchire, décodée en vsync.
+- **La marge** se règle sur les ratées (une image prête après le
+  rafraîchissement visé) : +1 ms par ratée ; après 5 s sans ratée, −moitié de
+  ce que les images les plus serrées avaient de trop (1ᵉʳ centile), au moins
+  0,25 ms, plancher 0,5 ms. Cible : ≤ 0,5 % de ratées. L'erreur de l'horloge
+  s'annule : le rafraîchissement et l'instant « prête » passent par la même
+  estimation.
+- **Côté hôte** (`core/DeadlineCadence.h`, boucle Windows, `6f9a6bbc`) : pour
+  le rafraîchissement R, l'image est prise à R − avance. La boucle ne prend
+  rien entre deux rafraîchissements du client : elle dort jusqu'à cet instant
+  (minuterie haute résolution, puis attente active de 250 µs), prend ce que
+  l'écran a présenté en dernier et l'encode aussitôt. Desktop Duplication
+  replie toutes les présentations intermédiaires dans cette prise, sans les
+  convertir : une conversion par rafraîchissement du client, même à 500 Hz.
+  Rien de neuf, rien d'envoyé. Une grille muette depuis 2 s, ou absurde, rend
+  la main à la porte d'aujourd'hui.
+- **L'horodatage** d'une image visée est l'instant de sa prise, pas sa
+  présentation. Un jeu à 60 i/s sur un écran à 240 Hz laisse sa dernière
+  présentation jusqu'à 16 ms avant l'instant ; une avance qui la compterait
+  avancerait chaque prise pour rien.
+- **Chaque pong** dit si l'hôte veut une grille (`grid`) et s'il la suit
+  (`deadline`) : le client ne compte ses ratées et ne lâche sa réserve de rendu
+  (`useReserve`, Chromium sans tearing) que dans ce cas.
+
+**L'option C de Bruno** (convertir la dernière présentation convertible à
+temps, sans attendre l'échéance) choisit **la même image** que la prise à
+R − avance : la dernière présentation qui peut être prise, convertie, encodée
+et livrée à temps. Sa seule différence est de traiter plus tôt, ce qui laisse
+du temps en réserve sans rajeunir l'image ; la prise à l'échéance ne demande
+ni la grille de l'écran de l'hôte ni son délai de composition. Le « ~1 ms » de
+conversion annoncé le 30/09 pour la capture à l'échéance était une erreur : il
+est dans l'avance mesurée, pour les deux façons de faire.
+
+**Tearing** (décision de Bruno, 30/09) : la méthode vaut pour tous les
+clients, « autoriser le tearing » reste activé. Une image dessinée avant le
+début du balayage est montrée entière ; une image en retard déchire sur
+quelques lignes du haut, puis elle est entière au rafraîchissement suivant.
+
+**Les cas de Bruno : un jeu plus lent, puis plus rapide que le client** (30/09,
+17:00 ; délais calculés, pas mesurés, client à 60 Hz, entre l'image du jeu et
+son apparition à mi-hauteur de l'écran).
+- Un jeu à 49-53 i/s : aucune image n'est jamais en concurrence pour un
+  rafraîchissement. En tearing, attendre l'échéance coûtait ~9 ms (~18 contre
+  ~8 ms pour l'envoi immédiat), puisque le canvas montre l'image dès qu'elle
+  est dessinée sur les lignes que le balayage n'a pas atteintes. En vsync,
+  l'échéance et l'envoi immédiat tombent sur le même rafraîchissement.
+- Un jeu à 75-83 i/s : en vsync, la visée prend la plus fraîche, pour un gain
+  faible (~1 ms : les images du jeu sont à 12,5 ms les unes des autres) ; en
+  tearing, envoyer les 80 images (~6 ms) bat une par rafraîchissement (~8) et
+  la visée (~16).
+- Un écran VRR côté client attend l'image : en tearing, l'envoi immédiat est
+  idéal (~3 ms, le temps du balayage à 170 Hz), si Chrome active le VRR pour
+  une page — à vérifier au compteur de l'écran.
+
+D'où la règle **ne jamais attendre pour rien** (`f2954fa4`) : la grille dit si
+le canvas déchire, avec un budget (son rafraîchissement × `mw_vsyncgrid_budget`,
+1 par défaut). Un canvas qui déchire reçoit chaque nouvelle image aussitôt, par
+une porte au budget qui saute et ne retient jamais ; seul un client en vsync
+est visé. La page de banc prend le rythme d'un jeu (`scroll.html?fps=49-53`,
+`--game-fps`, `672d84f6`).
+
+Côté hôte, l'écran virtuel n'a pas de balayage : à 500 Hz, une image du jeu
+est composée entière au rafraîchissement suivant (≤ 2 ms, 1 en moyenne) et la
+capture la prend entière. Un jeu qui déchire sur un écran physique de l'hôte
+ne déchire que sur ce panneau : Desktop Duplication livre des images entières.
+
+**Le banc (P3, 30/09 au soir, banc §8p.7)** : client N95 en Wi-Fi à 60 Hz,
+une passe par case.
+- En vsync, l'âge affiché baisse de ~11 ms, mais surtout par la réserve
+  retirée, et le client ne dessine plus que ~35 images par seconde au lieu de
+  43 à 50. L'étalement capture → prête du Wi-Fi (40 à 60 ms) dépasse la
+  période (17 ms) : aucune marge ne tient, 11 à 22 % de ratées.
+- En tearing, le même envoi qu'Auto, par construction.
+- Côté hôte, la méthode tient : réveil à ~0,1 ms près, 55 à 65 conversions par
+  seconde au lieu de 220 à 420.
+
+**Le garde-fou** (`26e6134a`) : le client ne demande la visée que sur un lien
+qui peut la tenir. Si capture → prête s'étale de plus d'une demi-période (p95
+moins la médiane, sur 2 s) ou si la marge a atteint une période, la grille dit
+`steady: false` : l'hôte envoie chaque image aussitôt, comme à un canvas qui
+déchire (« the client's frames arrive too unevenly to aim »), et le client
+garde sa réserve. La visée revient après 5 s sous un tiers de période, la
+marge repartie de zéro. Sur le N95 : 50,8 images dessinées par seconde, la
+cadence d'aujourd'hui retrouvée.
+
+**VRR** : sur les M27Q de DualRTX (iGPU AMD en FreeSync, RTX en G-SYNC
+Compatible fenêtré), un flux à 51 i/s en plein écran laisse l'écran à sa
+fréquence (60 et 144 au compteur), même avec le réglage Windows du VRR des
+jeux fenêtrés. Le cas 3 reste théorique ; l'écran virtuel principal à 500 Hz
+pendant le stream est une cause possible, à écarter par un contrôle sans lui.
+
+**Reste** : un client en Ethernet (UM790Pro sous Windows, Mac au calme), là où
+la visée peut tenir — âge au rafraîchissement en vsync contre Auto, avec les
+mêmes décodages et ≤ 0,5 % de ratées ; le contrôle VRR sans écran virtuel.
+
+### 33.9 Décision A en produit : l'écran virtuel à 240 Hz (30/09/2026)
+
+Sous Windows, l'écran virtuel du produit tourne à 240 Hz (`kRateMax`) quelle
+que soit la fréquence du client (`refreshForStream(…, faster)`, `03c189ea`).
+Le flux garde la sienne — celle de l'écran du client sous Auto — et encode la
+première présentation de chaque intervalle : rien de plus n'est encodé ni
+envoyé, le débit automatique ne bouge pas. Une image que l'hôte dessine attend
+la composition 4,2 ms au plus, au lieu d'une période du flux.
+- Mesuré : −6 à −17 ms d'âge affiché derrière un Arc ou un iGPU, neutre
+  derrière la RTX (§33.7, banc §8p.4 sexies) ; clic → drapeau sur le N95,
+  −5,5 ms en médiane et −15 au p90 (banc §8p.8).
+- macOS garde la fréquence du flux ; `MW_VDD_REFRESH` reste la clé de banc ;
+  le journal de session dit la fréquence et pourquoi.
+- Reste : les i/s d'un vrai jeu à 240 Hz (RE9 n'a pas pu être piloté ce
+  soir-là) et le ressenti de Bruno.
+- Depuis le 16/10/2026, sous Windows, l'écran tourne à un multiple entier de la
+  fréquence réelle du client, jusqu'à 330 Hz, et à 240 Hz seulement quand aucun
+  ne tient (`vddmatch`, §9.6.3).
+
+### 33.10 « Auto » avec détection (01/10/2026, POC Ultra, Phase UA)
+
+Décision de Bruno (01/10) : la cadence de l'hôte revient comme un
+comportement de l'« Auto » existant, sans choix de plus dans la liste, avec
+une clé pour le couper. Esquisse : plan `framerate-hote.md` §14 ; étapes et
+porte : Phase UA du plan du POC Ultra.
+
+**Pourquoi une détection.** `host-guarded` gagne 3 à 6 ms sur un client qui
+suit (UM790Pro en Ethernet, Mac) et perd lourdement ailleurs (N95 : 140 à
+170 ms ; iGPU AMD local : 31 → 47 ms), et aucun crédit ne voyait la file du
+N95 (§33.7). On ne sait pas d'avance qui suit : le client le mesure, un palier
+à la fois, et redescend dès que ça coûte.
+
+**L'échelle.** La fréquence du flux (celle de l'Auto), puis deux fois elle,
+puis la fréquence de l'écran capturé (240 Hz sur l'écran virtuel du produit,
+§33.9), chacune plafonnée à cette dernière. Un palier n'est essayé que si
+l'écran capturé présente nettement plus vite que le palier en cours (× 1,15),
+et cela dans cinq relevés de l'hôte d'affilée, soit environ 5 s : un jeu à
+49-53 i/s sur un client à 60 Hz n'en déclenche aucun, un jeu à 75-83 i/s monte
+à 120 et s'y arrête. Les cinq relevés viennent du banc (UA.3, 01/10). Un kiosque
+qui s'ouvrait par-dessus la page à 50 i/s a présenté 169 puis 84 fois par
+seconde pendant quatre relevés. Avec un seul relevé comme seuil, il avait
+déclenché un essai.
+
+**L'hôte** (`core/CadenceStep.h`, Windows seulement) :
+- Le client demande un palier par `fpsstep` (0 : retour à sa fréquence). Le
+  relais répond aussitôt : appliqué, plafonné à la fréquence de l'écran, ou
+  refusé avec la raison. Les raisons : un encodage dont le p95 sur la dernière
+  fenêtre de 2 s dépasse deux images à ce rythme (une seule pour l'encodeur
+  logiciel, OpenH264, qui n'en a jamais deux en vol : une VM sans GPU, décision
+  de Bruno du 02/10), une clé de banc `cadence=`, un
+  plafond du décodeur (`clientfpscap`), un client en vsync, un écran pas plus
+  rapide que le flux. Un refus laisse le palier déjà gardé.
+- La boucle applique le palier entre deux images, par le chemin d'un écran
+  client qui change (`chooseCadence` : porte à ce rythme, plafond à la
+  fréquence de l'écran). Le budget par image suit (`EffectiveCadence::retarget`)
+  et le fil garde le débit de la fréquence du client : le doubler avait coûté
+  ~3 ms (banc §8p.4 septies).
+- Les contrôles de charge (Lanczos-2, palier du CPU) gardent la fréquence de
+  base : un essai à 240 ne coûte pas sa mise à l'échelle à la session.
+- `stats.cadence`, chaque seconde : les présentations par seconde de l'écran
+  capturé (acquises et repliées), la fréquence de base, le palier en cours,
+  la fréquence de l'écran.
+- Linux et macOS refusent tout palier et n'annoncent rien ; Sunshine, Wolf et
+  MultiSeat ne connaissent pas le message.
+
+**Le client** (`stream/CadenceStepper.js`) :
+- L'âge de ce qui est montré : la médiane de capture → peinte, sur l'horloge
+  de l'hôte (estimateur du ping/pong, un ping toutes les 500 ms tant qu'il
+  tourne), plus une demi-période entre deux images peintes.
+- 2,5 s de base au palier en cours, la demande, 0,4 s après la réponse, puis
+  2,5 s d'essai. Le palier est gardé si l'âge baisse d'au moins 1 ms et si au
+  moins 90 % des images reçues sont peintes. Sinon retour au palier d'avant et
+  recul : 30 s, 1, 2, 4, 8, 16 min, remis à zéro quand le contenu (la bande des
+  présentations) ou le lien (écran, retour d'arrière-plan) change. Un palier
+  gardé sert de base à l'essai suivant.
+- Le contenu commande aussi la descente, sans faute à compter ni recul. Au
+  banc du 01/10, avant cette règle, un palier gardé sur une page qui
+  ralentissait restait en place ; le filet sautait 20 à 25 s plus tard, et le
+  p99 grimpait (jusqu'à 100 ms). Désormais :
+  - un essai pendant lequel le contenu ralentit est repris (« non concluant ») ;
+  - un palier gardé que le contenu n'utilise plus, deux relevés d'affilée,
+    redescend au palier qu'il utilise.
+- Le filet est armé dès que le flux dépasse la fréquence du client, essais
+  compris. Il déclenche dans deux cas :
+  - la médiane de capture → peinte sur les 250 dernières ms reste 500 ms
+    au-dessus de sa référence (mesurée à la fréquence du client) d'une
+    demi-période du client ;
+  - deux images restent en file au décodeur pendant 150 ms.
+  Le flux revient alors aussitôt à la fréquence du client, en un aller-retour.
+  Deux filets d'affilée sur un même lien (`NET_STRIKES`), et l'essai suivant
+  attend le plus long recul (16 min), même si le contenu change ; un palier
+  gardé qui tient 30 s, ou un lien qui change, efface le compte. Au banc du
+  02/10, le N95 a sauté au filet à chacun de ses 8 essais.
+- Le filet s'élargit sur confiance (UA.3 bis, 02/10). À sa propre fréquence,
+  un Mac en Wi-Fi passe un tiers du temps au-dessus de la borne, par hausses de
+  1 à 2,7 s, et il ne va pas plus mal à 240 ; un N95 en Wi-Fi, lui, s'y noie.
+  Rien ne les distingue dans la première seconde. D'où les règles :
+  - si le lien, à la fréquence du client, est resté au-dessus de la borne plus
+    de 500 ms (dans les images gardées avant l'essai, ou dans la dernière
+    minute), l'essai tient pendant sa plus longue hausse × 1,2, entre 3 et
+    4 s. Il
+    est jugé sur le quartile bas de capture → peinte, qu'une hausse ne déplace
+    pas. Sinon, 500 ms comme avant ;
+  - un essai élargi qui échoue, rendu ou par le filet, compte comme un filet et
+    rend le suivant étroit ;
+  - un filet étroit qui saute sur une hausse, ou un filet élargi sous un palier
+    déjà gardé, laisse le suivant s'élargir.
+
+  En simulation, le Mac garde ainsi 240 en moins de 10 s, et le N95 paie un
+  essai élargi, puis un étroit, avant d'attendre 16 min.
+
+  Le plancher de 3 s vient du banc du Mac (§8t.6 du banc). Les hausses vues
+  avant l'essai, 1,2 à 2,9 s de filet, ne sont pas les plus longues : à 240,
+  le lien du Mac monte jusqu'à 2,8 s, et le palier gardé a sauté dans 5 passes
+  sur 7. Le N95 n'y perd rien : sa file de décodeur le rend en 0,6 à 1,3 s, ou
+  son essai est jugé à 2,9 s.
+
+  Rejoué hors ligne sur les passes `host-guarded` de la nuit, le filet de
+  500 ms sautait sur les 12 passes du Mac, l'élargi sur 2.
+  Les 500 ms de tenue datent du banc du 02/10. Sans elles, le Mac en Wi-Fi
+  perdait chaque 240 gardé en 0,1 s, sur des pointes qu'il a aussi à 120 (p99
+  de 140 à 240 ms). Pourtant, `host-guarded` lui montrait à 240 des images
+  plus jeunes de 15 ms. Un client qui se noie reste au-dessus et redescend
+  en moins d'une seconde.
+- Ce que l'appareil retient (décision de Bruno, 02/10). Chaque essai qui
+  échoue laisse une pointe : sur le N95, le p99 passe de 211 à 350 ms à cause
+  des seuls essais (banc §8t.7).
+  - Un palier est retenu quand il a coûté deux fois dans un stream sans jamais
+    y être gardé. Coûter, c'est un essai repris par le filet, ou rendu sur une
+    image plus vieille d'une demi-période du client ou sur moins de 90 %
+    d'images peintes.
+  - Il est retenu pour cet hôte, à cette résolution, dans le `localStorage` de
+    l'appareil (`mw_autostep_failed`).
+  - Les streams suivants ne l'essaient pas pendant leurs 16 premières minutes.
+  - Un palier gardé est oublié ; l'oubli vient aussi après 7 jours, ou plus
+    tôt pour un lien qui change en cours de stream.
+  - Un essai rendu sans gain ne coûte rien et n'est pas retenu.
+  - Le banc efface la mémoire à chaque passe (`pass.py`).
+- Un gouverneur de décodage qui demande moins d'images (`clientfpscap`)
+  l'emporte : le palier est lâché, et aucun essai n'a lieu tant qu'il plafonne.
+- Il ne tourne que là où il mesure : hôte natif, fréquence laissée à l'Auto,
+  canvas qui déchire (Chromium sur un ordinateur, son défaut), décodage et
+  dessin sur le fil principal, sans pacer. Un client en vsync garde sa
+  fréquence ; l'émission calée (§33.8) en reste la piste.
+- Simulé (Vitest) : 120 → 240 demandé à 5 s et gardé vers 8 s ;
+  60 → 120 → 240 en ~11 s, le second palier étant demandé dès que le premier
+  est gardé.
+
+**La clé.** Allumée par défaut depuis la porte UA (02/10) :
+`localStorage.mw_autostep = '0'` la coupe. Une TV la garde coupée, sauf
+`'1'` : son « peinte » est la remise de l'image au `<video>`, pas ce que montre
+son écran, et une TV qui en montre 30 garderait 60. Le banc pose `'0'` pour ses
+modes de référence (`pass.py`). `window.mwCadenceStepper` donne au banc l'état
+et les décisions (`events`).
+
+**Le banc** (UA.3, nuit du 01 au 02/10, banc §8t) :
+- passé sur l'UM790Pro en Ethernet. 240 y est gardé en 4 à 10 s, au niveau
+  de `host-guarded` (−1 à −14 ms contre l'Auto) ;
+- passé aussi sur le N95 en Wi-Fi (jamais pire, chaque essai rendu en 2,6 s
+  au plus), sur le client local (−8 ms) et sur le jeu à 50 i/s (aucun
+  essai) ;
+- échoué sur le Mac en Wi-Fi. Son lien a déjà, à 120, des hausses de 1 à 2,7 s,
+  un tiers du temps, que le filet de 500 ms prend pour un échec du palier. À
+  240, son lien ne va pas plus mal qu'à 120, alors que le N95 s'y noie.
+
+**La porte** (Bruno, 02/10) : l'« Auto » détecté par défaut, avec la sûreté
+des deux filets. Reste un filet jugé contre ce que le lien fait à la fréquence
+du client (UA.3 bis), à mesurer sur le Mac et le N95 avant le push.
+
+## 34. Le flux commun des invités (plan du 28/09 au 01/10/2026)
+
+Plan « flux commun des invités » (`non-je-veux-que-jazzy-sutherland.md`).
+Hôte natif seulement : Sunshine, Wolf et MultiSeat gardent une session et un
+encodeur par invité, leurs chemins n'ont pas changé.
+
+### 34.1 Pourquoi
+
+Chaque invité d'un hôte natif avait son worker complet : sa capture, sa
+conversion, son encodeur. Les encodages des invités et celui du owner voyaient
+la même image au même instant et passaient ensemble, et celui du owner attendait
+derrière les autres. Sur la RTX, trois invités doublaient le total hôte du owner
+(3,58/4,07 → 6,78/10,69 ms au p50/p99, banc §8q.1). Le owner garde maintenant sa
+session telle quelle, et ses invités regardent un seul flux, encodé une fois :
+**deux encodages au plus**, quel que soit le nombre d'invités.
+
+### 34.2 Un producteur, des abonnés
+
+```
+worker « feed » : capture ─ conversion ─ HEVC (IR) ─────────► FeedPublisher ─┬─► pipe ─► worker invité 2 ─► WebRTC
+                                         ▲ idr, link, evict                    ├─► pipe ─► worker invité 3 ─► …
+                                         └─────────────────────────────────────┴─► pipe ─► worker invité 4 ─► …
+worker owner (slots 0/1) : inchangé, son propre encodeur
+```
+
+- **Le producteur** est un `--stream-worker` de rôle `feed` : un
+  `NativeMediaEngine` sans session, sans relais ni signalisation, qui publie
+  ses images au lieu de les donner à un pair. Son profil est fixe :
+  - 60 i/s, SDR, 4:2:0 ;
+  - la hauteur choisie par le owner et la forme de l'écran, sans agrandissement ;
+  - **l'intra-refresh sur la route que la machine choisit pour ce GPU**, comme
+    le stream du owner le demande. La route n'est jamais changée pour lui :
+    le flux a d'abord exigé l'intra-refresh (`intraRefreshRequired`, S1), et
+    sur l'Arc, cela le mettait sur oneVPL en D3D11 à côté du D3D12 VE du owner.
+    Au banc S9, avec un seul invité, le p99 du owner est passé de 7,8 à 27 ms,
+    et le flux encodait en 12 ms au lieu de 4. Là où la route n'a pas de vague
+    (le D3D12 VE de l'Arc et du N95), le flux se répare par images clés,
+    regroupées et rationnées (§34.4). `intraRefreshRequired` reste une clé de
+    banc (`intra=2`) ;
+  - un plancher du gouverneur à 60 % (`governorFloorPercent`, 20 ailleurs).
+- **Chaque invité garde son worker** : ses ports, son chemin WS, son échelon de
+  transport. Seule sa source vidéo change : `videoSource = External` fait une
+  session sans capture ni encodeur. Elle garde l'entrée, l'audio (sa propre
+  boucle WASAPI), `inputPolicy` et les manettes. Le rectangle du bureau
+  (`SessionInfo::desktop*`) et le curseur arrivent par le pipe.
+- **Pourquoi pas un seul processus à N relais** : `Session` et
+  `SignalingServer` ne portent qu'un relais chacun, un échelon qui échoue ne
+  relance que son invité, et un crash de libdatachannel emporterait tous les
+  invités.
+
+### 34.3 Le pipe
+
+- `QLocalServer` : un pipe nommé sous Windows, nommé `mw-feed-<édition>-<nonce>`
+  et réservé à l'utilisateur. Le premier message est `hello`, avec un jeton de
+  128 bits comparé en temps constant. Rien ne part avant ; après 3 s de silence,
+  la connexion est fermée.
+- Les abonnés sont lancés dans le même contexte que le flux
+  (`StreamWorkerHost::startAs`) : le SYSTEM du service, une tâche élevée ou un
+  simple enfant. C'est ce qui permet au pipe de rester réservé à l'utilisateur.
+- **Trame** (`FeedWire.h`) : un en-tête de 64 octets, puis le flux. L'en-tête
+  porte le numéro de l'image, le drapeau clé et ses horodatages (`presentUs`,
+  `capturedUs`, `submittedUs`, `convertedUs`, `encodedUs`). L'horloge est celle
+  de la machine, commune aux deux processus : l'E2E et les étapes de l'overlay
+  d'un invité restent justes, et le passage par le pipe compte dans « Queue ».
+- **Aucun invité ne fait attendre la capture.** `publishFrame` ne fait que
+  copier dans une `FreshestQueue` par abonné, où un delta peut être remplacé et
+  une image clé jamais. L'écriture a son propre fil, et elle s'arrête pour un
+  abonné dont le pipe retient plus de 4 Mo.
+- **Messages de contrôle** :
+  - du flux vers les invités : `info` (le `SessionInfo` du flux : codec,
+    taille, intra-refresh, encodeur ; `FeedInfo`), `cursor`, `displayFormat`,
+    `codec`, `bye` ;
+  - des invités vers le flux : `idr`, `link`, `evict`.
+- L'abonné ne livre rien à son navigateur avant une image clé. Si le flux
+  disparaît, il attend 10 s qu'il revienne sous le même nom.
+
+### 34.4 L'arbitrage (`FeedArbiter`)
+
+- **Images clés** : les demandes des invités (une arrivée, un décodeur perdu)
+  sont regroupées sur 250 ms, avec une par seconde au plus pour tous. Avec
+  intra-refresh, une image clé ne fait que hâter la réparation ; sans, elle
+  est la réparation. Le relais d'un invité ne traverse les pertes
+  (`ridingOutLoss`) que si l'`info` du flux annonce l'intra-refresh.
+- **Débit** : les rapports de lien sont fusionnés au pire (plus forte montée
+  d'OWD, plus fort taux de trous), un `reportLink` toutes les 500 ms au plus.
+  Le débit suit donc l'invité le plus lent, sans descendre sous 60 % de la
+  cible. En dessous, seul cet invité saute des images, réparées par la vague
+  ou, sans elle, par l'image clé rationnée.
+- **Cadence fixe** : un abonné ne commande pas le flux. `clientfpscap`,
+  `clientrefresh`, `framefloor`, la file de décodage et la grille vsync des
+  invités sont ignorés.
+- L'invalidation de référence ne s'applique pas à un flux commun
+  (`ref_invalidation = false` dans l'`info`).
+- **Pointeur** : le flux dessine le pointeur de l'hôte dans l'image commune,
+  quel que soit le mode de chaque invité. Il le ramène au milieu de l'écran
+  streamé s'il est ailleurs à son démarrage, puis le laisse libre (§29.5,
+  « seulement au démarrage partout », Bruno, 05/10).
+  - 01/10 : le flux le ramenait toute la session, et un invité en mode bureau
+    tirait la souris de l'hôte hors de ses autres écrans. Corrigé alors en ne
+    le ramenant que pour un invité en pointeur verrouillé (`5e39ea3a`).
+  - 11/10 (S9.2) : un invité en mode bureau ne la voyait donc jamais arriver.
+    Réduit au démarrage, le retour n'a plus à trier les invités : ce tri
+    (`cursormode` remonté au flux, `FeedArbiter`) est retiré.
+
+### 34.5 La vie du flux (`SharedFeed`, côté serveur)
+
+- **Lancement et arrêt** : le flux démarre au premier invité et s'arrête 10 s
+  après le départ du dernier. Un invité qui revient plus tôt ne coûte rien.
+- **Partage** : deux invités partagent un flux quand il montre le même écran
+  (même hôte, même appli) à la même hauteur. Le codec n'est pas une raison d'en
+  faire deux.
+- **Mort du worker** : il est relancé sous le même pipe après 250 ms, puis
+  500 ms, etc. Ses invités l'attendent et demandent une image clé. Au troisième
+  échec d'affilée, ce partage revient aux encodeurs par invité : les invités
+  quittent et rejoignent. Un flux qui a tenu une minute remet le compte à zéro.
+- **Hauteur** : le owner choisit l'image des invités (720, 1080 ou 1440p,
+  1080p par défaut), une fois pour toute la fenêtre de partage. Le choix est
+  gardé dans `share.json` et exposé par `POST /api/share/feed`.
+  - Le flux est reconstruit sous le même pipe. La largeur suit la forme, et le
+    débit suit le nombre de pixels.
+  - Les invités attendent comme après une mort, et leurs décodeurs prennent la
+    nouvelle taille à l'image clé.
+  - Un invité qui arrive pendant une relance attend avec les autres.
+- **H.264** : la page d'un invité teste le HEVC avant de rejoindre
+  (`hevcClientDecodes`). S'il ne le décode pas, tout le flux passe en H.264
+  jusqu'à son arrêt, sans jamais faire deux flux.
+  - Le worker du flux prévient ses invités (`codec`), puis s'arrête.
+  - Leurs pages reviennent en H.264 par le repli de codec existant (avis
+    `feedcodec`).
+- **Interrupteur** : `MW_SHARED_FEED=0`, ou `shared_feed_enabled: false` dans
+  `settings.json`, et chaque invité encode de nouveau seul, comme avant.
+  Windows seulement pour l'instant : la session `External` n'existe pas encore
+  sous Linux.
+
+### 34.6 Les manettes des invités
+
+Sur un hôte natif, chaque worker a sa propre table de quatre pads ViGEm. Le
+décalage par slot de GameStream (`gamepadOffset`) n'y séparait donc rien, et
+faisait perdre le deuxième pad de l'invité du slot 4. Le moteur garde
+maintenant la numérotation du navigateur (`padNumber`) : la vibration revient
+au bon numéro, et le masque des manettes reste cohérent. Sunshine décale
+toujours (`MoonlightShim`).
+
+### 34.7 L'écran virtuel allumé par un invité
+
+Un invité qui ouvre à froid une invitation sur « MoonlightWeb Virtual
+Display », sans stream du owner, l'allume (`VirtualDisplayJob::activateIfOff`).
+L'écran est fait à la taille de l'image des invités, avant que le flux ne le
+cherche. S'il est déjà allumé (owner, autre invité, grâce en cours), il reste
+tel quel : un nouveau mode l'enlèverait à ceux qui le regardent.
+
+### 34.8 Mesuré (banc §8q.3-§8q.5)
+
+- **RTX, trois invités** : total hôte du owner 6,78/10,69 → **3,84/6,19 ms**
+  (p50/p99), sessions NVENC 4 → 2, moteur d'encodage 45 → 29 %. C'est la
+  ligne « un invité » de S0.
+- **Arc et iGPU AMD** payaient peu en S0 et paient autant ou moins : Arc
+  +1,2 ms de p99 à trois invités (S0 +1,6), AMD +1,3 (S0 +2,4), p50 inchangé.
+- **Cas durs** : le flux tué revient en 1,3 s ; un changement de mode de
+  l'écran fait une reconstruction ; un invité seul qui part et revient ne
+  relance rien ; un invité sans HEVC fait une bascule. Un invité bridé à
+  3 Mb/s tombe seul à 28 i/s peintes, pendant que les autres gardent 61 et que
+  le flux s'arrête à son plancher de 6 Mb/s.
+- **N95** (quatre cœurs, Wi-Fi) : un invité le met toujours à genoux, puisque
+  le owner et le flux font deux captures et deux encodages comme avant. Le
+  deuxième invité rejoint désormais (impossible en S0), le troisième non.
+
+## 35. L'écran virtuel sous Linux, par compositeur (01/10/2026)
+
+L'écran virtuel Linux passait par le portail (source VIRTUAL, GNOME 46 et après,
+§32) : à 60 Hz, une fenêtre « Partager l'écran » à valider sur l'hôte au premier
+stream, ni KDE ni GNOME avant 46. Le chapitre C du plan « Idées Punktfunk » le
+fait demander au compositeur lui-même. Mesures : banc §8s.
+
+### 35.1 Les routes
+
+- **GNOME 42 et après** : l'API D-Bus de Mutter (`org.gnome.Mutter.ScreenCast`,
+  version 4), par sd-bus (`MutterScreenCast.cpp`). `RecordVirtual` crée l'écran,
+  `RecordMonitor` filme un écran qui existe.
+  - Ni fenêtre ni jeton : Mutter ne regarde pas l'appelant.
+  - Pas de session RemoteDesktop : les entrées restent par uinput.
+  - Mutter ferme la session quand l'écran filmé part ou que le bureau se
+    verrouille ; la capture le lit (`Closed`) et le stream repart.
+- **Repli, le portail** : quand Mutter refuse net (méthode inconnue, accès
+  refusé). La clé de banc `mutter=0` le force.
+- **KDE Plasma 6** : son portail n'a pas de source VIRTUAL (6.3). La sortie
+  virtuelle de KWin (`stream_virtual_output`, `KwinVirtualOutput.cpp`,
+  libwayland chargée au premier usage) est demandée par l'auxiliaire sans
+  capacités de §32, dont le binaire porte le droit de KWin (`.desktop` caché,
+  `X-KDE-Wayland-Interfaces`).
+- **X11** : aucune route, la carte n'est pas proposée.
+
+### 35.2 Taille, fréquence, place
+
+- **Taille** : celle que le stream demande, au pixel ; « Match my screen » fait
+  celle du client (un téléphone en 1170×2532 compris).
+- **Fréquence** : l'écran prend le `maxFramerate` que la capture négocie (GNOME
+  42, 46 et 48 ; `modes` n'y change rien, Mutter 50 le lirait). Il est créé à
+  240 Hz comme sous Windows (§33.9), le stream gardant la cadence du client. À
+  60 Hz servi à 60 i/s, 40 % des images manquaient ; à 240 Hz, toutes passent.
+- **Principal**, sous GNOME : l'écran du owner le devient par `DisplayConfig`,
+  en configuration temporaire. Les écrans physiques restent allumés, à sa
+  droite : en éteindre un a fait planter gnome-shell 46 (le M27Q de la GTX).
+  Mutter remet la disposition quand l'écran part. Pas sous KDE.
+
+### 35.3 Un seul écran pour tous les streams (GNOME)
+
+- Un registre et un verrou dans `XDG_RUNTIME_DIR` (`SharedMonitor.h`). Le owner
+  crée l'écran et l'inscrit ; un invité le filme tel quel. Un invité seul en
+  crée un, et passe sur celui du owner quand il arrive. L'écran part avec son
+  stream ; le premier qui revient le recrée.
+- Créations et retraits un à la fois, tenus jusqu'à ce que la disposition ne
+  bouge plus : Punktfunk a vu gnome-shell planter sur des reconstructions
+  concurrentes.
+- Le pointeur est recalé quand Mutter change ses écrans (`MonitorsChanged`). La
+  veille des modes KMS ne s'applique pas à un écran sans CRTC.
+- Sous KDE, chaque stream garde sa propre sortie.
+
+### 35.4 Le pointeur
+
+- Jusqu'à GNOME 47, Mutter recopie la vue de l'écran virtuel, pointeur compris,
+  dans ses images DMA-BUF, quel que soit le mode demandé. En métadonnées, un
+  mouvement seul n'apporte souvent qu'une position, sans image : le pointeur de
+  l'image restait figé, puis sautait avec ce qui se redessinait. Il clignotait
+  sous une main qui bouge (97 images sur 450 sans lui).
+- Avant GNOME 48, il est donc demandé dans l'image (`cursor-mode` 1 ; portail
+  `cursor_mode` 2). Chaque mouvement est une image, et l'hôte dit au client de
+  n'en dessiner aucun. Il suit la latence de l'image.
+- À partir de GNOME 48 : en métadonnées, et le client le dessine.
+
+### 35.5 Les invités
+
+Un invité d'un hôte Linux encode seul : le flux commun (§34) est réservé à
+Windows. Sa page demande maintenant `ride_out_loss` comme celle du owner, et son
+flux passe en intra-refresh : une perte ne lui coûte plus d'image clé. Avant,
+il en demandait 17 et 22 en 24 et 42 s.
+
+### 35.6 Limites
+
+- KDE : un invité garde sa propre sortie (`stream_output` de KWin non utilisé) ;
+  60 Hz avant KWin 6.6 ; pas d'écran principal.
+- GNOME 49 et après : non mesuré.
+- gamescope : §35.7.
+
+### 35.7 Une app sur son propre écran : gamescope (chapitre G)
+
+Une carte de l'hôte Linux ouvre une app dans un gamescope sans écran
+(`--backend headless`), à la taille et à la cadence du client, à côté du
+bureau : ni écran ajouté ni disposition touchée, le clavier et la souris du
+bureau à part. Aucune session de bureau n'est nécessaire : une session X11, ou
+pas de session du tout, a la carte aussi. Mesures : banc §8s.13, §8s.14 et
+§8s.15 (G6, le vrai Steam : Big Picture, un jeu, owner et invité, 60 à 240 Hz,
+téléphone tenu droit, X11).
+
+- **La taille** : la page traite ces cartes comme l'écran virtuel. Chaque
+  choix de résolution y nomme une taille exacte : un téléphone a l'écran de sa
+  forme tenue en paysage, une taille personnalisée est prise telle quelle
+  (`App.isMadeForStream`, `7b860195`). L'hôte la prend telle quelle
+  (`isMadeForStreamKey`). Tourner l'appareil ne relance rien : la session garde
+  sa taille de départ.
+
+- **Les cartes** :
+  - « Steam Big Picture », quand un gamescope 3.16.22 ou plus récent (avant,
+    interblocage avec PipeWire 1.6) et un Steam utilisé sont là ;
+  - une carte par app de l'owner (`gamescope_apps` : nom et commande, lancée
+    par `/bin/sh`), quand gamescope est là. Les commandes s'écrivent depuis
+    l'hôte seulement ; elles tournent avec l'utilisateur de l'hôte.
+- **gamescope de la distribution** (décision du 01/10) :
+  - le binaire vient de `MW_GAMESCOPE_BIN`, du PATH, de `~/.local/bin` ou de
+    `/usr/games` ;
+  - il est accepté s'il a 3.16.22 ou plus (Fedora 43+, Arch, Bazzite, SteamOS,
+    Debian 13 backports, Ubuntu 26.10+) ;
+  - Ubuntu 24.04 n'en a pas, et la 26.04 a la 3.16.20 : la carte n'y apparaît
+    pas.
+- **La session** (`GamescopeSession.{h,cpp}`) :
+  - unité utilisateur transitoire (`systemd-run --user`), sans `DISPLAY` ni
+    `WAYLAND_DISPLAY`, le dossier de gamescope en tête du PATH
+    (`gamescopereaper`) ;
+  - une enveloppe d'une ligne relaie le socket EIS et le display X que gamescope
+    donne à son app ; le nœud PipeWire vient de son journal ;
+  - registre et verrou dans `XDG_RUNTIME_DIR`. Le stream suivant retrouve la
+    session, à sa taille d'origine, cadrée comme un invité filme l'écran du
+    owner. L'owner et les invités partagent la session ;
+  - minuterie de 10 min, réarmée chaque minute par chaque stream : la session
+    s'arrête 10 min après le dernier, même s'il est mort sans prévenir.
+- **Steam** : un seul par utilisateur. La carte démarre le Steam en service,
+  sinon celui connecté en dernier (paquet, snap ou Flatpak).
+  - Un Steam ouvert sur le bureau est prié de quitter, par le relais de son
+    runtime (`steam-runtime-steam-remote -shutdown`, son HOME). La demande est
+    refusée si un jeu y tourne, ou s'il n'a pas quitté en 20 s (le navigateur
+    abandonne à 25).
+  - À l'arrêt de l'unité, `ExecStop` fait quitter Steam proprement, puis
+    `ExecStopPost` le rouvre sur le bureau s'il y était.
+- **Capture** (`PortalCapture::setGamescope`) :
+  - le nœud de gamescope sur le PipeWire de la session, sans portail ;
+  - son flux se met en pause quand gamescope part, sans erreur : la capture
+    surveille donc son PID. L'app quittée termine le stream avec une phrase.
+- **Entrées** (`EiInput`) : libei, chargée au premier usage, en émetteur sur le
+  socket EIS de gamescope (clavier, souris relative et absolue, molette,
+  boutons). gamescope ne lit aucun périphérique sans écran ; les manettes
+  restent en uinput, et les jeux les lisent directement. Le texte est tapé sur
+  une disposition US, celle de gamescope.
+- **Pointeur** (`XFixesCursor`) : hors de l'image de gamescope. Il est relu sur
+  son Xwayland : la forme par XFixes, la position par `XQueryPointer`. Il est
+  visible quand sa forme a de l'encre, et le client le dessine. Le gestionnaire
+  d'erreurs d'Xlib de Qt terminait le processus quand cet Xwayland partait ; un
+  gestionnaire chaîné et une sortie par connexion (libX11 1.7 et plus) l'en
+  empêchent.
+- **Limites** :
+  - une fenêtre plus petite que l'écran est mise à l'échelle par gamescope :
+    l'absolu et le pointeur sont alors décalés ; Big Picture et un jeu plein
+    écran sont justes ;
+  - clavier US (amont) ;
+  - pas de HDR ;
+  - pas de changement de taille en cours de session ;
+  - l'app choisit son GPU elle-même : sur une machine hybride, une app Vulkan
+    peut prendre la carte dédiée quand gamescope compose sur l'autre, et chaque
+    image traverse alors d'un GPU à l'autre (vkcube sur la GTX 1050 de
+    l'UM790Pro : 2 i/s en 720p à 240 Hz, 214 i/s sur le 780M) ;
+  - pas de son quand l'hôte n'a aucune sortie audio réelle (« Dummy Output »),
+    comme pour le bureau.
+
+**Concrètement, pour l'utilisateur** : sous Linux Wayland, la carte « écran
+virtuel » montre un bureau à la taille de l'appareil qui regarde, à 240 Hz, sans
+fenêtre à valider sur l'hôte, même sur un mini-PC sans écran. Sous GNOME, il
+devient l'écran principal le temps du stream, et un invité voit le même bureau
+que le owner. Sous KDE Plasma 6 aussi, à 60 Hz.
+
+Avec un gamescope récent, la carte « Steam Big Picture » ouvre Steam en mode
+console sur son propre écran, à la taille de la TV ou du téléphone, sans toucher
+au bureau. L'hôte peut servir à quelqu'un d'autre pendant ce temps, même en
+session X11. Les apps de l'owner, déclarées dans la page d'administration, font
+de même.
+- **Sunshine et Wolf** : inchangés (un encodeur par invité, trois qualités).
+## 36. Le clavier : le texte d'un téléphone en vraies touches, le clavier physique selon le mode souris (22/10/2026)
+
+Signalement d'Odin (Discord) : depuis son téléphone, rien ne s'écrivait dans un PowerShell
+administrateur. Reproduit sur DualRTX : **la console classique (conhost) ignore un caractère
+injecté comme tel** (`KEYEVENTF_UNICODE`), administrateur ou non, alors que les vraies touches
+(Entrée, Retour arrière, Tab et Ctrl+V de la barre) passent. Ce n'était pas une question de droits
+(§31 : le worker est SYSTEM). Plan `texte-tactile-touches-reelles.md`.
+
+### 36.1 La table d'une disposition (`input/windows/WinTextKeys`)
+
+- **Relue, jamais supposée.** `VkKeyScanExW` ne connaît ni le Verr. Maj ni les touches mortes, et se
+  trompe : sur la disposition française Apple, il nomme la touche é pour É, qui tape é. La table de
+  chaque disposition est donc relue touche par touche par `ToUnicodeEx` (bit 2 de `wFlags` : l'état
+  des touches mortes de la personne à l'hôte n'est pas touché), aux quatre niveaux qu'on tape
+  (rien, Maj, AltGr, Maj+AltGr) et aux deux états de Verr. Maj. Ce qui y est, la touche le tape
+  vraiment. Le scancode vient de la même disposition (`MapVirtualKeyExW`), jamais de la table US.
+- **Ctrl seul ou Alt seul n'entrent pas** : ces niveaux font des caractères de contrôle, et un
+  0x03 dans un texte collé ne doit pas devenir Ctrl+C.
+- **Touches mortes** : ce qu'une touche morte compose ne se demande pas à `ToUnicodeEx` sans
+  changer l'état du clavier. La table `DEADKEY` de la DLL de la disposition (`KbdLayerDescriptor`,
+  `KBDFR.DLL`…) le dit, retrouvée par le registre (`Keyboard Layouts\<KLID>`, « Layout Id » pour
+  une variante `0xFnnn`) et chargée depuis System32 seulement. ê = ^ mort puis e ; un ~ seul =
+  la touche morte puis Espace.
+- **Repli Unicode** pour ce qu'aucune touche ne tape (un emoji, É sur l'AZERTY classique), et
+  pour tout le texte quand une méthode de saisie est ouverte (japonais, chinois, coréen) ou
+  qu'aucune fenêtre au premier plan ne dit sa disposition. Dans conhost, ces caractères-là restent
+  perdus : limite connue.
+- Tests : `test_win_text_keys.cpp`, sur l'AZERTY classique, l'AFNOR, l'US, l'allemand,
+  l'US-International, le russe (aucune lettre latine) et la disposition Apple quand elle est là ;
+  une disposition absente est chargée pour le test (`KLF_NOTELLSHELL`, jamais activée) puis
+  déchargée.
+
+### 36.2 Le texte (`planText`, `Win32Input::injectText`)
+
+- Chaque caractère devient les touches qui le tapent ; la disposition décide Maj et AltGr. Une Maj
+  ou un AltGr que le spectateur tient et que le caractère ne veut pas est relâché le temps de la
+  touche, puis remis ; un Ctrl ou un Alt tenu seul est un raccourci voulu, gardé.
+- **AltGr part comme un clavier l'envoie, Ctrl gauche + Alt droit** (scancode étendu). Un Ctrl+Alt
+  gauche tape la même chose dans Notepad, mais Windows Terminal lit Ctrl+Alt+2 à 9 comme « aller à
+  l'onglet » : sur un hôte AZERTY, # { [ ~ \ | n'y arrivaient pas (banc P3). Windows relâche avec
+  l'Alt droit le Ctrl qu'il a mis dessous : le Ctrl voulu après est donc rappuyé, un Ctrl non voulu
+  relâché encore.
+- **Un Alt seul n'est jamais tapé seul** : une touche non attribuée (VK 0xE8, le « menu mask »
+  d'AutoHotkey) le masque avant qu'on relâche quoi que ce soit dessous, et après qu'on le remet
+  seul. Sinon l'Option du Mac, relâchée pour « { » puis remise, faisait deux appuis d'Alt, et un
+  appui d'Alt donne les touches à la barre de menus (Alt+Maj change la langue de saisie).
+- Entrée et Tab sont leurs touches (`\n`, `\r`, `\r\n`), les autres caractères de contrôle sont
+  jetés.
+- Un `SendInput` par morceau de 256 caractères : un collage garde son ordre, sans appel géant.
+- Rien de ce chemin n'entre dans `m_HeldKeys`. Une ligne par session dans le journal du worker :
+  combien de caractères en touches, par touche morte, en Unicode et pourquoi — jamais un caractère —
+  et la classe de la fenêtre qui a reçu le premier texte.
+
+### 36.3 Les accords de la barre du clavier tactile
+
+Une lettre tapée avec un modificateur verrouillé de la barre partait comme la position US de la
+lettre : sur un hôte AZERTY, Maj puis a tapait Q, Ctrl+z devenait Ctrl+W (l'onglet se fermait). Le
+client envoie maintenant le caractère, marqué `chord`. L'hôte natif presse la touche qui le porte
+dans sa disposition, sans toucher aux modificateurs tenus (Ctrl+Maj+T reste Ctrl+Maj+T) ; Sunshine
+pour Windows reçoit une lettre en VK non normalisé ; les autres hôtes gardent la position. Ce
+chemin ne dépend pas de `keyboard_layout_fidelity`.
+
+### 36.4 Le clavier physique : « auto », « always », « never »
+
+- `"auto"` (défaut) : en mode souris **Bureau**, les caractères de la disposition du client ; en
+  mode **Jeu**, les positions. `"always"` garde les caractères en Jeu, `"never"` les positions
+  partout. La clé était un booléen semé à `false` depuis le 19/09 : au démarrage `true` devient
+  `"always"` et `false` devient `"auto"`.
+- Le mode souris n'existe que dans le client : chaque appui le porte (`gaming`), son relâchement et
+  le battement `inputstate` rejouent celui de l'appui. En Jeu, une touche morte part par sa
+  position (l'hôte compose) et la touche suivante n'attend plus la composition du navigateur.
+- Sunshine pour Windows reçoit au Bureau **toutes** les lettres en VK non normalisé, plus seulement
+  celles qu'un clavier US n'aurait pas données (un QWERTY sur un Sunshine AZERTY tapait q pour a).
+- **AltGr et l'Option du Mac** choisissent le caractère : le client le marque (`altGraph`) pour
+  AltGr sous Windows (Ctrl+Alt avec AltGraph), sous Linux (AltGraph seul), pour un Ctrl+Alt gauche
+  qui a tapé ce qu'AltGr tape à cet endroit (€ sur le E d'un AZERTY), et pour l'Option du Mac
+  ({ [ | ~ €). L'hôte Windows ou Linux relâche alors le Ctrl et l'Alt du spectateur pour la touche
+  quand sa disposition n'en veut pas. Sans la marque, un Ctrl+Alt est un raccourci, gardé entier
+  (Ctrl+Alt+T).
+- **Un raccourci** (Ctrl, Cmd, ou un Alt qui n'est pas AltGr) ne porte le caractère que d'une
+  lettre : Ctrl+A sur un AZERTY reste le A de l'hôte, et l'hôte Windows appuie la touche que la
+  disposition appelle A, sous les modificateurs tenus, sans Maj ajoutée ni levée (Ctrl+A sur une
+  disposition russe aussi, qui n'a pas de « a »). Le reste part par sa position, comme un clavier
+  branché sur l'hôte : Ctrl+1 sur un AZERTY était Ctrl+Maj+7 sur un hôte US. Décidé à l'appui, que
+  le relâchement et le battement rejouent. **Le pavé numérique** part toujours par sa position
+  (son 1 tapé en caractère devenait le 1 de la rangée du haut : Alt+0233 et les vues de Blender
+  ne le voyaient pas).
+- **Les niveaux reviennent avec l'appui** (hôte Windows) : Maj et AltGr sont posés, la touche
+  appuyée, puis les niveaux remis comme le spectateur les tient, d'un seul lot ; le relâchement
+  ne lâche que la touche. Gardés jusqu'au relâchement, ils étaient sous la touche suivante tapée
+  entre-temps (« 1a » roulé sur un clavier US sortait « 1A » sur un hôte AZERTY), et une session
+  coupée touche enfoncée laissait la Maj ou l'AltGr enfoncé. Windows ne répète rien de ce qu'on
+  lui envoie : les répétitions du client arrivent en appuis. Sous Linux, la répétition est celle
+  du compositeur, qui relit les modificateurs du moment : les niveaux y restent le temps de la
+  touche (limite connue : des touches roulées entre deux dispositions différentes).
+- **Une touche morte laissée de côté** par l'hôte natif est remplacée par un appui de la touche non
+  attribuée (0xE8) : sous l'Option du Mac (Option+n pour « ~ »), l'hôte voyait sinon un Alt
+  descendre et remonter sans rien entre les deux. En Jeu sous `"always"`, la touche morte part par
+  sa position (le client n'y retient pas la touche suivante).
+- **Une répétition rejoue l'appui entier**, mode souris et AltGr compris : une touche tenue en Jeu
+  passait au caractère dès la première répétition, et son relâchement avec elle.
+- La valeur passe au worker dans sa config (`StreamWorkerHost::prepare`), avec `keyboard_debug` :
+  un worker SYSTEM lit le settings.json de systemprofile, jamais celui du propriétaire.
+
+### 36.5 Les invités et les fenêtres administrateur
+
+La règle « policy » (§30) ferme les fenêtres administrateur aux invités. La clé
+`share_guests_admin_windows` (défaut `false`, sans interface) les ouvre à tous ceux qui ont clavier
+ou souris, bureau sécurisé compris ; le worker de l'invité le dit dans son journal. Le bouton
+« Minimise the host's windows » est offert à l'invité aussi (décision du 22/10) : un jeu lancé en
+administrateur qui remplit l'écran ne lui laisse rien d'autre à cliquer. Wiki : Sécurité §6.4c.
+
+### 36.6 Banc P3 (22/10, DualRTX, hôte FR `040C`)
+
+Le texte du clavier d'un téléphone (Chrome headless sur SwiftShader, écran tactile émulé,
+`Input.insertText`), envoyé par le flux dans de vraies fenêtres, le premier plan vérifié avant
+chaque texte :
+
+| Fenêtre | ASCII | é è à ù ç ê ë… | É (Unicode) | AltGr @ € # { } [ ] ~ \ ^ \| | Émoji |
+|---|---|---|---|---|---|
+| cmd (conhost) | oui | oui | oui | oui | oui |
+| PowerShell 5.1 (conhost, PSReadLine 2.0.0) | oui | oui | **jeté** | oui sauf **~ → « é~ »** | **jeté** |
+| Windows Terminal (cmd) | oui | oui | oui | oui depuis `7be93512` (avant : # { [ ~ \ \| manquaient) | deux carrés |
+| Champ EDIT classique | oui | oui | oui | oui | oui |
+| Raw Input | vraies touches, scancodes de la disposition ; Alt droit marqué E0 | | | | Unicode |
+
+- PSReadLine 2.0.0 jette ce qui arrive en Unicode, et compose mal la touche morte d'AltGr, avec
+  l'Alt droit comme avec le gauche : à comparer avec un vrai clavier.
+- Non mesurés : Notepad (celui de Bruno était ouvert) et Edge (sa fenêtre de premier lancement a
+  pris le premier plan).
+- Accords de la barre, mesurés le 23/10 dans le champ EDIT : Maj puis a tape A ; Ctrl puis a part
+  en VK 0x41, scancode 0x10, soit Ctrl+A sur l'AZERTY et non plus Ctrl+Q. C'est le journal `[KBD]`
+  qui le prouve : le champ EDIT classique ne gère pas Ctrl+A.
+- Le banc ne clique plus dans le flux que si la fenêtre sous le point visé est la cible : un clic
+  au centre de l'écran diffusé est tombé une fois sur une fenêtre de Bruno (rien n'y a été tapé).
+
+### 36.7 Banc C4 (23/10, DualRTX, hôte FR `040C`) : le clavier physique
+
+Trois claviers de client imités dans Chrome headless (SwiftShader) par `Input.dispatchKeyEvent`,
+avec le code, le caractère et les modificateurs que le navigateur donne à chaque touche (l'AZERTY
+du Mac avec l'agent utilisateur d'un Mac). Ils sont tapés par le flux dans le champ EDIT, sous
+`"auto"`, et le premier plan est vérifié avant et après chaque touche :
+
+| Client | Bureau : les caractères du client | Jeu : les positions |
+|---|---|---|
+| AZERTY Windows | 19/19 | 19/19 |
+| QWERTY US | 16/16 | 16/16 sur le fond (le banc en compte 14 : le ^ mort, ci-dessous) ; q w a z m ; 1 @ donnent a z q w , m & 2 |
+| AZERTY Mac | 14/14, Option comprise ({ } [ ] \|) | 14/14 : § ! - @ donnent - _ = ² ; Option + touche ne tape rien |
+
+- Au Bureau, tout part en vraies touches de la disposition de l'hôte, accents, AltGr et Option
+  compris.
+- En Jeu, la position [ d'un clavier US est le ^ mort de l'AZERTY : rien ne sort, puis « ^) » avec
+  la touche suivante, comme avec un clavier AZERTY branché sur l'hôte. Le worker écrit le passage
+  d'un mode à l'autre : « keys from the client's gaming mode — by position ».
+- **Pièges du banc** :
+  - un Ctrl, un Alt ou une Maj imités sans leurs drapeaux de modificateurs font lever au client
+    (`_reconcileModifiers`) le Ctrl, puis l'Alt, sur l'hôte. L'hôte voit alors un Alt tapé seul, et
+    la barre de menus prend la touche suivante : la première touche après Ctrl+Alt+Maj+M se perdait ;
+  - le settings.json des instances dev portait `"always"`, venu d'un ancien `true`. Le banc met
+    `"auto"` le temps du passage ;
+  - depuis la session du banc, `SetWindowPos(HWND_TOPMOST)` réussit, mais la fenêtre ne devient pas
+    TOPMOST : le centre de l'écran diffusé doit être libre, ou la fenêtre de banc se met elle-même
+    TOPMOST à sa création (`WS_EX_TOPMOST`, vu sur le N95, ci-dessous) ;
+  - le ^ mort compté faux : le banc demande le caractère attendu à `ToUnicodeEx` après la frappe,
+    quand la disposition garde encore le ^ en attente. Il obtient « ^ » au lieu d'une touche morte,
+    alors que ce qui sort, « ^) », est juste.
+
+**Sunshine pour Windows** (23/10, 13:33-13:36, Sunshine 2026.921 de DualRTX, même hôte FR) : la
+`--dev` ouvre le Desktop de Sunshine comme hôte GameStream, et la session écrit « Sunshine/Windows,
+letters as non-normalized VKs | layout fidelity: auto ».
+
+| Client | Bureau : les lettres du client, le reste en position | Jeu : les positions |
+|---|---|---|
+| AZERTY Windows | 19/19 | 19/19 |
+| QWERTY US | 16/16 sur le fond : q w a z m restent q w a z m ; ; 1 @ donnent m & 2 | 16/16 sur le fond : q w a z m donnent a z q w , |
+| AZERTY Mac | 14/14 : les lettres justes ; § ! - @ donnent - _ = ² ; Option + touche ne tape rien | 14/14 |
+
+- Le cas miroir est réglé. Avant, un QWERTY branché sur un hôte AZERTY tapait « a » pour « q ».
+  Ses lettres partent maintenant en touche virtuelle non normalisée (journal KBD « VK 0x51
+  non-normalized »), et Sunshine les tape dans la disposition de l'hôte.
+- Chiffres et ponctuation restent en position sur Sunshine, comme voulu : jamais de texte à la
+  place d'une vraie touche (règle du 09/09). La ponctuation d'un AZERTY de Mac y reste donc
+  fausse.
+- **Pièges du banc** :
+  - Sunshine filme l'écran principal (DISPLAY5 sur DualRTX), qui n'est pas celui du flux natif ;
+  - son Desktop reste ouvert après un stream : le banc le reprend, et le laisse ouvert ;
+  - le temps de la session, Sunshine fait passer la sortie son par défaut sur « Steam Streaming
+    Speakers ». Il la rend une vingtaine de secondes après la déconnexion du client.
+
+**Hôte US** (23/10, le N95 : un premier passage arrêté à 15:25, le banc complet de 18:32 à
+18:35) : le champ de texte tape en US `00000409`, et le serveur de banc est l'exe de la `--dev` de
+DualRTX, avec le même frontend. Il tourne dans un dossier à part, derrière une règle de pare-feu
+temporaire. Le worker tourne en `"auto"`. Il lit d'abord la disposition de l'hôte (`040C040C`),
+puis à la première touche celle de la fenêtre au premier plan : « layout 0x04090409 read — 95
+character(s) on keys, 0 through dead keys ».
+
+| Client | Bureau : les caractères du client | Jeu : les positions |
+|---|---|---|
+| AZERTY Windows | 19/19 | 19/19 : a z q m , & 1 é donnent q w a ; m 1 ! 2 |
+| QWERTY US | 16/16 | 16/16 |
+| AZERTY Mac | 14/14, Option comprise ({ } [ ] \|) | 9/9 : § ! - @ donnent 6 8 = `` ` `` ; les 5 touches sous Option ne sont pas envoyées |
+
+- Au Bureau, lettres et ponctuation partent en vraies touches US : & = Maj+7, ! = Maj+1,
+  : = Maj+;, @ = Maj+2, { = Maj+[, | = Maj+\.
+- é è ç à ù, et le § du Mac, n'ont pas de touche US. Ils arrivent en texte Unicode, et le journal
+  dit « no key on this layout | Notepad: OK as Unicode text | Game: KO nothing was pressed ».
+- L'Option d'un Mac : l'hôte lâche l'Alt pour la touche ({ = Maj+[ sans Alt), et le masque d'une
+  touche neutre (0xE8) quand il le lâche et le remet. Ni menu ni bip. Après Option+Maj+5 (« [ »),
+  ] et | sont encore tapés en US : l'Alt et la Maj tenus ensemble n'ont pas changé la langue de
+  l'hôte.
+- En Jeu, une touche sous Option n'est pas envoyée par le banc : Alt + une touche prend le menu de
+  la fenêtre, et Windows bipe. Rien ne doit s'entendre sur le N95.
+- **Pièges du banc** :
+  - sur un PC où quelqu'un a des fenêtres ouvertes, la fenêtre de banc ne passe au-dessus que si
+    elle se met elle-même TOPMOST, à sa création ;
+  - un exe neuf qui écoute ouvre une alerte du pare-feu. Il faut une règle par programme, profil
+    Privé, posée avant le démarrage et retirée à la fin ;
+  - on ne tape pas si quelqu'un a pu se servir du PC dans les deux dernières minutes. Or
+    GetLastInputInfo compte aussi le clic et les touches du banc. Avant la première, il faut donc
+    deux minutes de calme ; ensuite, une entrée plus récente que la dernière du banc (1,5 s de
+    marge) est celle de quelqu'un. Le premier passage, à 15:25, s'est arrêté faute de savoir le
+    lire.
+
+### 36.8 Séances avec Bruno et correctifs suivants (23-26/10)
+
+**P5, le texte d'un téléphone** (iPhone et Android, hôte FR, 23-24/10) : Bloc-notes, cmd, Windows
+PowerShell, Windows Terminal, accords de la barre, tout juste, ~ compris dans PowerShell 5.1. Dans
+Windows Terminal, un emoji sort en deux carrés : ses deux moitiés arrivent séparées, en Unicode,
+comme avant. Dans Portal 2, Espace (saut) et E (utiliser) marchent ; marcher ne se teste pas ainsi :
+un clavier tactile donne une lettre tapée, jamais une touche tenue, et `injectText` presse et lâche
+dans le même `SendInput`.
+
+**P4, administrateur et SYSTEM** (24-25/10, édition DEV installée, worker SYSTEM du service ; la
+`--dev` n'en a pas) : depuis l'Android, le texte arrive dans un PowerShell administrateur, et le PIN
+Windows se tape à l'écran de verrouillage. Pour un invité (lien de partage, Chrome de banc), la clé
+`share_guests_admin_windows` décide, essai par essai :
+
+| Clé | Texte dans la fenêtre administrateur | Clic | Bandeau, journal du worker |
+|---|---|---|---|
+| `false` | rien | 0 | bandeau ; « input gate closed (policy) », appuis jetés |
+| `true` | tapé | 1 | « administrator windows open to this invited player » |
+| `false` | rien | 0, au même point | bandeau |
+
+- Pièges du banc : l'édition DEV et la `--dev` partagent le bloc de tunnel 46064-46095 et la base de
+  signalisation (Internet et UPnP coupés, `--ws-port` à part) ; l'invité voit l'image avec ses bandes
+  noires, le point de clic se calcule dans l'image ; l'arrivée et le départ d'un invité font chacun
+  une notification de l'hôte, qui peut sonner (`stream_notifications` à `false` le temps du banc).
+
+**C5, l'AZERTY d'un Mac** (24/10) :
+- **@ et #** : la touche en haut à gauche d'un clavier Mac arrive en `IntlBackslash`, envoyée en
+  VK_OEM_102 brut (« < » sur l'hôte FR). Au Bureau, sur l'hôte natif, `IntlBackslash` et `IntlRo`
+  tapent maintenant leur caractère (`aae86dcf`).
+- **Les touches mortes du Mac** (~ par Option+N, ^, ¨) : relevé dans Chrome et Safari, une page qui
+  n'est pas un champ de texte ne compose jamais : « Dead », puis la lettre seule. Dans un champ, la
+  touche suivante porte la composition (keyCode 229, sans keypress) ; Chrome compose au keydown,
+  Safari a déjà fini. Sur un Mac sans écran tactile, les touches passent donc par un champ de texte
+  invisible (`textarea.stream-kbd-capture`), au Bureau seulement, et la touche composée part tout
+  de suite (`e0ba72f9`) : ~ ñ ê ë, et une touche tenue répète sans bulle d'accents. En Jeu, ce sont
+  des positions : Option+N puis Espace ne donne rien de composé, voulu.
+- Le reste passait déjà : § ! - < > _ { } [ ] | \ €.
+
+**C0, reconnaître un jeu** (sonde en lecture seule, 24/10, 4 jeux lancés par Bruno en mode Jeu, puis
+10 fenêtres de saisie) :
+
+| Fenêtre | Game Bar | Bibliothèque Steam | Classe | ZQSD |
+|---|---|---|---|---|
+| Ravenfield | oui | oui | UnityWndClass | non |
+| Portal 2 | oui | oui | Valve001 | non |
+| Vanquish | oui | oui | VANQUISH | oui |
+| Half-Life 2, tout premier lancement | non, puis oui 1 s après | oui | Valve001 | non |
+| Bloc-notes, Windows Terminal, Chrome, Edge, Explorateur, VS Code, Steam, Big Picture, Discord, Word | non | non | divers | — |
+
+- Aucun faux positif ; la bibliothèque Steam reconnaît un jeu neuf dès son premier passage au
+  premier plan. Moins de 0,3 ms par changement de premier plan, rien à chaque touche ; le plein
+  écran ne distingue rien (`SHQueryUserNotificationState` jusqu'à 114 ms : écarté).
+- **Décision de Bruno (D-C2) : pas de détection.** Elle marche, mais ne change rien à ce qu'il a vu :
+  un Mac AZERTY et un PC AZERTY mettent les lettres aux mêmes places, caractère et position donnent
+  le même scancode. Le « ZQSD non » vient du jeu : Source et Unity lisent la lettre dans la
+  disposition de l'hôte, avec des commandes QWERTY (avancer = W, comme avec un clavier AZERTY branché
+  sur l'hôte) ; Vanquish lit la position. Présenter au jeu une disposition US en mode Jeu : non aussi.
+
+**Les KeyTips du Bloc-notes** (25-26/10) : depuis un Mac US, le texte était juste, mais le Bloc-notes
+de Windows 11 ouvrait les KeyTips de sa barre de menus après un @ (Maj+2 en US, AltGr+à sur l'hôte
+FR). La séquence était Maj↑ (l'hôte la lâche), Ctrl↓, Alt droit↓, à↓, Alt droit↑, Ctrl↑, Maj↓, puis
+à↑ au relâchement. Une fenêtre WinUI 3 à barre de menus ne l'a jamais reproduit (702 essais) : le
+défaut tient au Bloc-notes. Correctif (`95bcbfaa`) : `planKeyEdge` tape un caractère du niveau AltGr
+en entier à l'appui (touche enfoncée puis relâchée sous l'Alt droit, masque VK 0xE8 avant de lâcher
+l'Alt droit), rien au relâchement, et dit si la touche reste enfoncée ; `injectChar` ne retient rien
+pour elle. Vérifié par Bruno dans le Bloc-notes, depuis le Mac US : plus aucun KeyTips.
+
+**La touche Win de la barre** (26/10, décision de Bruno) se verrouille comme Maj, Ctrl et Alt
+(`41c43b84`) : Win puis L verrouille le PC, Win puis R ouvre Exécuter ; tapée seule, elle ouvre
+Démarrer.
+
+**Le Verr. Num** (26/10) :
+- La synchronisation des verrous, et la touche Verr. Num du client, partaient en scancode E0 45.
+  Injecté ainsi, Windows le lit comme aucune touche (VK 0xFF, FR et US, Windows 26200) : le Verr. Num
+  de l'hôte ne suivait jamais. Verr. Num est un 0x45 seul, sans E0 (`d6227f61`) ; Pause est
+  E1 1D 45. Un test relit chaque touche à E0 sur la disposition US.
+- Un clavier Apple n'a pas de Verr. Num, et son pavé tape toujours des chiffres. Envoyé « éteint »,
+  il aurait éteint celui du PC au premier appui. Depuis un Mac ou un iPad, la synchronisation dit
+  donc « allumé » (`f86bfdf2`). Sa touche Clear porte le code NumLock : appuyée en premier, le PC la
+  bascule après la synchronisation, qui dit alors « éteint » pour finir allumé.
+- À vérifier avant la v0.4.1 : depuis un Mac, le Verr. Num du PC s'allume à la première touche ;
+  depuis un PC Windows, il prend l'état de celui du client, puis bascule avec sa touche.

@@ -12,10 +12,10 @@ Headline capabilities:
 - **Low-latency streaming** up to 4K HDR, 120+ FPS, with **H.264 / HEVC / AV1**, on NVENC · AMF · Quick Sync · VA-API · VideoToolbox, with a software stage when no GPU will encode.
 - **WebRTC transport** (DataChannels + RTP media tracks) with automatic WSS fallback — a five-step fallback chain guarantees a connection on almost any network.
 - **Opus audio** encoded on the host, decoded in the browser with an adaptive jitter buffer.
-- **Full input**: keyboard, mouse (pointer-lock), touch trackpad, Xbox/PS **gamepads** with rumble, bidirectional **clipboard**.
+- **Full input**: keyboard, mouse (pointer-lock), touch trackpad, Xbox/PS **gamepads** with rumble, **wheels, flight sticks and RC radios** — as an Xbox pad or sent to the game as themselves, force feedback included ([§4.9](04-Frontend.md#49-wheels-and-radios-as-themselves)) — bidirectional **clipboard**.
 - **Other hosts too** — Sunshine/Apollo, Wolf (Games-on-Whales) and MultiSeat, found on the LAN by mDNS or added by IP.
 - **Internet access** (opt-in consent): per-session UPnP media mapping for remote streams, plus the **remote entry link** — one outgoing connection to an introduction server, which is how the instance is reached from outside without publishing anything: no DNS record, no certificate in its name, no open web port.
-- **Video Enhancement**: GPU upscaling & sharpening (FSR1 / SGSRv1 via WebGPU) in the browser.
+- **Video Enhancement**: GPU upscaling & sharpening in the browser, MoonlightWeb's own upscaler (MWSR) on WebGL2, or WebGPU in HDR and on iPhone.
 
 ## 1.1 The User's journey
 
@@ -28,7 +28,7 @@ The home page opens on **this machine**, listed as `<hostname> — MoonlightWeb 
 1. **This machine, straight away** — no discovery, no pairing, no PIN: the native host answers `ensurePaired()` immediately, because there are no two parties to authenticate. Its "app list" is its displays.
 2. **Discovery** — the server scans the LAN via mDNS (`_nvstream._tcp`); hosts can also be added by IP.
 3. **Pairing** (other hosts only) — click *Pair*, a PIN dialog appears; type that PIN into the host's web UI. Pairing uses the standard GameStream challenge-response with a generated RSA identity (see [Security](06-Security.md)). Wolf is paired without a human in the loop — MoonlightWeb posts the PIN itself.
-4. **Streaming** — pick a display, an app or *Desktop*; the browser goes fullscreen into the stream overlay.
+4. **Streaming** — pick a display, an app or *Desktop*; the stream overlay opens (fullscreen with **Settings → Start streams in fullscreen**).
 
 ### The stream
 
@@ -38,7 +38,7 @@ Desktop and mobile get the same pipeline with adapted input:
 |:---:|:---:|
 | ![Desktop streaming in the browser](../screenshots/desktop.png) | ![iPhone streaming with virtual keyboard](../screenshots/mobile.png) |
 
-- **Desktop**: pointer-lock ("gaming mode") or absolute mouse, keyboard capture (Escape is forwarded as a normal key; `Ctrl/Cmd+Alt+Shift+Z` releases the mouse; `Q` quits, `Z` toggles stats, `X` fullscreen, `M` mouse mode).
+- **Desktop**: pointer-lock ("gaming mode") or absolute mouse, keyboard capture (Escape is forwarded as a normal key; with `Ctrl+Alt+Shift` — `Cmd+Option+Ctrl` on a Mac — `Z` releases the mouse and leaves fullscreen, `Q` quits, `I` toggles stats, `X` fullscreen, `M` mouse mode, `S` sound off/on).
 - **Mobile**: the whole screen is a **relative trackpad** — 1 finger moves the mouse, 2 fingers scroll/pinch, 3 fingers pan; taps click; a toolbar summons the virtual keyboard (input captured by diffing `input` events with a sentinel, the only reliable technique across iOS/Gboard).
 - An **overlay header** exposes stats, fullscreen, settings and quit.
 
@@ -50,33 +50,34 @@ Per-browser preferences (stored in `localStorage`, with server defaults) are edi
 |:---:|:---:|
 | ![Stream settings](../screenshots/settings.png) | ![Advanced options (mobile)](../screenshots/advanced.png) |
 
-- **Bitrate** 1–150 Mbps or auto (recommendation derived from resolution/FPS/HDR), **resolution** 720p–2160p or *Native Host*, **FPS** 15–240, **codec** auto/H.264/HEVC/AV1 (unsupported options greyed out live via `VideoDecoder.isConfigSupported`), **HDR**, **4:4:4 chroma**, aspect ratio, allow-tearing (on by default where the browser can tear; off = VSync pacing), performance stats, gaming mode, touch sensitivity / touch-screen mode (mobile & tablet only), and a mobile **Power Saving** mode that forces the lightest pipeline.
+- **Bitrate** 1–150 Mbps or auto (recommendation derived from resolution/FPS/HDR), **resolution** 720p–2160p or *Native Host*, **FPS** 15–240, **codec** auto/H.264/HEVC/AV1 (unsupported options greyed out live via `VideoDecoder.isConfigSupported`), plus **PyroWave (Wired LAN only)** for a device on Ethernet streaming a native Windows host (greyed out, with the reason, where no host here codes it, the browser has neither WebGPU nor WebGL2, or HDR is ticked), **HDR**, **4:4:4 chroma**, aspect ratio, allow-tearing (on by default where the browser can tear; off = VSync pacing), performance stats, gaming mode, touch sensitivity / touch-screen mode (mobile & tablet only), and a mobile **Power Saving** mode that forces the lightest pipeline.
 - Changing quality mid-stream is **seamless**: a second stream is prepared in the background and the display switches on its first frame — no loader, no reconnection (the same mechanism the automatic congestion ladder uses).
-- **Video Enhancement** (WebGPU upscaling + sharpening) with algorithm choice (auto / SGSR / FSR1):
+- **Video Enhancement** (GPU upscaling + sharpening): one switch, MoonlightWeb's own upscaler (MWSR) in the flavour the device runs best (WebGL2 on a computer and on Android, WebGPU on iPhone and iPad and in HDR), none on an entry-level Mali GPU:
 
 ![Video Enhancement — 720p upscaled to 1440p](../screenshots/video_enhancement.gif)
 
 ## 1.2 The Administrator's journey
 
-The **Admin page** (`https://localhost/admin`, also reachable from the tray icon → *Server Settings*) configures the server itself. It is **only functional from the host machine**: all `/api/admin/*` routes return 403 for non-localhost requests (a *host-key* mechanism extends this to the host's own browser when it arrives through the remote entry link, and a LAN machine can unlock it with the admin password — see [Security](06-Security.md)).
+The **Admin page** (`https://localhost/admin`, also reachable from the tray icon → *Server Settings*) configures the server itself. It is **only functional from the host machine**: all `/api/admin/*` routes return 403 for non-localhost requests (a *host-key* mechanism extends this to the host's own browser when it arrives through the remote entry link, and a LAN machine — or a device on the internet, when the owner allows it — can unlock it with the admin password; see [Security](06-Security.md)).
 
 ![Open the Admin page from the tray icon → Server Settings](../screenshots/localhost.png)
 
 The admin page controls:
 
-- **Access PIN** — generate/clear the 8-character PIN remote devices must enter once; each successful use auto-regenerates it.
-- **Sessions table** — every authenticated device with IP, geolocation (city/country), last-seen, streaming flag; sessions can be renamed or revoked (revoking a streaming session kills the stream immediately).
+- **Access PIN** — generate/clear the 6-digit PIN remote devices must enter once; each successful use auto-regenerates it.
+- **Sessions table** — every authenticated device with IP, geolocation (city/country, only with `session_location_enabled`), last-seen, streaming flag; sessions can be renamed or revoked (revoking a streaming session kills the stream immediately).
 - **Certificate authentication** — download/regenerate a token file that remote users can upload instead of typing a PIN.
 - **HTTPS port** (rebinds live; the HTTP port is displayed only), **transport mode** (auto or forced), and the **Internet Access** toggle.
 - **Stream notifications** — a desktop notification when someone starts or stops streaming *this* screen through the native host (server-side setting; the tray obeys it, and the tray may live in another process).
 - **Instance name** — the name this install shows in the header of every browser paired with it, and in the switcher those browsers use to reach the others.
+- **Give the stream priority on the network** (AF41 marking, on by default), the **remote administration** password; under **Advanced**, the **video pipeline**, debug mode and **Download logs**; on the native host, **Apps on this PC** (the cards it shows, Steam Big Picture's among them).
 
 ### Internet access
 
 **Internet Access** is an explicit, versioned, logged consent — the master switch for being reachable from the internet. While it is on, the server:
 
 1. **Detects the public IP** (STUN — our own server at `stream.{MW_DOMAIN}:3478` first, public ones behind it; HTTPS fallback via ipify/icanhazip), and reports CGNAT/double-NAT when it sees one.
-2. **Asks the router (UPnP) to open the streaming port during each session**, and removes the mapping when the session — or the consent — ends. Peers connect directly, so each side of a WebRTC connection sees the other's public IP.
+2. **Asks the router (UPnP) for a streaming port per stream slot**, kept from one stream to the next (an invited player's is removed when they leave); every mapping is removed when MoonlightWeb quits. Withdrawing the consent keeps the next streams from announcing a public address; the ports already mapped stay until that exit. Peers connect directly, so each side of a WebRTC connection sees the other's public IP.
 
 3. **Holds one outgoing connection to the introduction server** — the **remote entry link** — which makes the instance reachable at `https://stream.{MW_DOMAIN}/{id}` while the line is up. That server learns the host's public address and when it is online, and nothing else: the signalling it copies is signed with a key it has never seen ([Infrastructure §10.7](10-Infrastructure-Stack.md#107-the-introduction-server-mw-rendezvous)).
 

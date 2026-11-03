@@ -22,6 +22,43 @@ describe('App model', () => {
         const a = new App({ id: 7, name: 'Game' }, 'host/uuid');
         expect(a.boxArtUrl).toBe('/api/hosts/host%2Fuuid/appasset?appid=7');
     });
+
+    it('knows the screens made for the stream: the virtual display and gamescope apps', () => {
+        const card = (key) => new App({ id: 3, device: { key } });
+        expect(card('moonlightweb-virtual-display').isMadeForStream).toBe(true);
+        expect(card('moonlightweb-virtual-display').isGamescope).toBe(false);
+        expect(card('gamescope-steam').isMadeForStream).toBe(true);
+        expect(card('gamescope-steam').isGamescope).toBe(true);
+        expect(card('gamescope-app-Cube').isGamescope).toBe(true);
+        expect(card('gamescope-app-Cube').isVirtualDisplay).toBe(false);
+        expect(card('HDMI-A-1').isMadeForStream).toBe(false);
+        expect(new App({ id: 3 }).isMadeForStream).toBe(false);
+    });
+
+    it("knows the native host's apps, and the screen each opens on", () => {
+        const app = (device) => new App({ id: 2001, device }, 'moonlightweb-native-host');
+        const onVirtual = app({ key: 'host-app-x', screen: 'virtual' });
+        expect(onVirtual.isHostApp).toBe(true);
+        expect(onVirtual.screen).toBe('virtual');
+        expect(onVirtual.isMadeForStream).toBe(true);
+        const onPrimary = app({ key: 'host-app-y', screen: 'primary' });
+        expect(onPrimary.isMadeForStream).toBe(false);
+        expect(app({ key: 'gamescope-app-z', screen: 'gamescope' }).isGamescope).toBe(true);
+        expect(app({ key: 'HDMI-A-1' }).isHostApp).toBe(false);
+        expect(app({ key: 'HDMI-A-1' }).screen).toBeNull();
+    });
+
+    it("puts an app image's hash in its URL, so each version is a URL of its own", () => {
+        const withArt = new App(
+            { id: 2001, boxArt: true, device: { screen: 'virtual', art: 'ab12' } },
+            'moonlightweb-native-host',
+        );
+        expect(withArt.boxArtUrl).toBe(
+            '/api/hosts/moonlightweb-native-host/appasset?appid=2001&v=ab12',
+        );
+        const without = new App({ id: 2002, boxArt: false, device: { screen: 'virtual' } }, 'n');
+        expect(without.boxArtUrl).toBeNull();
+    });
 });
 
 describe('Host model', () => {

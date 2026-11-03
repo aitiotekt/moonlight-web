@@ -344,11 +344,14 @@ bool AuthManager::isLanAddress(const QString& ip)
     return false;
 }
 
-bool AuthManager::canUnlockAdmin(const QString& ip, bool hostTrusted, bool viaTunnel)
+bool AuthManager::canUnlockAdmin(const QString& ip, bool hostTrusted, bool viaTunnel, bool internet)
 {
-    // The one condition that never bends: the password buys nothing from an
-    // address outside this LAN, whichever way the request came in.
-    if (!isLanAddress(ip)) return false;
+    if (!isLanAddress(ip)) {
+        // Outside the LAN the password buys nothing unless the owner opened
+        // that door, and then only on the rendezvous tunnel, from a peer ICE
+        // gave an address to — a label ("peer-4f2a") parses as nothing.
+        return internet && viaTunnel && !QHostAddress(cleanClientAddress(ip)).isNull();
+    }
 
     // On the tunnel, that address is ICE's own conclusion and is the whole
     // proof — see the header for why the Host header cannot stand in for it
@@ -366,6 +369,48 @@ QString AuthManager::rateLimitKey(const QString& ip)
         for (int i = 8; i < 16; ++i)
             raw[i] = 0;
         return QHostAddress(raw).toString() + QStringLiteral("/64");
+    }
+    return clean;
+}
+
+QString AuthManager::attemptAddress(const QString& peer, const QMap<QString, QString>& headers)
+{
+    const QString clean = cleanClientAddress(peer);
+    if (!QHostAddress(clean).isLoopback()) return clean;
+
+    // One candidate as a proxy writes it: maybe quoted, maybe with a port, an
+    // IPv6 address in brackets when it has one ("[2001:db8::1]:4711").
+    const auto parse = [](QString v) -> QString {
+        v = v.trimmed();
+        if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')) && v.size() >= 2)
+            v = v.mid(1, v.size() - 2);
+        if (v.startsWith(QLatin1Char('['))) {
+            const int end = v.indexOf(QLatin1Char(']'));
+            v = end > 0 ? v.mid(1, end - 1) : QString();
+        } else if (v.count(QLatin1Char(':')) == 1) {
+            v = v.left(v.indexOf(QLatin1Char(':'))); // IPv4 with a port
+        }
+        const QHostAddress addr(v);
+        return addr.isNull() ? QString() : cleanClientAddress(addr.toString());
+    };
+
+    const QString cf = parse(headers.value(QStringLiteral("cf-connecting-ip")));
+    if (!cf.isEmpty()) return cf;
+    const QStringList xff = headers.value(QStringLiteral("x-forwarded-for"))
+                                .split(QLatin1Char(','), Qt::SkipEmptyParts);
+    if (!xff.isEmpty()) {
+        const QString last = parse(xff.last());
+        if (!last.isEmpty()) return last;
+    }
+    const QStringList fwd =
+        headers.value(QStringLiteral("forwarded")).split(QLatin1Char(','), Qt::SkipEmptyParts);
+    if (!fwd.isEmpty()) {
+        for (const QString& pair : fwd.last().split(QLatin1Char(';'))) {
+            const QString p = pair.trimmed();
+            if (!p.startsWith(QStringLiteral("for="), Qt::CaseInsensitive)) continue;
+            const QString addr = parse(p.mid(4));
+            if (!addr.isEmpty()) return addr;
+        }
     }
     return clean;
 }
@@ -529,6 +574,14 @@ bool AuthManager::setAdminPassword(const QString& password)
     return true;
 }
 
+void AuthManager::clearAdminPassword()
+{
+    if (!m_settings) return;
+    m_settings->setAdminPasswordDigest(QString());
+    demoteAdminSessions();
+    Logger::info("[Auth] Remote admin password removed");
+}
+
 void AuthManager::setRemoteAdminEnabled(bool enabled)
 {
     if (!m_settings) return;
@@ -538,6 +591,31 @@ void AuthManager::setRemoteAdminEnabled(bool enabled)
     Logger::info(QString("[Auth] Remote administration %1").arg(enabled ? "enabled" : "disabled"));
 }
 
+bool AuthManager::remoteAdminInternet() const
+{
+    return m_settings && m_settings->remoteAdminInternet();
+}
+
+void AuthManager::setRemoteAdminInternet(bool enabled)
+{
+    if (!m_settings) return;
+    m_settings->setRemoteAdminInternet(enabled);
+    // Which sessions the internet unlocked is not recorded, and one unlocked
+    // on the LAN is honoured wherever it goes next: closing the internet side
+    // takes back every unlock, like a password change does.
+    if (!enabled) demoteAdminSessions();
+    Logger::info(QString("[Auth] Remote administration from the internet %1")
+                     .arg(enabled ? "enabled" : "disabled"));
+}
+
+namespace {
+// One bucket for every attempt from outside the LAN. On the internet an
+// address costs nothing to change, so the per-address counter alone would let
+// a caller with many of them guess on; this one does not care where the next
+// attempt comes from. It never touches the LAN's attempts.
+const QString kInternetAdminBucket = QStringLiteral("admin|internet");
+} // namespace
+
 AuthManager::ValidateResult AuthManager::validateAdminPassword(const QString& ip,
                                                                const QString& password)
 {
@@ -545,7 +623,10 @@ AuthManager::ValidateResult AuthManager::validateAdminPassword(const QString& ip
 
     // Own counter, so failed unlock attempts never lock a user out of PIN login.
     const QString bucket = QStringLiteral("admin|") + rateLimitKey(ip);
-    if (const int locked = bucketLockout(bucket); locked > 0) {
+    const bool internet = !isLanAddress(ip);
+    int locked = bucketLockout(bucket);
+    if (internet) locked = qMax(locked, bucketLockout(kInternetAdminBucket));
+    if (locked > 0) {
         Logger::info(
             QString("[Auth] Admin unlock rate limited for %1: %2s remaining").arg(ip).arg(locked));
         return {RateLimited, 0, locked};
@@ -559,7 +640,15 @@ AuthManager::ValidateResult AuthManager::validateAdminPassword(const QString& ip
         const QString digest = m_settings->adminPasswordDigest();
         matched = !digest.isEmpty() && passwordMatches(digest, password);
     }
-    return recordAttempt(bucket, matched, ip, QStringLiteral("admin password"));
+    ValidateResult result = recordAttempt(bucket, matched, ip, QStringLiteral("admin password"));
+    if (internet) {
+        // The stricter of the two counters is the caller's answer.
+        const ValidateResult shared = recordAttempt(kInternetAdminBucket, matched, ip,
+                                                    QStringLiteral("admin password (internet)"));
+        result.remainingAttempts = qMin(result.remainingAttempts, shared.remainingAttempts);
+        result.lockoutSeconds = qMax(result.lockoutSeconds, shared.lockoutSeconds);
+    }
+    return result;
 }
 
 QString AuthManager::createSession(const QString& ip, const QString& machineName, bool isHost,

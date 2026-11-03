@@ -22,7 +22,7 @@
 pkgname=moonlightweb-bin
 pkgver=@MW_VERSION@
 pkgrel=1
-pkgdesc="Stream your Sunshine games to any device with a browser"
+pkgdesc="Stream your gaming PC to any device with a browser"
 arch=('x86_64')
 url="https://moonlightweb.top/"
 license=('GPL-3.0-only')
@@ -36,6 +36,11 @@ license=('GPL-3.0-only')
 depends=('glibc' 'gcc-libs' 'libglvnd' 'libx11' 'libxkbcommon-x11'
          'fontconfig' 'freetype2' 'zlib' 'dbus'
          'libdrm' 'libva' 'mesa' 'pipewire' 'libcap')
+# Opened at run time, never linked: without it the host converts through GL
+# and encodes through VA-API, as it always has.
+optdepends=('vulkan-icd-loader: the Vulkan conversion and the Vulkan Video encoder'
+            'vulkan-radeon: the same on AMD'
+            'vulkan-intel: the same on Intel')
 
 provides=('moonlightweb')
 conflicts=('moonlightweb')

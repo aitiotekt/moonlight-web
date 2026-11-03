@@ -63,6 +63,22 @@ struct CapturedFrame
     /// When acquire() returned. `capturedUs - presentUs` is the capture
     /// latency, and it is the first number worth watching.
     int64_t capturedUs = 0;
+
+    // For the click trace (core/ClickTrace.h), left at 0 / -1 where the
+    // capture cannot tell.
+    /// The OS's own present stamp, before any correction: WGC's runs up to
+    /// ~9 ms ahead of the moment it hands the frame over, and presentUs is
+    /// clamped to capturedUs.
+    int64_t presentRawUs = 0;
+    /// DDA: when the pointer last moved or changed, 0 when this frame says
+    /// nothing of it.
+    int64_t mouseUs = 0;
+    /// DDA: the presents folded into this frame (AccumulatedFrames).
+    int accumulated = -1;
+
+    /// The desktop as it stood when retake() was answered, not a present:
+    /// presentUs says nothing worth measuring from.
+    bool retaken = false;
 };
 
 class IWindowsCapture
@@ -91,6 +107,22 @@ public:
     virtual void release() = 0;
 
     virtual void stop() = 0;
+
+    /// Have the next acquire() hand the desktop over as it stands, still
+    /// screen or not, flagged CapturedFrame::retaken — what a fresh start()
+    /// delivers first, on the same device, so that whatever was built on it
+    /// stays. For the pointer drawn into the picture over a desktop nobody
+    /// kept a copy of (see WindowsSession's retakeDesktop()). The caller lets
+    /// go of every texture it kept from this capture first.
+    ///
+    /// False with @p error when the capture cannot. Where it had already let
+    /// go of what it had, the next acquire() says Lost, and the capture is
+    /// opened again the ordinary way.
+    virtual bool retake(std::string& error)
+    {
+        error = "this capture cannot hand the desktop over again";
+        return false;
+    }
 
     /// The D3D11 device the frames live on — created on the adapter that drives
     /// the captured display, so the encoder can attach to it with no copy.
@@ -133,6 +165,11 @@ public:
     /// presents between two acquires come back as ONE frame, the latest. The
     /// sum since start(), or -1 where the capture cannot tell.
     virtual int64_t foldedPresents() const { return -1; }
+
+    /// The display's refresh period as the mode this capture opened on says,
+    /// in ns — for the lattice the stream's gate locks on
+    /// (core/PresentLattice.h). 0 where the capture cannot tell.
+    virtual int64_t refreshPeriodNs() const { return 0; }
 
 protected:
     IWindowsCapture() = default;

@@ -1,45 +1,512 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<!-- Written by scripts/website/build-site.mjs — do not edit by hand. -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
   <url>
     <loc>https://moonlightweb.top/</loc>
-    <lastmod>2026-07-19</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>1.0</priority>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/"/>
   </url>
   <url>
-    <loc>https://moonlightweb.top/faq.html</loc>
-    <lastmod>2026-07-19</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.8</priority>
+    <loc>https://moonlightweb.top/fr/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/"/>
   </url>
   <url>
-    <loc>https://moonlightweb.top/contact.html</loc>
-    <lastmod>2026-07-23</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.7</priority>
+    <loc>https://moonlightweb.top/de/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/"/>
   </url>
   <url>
     <loc>https://moonlightweb.top/guides/</loc>
-    <lastmod>2026-07-24</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.8</priority>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/guides/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/guides/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/guides/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/"/>
   </url>
   <url>
     <loc>https://moonlightweb.top/guides/windows.html</loc>
-    <lastmod>2026-07-19</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.8</priority>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/windows.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/guides/windows.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/windows.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/guides/windows.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/windows.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/guides/windows.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/windows.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/windows.html"/>
   </url>
   <url>
     <loc>https://moonlightweb.top/guides/macos.html</loc>
-    <lastmod>2026-07-19</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.7</priority>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/macos.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/guides/macos.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/macos.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/guides/macos.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/macos.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/guides/macos.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/macos.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/macos.html"/>
   </url>
   <url>
     <loc>https://moonlightweb.top/guides/linux.html</loc>
-    <lastmod>2026-07-29</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.7</priority>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/linux.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/guides/linux.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/linux.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/guides/linux.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/linux.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/guides/linux.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/linux.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/linux.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/faq.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/faq.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/faq.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/faq.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/faq.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/faq.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/faq.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/faq.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/faq.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/contact.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/contact.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/contact.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/contact.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/contact.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/contact.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/contact.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/contact.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/contact.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/server-access/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/server-access/"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/server-access/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/server-access/"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/server-access/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/server-access/"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/server-access/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/server-access/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/server-access/"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/play/chromebook.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/chromebook.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/play/chromebook.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/chromebook.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/play/chromebook.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/chromebook.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/play/chromebook.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/chromebook.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/chromebook.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/play/iphone-ipad.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/iphone-ipad.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/play/iphone-ipad.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/iphone-ipad.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/play/iphone-ipad.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/iphone-ipad.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/play/iphone-ipad.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/iphone-ipad.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/iphone-ipad.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/play/tv.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/tv.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/play/tv.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/tv.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/play/tv.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/tv.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/play/tv.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/play/tv.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/play/tv.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/sunshine-web-client.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/sunshine-web-client.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/sunshine-web-client.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/sunshine-web-client.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/sunshine-web-client.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/sunshine-web-client.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/sunshine-web-client.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/sunshine-web-client.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/sunshine-web-client.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/browser-game-streaming.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/browser-game-streaming.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/browser-game-streaming.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/browser-game-streaming.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/browser-game-streaming.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/browser-game-streaming.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/browser-game-streaming.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/browser-game-streaming.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/browser-game-streaming.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/controllers.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/controllers.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/fr/controllers.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/controllers.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/de/controllers.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/controllers.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/zh/controllers.html</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://moonlightweb.top/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/controllers.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/controllers.html"/>
+  </url>
+  <url>
+    <loc>https://moonlightweb.top/mwsr/</loc>
+    <lastmod>2026-10-29</lastmod>
   </url>
 </urlset>

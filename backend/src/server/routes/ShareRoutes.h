@@ -38,14 +38,23 @@ struct ShareRoutesDeps
     /// ratio (width is derived from it) — everything else (fps, codec, bitrate)
     /// is decided server-side. @p serverHost is the hostname the player reached
     /// us on, needed to build the signaling URL they must come back to.
+    /// @p transportIndex is the rung of the transport chain to try, walked by the
+    /// guest's browser exactly as the owner's walks theirs; @p req is the join
+    /// request itself, for where the guest is and how they arrived.
     std::function<void(int slot, int height, QString aspect, ShareManager::Permissions perms,
-                       QString serverHost, ResponseCallback respond)>
+                       QString serverHost, int transportIndex, const HttpRequest& req,
+                       ResponseCallback respond)>
         startPlayerStream;
 
     /// Tear a player's worker down without touching Sunshine or other slots.
     /// @p notifyEnded sends the "the owner ended it" notice first — true when
     /// the owner pulled the plug, false when the player left on their own.
     std::function<void(int slot, bool notifyEnded)> stopPlayerStream;
+
+    /// How the stream @p streamId of @p slot ended ("live", "crashed",
+    /// "ended", "stopped"), "unknown" for one that is not that slot's. Asked by
+    /// a guest whose link went: a crash is rejoined, anything else is not.
+    std::function<QString(int slot, const QString& streamId)> streamState;
 
     /// What joining @p slot would do right now: the display name of the app the
     /// invitation leads to, and whether the guest's arrival would *launch* it
@@ -59,6 +68,11 @@ struct ShareRoutesDeps
     /// nothing is up. Read at activation time to bind the share to that host, so
     /// the link can never later be routed to a different machine.
     std::function<std::pair<QString, int>()> currentOwnerContext;
+
+    /// Whether the owner has a stream of @p hostUuid up right now: what a
+    /// guest's header counts them by (/api/share/player/presence). Not
+    /// currentOwnerContext, which outlives the owner's Leave on purpose.
+    std::function<bool(const QString& hostUuid)> ownerWatching;
 
     /// Whether @p hostUuid is a known, paired host and @p appId one of its apps.
     /// Checked when an invitation is opened cold — with no stream running, the
@@ -94,6 +108,18 @@ struct ShareRoutesDeps
     /// A guest's own session is one of the things counted, so the join page
     /// says so — they cannot change the answer, but they get to know it.
     std::function<bool()> statsReporting;
+
+    /// How the guests of @p hostUuid get their picture. On a native host its
+    /// height is the owner's pick (ShareManager::feedHeight), not the guest's,
+    /// and — the shared feed switched on — they all watch one encode of it.
+    /// Every other host: neither, each guest picks and gets a stream of their
+    /// own.
+    struct GuestPicture
+    {
+        bool ownerHeight = false;
+        bool shared = false;
+    };
+    std::function<GuestPicture(const QString& hostUuid)> guestPicture;
 };
 
 /// Register the share API. A no-op when ShareManager::kSessionSharingEnabled is

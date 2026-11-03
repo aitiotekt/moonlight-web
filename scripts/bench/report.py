@@ -197,6 +197,21 @@ MITIGATIONS = {
         "cadence, not the encoder — the flag falls either side of the next deadline. Then split "
         "the chain with `cdp.py perf`: host acquire/convert/encode against client "
         "handoff/decode/queue/render. Only a leg that moved between two passes is a finding.",
+    "photon-tail":
+        "Some clicks come back a whole step later than the rest — farther than one capture "
+        "period, so not the cadence. The ~235 ms step of 25/09/2026 was the bench's own: the "
+        "host's flag window, topmost on EVERY screen, covered the client's desynchronized canvas "
+        "on a physical screen and stalled its presentation ~200 ms (DualRTX, AMD client; none "
+        "on a virtual screen, none with VSync, none once the flag stayed off). First make sure "
+        "the host ran with MW_LATENCY_FLAG_SKIP naming the client's screen (run-browser.ps1 "
+        "warns, and the pass notes it). Only then suspect SCTP: the host logs 'SCTP this "
+        "session' (retransmissions, T3 timeouts) when a stream ends.",
+    "photon-flag-on-client":
+        "The host drew its latency flag on the screen the measuring client sits on. Over a "
+        "desynchronized canvas on a physical screen that topmost window stalls presentation "
+        "~200 ms, so this pass's click-to-photon may be measuring the flag, not the stream. "
+        "Restart the host with MW_LATENCY_FLAG_SKIP=<the client's GDI name> in its environment "
+        "and play the pass again.",
     "photon-discarded":
         "Read `saw` and `via` on the discarded samples: a flag absent from the picture, the wrong "
         "surface sampled and a surface that was never drawn all read as `timeout` and have "
@@ -254,6 +269,16 @@ MITIGATIONS = {
         "types 'x'` means a key was pressed and it was the wrong one. On a Sunshine host the KO "
         "may also read `only if the host runs the client's layout`, which is not a failure but an "
         "unknown: the protocol carries no way to read a remote layout.",
+    "keyboard-flood":
+        "One keystroke reached the host many times over: an input loop, not a layout question. "
+        "The known one is the self-stream echo — the host injects into the foreground window, "
+        "which is the client when the bench streams its own screen, and a client that sends back "
+        "what it receives presses the key forever (every 22 ms on 25/09/2026). A self-stream "
+        "client must drop the echoes (StreamView._selfStream); check that the launch really "
+        "flagged the stream as one, and read the worker log: one [KBD] line per keystroke, two at "
+        "most on a self-stream (a key CDP pressed was never down for the OS, so its first echo "
+        "looks like a fresh press). A player on such a stream types a character forty times a "
+        "second until the stream ends.",
     "keyboard-not-armed":
         "Not one [KBD] line while keys were being typed. The instrument is read by the process "
         "that HANDLES the keys, and in worker mode — the default — that is the stream "
@@ -379,6 +404,30 @@ def bar_chart(series, unit="ms", width=760, bar_h=26, threshold=None):
                    f'class="val">{text}</text>')
     out.append('</svg>')
     return "".join(out)
+
+
+def humps(samples):
+    """Split a click-to-photon series at its widest gap: (low, high) sample
+    lists, or None when there is nothing to split. The two humps the capture
+    cadence makes sit about one capture period apart; a gap far wider than
+    that is another phenomenon (see MITIGATIONS['photon-tail'])."""
+    s = sorted(x for x in samples if isinstance(x, (int, float)))
+    if len(s) < 5:
+        return None
+    gaps = [(s[i + 1] - s[i], i) for i in range(len(s) - 1)]
+    width, at = max(gaps)
+    if width <= 0:
+        return None
+    return s[:at + 1], s[at + 1:]
+
+
+def hump_distance(samples):
+    """Milliseconds between the medians of the two humps, or None."""
+    split = humps(samples)
+    if not split:
+        return None
+    lo, hi = split
+    return statistics.median(hi) - statistics.median(lo)
 
 
 def histogram(samples, width=760, height=190, bins=18):
@@ -525,7 +574,16 @@ def analyse(results_dir):
         got = e["negotiated"]
         asked_codec = str(want.get("video_codec", "")).lower()
         got_codec = str(got.get("Codec", "")).lower().replace(".", "")
-        if asked_codec and got_codec and not got_codec.startswith(asked_codec.replace(".", "")):
+        # 4:4:4 in H.264 where the setting says HEVC is the client's own choice
+        # since 24be92df: a browser that decodes 4:4:4 only in H.264 asks for it
+        # there from the start (chroma444Codec), with no relaunch. A note, not a
+        # loss - a relaunch would show as a second stream request in the host log.
+        planned_444 = (want.get("chroma_444_enabled") and got_codec.startswith("h264")
+                       and "4:4:4" in got_codec)
+        if planned_444 and not got_codec.startswith(asked_codec.replace(".", "")):
+            e["notes"].append(f"4:4:4 asked in H.264 from the start ({asked_codec.upper()} "
+                              f"setting): the client decodes 4:4:4 only in H.264")
+        elif asked_codec and got_codec and not got_codec.startswith(asked_codec.replace(".", "")):
             e["notes"].append(f"codec asked {asked_codec.upper()}, negotiated {got_codec.upper()}")
             flag_anomaly(
                 f"codec-fallback-{e['id']}",
@@ -619,6 +677,36 @@ def analyse(results_dir):
                 flag_anomaly("photon-discarded",
                              f"{e['id']}: {of - n} of {of} click-to-photon samples discarded",
                              ", ".join(str(x) for x in (pr.get("all") or [])[:8]))
+            flag_client = (e.get("browser") or {}).get("flagOnClient")
+            if flag_client:
+                flag = YELLOW if flag == GREEN else flag
+                e["notes"].append(f"host flag drawn on the client's screen {flag_client}")
+                flag_anomaly("photon-flag-on-client",
+                             f"{e['id']}: the host's flag was on the client's screen {flag_client}",
+                             f"median {pr.get('median')} ms, p90 {pr.get('p90')} ms, max {pr.get('max')} ms")
+            # Two humps are the capture cadence only when they are about one
+            # capture period apart. A slow hump much farther out is something
+            # else, and the timeouts are usually its tail past the 200 ms wait.
+            period = 1000.0 / (num(want.get("stream_fps")) or 60.0)
+            split = humps(pr.get("samples") or [])
+            # A tail: the slow hump is the minority (a fast one-off below a
+            # slower majority is not this).
+            # ...and a hump, not one click: a single slow sample is noise (an
+            # enhancer ladder's recovery bet, one late frame), and calling it a
+            # tail sends the reader after the flag or SCTP for nothing.
+            if (split and 2 <= len(split[1]) <= len(split[0])
+                    and hump_distance(pr.get("samples") or []) > max(1.5 * period, 20.0)):
+                lo, hi = split
+                timeouts = sum(1 for x in (pr.get("all") or []) if str(x).endswith("timeout"))
+                flag = YELLOW if flag == GREEN else flag
+                e["notes"].append(f"{len(hi)} click(s) ~{statistics.median(hi):.0f} ms, "
+                                  f"the rest ~{statistics.median(lo):.0f} ms")
+                flag_anomaly("photon-tail",
+                             f"{e['id']}: {len(hi)} of {len(lo) + len(hi)} clicks "
+                             f"~{statistics.median(hi) - statistics.median(lo):.0f} ms behind the rest",
+                             f"humps at ~{statistics.median(lo):.0f} and ~{statistics.median(hi):.0f} ms "
+                             f"(capture period {period:.1f} ms); {timeouts} timeout(s) past "
+                             f"{pr.get('timeoutMs') or 200} ms")
             median = num(pr.get("median"))
             if perf_meaningful and median and median > THRESHOLDS["photon_median_ms"]:
                 flag = YELLOW if flag == GREEN else flag
@@ -681,6 +769,13 @@ def analyse(results_dir):
                          str(run["error"]), owner="Opus")
             continue
         rows = run.get("keys") or []
+        flooded = [r for r in rows if r.get("flood")]
+        if flooded:
+            ev = "; ".join(f"{r['code']} x{r.get('presses')}" for r in flooded[:8])
+            flag_anomaly("keyboard-flood",
+                         f"{run.get('profile')}: {len(flooded)} key(s) reached the host again "
+                         "and again for one keystroke",
+                         f"presses per keystroke — {ev}", owner="Opus")
         bad_game = [r for r in rows
                     if r.get("gameOk") is False and r.get("role") in ("cs", "both")]
         bad_note = [r for r in rows if r.get("noteOk") is False]
@@ -957,9 +1052,17 @@ def render(inventory, matrix, passes, anomalies, drift, perf_meaningful, provena
         ref_probe = next((e["probe"] for e in passes if e["id"] == "ref-head" and e["probe"]), None)
         if ref_probe and ref_probe.get("samples"):
             parts.append("<h3>Distribution of the reference series</h3>")
+            ref_fps = num(((matrix.get("reference") or {}).get("stream_fps"))) or 60.0
+            ref_period = 1000.0 / ref_fps
+            dist = hump_distance(ref_probe["samples"])
+            if dist is not None and dist > max(1.5 * ref_period, 20.0):
+                hump_note = (f'The humps are {dist:.0f} ms apart, far more than one capture period '
+                             f'({ref_period:.1f} ms): not the cadence — see the photon-tail anomaly.')
+            else:
+                hump_note = ('Two humps about one capture period apart are the capture cadence, the '
+                             'flag falling either side of the next deadline — not the presenter.')
             parts.append('<div class="card">' + histogram(ref_probe["samples"]) +
-                         '<p class="note">Two humps are normal: they are the capture cadence, the '
-                         'flag falling either side of the next deadline — not the presenter.</p></div>')
+                         f'<p class="note">{esc(hump_note)}</p></div>')
     else:
         parts.append('<div class="card"><p class="empty">No click-to-photon series in this '
                      'campaign. Where the host cannot raise the flag that is expected, not a '
@@ -999,12 +1102,16 @@ def render(inventory, matrix, passes, anomalies, drift, perf_meaningful, provena
             game_for_this_key = r.get("role") in ("cs", "both")
             pressed = r.get("gameKey") or "—"
             shift = "Shift+" if r.get("shift") else ""
+            presses = r.get("presses") or 1
+            dot_color = RED if r.get("flood") else YELLOW
+            times = (f'<div><span class="dot dot--{dot_color}"></span>'
+                     f'reached the host {presses} times</div>') if presses > 1 else ""
             parts.append(
                 "<tr>"
                 f'<td><code>{shift}{esc(str(r.get("code")))}</code>'
                 f'<div class="note">US {esc(str(r.get("us")))}</div></td>'
                 f'<td><code>{esc(str(r.get("key")))}</code></td>'
-                f'<td class="note">{esc(str(r.get("sent") or r.get("error") or ""))}</td>'
+                f'<td class="note">{esc(str(r.get("sent") or r.get("error") or ""))}{times}</td>'
                 f'<td>{dot(r.get("noteOk"), not game_for_this_key)}'
                 f'<div class="note">{esc(str(r.get("note") or ""))}</div></td>'
                 f'<td>{dot(r.get("gameOk"), game_for_this_key)}'
@@ -1066,9 +1173,10 @@ def render(inventory, matrix, passes, anomalies, drift, perf_meaningful, provena
         parts.append("</table></div>")
     else:
         parts.append('<div class="card"><p class="empty">No screen-follow check in this campaign. '
-                     'Run <code>display-follow.ps1</code> on a native host with a virtual display '
-                     'to switch — the only instrument that says whether the stream keeps the '
-                     'host’s shape and dynamic range when they change.</p></div>')
+                     'Run <code>display-follow.ps1</code> on a native host — it brings the '
+                     'MoonlightWeb Virtual Display up by itself (the host’s physical primary '
+                     'goes dark while it streams) — the only instrument that says whether the '
+                     'stream keeps the host’s shape and dynamic range when they change.</p></div>')
 
     parts.append("<h2>Encoder</h2>")
     enc = [(e["id"], num((e["bench"] or {}).get("encodeMean")),

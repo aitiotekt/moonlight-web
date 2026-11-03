@@ -43,6 +43,17 @@ twelve:
 **The star** — exactly one factor moves at a time: codec (`h264`, `av1`),
 enhancer on, 4:4:4 on, HDR on, mute off.
 
+HDR is the one factor a setting cannot ask for: the native host streams HDR
+exactly when its display is in HDR. `run-campaign.ps1 -Hdr physical` switches
+Windows HDR on the captured screen (by its GDI name — the desk has three
+M27Q) for the `hdr-on` pass only, in the encoder half (`run-matrix.ps1
+-HdrDevice`) and in the browser half (which also waits for the host's
+`hdr_active`), and puts it back in a `finally` (`hdr-switch.ps1`). Physical,
+because click-to-photon cannot be measured on a virtual screen; HDR only,
+never the mode. `-Hdr virtual` leaves HDR to `display-follow.ps1` (§5 ter);
+the default `off` plays the pass only if the OS already has HDR on there.
+Afterwards `scripts\Set-DisplayHdr.ps1 -List` says what state each screen is in.
+
 **The sweep** — resolution and cadence, everything else at the reference:
 720p60, 720p120, 1080p120, 1440p60, 1440p120.
 
@@ -176,6 +187,23 @@ when only a virtual screen is available, the probe's cases are **grey with that
 reason**, never red. The same goes for a very small screen: on 800×600 the flag
 is 96×30 px, which does not survive a downscale to 720p.
 
+**Keep the flag off the client's own screen.** The flag goes on every screen, and
+on a self-stream bench one of them shows the measuring client. Over its
+desynchronized canvas on a **physical** screen, that topmost window stalls
+presentation ~200 ms: on 25/09/2026 (DualRTX, AMD client) one click in two
+landed near 235 ms against a 30 ms median, then none at all once the flag stayed
+off that screen — and none with VSync, none with the client on a virtual screen.
+Start the host with the client's screen named in its environment:
+
+```powershell
+$env:MW_LATENCY_FLAG_SKIP = '\\.\DISPLAY9'   # GDI names, ; or , separated
+.\build\MoonlightWeb.exe --dev --autostart
+```
+
+`/api/settings/streaming` reports it as `latency_flag_skip`; `run-browser.ps1`
+warns when the client's screen is missing from it, and the report then raises
+`photon-flag-on-client` on every pass it measured that way.
+
 **Wolf is grey by design**: it injects into the uinput of a container with its
 own compositor, so no flag placed on the host is in its picture. A Wayland
 session is grey too — no client may draw above everything else, and a flag that
@@ -293,9 +321,21 @@ it decoded, whether it decided to move and whether it relaunched.
 
 It changes real display settings, so it picks its screens with care:
 
-- **The captured screen is a virtual display** (a VDD / indirect display
-  driver) unless `-Device` names one: it takes HDR and a 4:3 mode and nobody
-  sees it flicker. A physical monitor is never guessed.
+- **The captured screen is the product's own "MoonlightWeb Virtual Display"**
+  unless `-Device` names one. It exists only while a stream holds it (on at
+  the launch on its tile, off 4 s after the last stream), so the script
+  launches that tile and takes the screen that appeared. It is made at a 4:3
+  custom size (1440×1080): its other modes are all 16:9, which gives the shape
+  change a real other shape. The HDR launch goes to HDR under the running
+  stream and relaunches inside those 4 s (`cdp.py relaunch`), since every new
+  activation comes up SDR; missed, the row says so instead of judging. A
+  physical monitor is never guessed.
+- ⚠️ **While it streams, the virtual display is the primary screen and the
+  host's physical primary goes dark** (product behaviour). Warn whoever sits
+  at the host, and check afterwards that the physical screens are back
+  (`monitors.ps1`) and that `GET /api/native/virtual-display` says
+  `active: false` — on 25/09/2026 a worker that never saw its page go kept
+  both for 31 minutes.
 - **The client's screen is physical** and is flipped out of HDR and back
   (`-NoClientFlip` to skip). Some monitors drop their refresh rate on entering
   HDR and keep it — the M27Q goes from 144 Hz to 60 Hz — so its mode is put back
@@ -308,9 +348,9 @@ computed from it, so a client that cannot show HDR is tested on the SDR branch
 rather than failed. An HEVC HDR stream on an HDR screen is drawn by a `<video>`
 sink, not a canvas: the view is read from whichever is on the page.
 
-**On the reference bench** (bench-desk): the virtual display is captured at
-2560×1440, its alternative mode is 800×600, and the client kiosk sits on the
-HDR monitor. Results go to `results/display.jsonl`; the report renders them
+**On the reference bench** (DualRTX): the virtual display is rendered by the
+RTX at 1440×1080, its alternative mode is 16:9, and the client kiosk sits on
+the screen of `-ClientAdapterLuid` (the AMD iGPU's, `0,83538` on 25/09). Results go to `results/display.jsonl`; the report renders them
 under *Host screen follow*.
 
 *Seen within* is an upper bound: both ends are polled every two to three
@@ -687,9 +727,10 @@ does not prove which code is running.
 
 Three gaps a local build cannot close, all of them already known:
 
-- **Windows ARM64** — the cross-compiled OpenSSL is broken (every client TLS
-  handshake crashes in `libssl!tls_parse_all_extensions`). Only the CI's native
-  `windows-arm64` job produces a sound binary.
+- **Windows ARM64** — the build machine's cross-compiler is not the CI's native
+  one, and the bench is too small to build on. (What was long read as "the
+  cross-compiled OpenSSL is broken" was MSVC 14.51 miscompiling it, native or
+  cross; OpenSSL is now a committed prebuilt — `docs/design/openssl-windows.md`.)
 - **macOS** — the `.pkg` cannot be assembled on the bench: `ibtool` needs a full
   Xcode and the bench has only the Command Line Tools. The signing identity and
   the TCC behaviour of the shipped app are also not those of a hand-built one.

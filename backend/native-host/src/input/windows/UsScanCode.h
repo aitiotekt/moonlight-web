@@ -124,8 +124,8 @@ inline uint16_t usScanCode(int vk)
     case 0x25: return 0xE04B; // VK_LEFT
     case 0x27: return 0xE04D; // VK_RIGHT
 
-    // Numpad operators. NumLock's make code is NOT extended — the extended flag
-    // is added on the way out (see isExtendedKey) so it is not read as Pause.
+    // Numpad operators. NumLock is a bare 0x45, as a keyboard sends it: Pause
+    // is 0xE1 0x1D 0x45 (below), and 0xE0 0x45 is no key at all.
     case 0x90: return 0x0045; // VK_NUMLOCK
     case 0x6F: return 0xE035; // VK_DIVIDE
     case 0x6A: return 0x0037; // VK_MULTIPLY
@@ -137,6 +137,40 @@ inline uint16_t usScanCode(int vk)
     // 0xE1 0x1D 0x45, which a single INPUT cannot express. Falling through to
     // 0 sends it as a virtual key instead of half a sequence.
     default: return 0;
+    }
+    // clang-format on
+}
+
+/// Keys whose scancode needs the 0xE0 prefix. MAPVK_VK_TO_VSC_EX reports the
+/// prefix for most of them, but not consistently across layouts and Windows
+/// versions; naming them is cheap insurance for the keys Windows is asked for.
+///
+/// NumLock is not one of them, whatever the flag Windows puts on its
+/// messages: injected by scancode, 0xE0 0x45 is read as no key at all
+/// (VK 0xFF), and the host's NumLock never followed the client's (25/10/2026).
+inline bool isExtendedKey(int vk)
+{
+    // clang-format off
+    switch (vk) {
+    case 0xA3: // VK_RCONTROL
+    case 0xA5: // VK_RMENU
+    case 0x2D: // VK_INSERT
+    case 0x2E: // VK_DELETE
+    case 0x24: // VK_HOME
+    case 0x23: // VK_END
+    case 0x21: // VK_PRIOR
+    case 0x22: // VK_NEXT
+    case 0x25: // VK_LEFT
+    case 0x27: // VK_RIGHT
+    case 0x26: // VK_UP
+    case 0x28: // VK_DOWN
+    case 0x6F: // VK_DIVIDE
+    case 0x5B: // VK_LWIN
+    case 0x5C: // VK_RWIN
+    case 0x5D: // VK_APPS
+    case 0x2C: // VK_SNAPSHOT
+        return true;
+    default: return false;
     }
     // clang-format on
 }

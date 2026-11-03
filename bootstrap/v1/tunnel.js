@@ -51,11 +51,86 @@ const FRAME_WS_OPENED = 0x08;
  */
 export const SHELL_CACHE = 'mw-shell';
 
+/**
+ * The order to fetch the application's files in: the largest first.
+ *
+ * Over a long round trip each answer is slow to get going, and a large one that
+ * starts last trails alone at the end while the channel sits half idle (the
+ * bench of 24/10, 115 ms away: 2 to 5 s per large file). Started first, the
+ * large ones overlap everything else. `sizes` runs beside `files` in the host's
+ * manifest since v0.4.1; an older host sends none, and its order is kept.
+ */
+export function shellFetchOrder(files, sizes) {
+    if (!Array.isArray(sizes) || sizes.length !== files.length) return [...files];
+    const size = (i) => (Number.isFinite(sizes[i]) ? sizes[i] : 0);
+    return files
+        .map((path, i) => i)
+        .sort((a, b) => size(b) - size(a) || a - b)
+        .map((i) => files[i]);
+}
+
+/** How long a refused file waits before its one more try. */
+export const SHELL_STORE_RETRY_MS = 500;
+
+/**
+ * Put one of the application's files in the cache, trying once more after a
+ * pause, and naming it when the browser refuses both times.
+ *
+ * A fresh Chrome profile once refused the whole interface with only "Failed to
+ * execute 'put' on 'Cache': Entry already exists." (26/10, not reproduced since),
+ * which looked like the storage failing for a moment rather than anything about
+ * the files. One more try rides out such a moment. The path and the last storage
+ * error's name are what make a report of the failure one to go on.
+ *
+ * The second try is handed a copy taken beforehand: the first put may have read
+ * the body before it failed.
+ */
+export async function storeShellFile(cache, path, response) {
+    const spare = response.clone();
+    try {
+        await cache.put(path, response);
+        return;
+    } catch {
+        await new Promise((resolve) => setTimeout(resolve, SHELL_STORE_RETRY_MS));
+    }
+    try {
+        await cache.put(path, spare);
+    } catch (e) {
+        const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        throw new Error(`the browser could not store ${path} (${cause})`);
+    }
+}
+
+/**
+ * Requests answered here rather than sent to the machine.
+ *
+ * /api/auth/home-screen/instances carried the list of machines this browser
+ * knows, for the menu of a home-screen shortcut. That list stays in the browser
+ * (27/10/2026). The applications of 0.3.1 and 0.4.0 still send the request, and
+ * every connection of every application version is a Tunnel of this file, so it
+ * is answered here, as the host would answer it: a shortcut's menu fills as the
+ * shortcut is used.
+ */
+const NEVER_SENT = new Set(['/api/auth/home-screen/instances']);
+
+function sentNowhere() {
+    return new Response(JSON.stringify({ status: 'ok' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+    });
+}
+
 /** How long a request may wait for its first byte before it is given up on. */
 const REQUEST_TIMEOUT_MS = 30000;
 
 /** How long the whole connect sequence may take before it is called failed. */
 const CONNECT_TIMEOUT_MS = 25000;
+
+/**
+ * How long the machine has to say something on the channel once the signalling
+ * line has gone from under a working tunnel. See _lineLost().
+ */
+const LINE_LOST_CHECK_MS = 5000;
 
 /**
  * The protocol revision this page speaks INSIDE /v1/, sent as `?v=` when it
@@ -84,9 +159,22 @@ const MAX_EARLY_CANDIDATES = 64;
  */
 function noRouteError() {
     const err = new Error('Your machine answered, but no direct connection could be opened.');
+    err.answered = true;
     err.hint =
         'This network is not letting the two ends reach each other. Company networks and ' +
         'public Wi-Fi often block what that takes. A phone hotspot is the quickest way to tell.';
+    return err;
+}
+
+/**
+ * A failure that can pass by itself within a minute, marked `transient` so a
+ * page may keep calling under it. These are what a restart of the introduction
+ * server looks like from here: the server not there, or back while the
+ * machine's own line to it is not yet.
+ */
+function passingError(message) {
+    const err = new Error(message);
+    err.transient = true;
     return err;
 }
 
@@ -295,6 +383,9 @@ export class Tunnel {
         this._nextId = 1;
         this._pending = new Map(); // request id → { resolve, reject, head, chunks }
         this._sockets = new Map(); // socket id → TunnelSocket
+        // Frames received from the host, counted so that _lineLost() can tell a
+        // machine that is still there from a channel that only looks open.
+        this._framesIn = 0;
 
         /** Called with a short status word so a page can say what is happening. */
         this.onstatus = null;
@@ -339,25 +430,76 @@ export class Tunnel {
             wsUrl.searchParams.set('v', String(PROTO));
 
             this._ws = new WebSocket(wsUrl);
+            let opened = false;
+            this._ws.onopen = () => {
+                opened = true;
+            };
             this._ws.onmessage = (ev) => this._onRelayFrame(ev.data, settle);
-            this._ws.onerror = () => settle(new Error('Could not reach the introduction server.'));
+            this._ws.onerror = () =>
+                settle(passingError('Could not reach the introduction server.'));
             this._ws.onclose = (ev) => {
                 // The code and reason are the only account of WHY the line went,
                 // and this is the failure a user reports as "it just stops".
-                console.warn(
-                    `[MW] Signalling line closed: code=${ev.code} reason=${ev.reason || '(none)'}`,
-                );
+                // A line that never opened has no such account to give — 1006,
+                // nothing more — and its failure is the rejection below; a page
+                // that keeps calling a server that is down (lineKeeper behind a
+                // stream, the entry page's retries) would log it on every try.
+                if (opened) {
+                    console.warn(
+                        `[MW] Signalling line closed: code=${ev.code} reason=${ev.reason || '(none)'}`,
+                    );
+                }
                 if (!this.connected) {
-                    settle(new Error('The introduction server hung up.'));
+                    settle(passingError('The introduction server hung up.'));
                     return;
                 }
-                // The line dropped under a working tunnel. The host treats that
-                // as the browser leaving and takes its side down, so waiting for
-                // the data channel to notice would only add a silent gap first.
-                this._teardown('the introduction server hung up');
+                this._lineLost();
             };
             this._onChannelOpen = settle;
         });
+    }
+
+    /**
+     * The signalling line went away under a working tunnel — and the tunnel
+     * stays.
+     *
+     * It used to go down with the line, on the reasoning that the host takes a
+     * closed line for the browser leaving. That is true of one thing only: the
+     * introduction server telling the host this browser's session is over. The
+     * host does nothing to its tunnels when its OWN line drops. So when the
+     * server itself goes — a restart, a deploy, a reboot — both lines fall
+     * together, nobody tells the host anything, and the channel is still a
+     * perfectly good direct connection between the two machines. Tearing it
+     * down was the only thing that ended every session on the server's way out,
+     * the ones on the same LAN as their machine included, and every stream with
+     * them.
+     *
+     * Whether the host is still there is asked of the host, over the channel:
+     * one request, and any frame back within LINE_LOST_CHECK_MS settles it. Any
+     * frame, not the answer to that request in particular — the answer can be
+     * queued behind a large body the channel is still carrying. Silence means
+     * the line went because the network did, and the tunnel goes down as it
+     * always did. A host that did hear "the browser left" closes the channel
+     * itself, which ends it by the ordinary route below.
+     *
+     * The line is not dialled again. A new one would be a new session, with a
+     * new offer from the host for a connection this page already has.
+     */
+    _lineLost() {
+        console.warn('[MW] Keeping the tunnel without its signalling line — asking the machine');
+        const heard = this._framesIn;
+        this.fetch('/api/health').catch(() => {
+            /* only an occasion for the host to speak; the count is the verdict */
+        });
+        setTimeout(() => {
+            // Closed meanwhile: the channel's own close has said so already.
+            if (!this.connected) return;
+            if (this._framesIn > heard) {
+                console.info('[MW] The machine still answers — the tunnel carries on');
+                return;
+            }
+            this._teardown('the introduction server hung up and the machine went silent');
+        }, LINE_LOST_CHECK_MS);
     }
 
     /**
@@ -395,7 +537,11 @@ export class Tunnel {
                 // does fetch the current ones — unlike most "reload" advice.
                 unsupported_version: 'This page is out of date — reload it.',
             };
-            settle(new Error(said[frame.code] || 'The introduction server refused.'));
+            // A machine not online may only be reconnecting its line; one at
+            // its connection limit, or a page out of date, is a plain answer.
+            const passing = frame.code === 'offline' || frame.code === 'host-gone';
+            const message = said[frame.code] || 'The introduction server refused.';
+            settle(passing ? passingError(message) : new Error(message));
             return;
         }
         if (frame.t === 'ready') {
@@ -608,6 +754,7 @@ export class Tunnel {
     }
 
     _onChannelMessage(bytes) {
+        this._framesIn++;
         if (bytes.length < 5) return;
         const kind = bytes[0];
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -689,9 +836,12 @@ export class Tunnel {
 
     /** One HTTP request over the channel. Same shape as window.fetch. */
     async fetch(input, init = {}) {
+        const url = new URL(typeof input === 'string' ? input : input.url, location.origin);
+        // Answered here and never sent: see NEVER_SENT.
+        if (NEVER_SENT.has(url.pathname)) return sentNowhere();
+
         if (!this.connected) throw new Error('the tunnel is not open');
 
-        const url = new URL(typeof input === 'string' ? input : input.url, location.origin);
         const headers = {};
         new Headers(
             init.headers || (typeof input === 'object' ? input.headers : undefined),
@@ -784,7 +934,7 @@ export function rememberLastHost(hostId) {
 /**
  * The machines this browser has been to, newest first.
  *
- * READ ONLY, and that is the whole relationship: the register is written by the
+ * READ ONLY, but for one removal (forgetInstance): the register is written by the
  * application (frontend/js/util/instances.js), which is the only code that ever
  * learns what a machine calls itself — it asks the machine. This page never
  * reaches one far enough to be told a name, so it can offer the list and must
@@ -825,6 +975,29 @@ export function knownInstances() {
         // No storage, or a value this build cannot parse. The page keeps working
         // and simply has nothing to offer, which is what it did before.
         return [];
+    }
+}
+
+/**
+ * Drop one machine from the register, at the person's request (boot.js, the
+ * "Not connected" page). The single exception to the read-only rule above, and
+ * a narrow one: it removes a row, never writes one, and leaves every other row
+ * exactly as the application stored it — fields this build does not know
+ * included. The last-used marker goes with it, or the bare address would keep
+ * opening the machine that was just let go.
+ */
+export function forgetInstance(id) {
+    try {
+        const raw = JSON.parse(localStorage.getItem('mw-instances') || '[]');
+        if (Array.isArray(raw)) {
+            localStorage.setItem(
+                'mw-instances',
+                JSON.stringify(raw.filter((e) => !(e && e.id === id))),
+            );
+        }
+        if (localStorage.getItem('mw-last-host') === id) localStorage.removeItem('mw-last-host');
+    } catch {
+        /* no storage: there was no list to remove it from */
     }
 }
 
@@ -910,6 +1083,11 @@ export function landingPathFromLocation() {
         }
     }
     if (shareTokenFromLocation()) return '/p';
+    // A start of the application itself — a reload of /admin, a shortcut —
+    // that the service worker sent here so the cache is checked first (R1):
+    // the page it was on.
+    const here = location.pathname;
+    if (here !== '/' && LANDING_SHAPE.test(here) && !ID_SHAPE.test(here.slice(1))) return here;
     return null;
 }
 

@@ -43,8 +43,10 @@ public:
     /// has an entry for that external port. False when it has none OR cannot
     /// answer the question — and the two are reported alike on purpose: an IGD
     /// that does not implement the query must not make the caller throw away
-    /// mappings that are working.
-    virtual bool owner(uint16_t externalPort, const QString& protocol, QString& client) = 0;
+    /// mappings that are working. `leaseLeft`: the seconds the router says the
+    /// entry has left, 0 for a permanent one, -1 when it does not say.
+    virtual bool owner(uint16_t externalPort, const QString& protocol, QString& client,
+                       int& leaseLeft) = 0;
 
     virtual bool remove(uint16_t externalPort, const QString& protocol) = 0;
 };
@@ -147,6 +149,15 @@ public:
     /// entry, because ICE would advertise it.
     RouterPortCore(IUpnpGateway& gateway, std::function<bool(uint16_t)> localBindProbe);
 
+    /// Whether a tunnel hole on `port` is one this kind of instance may hold:
+    /// the preferred list and the pool for the installed host, the --dev block
+    /// for a --dev (RouterPortPools.h).
+    static bool tunnelPortAllowed(bool devInstance, uint16_t port);
+
+    /// The tunnel's request. A remembered port the instance may not hold is
+    /// left out — a --dev remembering 3479 from before it had a block.
+    static Request tunnelRequest(bool devInstance, const QList<uint16_t>& remembered);
+
     /// The address this host had when its remembered ports were obtained.
     /// An entry the router still points there is ours to overwrite.
     void setPreviousLanAddress(const QString& ip) { m_PreviousLan = ip; }
@@ -157,10 +168,18 @@ public:
 
     /// Re-add every held mapping, then read each back. Returns the ones the
     /// table now aims elsewhere — those are dropped from the held list, since
-    /// a hole that leads to another machine is worse than none. Also drives
-    /// the lease latch: two consecutive renewal failures switch to permanent
-    /// mappings and re-add once more.
+    /// a hole that leads to another machine is worse than none. One still
+    /// running down its old lease after the write is removed and added
+    /// afresh: some routers answer a re-add without renewing anything. Also
+    /// drives the lease latch: two consecutive renewal failures switch to
+    /// permanent mappings and re-add once more.
     QList<Lost> renew();
+
+    /// The same for one held mapping, now: a stream or a browser about to be
+    /// sent to it, after a router reboot or a night's sleep the half-hour
+    /// renewal has not caught up with yet. Leaves the failure count alone.
+    /// Nothing for a port this core does not hold.
+    QList<Lost> renew(uint16_t externalPort);
 
     /// Remove one held mapping (UDP, and TCP if it was accepted).
     void release(const Claim& claim);
@@ -175,8 +194,25 @@ private:
     bool tryOne(uint16_t external, const Request& request, Result& result);
     /// Empty when the router has no entry, or cannot say.
     QString ownerOf(uint16_t external);
+    /// The same, with the lease the entry has left (see IUpnpGateway::owner).
+    QString entryOf(uint16_t external, int& leaseLeft);
+    /// Whether the TCP entry of `external` may be written or removed: none, one
+    /// this host holds (or held before a DHCP renumbering), or a router that
+    /// cannot say. A neighbour's TCP forward on the same number is not ours,
+    /// whoever holds the UDP one.
+    bool tcpWritable(uint16_t external);
+    /// Whether an entry read back just after a write still counts down the
+    /// lease it had before it: the router took the write and kept the entry.
+    bool keptOldLease(int leaseLeft) const;
     bool addWithLatch(uint16_t external, uint16_t internal, const QString& description,
                       const QString& protocol);
+    /// Remove, then add: the one write such a router acts on.
+    bool addAfresh(uint16_t external, uint16_t internal, const QString& description,
+                   const QString& protocol);
+    /// One renewal of a held mapping: UDP and TCP written, UDP read back into
+    /// `owner`, the pair added afresh if the router kept its old lease. False
+    /// when the router refused the UDP write.
+    bool rewrite(const Claim& claim, QString& owner);
 
     IUpnpGateway& m_Gateway;
     std::function<bool(uint16_t)> m_BindProbe;

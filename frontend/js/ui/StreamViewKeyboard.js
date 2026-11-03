@@ -22,6 +22,9 @@ import { t } from '../i18n/i18n.js';
  *  before we consider it open (an accessory bar alone is smaller than this). */
 const KB_OPEN_THRESHOLD = 120;
 
+/** What is left between the picture and the special-keys bar while typing. */
+const KB_PICTURE_GAP = 4;
+
 /** Typematic for the press-and-hold toolbar keys: how long a finger has to
  *  stay down before the key starts repeating, and how fast it repeats then.
  *  Roughly the Windows defaults, which is what the arrows should feel like. */
@@ -56,7 +59,18 @@ function publishKbdInset(px) {
  */
 export class StreamViewKeyboard {
     /**
-     * Send typed text to the host, warning once when it may arrive as garbage.
+     * Send typed text to the host. The server decides how each character
+     * goes, and says so when one cannot go as a key (_noteTextViaIme).
+     *
+     * @param {string} text the characters the soft keyboard produced
+     */
+    _sendTextInput(text) {
+        this.webrtc.send({ type: 'textinput', text });
+    }
+
+    /**
+     * The server's word that some typed characters went to the host's input
+     * method, warning once per view that they may not arrive.
      *
      * Why the warning exists
      * ----------------------
@@ -67,34 +81,25 @@ export class StreamViewKeyboard {
      * and with no input method listening in the host's session the prefix is
      * swallowed and the digits are typed bare.
      *
-     * The defect is on the host, and nothing we send can work around it: the
-     * alternative — sending key events instead of text — needs the host's
-     * KEYBOARD LAYOUT, which no part of the GameStream protocol carries. So the
-     * honest thing is to say it, once, to the person who is about to be
-     * confused by it.
+     * Why only now, and only for these characters
+     * -------------------------------------------
+     * The server now sends what a key can type as that key (InputMsg::planText
+     * — US keys, or this PC's layout when the owner ticked the box), and only
+     * the rest as text. Warning on the first letter, as this did, was a false
+     * alarm on every Wolf: the letters arrived, with a warning that they would
+     * not (issue #44, 30/10/2026). So the server names the characters it had
+     * to leave to the input method (`textviaime`), and only those are worth a
+     * sentence — named, so the person knows which ones to look for.
      *
-     * Who gets warned, and who deliberately does not
-     * ----------------------------------------------
-     *  - MoonlightWeb's own host: never. Its Linux backend resolves the
-     *    character in the session's real layout (XkbTextMap), so text works.
-     *  - A host positively identified as Windows or macOS: never. Both inject
-     *    text directly. HostOsProbe names Windows from its IP TTL, from
-     *    MultiSeat, and from the original NVIDIA software.
-     *  - Everything else — Linux, and Unknown: warned. Unknown is mostly Linux
-     *    or macOS (a TTL of 64 cannot separate them), and a false warning on a
-     *    rare macOS host costs one sentence, while staying silent costs a user
-     *    a keyboard that types nonsense with no explanation.
-     *
-     * @param {string} text the characters the soft keyboard produced
+     * @param {string} text the characters left to the host's input method
      */
-    _sendTextInput(text) {
-        if (!this._textInputHostWarned) {
-            this._textInputHostWarned = true;
-            const os = (this.host?.hostOs || '').toLowerCase();
-            const mayMangle = !this._nativeHost && os !== 'windows' && os !== 'macos';
-            if (mayMangle) Toast.warning(t('stream.textInputNeedsIme'), { durationMs: 10000 });
-        }
-        this.webrtc.send({ type: 'textinput', text });
+    _noteTextViaIme(text) {
+        if (this._textInputHostWarned || !text) return;
+        this._textInputHostWarned = true;
+        // A paste can leave a whole sentence to it: a few are enough to name.
+        const cps = Array.from(text);
+        const chars = cps.length > 8 ? cps.slice(0, 8).join('') + '…' : text;
+        Toast.warning(t('stream.textInputNeedsIme', { chars }), { durationMs: 10000 });
     }
 
     /**
@@ -125,11 +130,14 @@ export class StreamViewKeyboard {
             // Gboard composition has no usable data → falls through to the diff.
             const it = e && e.inputType;
             // With a latched toolbar modifier, route a typed character through a
-            // key event so the modifier applies (Ctrl+C, Alt+F4, Win+R, …).
+            // key event so the modifier applies (Ctrl+C, Alt+F4, Win+R, …). The
+            // character rides along as a chord: the host presses the key that
+            // carries it on its own layout. Its US position alone was Ctrl+W
+            // for Ctrl+z on an AZERTY host, and Shift+a typed Q (22/10/2026).
             if (this._anyModHeld() && it === 'insertText' && e.data != null) {
                 const vk = StreamViewKeyboard.charToVk(e.data);
                 if (vk != null) {
-                    this._sendToolbarKey(vk);
+                    this._sendToolbarKey(vk, e.data);
                     this._resetKbdCapture();
                     return;
                 }
@@ -315,20 +323,17 @@ export class StreamViewKeyboard {
         // [label, kind, id]. kind: 'mod' | 'key'.
         // [label, kind, id] — `id` is a virtual-key code for 'key' entries and a
         // modifier name for 'mod' entries, so the tuple is deliberately mixed.
-        /** @type {Array<[string, 'key', number] | [string, 'mod', string] | [string, 'sas', number]>} */
+        /** @type {Array<[string, 'key', number] | [string, 'mod', string]>} */
         const items = [
-            ['Win', 'key', 0x5b], // momentary tap → Start menu (single press)
+            // Win latches as Shift, Ctrl and Alt do, for Win+L or Win+R from a
+            // phone (Bruno, 26/10/2026); latched and let go alone, it opens Start.
+            ['Win', 'mod', 'meta'],
             ['Esc', 'key', 0x1b],
             ['Tab', 'key', 0x09],
             ['Shift', 'mod', 'shift'],
             ['Ctrl', 'mod', 'ctrl'],
             ['Alt', 'mod', 'alt'],
-            ['Del', 'key', 0x2e],
-            // Not the three keys: the viewer's own OS swallows that combination
-            // before the page ever sees it, and even forwarded it would be
-            // refused — Windows reserves it in the kernel. It goes as a message
-            // of its own, which the host turns into a real SAS when it can.
-            ['C+A+Suppr', 'sas', 0],
+            ['Del', 'key', 0x2e], // with Ctrl and Alt down: Ctrl+Alt+Suppr, see below
             ['←', 'key', 0x25],
             ['↑', 'key', 0x26],
             ['↓', 'key', 0x28],
@@ -387,6 +392,20 @@ export class StreamViewKeyboard {
                     e.preventDefault();
                     e.stopPropagation();
                     if (btn._held) return;
+                    // Del with Ctrl and Alt down is Ctrl+Alt+Suppr, which no
+                    // injected key can forge: Windows reserves it in the
+                    // kernel, and the viewer's own OS swallows the physical one
+                    // before the page sees it. It goes as a message of its own,
+                    // which the host turns into a real SAS when it can. Every
+                    // modifier is let go first, locked ones included: the host
+                    // is about to switch to the secure desktop, where anything
+                    // still held would stay held with nobody to release it.
+                    if (id === 0x2e && this._heldMods.ctrl && this._heldMods.alt) {
+                        this._releaseAllMods();
+                        this.webrtc.send({ type: 'secureattention' });
+                        this._refocusCapture();
+                        return;
+                    }
                     btn._held = true;
                     this._sendKeyEvent({ type: 'keydown', ...flags() });
                     // The key stays in the held set throughout, so the repeat is a
@@ -408,17 +427,6 @@ export class StreamViewKeyboard {
                 btn.addEventListener('pointerup', release);
                 btn.addEventListener('pointercancel', release);
                 btn.addEventListener('lostpointercapture', release);
-            } else if (kind === 'sas') {
-                btn.addEventListener('pointerdown', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    // Latched modifiers first: the host is about to switch to
-                    // the secure desktop, where anything still held would stay
-                    // held with nobody to release it.
-                    this._releaseLatchedMods();
-                    this.webrtc.send({ type: 'secureattention' });
-                    this._refocusCapture();
-                });
             } else {
                 btn.addEventListener('pointerdown', (e) => {
                     e.preventDefault();
@@ -480,11 +488,21 @@ export class StreamViewKeyboard {
     }
 
     /** Send a toolbar action key (down+up) with the current latched mods, then
-     *  release the latches (one-shot sticky keys: Shift/Ctrl/Alt apply to the
+     *  release the latches (one-shot sticky keys: Shift/Ctrl/Alt/Win apply to
+     *  the next key only and auto-clear once it fires).
+     *  `ch`, for a letter or a digit typed under a latched modifier, makes it a
+     *  chord: `char` and `chord: true` beside the US position, so a host that
+     *  can resolves the shortcut by its character (InputMsg::resolveKey).
      * @this {StreamViewInstance}
-     *  next key only and auto-clear once it fires). */
-    _sendToolbarKey(vk) {
+     * @param {number} vk
+     * @param {string} [ch] */
+    _sendToolbarKey(vk, ch) {
+        /** @type {Record<string, unknown>} */
         const base = { keyCode: vk, code: '', key: '', ...this._modFlags() };
+        if (ch) {
+            base.char = ch;
+            base.chord = true;
+        }
         this._sendKeyEvent({ type: 'keydown', ...base });
         this._sendKeyEvent({ type: 'keyup', ...base });
         this._releaseLatchedMods();
@@ -543,7 +561,8 @@ export class StreamViewKeyboard {
      * @this {StreamViewInstance}
      *  Must run inside a user gesture (button tap / 3-finger tap). */
     _showVirtualKeyboard() {
-        if (!this._kbdCapture) return;
+        // A guest without keyboard: the 3-finger tap opens nothing either.
+        if (!this._kbdCapture || !this._mouseAllowed) return;
         this._resetKbdCapture();
         try {
             this._kbdCapture.focus({ preventScroll: true });
@@ -567,8 +586,24 @@ export class StreamViewKeyboard {
     _handleViewportResize() {
         const vv = window.visualViewport;
         if (!vv || !this.streamEl) return;
-        // In real fullscreen the keyboard rarely opens; skip to avoid fighting it.
-        const kbHeight = window.innerHeight - vv.height - vv.offsetTop;
+        // What the soft keyboard hides of the bottom of the layout viewport: all
+        // a bottom-anchored fixed element (the toast stack) has to clear.
+        const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        // Not every browser keeps the layout viewport when the keyboard opens.
+        // Chrome on an iPhone (27/10/2026) shrinks it with the visible area:
+        // `covered` then stays near 0 and the bar never showed, or, read before
+        // the layout caught up, the bar went that far above a bottom that had
+        // already moved — to the top of the screen. So the keyboard is told by
+        // the height the page had while no field held the focus, and the bar is
+        // placed from the top of the visible area, which holds either way.
+        const ae = document.activeElement;
+        const typing =
+            this._kbdVisible ||
+            (ae instanceof HTMLElement &&
+                (ae.isContentEditable || ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT'));
+        if (!typing || !this._layoutHeight) this._layoutHeight = window.innerHeight;
+        const kbHeight =
+            Math.max(this._layoutHeight, window.innerHeight) - vv.height - vv.offsetTop;
         if (kbHeight > KB_OPEN_THRESHOLD) {
             // Release `bottom` (set by inset:0) so `height` actually applies.
             this.streamEl.style.bottom = 'auto';
@@ -576,16 +611,31 @@ export class StreamViewKeyboard {
             // Park the special-keys bar just above the soft keyboard, then shrink
             // the stream by its height too so the bottom of the picture (e.g. the
             // Windows taskbar) stays visible above the bar instead of behind it.
+            // The pan the shorter area is about to clamp, for the way back, and
+            // where the clamp left it: a pan that moves from there is the
+            // user's own, kept when the keyboard closes (iPhone, 29/10/2026).
+            if (!this._panBeforeKbd) {
+                this._panBeforeKbd = { x: this._panX, y: this._panY, zoom: this._zoom };
+            }
+            const kept = this._panBeforeKbd;
+            if (kept.atX !== undefined && Math.abs(this._panX - kept.atX) > 0.5) kept.movedX = true;
+            if (kept.atY !== undefined && Math.abs(this._panY - kept.atY) > 0.5) kept.movedY = true;
             let tbHeight = 0;
             if (this._kbToolbar) {
-                this._kbToolbar.style.bottom = kbHeight + 'px';
                 this._kbToolbar.classList.add('visible');
                 tbHeight = this._kbToolbar.offsetHeight;
+                this._kbToolbar.style.bottom = 'auto';
+                this._kbToolbar.style.top = vv.offsetTop + vv.height - tbHeight + 'px';
             }
             this.streamEl.style.height = Math.max(0, vv.height - tbHeight) + 'px';
+            // Re-clamp the pan to the shorter area, then seat the picture.
+            if (this._applyZoomTransform) this._applyZoomTransform();
+            else this._seatPictureOnKbToolbar();
+            kept.atX = this._panX;
+            kept.atY = this._panY;
             // A hidden standby leg measures the same viewport as the live one;
             // let the visible view own the document-wide inset.
-            if (!this._standby) publishKbdInset(kbHeight + tbHeight);
+            if (!this._standby) publishKbdInset(covered + tbHeight);
         } else {
             // iOS Safari can hand over a page whose visible area starts inside
             // the layout viewport rather than at its top — seen after an update,
@@ -600,10 +650,66 @@ export class StreamViewKeyboard {
             this.streamEl.style.top = shifted ? vv.offsetTop + 'px' : '';
             this.streamEl.style.height = shifted ? vv.height + 'px' : '';
             this._hideKbToolbar();
+            // Closing the keyboard puts the picture back where it was before:
+            // the clamp to the shorter area moved it, not the user (iPhone,
+            // 27/10/2026). Only what the clamp moved, axis by axis: a pan the
+            // user made while typing stays, or closing the keyboard slides the
+            // desktop back sideways (iPhone, 29/10/2026). A zoom changed while
+            // typing keeps its own pan.
+            const before = this._panBeforeKbd;
+            this._panBeforeKbd = null;
+            if (before && Math.abs((before.zoom ?? 1) - (this._zoom ?? 1)) < 0.001) {
+                const untouched = (moved, at, now) =>
+                    !moved && (at === undefined || Math.abs(now - at) <= 0.5);
+                if (untouched(before.movedX, before.atX, this._panX)) this._panX = before.x;
+                if (untouched(before.movedY, before.atY, this._panY)) this._panY = before.y;
+            }
+            if (this._applyZoomTransform) this._applyZoomTransform();
+            else this._seatPictureOnKbToolbar(false);
             if (!this._standby) publishKbdInset(0);
         }
         // The header moves with the visible area; the stats card sits under it.
         this._positionStatsOverlay();
+    }
+
+    /**
+     * With the soft keyboard up, the picture rests a few pixels above the
+     * special-keys bar instead of in the middle of the area left to it: a
+     * landscape desktop on a portrait phone otherwise leaves half the spare
+     * height as a band of black between the picture and the bar (27/10/2026).
+     * The area is moved, not the picture inside it: every mapping of a touch
+     * or the cursor reads the area through getBoundingClientRect, which
+     * carries the move, so the letterbox arithmetic stays centred. A zoomed
+     * picture is measured at its zoom; once taller than the area it needs no
+     * move, the pan clamp (_applyZoomTransform) keeps its bottom on the bar.
+     * @this {StreamViewInstance}
+     * @param {boolean} [seat] false puts the area back where the layout has it.
+     */
+    _seatPictureOnKbToolbar(seat = true) {
+        const area = this.canvasArea;
+        if (!area) return;
+        let shift = 0;
+        if (seat && typeof this._surfaceIntrinsic === 'function') {
+            const [iw, ih] = this._surfaceIntrinsic(this._displayEl());
+            const w = area.offsetWidth,
+                h = area.offsetHeight;
+            if (iw > 0 && ih > 0 && w > 0 && h > 0) {
+                const zoom = this._zoom > 1.001 ? this._zoom : 1;
+                const picH = ih * Math.min(w / iw, h / ih) * zoom;
+                shift = Math.max(0, Math.floor((h - picH) / 2) - KB_PICTURE_GAP);
+            }
+        }
+        // Moved by its relative offset, never by a transform: a transformed
+        // ancestor becomes the containing block of its fixed descendants, and
+        // the pointer drawn for the trackpad (.stream-client-cursor, fixed,
+        // placed in viewport coordinates) then landed as far down as the area
+        // itself starts — the top of the picture out of its reach (iPhone,
+        // 28/10/2026).
+        const top = shift ? shift + 'px' : '';
+        if (area.style.top === top) return;
+        area.style.top = top;
+        this._invalidateMediaRect?.();
+        this._placeClientCursor?.();
     }
 
     /**
@@ -638,25 +744,34 @@ export class StreamViewKeyboard {
         if (!this._kbToolbar) return;
         this._kbToolbar.classList.remove('visible');
         // Release stuck modifiers so the host doesn't keep them held.
-        if (this._heldMods) {
-            for (const name of Object.keys(this._heldMods)) {
-                if (!this._heldMods[name]) continue;
-                this._heldMods[name] = false;
-                if (this._lockedMods) this._lockedMods[name] = false;
-                this._sendKeyEvent({
-                    type: 'keyup',
-                    keyCode: StreamViewKeyboard.MOD_VK[name],
-                    code: '',
-                    key: '',
-                    ctrlKey: false,
-                    shiftKey: false,
-                    altKey: false,
-                    metaKey: false,
-                });
-            }
-            this._kbToolbar
-                .querySelectorAll('.stream-kbd-key.active, .stream-kbd-key.locked')
-                .forEach((b) => b.classList.remove('active', 'locked'));
+        this._releaseAllMods();
+    }
+
+    /**
+     * Release every toolbar modifier, latched or locked, and clear the
+     * highlights.
+     *
+     * @this {StreamViewInstance}
+     */
+    _releaseAllMods() {
+        if (!this._heldMods || !this._kbToolbar) return;
+        for (const name of Object.keys(this._heldMods)) {
+            if (!this._heldMods[name]) continue;
+            this._heldMods[name] = false;
+            if (this._lockedMods) this._lockedMods[name] = false;
+            this._sendKeyEvent({
+                type: 'keyup',
+                keyCode: StreamViewKeyboard.MOD_VK[name],
+                code: '',
+                key: '',
+                ctrlKey: false,
+                shiftKey: false,
+                altKey: false,
+                metaKey: false,
+            });
         }
+        this._kbToolbar
+            .querySelectorAll('.stream-kbd-key.active, .stream-kbd-key.locked')
+            .forEach((b) => b.classList.remove('active', 'locked'));
     }
 }

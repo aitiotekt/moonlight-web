@@ -142,7 +142,9 @@ protected:
         ssl->setPeerVerifyMode(QSslSocket::VerifyNone);
 
         connect(ssl, &QSslSocket::encrypted, this, [this, ssl]() {
-            Logger::info("[HTTPS] TLS connection established");
+            // DEBUG: one per connection, a quarter of the log, and the ones
+            // that matter are the failures logged as warnings below.
+            Logger::debug("[HTTPS] TLS connection established");
             m_OnSslReady(ssl);
         });
 
@@ -152,10 +154,14 @@ protected:
             ssl->ignoreSslErrors();
         });
 
-        connect(ssl, &QAbstractSocket::errorOccurred, this, [ssl](QAbstractSocket::SocketError) {
-            Logger::warning("[HTTPS] Socket error: " + ssl->errorString());
-            ssl->deleteLater();
-        });
+        connect(ssl, &QAbstractSocket::errorOccurred, this,
+                [ssl](QAbstractSocket::SocketError error) {
+                    // A kept-alive connection is usually closed by the browser,
+                    // between two requests: nothing went wrong.
+                    if (error != QAbstractSocket::RemoteHostClosedError)
+                        Logger::warning("[HTTPS] Socket error: " + ssl->errorString());
+                    ssl->deleteLater();
+                });
 
         // Non-blocking SNI selection: peek the ClientHello once it arrives (via
         // readyRead) instead of blocking the accept thread with waitForReadyRead.
@@ -529,6 +535,7 @@ void HttpServer::stop()
     }
     m_Buffers.clear();
     m_PendingAsyncSockets.clear();
+    m_RequestIds.clear();
 }
 
 QTcpServer* HttpServer::createHttpsServer(quint16 port)
@@ -700,7 +707,11 @@ quint16 HttpServer::authorizeTunnelWebSocket(const HttpRequest& req, QString* ou
     }
 
     // No local exemption on this path, ever — see Arrival. A session is the only
-    // thing that opens it.
+    // thing that opens it, and only on the key it was paired with.
+    if (tunnelKeyRefused(req)) {
+        m_ConnGuard.reportAuthFailure(req.clientAddress);
+        return refuse(QStringLiteral("this session belongs to another browser"));
+    }
     if (m_AuthManager && !m_AuthManager->validateSession(sessionTokenFromRequest(req))) {
         m_ConnGuard.reportAuthFailure(req.clientAddress);
         return refuse(QStringLiteral("authentication required"));
@@ -835,6 +846,16 @@ int HttpServer::slotFromWsPath(const QString& path, bool* outIsRelay)
     return (ok && slot > 0) ? slot : -1;
 }
 
+bool HttpServer::tunnelKeyRefused(const HttpRequest& req) const
+{
+    if (!req.viaTunnel && req.tunnelKey.isEmpty()) return false;
+    if (!m_AuthManager) return false;
+    const QString token = sessionTokenFromRequest(req);
+    if (token.isEmpty()) return false;
+    return RequestGuard::tunnelKeyRefused(req.viaTunnel, req.tunnelKey,
+                                          m_AuthManager->sessionPairingKey(token));
+}
+
 bool HttpServer::isAuthenticated(const HttpRequest& req) const
 {
     if (!m_AuthManager) return true; // No auth manager = auth disabled
@@ -901,6 +922,10 @@ void HttpServer::onReadyRead()
 void HttpServer::onReadyReadSocket(QTcpSocket* socket)
 {
     m_Buffers[socket].append(socket->readAll());
+
+    // One request at a time on a connection: what a client sends before its
+    // answer waits in the buffer, and sendResponse() picks it up.
+    if (m_PendingAsyncSockets.contains(socket)) return;
 
     QByteArray& buffer = m_Buffers[socket];
     int headerEnd = buffer.indexOf("\r\n\r\n");
@@ -987,6 +1012,7 @@ void HttpServer::onDisconnected()
         bool wasPending = m_PendingAsyncSockets.contains(socket);
         m_Buffers.remove(socket);
         m_PendingAsyncSockets.remove(socket);
+        m_RequestIds.remove(socket);
         if (wasPending) {
             qWarning() << "[HttpServer] onDisconnected — socket had pending async request!"
                        << "peer=" << socket->peerAddress().toString() << ":" << socket->peerPort()
@@ -1062,10 +1088,24 @@ void HttpServer::processRequest(QTcpSocket* socket, const QByteArray& requestDat
         }
     }
 
+    // Keep the connection for the browser's next request unless it asked to
+    // close. Until 09/10/2026 every response closed its connection, so a page
+    // load cost ~128 TLS connections, one per file; from DualRTX's Chrome, one
+    // of them to mw-mac (Wi-Fi) regularly never opened, and the module it
+    // carried stopped the whole page, blank. A kept-alive page needs ~6.
+    // HTTP/1.0 closes by default and is answered so.
+    const int lineEnd = requestData.indexOf("\r\n");
+    const bool http11 = requestData.left(lineEnd).trimmed().endsWith("HTTP/1.1");
+    const bool keepAlive =
+        http11 && !req.headers.value("connection").contains("close", Qt::CaseInsensitive);
+
     const QString hostHeader = req.headers.value("host");
+    const quint64 requestId = ++m_NextRequestId;
+    m_RequestIds[socket] = requestId;
+    stopIdleClose(socket);
     m_PendingAsyncSockets.insert(socket);
-    QTimer::singleShot(ASYNC_TIMEOUT_MS, socket, [this, socket]() {
-        if (m_PendingAsyncSockets.contains(socket)) {
+    QTimer::singleShot(ASYNC_TIMEOUT_MS, socket, [this, socket, requestId]() {
+        if (m_PendingAsyncSockets.contains(socket) && m_RequestIds.value(socket) == requestId) {
             qWarning() << "[HttpServer] Async timeout for" << socket
                        << "peer=" << socket->peerAddress().toString();
             m_PendingAsyncSockets.remove(socket);
@@ -1074,13 +1114,14 @@ void HttpServer::processRequest(QTcpSocket* socket, const QByteArray& requestDat
     });
 
     serveRequest(std::move(req), Arrival::Socket,
-                 [this, socket, hostHeader](const HttpResponse& resp) {
-                     if (m_PendingAsyncSockets.contains(socket)) {
+                 [this, socket, hostHeader, requestId, keepAlive](const HttpResponse& resp) {
+                     if (m_PendingAsyncSockets.contains(socket) &&
+                         m_RequestIds.value(socket) == requestId) {
                          m_PendingAsyncSockets.remove(socket);
-                         sendResponse(socket, resp, hostHeader);
+                         sendResponse(socket, resp, hostHeader, keepAlive);
                      } else {
-                         // The socket is no longer pending because it disconnected
-                         // mid-request: onDisconnected() already did
+                         // This request was answered by the timeout (which closes),
+                         // or the socket disconnected mid-request: onDisconnected() did
                          // socket->deleteLater(), so by the time this async response
                          // arrives the QTcpSocket is a FREED QObject. Stream its
                          // ADDRESS as a plain void* — never the QObject* itself,
@@ -1149,6 +1190,20 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
         return;
     }
 
+    // A session cookie on another browser's tunnel is refused whole, before
+    // any route or privilege reads it: see tunnelKeyRefused. 401, which sends
+    // the page to its PIN screen, the one way to a session of its own.
+    if (viaTunnel && tunnelKeyRefused(req)) {
+        Logger::warning(QString("[HttpServer] Session refused on a tunnel whose browser key is not "
+                                "the session's: %1 %2 from %3")
+                            .arg(req.method, req.path, req.clientAddress));
+        m_ConnGuard.reportAuthFailure(req.clientAddress);
+        QJsonObject obj;
+        obj["error"] = "session_key_mismatch";
+        respond(HttpResponse::json(obj, 401));
+        return;
+    }
+
     const bool peerLocal = !viaTunnel && isLocalRequest(req.clientAddress);
     const QString sessionToken = sessionTokenFromRequest(req);
 
@@ -1173,6 +1228,7 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
     // password unlock, which judged that on the ICE address before promoting.
     ctx.adminKeyOk = (!viaTunnel || tunnelHost || ctx.adminSession) && adminKeyMatches(req);
     ctx.publicDomain = m_Certs.domain();
+    ctx.adminLocked = m_AdminLocked;
 
     const RequestGuard::Decision decision =
         RequestGuard::evaluate(RequestGuard::describe(req), ctx);
@@ -1194,7 +1250,16 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
                             .arg(req.headers.value("host"), req.path));
     }
 
+    if (m_AdminLocked && RequestGuard::lockedByNoAdmin(req.method, req.path, m_BoothShare)) {
+        QJsonObject obj;
+        obj["error"] = "admin_locked";
+        respond(HttpResponse::json(obj, 403));
+        return;
+    }
+
     const bool localPrivilege = decision.localPrivilege;
+    req.adminLocked = m_AdminLocked;
+    req.boothShare = m_AdminLocked && m_BoothShare;
     req.isLocal = decision.adminPrivilege;
     req.isHostMachine = decision.hostMachine;
     req.hostTrusted = decision.hostTrusted;
@@ -1235,9 +1300,50 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
     // fetch them in one pass instead of discovering them one redirect at a time.
     if (req.path == QLatin1String("/api/app/manifest")) {
         QJsonArray files;
+        // Beside the paths rather than in them: a bootstrap of before v0.4.1 reads
+        // `files` as a list of strings, and one of now still meets older hosts
+        // that send no sizes.
+        QJsonArray sizes;
+        // And what each one hashes to (sha256, hex), as this very request would
+        // be served it — the shell rewritten for the tunnel included. The
+        // bootstrap checks its cached copy against these on every start: every
+        // machine's interface shares one origin, so a page of another machine
+        // could have rewritten that cache, and this list, fetched from THIS
+        // machine over a channel its key signed, is what tells (R1, 26/10/2026).
+        // Empty where the copy legitimately differs: the web manifest, which
+        // carries a key of its own and which the signed-in page writes over.
+        QJsonArray hashes;
         const QStringList paths = m_StaticFiles->listFiles();
-        for (const QString& p : paths)
+        if (m_ShellHashesTag != m_StaticFiles->contentTag()) {
+            m_ShellHashes.clear();
+            m_ShellHashesTag = m_StaticFiles->contentTag();
+        }
+        for (const QString& p : paths) {
             files.append(p);
+            sizes.append(m_StaticFiles->servedSize(p));
+            const bool rewritten =
+                viaTunnel && m_HomeScreenIdentity && p == QLatin1String("/index.html");
+            if (p == QLatin1String("/manifest.webmanifest")) {
+                hashes.append(QString());
+                continue;
+            }
+            if (!rewritten) {
+                auto known = m_ShellHashes.constFind(p);
+                if (known != m_ShellHashes.constEnd()) {
+                    hashes.append(*known);
+                    continue;
+                }
+            }
+            HttpResponse file = m_StaticFiles->serveFile(p);
+            if (rewritten && file.statusCode == 200) personaliseForHomeScreen(req, file, QString());
+            const QString digest =
+                file.statusCode == 200
+                    ? QString::fromLatin1(
+                          QCryptographicHash::hash(file.body, QCryptographicHash::Sha256).toHex())
+                    : QString();
+            if (!rewritten) m_ShellHashes.insert(p, digest);
+            hashes.append(digest);
+        }
 
         // App version + a fingerprint of the served bytes. The bootstrap uses
         // this string alone to decide whether its cached copy of the whole
@@ -1265,8 +1371,10 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
                         .toHex()
                         .left(8));
         }
-        HttpResponse manifest = HttpResponse::json(
-            QJsonObject{{QStringLiteral("version"), version}, {QStringLiteral("files"), files}});
+        HttpResponse manifest = HttpResponse::json(QJsonObject{{QStringLiteral("version"), version},
+                                                               {QStringLiteral("files"), files},
+                                                               {QStringLiteral("sizes"), sizes},
+                                                               {QStringLiteral("sha256"), hashes}});
         manifest.headers["Cache-Control"] = "no-store";
         respond(manifest);
         return;
@@ -1488,6 +1596,10 @@ void HttpServer::handleWebSocketUpgrade(QTcpSocket* clientSocket, const QByteArr
     // Remove from our tracking — HttpServer should no longer manage this socket.
     m_Buffers.remove(clientSocket);
     m_PendingAsyncSockets.remove(clientSocket);
+    m_RequestIds.remove(clientSocket);
+    // A kept-alive connection may upgrade after other requests: its idle close
+    // must not cut the WebSocket it has become.
+    stopIdleClose(clientSocket);
 
     // Disconnect HttpServer's handlers from this socket so they don't interfere
     // with the bidirectional proxy.
@@ -1556,7 +1668,7 @@ void HttpServer::handleWebSocketUpgrade(QTcpSocket* clientSocket, const QByteArr
 }
 
 void HttpServer::sendResponse(QTcpSocket* socket, const HttpResponse& response,
-                              const QString& hostHeader)
+                              const QString& hostHeader, bool keepAlive)
 {
     // Only log failures — per-request logging floods the console with the
     // periodic /api/hosts polling.
@@ -1593,7 +1705,13 @@ void HttpServer::sendResponse(QTcpSocket* socket, const HttpResponse& response,
     // Defaults first, then the handler's own headers on top: a handler that sets
     // Cache-Control or a stricter policy wins, and neither can be emitted twice.
     QMap<QString, QString> headers = securityHeaders(hostHeader);
-    headers["Connection"] = "close";
+    keepAlive = keepAlive && socket->state() == QAbstractSocket::ConnectedState;
+    if (keepAlive) {
+        headers["Connection"] = "keep-alive";
+        headers["Keep-Alive"] = QString("timeout=%1").arg(KEEPALIVE_IDLE_MS / 1000);
+    } else {
+        headers["Connection"] = "close";
+    }
 
     for (auto it = response.headers.cbegin(); it != response.headers.cend(); ++it)
         headers[it.key()] = it.value();
@@ -1619,5 +1737,41 @@ void HttpServer::sendResponse(QTcpSocket* socket, const HttpResponse& response,
 
     socket->write(respData);
     socket->flush();
-    socket->disconnectFromHost();
+    if (!keepAlive) {
+        socket->disconnectFromHost();
+        return;
+    }
+
+    armIdleClose(socket);
+    // A request that came in behind this one waited in the buffer (pipelining);
+    // take it up from the event loop rather than from inside this answer.
+    if (!m_Buffers.value(socket).isEmpty()) {
+        QTimer::singleShot(0, socket, [this, socket]() {
+            if (m_Buffers.contains(socket) && !m_PendingAsyncSockets.contains(socket))
+                onReadyReadSocket(socket);
+        });
+    }
+}
+
+void HttpServer::armIdleClose(QTcpSocket* socket)
+{
+    auto* idle =
+        socket->findChild<QTimer*>(QStringLiteral("mw-keepalive-idle"), Qt::FindDirectChildrenOnly);
+    if (!idle) {
+        idle = new QTimer(socket);
+        idle->setObjectName(QStringLiteral("mw-keepalive-idle"));
+        idle->setSingleShot(true);
+        idle->setInterval(KEEPALIVE_IDLE_MS);
+        connect(idle, &QTimer::timeout, socket, [this, socket]() {
+            if (!m_PendingAsyncSockets.contains(socket)) socket->disconnectFromHost();
+        });
+    }
+    idle->start();
+}
+
+void HttpServer::stopIdleClose(QTcpSocket* socket)
+{
+    if (auto* idle = socket->findChild<QTimer*>(QStringLiteral("mw-keepalive-idle"),
+                                                Qt::FindDirectChildrenOnly))
+        idle->stop();
 }

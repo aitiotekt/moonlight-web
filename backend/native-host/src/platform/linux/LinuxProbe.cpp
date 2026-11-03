@@ -17,21 +17,31 @@
 
 #include "../../capture/linux/KmsCapture.h"
 #if defined(MW_NATIVE_LINUX_PORTAL)
+#include "../../capture/linux/GamescopeSession.h"
+#include "../../capture/linux/KwinVirtualOutput.h"
+#include "../../capture/linux/MutterScreenCast.h"
 #include "../../capture/linux/PortalScreenCast.h"
 #endif
+#include "../../core/LinuxRouteChoice.h"
 #include "../../core/Log.h"
 #include "../../core/Probe.h"
 #include "../../encode/OpenH264Encoder.h"
+#if defined(MW_NATIVE_LINUX_VULKAN)
+#include "../../encode/linux/Dav1dDecoder.h"
+#include "vulkan/VulkanDevice.h"
+#endif
 #include "../../input/linux/UinputGamepad.h"
 
 #include <fcntl.h>
 #include <glob.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 #include <va/va.h>
 #include <va/va_drm.h>
 #include <xf86drm.h>
 
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -48,8 +58,13 @@
 // running and whoever is logged in — that is the point of choosing it (see
 // KmsCapture.h). So the question Windows has to ask ("can this process reach a
 // desktop?") becomes "is anything being shown at all?", which is a CRTC with a
-// framebuffer. A machine whose screen is off, or headless, answers no and is
-// reported as such rather than as a capture failure.
+// framebuffer. A machine whose screen is off answers no and is reported as
+// such rather than as a capture failure.
+//
+// One exception: a Wayland session this process can reach, on a build with the
+// portal's route. A machine with no monitor at all still runs one — autologin
+// on a mini PC under the TV's shelf — and its compositor can make the virtual
+// display for a stream (enumerate() lists it then, or says why it cannot).
 
 namespace mw::native::platform {
 namespace {
@@ -78,6 +93,19 @@ std::string cardStableId(const std::string& cardPath)
         return device.substr(device.rfind('/') + 1);
     }
     return cardPath;
+}
+
+/// An X11 session, as the session says: XDG_SESSION_TYPE, or — when it names
+/// neither (unset; "tty" for a process started over ssh) — a DISPLAY with no
+/// WAYLAND_DISPLAY beside it.
+[[maybe_unused]] bool isX11Session()
+{
+    const char* type = std::getenv("XDG_SESSION_TYPE");
+    if (type && std::strcmp(type, "wayland") == 0) return false;
+    if (type && std::strcmp(type, "x11") == 0) return true;
+    const char* display = std::getenv("DISPLAY");
+    const char* wayland = std::getenv("WAYLAND_DISPLAY");
+    return display && *display && !(wayland && *wayland);
 }
 
 /// Whether the machine has a battery of its own. A mouse or a UPS reports one
@@ -239,6 +267,25 @@ bool hasInteractiveSession()
         for (const capture::KmsOutput& out : capture::KmsCapture::listOutputs(card, error))
             if (out.active) return true;
     }
+#if defined(MW_NATIVE_LINUX_PORTAL)
+    // ...or, with nothing shown, a Wayland session to make a display in. Before
+    // this, a machine with no monitor was "no interactive desktop session", and
+    // its native host card was gone — measured on the GNOME 48 VM with its only
+    // connector off (video=Virtual-1:d), gnome-shell running headless, the
+    // portal offering VIRTUAL (01/10/2026).
+    if (!isX11Session()) {
+        const char* wayland = std::getenv("WAYLAND_DISPLAY");
+        if (wayland && *wayland) {
+            std::string socket = wayland;
+            if (socket.front() != '/') {
+                const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+                socket = std::string(runtime ? runtime : "") + "/" + socket;
+            }
+            struct stat st = {};
+            if (::stat(socket.c_str(), &st) == 0 && S_ISSOCK(st.st_mode)) return true;
+        }
+    }
+#endif
     return false;
 }
 
@@ -296,6 +343,21 @@ Unavailability enumerate(Capabilities& caps)
         int indexOnCard = 0;
         for (const capture::KmsOutput& out : capture::KmsCapture::listOutputs(card, error)) {
             if (!out.connected) continue;
+            // Connected, but with nothing KMS shows on it: no card for it — a
+            // launch could only fail ("the display is disconnected", seen on
+            // the UM790Pro's GTX 1050 under X11, 30/09/2026). LinuxSession
+            // counts displays by this same rule, so the index it is handed
+            // still names the card that was picked.
+            if (!out.active) {
+                log::info("[native] " + out.name + " on " + card +
+                          " is connected but KMS shows nothing on it — not offered: " +
+                          (gpu.vendorId == 0x10DE
+                               ? "NVIDIA's own X driver sets its modes without KMS, and its "
+                                 "picture cannot be captured here"
+                               : "a screen switched off in the display settings, or one being "
+                                 "reconfigured"));
+                continue;
+            }
             DisplayInfo display;
             display.id = nextDisplayId++;
             display.gpuId = gpu.id;
@@ -308,13 +370,12 @@ Unavailability enumerate(Capabilities& caps)
             display.hdrActive = false;
             // KMS has no notion of a primary; the one at the desktop's origin
             // is what every compositor treats as such.
-            display.primary = !anyPrimary && out.x == 0 && out.y == 0 && out.active;
+            display.primary = !anyPrimary && out.x == 0 && out.y == 0;
             if (display.primary) anyPrimary = true;
             display.label = "Display " + std::to_string(display.id + 1);
             display.detail = out.name + " \xE2\x80\x94 " + std::to_string(out.width) + "\xC3\x97" +
                              std::to_string(out.height) + " \xC2\xB7 " +
-                             std::to_string((out.refreshMilliHz + 500) / 1000) + " Hz" +
-                             (out.active ? "" : " (off)");
+                             std::to_string((out.refreshMilliHz + 500) / 1000) + " Hz";
             display.kind = classifyConnectorName(out.name);
             display.key = cardStableId(card) + "/" + out.name;
             caps.displays.push_back(display);
@@ -326,11 +387,92 @@ Unavailability enumerate(Capabilities& caps)
         ++nextGpuId;
     }
 
-    if (caps.displays.empty()) {
+#if defined(MW_NATIVE_LINUX_PORTAL)
+    // The portal's VIRTUAL source: a monitor the compositor creates for a
+    // stream, at the client's size, and removes after it (GNOME 46+ says so
+    // in AvailableSourceTypes; GNOME 42 and KDE 5 do not). Listed whatever
+    // route the real monitors take — it has only the one — and even with no
+    // monitor at all, which is the headless machine it exists for.
+    //
+    // Not under X11: GNOME's portal says VIRTUAL there too (7 on the UM790Pro,
+    // 30/09/2026), but only its Wayland compositor can make such a monitor —
+    // under X11 the card would lead to a session that fails.
+    const uint32_t sourceTypes = capture::PortalScreenCast::sourceTypes();
+    bool portalVirtual = (sourceTypes & capture::PortalScreenCast::kSourceVirtual) != 0;
+    if (portalVirtual && isX11Session()) {
+        portalVirtual = false;
+        log::info("[native] the portal offers a virtual display, but this is an X11 session, "
+                  "where GNOME cannot make one — not offered");
+    }
+    // GNOME's own screen cast (MutterScreenCast.h, plan Idées Punktfunk C2),
+    // which the session asks before the portal: no dialog, and GNOME 42 to 45
+    // too, whose portal makes no virtual monitor. Wayland only, as above.
+    int mutterVersion = 0;
+    if (!isX11Session()) {
+        std::string why;
+        mutterVersion = capture::MutterScreenCast::version(why);
+    }
+    const bool mutterVirtual = mutterVersion >= capture::MutterScreenCast::kVirtualVersion;
+    portalVirtual = portalVirtual || mutterVirtual;
+    // KDE Plasma 6: its portal offers no VIRTUAL source (6.3: types 3), KWin
+    // makes the monitor itself (KwinVirtualOutput.h). Offered on KWin's word
+    // alone: whether it trusts the program is asked by the session, from the
+    // helper without capabilities — this process, the server's, may hold one.
+    bool kwinVirtual = false;
+    std::string kwinWhy;
+    if (!portalVirtual && sourceTypes != 0 && !isX11Session()) {
+        bool kwin = false;
+        bool granted = false;
+        if (capture::KwinVirtualOutput::probe(kwin, granted, kwinWhy) && kwin) {
+            kwinVirtual = true;
+            kwinWhy = granted ? "KWin grants its screencast protocol"
+                              : "KWin's grant is checked when the stream starts";
+        }
+    }
+    portalVirtual = portalVirtual || kwinVirtual;
+
+    // Steam's Big Picture in its own gamescope (GamescopeSession.h, plan Idées
+    // Punktfunk, chapter G): a gamescope recent enough and a Steam someone
+    // uses. No desktop needed — an X11 session, or none, has this card too.
+    // The user's own apps (G5) need gamescope alone: one hidden entry for them
+    // all, which the server turns into a card per app of its settings.
+    std::string gamescopeWhy;
+    std::string gamescopeDetail;
+    std::string gamescopeVersion;
+    bool gamescopeSteam = false;
+    bool gamescopeApps = false;
+    {
+        capture::GamescopeBinary gamescope;
+        if (capture::findGamescope(gamescope, gamescopeWhy)) {
+            gamescopeApps = true;
+            gamescopeVersion = gamescope.version.text();
+            const std::vector<capture::SteamInstall> installs = capture::findSteamInstalls();
+            int pid = 0;
+            const int chosen = capture::chooseSteam(installs, capture::runningDesktopSteam(pid));
+            if (chosen >= 0) {
+                gamescopeSteam = true;
+                gamescopeDetail = "Steam (" +
+                                  std::string(capture::toString(
+                                      installs[static_cast<size_t>(chosen)].packaging)) +
+                                  ") in its own gamescope " + gamescope.version.text() +
+                                  ", made at the client's size when the stream starts";
+            } else {
+                gamescopeWhy = installs.empty() ? "Steam is not installed"
+                                                : "no Steam install was ever signed in to";
+            }
+        }
+        if (!gamescopeSteam) log::debug("[native] no Steam Big Picture card: " + gamescopeWhy);
+    }
+#else
+    const bool portalVirtual = false;
+    const bool gamescopeSteam = false;
+    const bool gamescopeApps = false;
+#endif
+    if (caps.displays.empty() && !portalVirtual && !gamescopeSteam && !gamescopeApps) {
         caps.diagnostic = "no display is connected";
         return Unavailability::NoDisplay;
     }
-    if (!anyPrimary) caps.displays.front().primary = true;
+    if (!anyPrimary && !caps.displays.empty()) caps.displays.front().primary = true;
     caps.hasBattery = hasSystemBattery();
 
     // The privilege check, once, so the host list can say why rather than a
@@ -355,7 +497,7 @@ Unavailability enumerate(Capabilities& caps)
     // would be offering three buttons that all do the same thing and none of
     // them what they say. The size shown is the primary output's, as a
     // reasonable guess — the real one arrives when the compositor negotiates.
-    if (caps.capture != CaptureApi::Kms) {
+    if (caps.capture != CaptureApi::Kms && !caps.displays.empty()) {
         std::string reason;
         if (capture::PortalScreenCast::available(reason)) {
             const DisplayInfo* hint = nullptr;
@@ -383,6 +525,108 @@ Unavailability enumerate(Capabilities& caps)
             log::info("[native] no capability to read the scanout (" + caps.diagnostic +
                       ") \xE2\x80\x94 falling back to the ScreenCast portal, which asks the user "
                       "once");
+            caps.diagnostic.clear();
+        }
+    }
+
+    if (portalVirtual) {
+        // Encoded where an encoder is: the compositor renders it on whichever
+        // GPU it likes, and the portal hands it over like any of its streams.
+        const GpuInfo* gpu = nullptr;
+        for (const GpuInfo& g : caps.gpus)
+            if (!gpu && !g.encoders.empty() && !g.codecs.empty()) gpu = &g;
+        if (!gpu && !caps.gpus.empty()) gpu = &caps.gpus.front();
+        int nextId = 0;
+        for (const DisplayInfo& d : caps.displays)
+            nextId = std::max(nextId, d.id + 1);
+        DisplayInfo virt;
+        virt.id = nextId;
+        virt.gpuId = gpu ? gpu->id : -1;
+        // Nominal: the real size is the client's, set when the stream starts.
+        virt.width = 1920;
+        virt.height = 1080;
+        virt.refreshMilliHz = 60000;
+        virt.primary = caps.displays.empty();
+        virt.label = "Virtual display";
+        virt.model = "Virtual display";
+        virt.kind = DisplayKind::Virtual;
+        virt.key = kPortalVirtualDisplayKey;
+        virt.capture = CaptureApi::PipeWire;
+        virt.detail = mutterVirtual ? "created by GNOME at the client's size when the stream "
+                                      "starts, and shared by the streams on it (Mutter's screen "
+                                      "cast, version " +
+                                          std::to_string(mutterVersion) + ")"
+                      : kwinVirtual ? "created by KWin at the client's size when the stream "
+                                      "starts (" +
+                                          kwinWhy + ")"
+                                    : "created by the ScreenCast portal at the client's size "
+                                      "when the stream starts (source types " +
+                                          std::to_string(sourceTypes) + ")";
+        caps.displays.push_back(virt);
+        // Nothing else to capture: this display's route is the machine's.
+        if (caps.capture != CaptureApi::Kms && caps.capture != CaptureApi::PipeWire &&
+            caps.displays.size() == 1) {
+            caps.capture = CaptureApi::PipeWire;
+            caps.diagnostic.clear();
+        }
+    }
+
+    if (gamescopeSteam) {
+        // Encoded where an encoder is, like the virtual display: gamescope
+        // renders on the GPU Vulkan picks, and its node hands the picture over.
+        const GpuInfo* gpu = nullptr;
+        for (const GpuInfo& g : caps.gpus)
+            if (!gpu && !g.encoders.empty() && !g.codecs.empty()) gpu = &g;
+        if (!gpu && !caps.gpus.empty()) gpu = &caps.gpus.front();
+        int nextId = 0;
+        for (const DisplayInfo& d : caps.displays)
+            nextId = std::max(nextId, d.id + 1);
+        DisplayInfo steam;
+        steam.id = nextId;
+        steam.gpuId = gpu ? gpu->id : -1;
+        // Nominal, as the virtual display's: the size is the client's.
+        steam.width = 1920;
+        steam.height = 1080;
+        steam.refreshMilliHz = 60000;
+        steam.primary = caps.displays.empty();
+        steam.label = "Steam Big Picture";
+        steam.model = "Steam Big Picture";
+        steam.kind = DisplayKind::Virtual;
+        steam.key = kGamescopeSteamDisplayKey;
+        steam.capture = CaptureApi::PipeWire;
+        steam.detail = gamescopeDetail;
+        caps.displays.push_back(steam);
+        if (caps.capture != CaptureApi::Kms && caps.capture != CaptureApi::PipeWire &&
+            caps.displays.size() == 1) {
+            caps.capture = CaptureApi::PipeWire;
+            caps.diagnostic.clear();
+        }
+    }
+
+    if (gamescopeApps) {
+        const GpuInfo* gpu = nullptr;
+        for (const GpuInfo& g : caps.gpus)
+            if (!gpu && !g.encoders.empty() && !g.codecs.empty()) gpu = &g;
+        if (!gpu && !caps.gpus.empty()) gpu = &caps.gpus.front();
+        int nextId = 0;
+        for (const DisplayInfo& d : caps.displays)
+            nextId = std::max(nextId, d.id + 1);
+        DisplayInfo apps;
+        apps.id = nextId;
+        apps.gpuId = gpu ? gpu->id : -1;
+        apps.width = 1920;
+        apps.height = 1080;
+        apps.refreshMilliHz = 60000;
+        apps.label = "Apps in gamescope";
+        apps.kind = DisplayKind::Virtual;
+        apps.key = kGamescopeAppDisplayKey;
+        apps.capture = CaptureApi::PipeWire;
+        apps.detail = "the user's own apps, each in its own gamescope " + gamescopeVersion +
+                      " at the client's size (a card per app of the settings)";
+        caps.displays.push_back(apps);
+        if (caps.capture != CaptureApi::Kms && caps.capture != CaptureApi::PipeWire &&
+            caps.displays.size() == 1) {
+            caps.capture = CaptureApi::PipeWire;
             caps.diagnostic.clear();
         }
     }
@@ -419,6 +663,58 @@ void probeFallbackEncoders(Capabilities& caps)
     cpu.hardware = false;
     cpu.name = encode::OpenH264Encoder::version();
     caps.fallbacks.push_back(std::move(cpu));
+}
+
+std::vector<Codec> offerSessionCodecs(Capabilities& caps, const SessionConfig& config)
+{
+    // AV1, the one codec only Vulkan Video encodes here (C13.12): added to a
+    // GPU that encodes through VA-API already — the chain falls back to it for
+    // everything else — only for a session whose bench key, setting or vendor
+    // table (AMD's since 05/10/2026) asks for the Vulkan Video chain on that
+    // GPU, and only where the GPU's Vulkan driver shows an AV1 encoder and
+    // this build can prove one at the pixel.
+    // A session that would have encoded through VA-API is never handed AV1;
+    // the proof itself runs in the session, which falls back to the client's
+    // next codec if it does not pass (LinuxSession::buildPipeline).
+    std::vector<Codec> added;
+#if defined(MW_NATIVE_LINUX_VULKAN)
+    if (!encode::Dav1dDecoder::built()) return added;
+    for (GpuInfo& gpu : caps.gpus) {
+        if (std::find(gpu.encoders.begin(), gpu.encoders.end(), EncoderApi::VaApi) ==
+                gpu.encoders.end() ||
+            std::find(gpu.codecs.begin(), gpu.codecs.end(), Codec::Av1) != gpu.codecs.end())
+            continue;
+        if (linuxWantedPipeline(config.tuning.pipeline, config.videoPipeline, gpu.vendorId) !=
+            VideoPipeline::Vulkan)
+            continue;
+        std::string renderNode;
+        for (const std::string& card : cardPaths()) {
+            if (cardHandle(card) != gpu.nativeHandle) continue;
+            const int fd = ::open(card.c_str(), O_RDWR | O_CLOEXEC);
+            if (fd < 0) break;
+            if (char* node = drmGetRenderDeviceNameFromFd(fd)) {
+                renderNode = node;
+                std::free(node);
+            }
+            ::close(fd);
+            break;
+        }
+        vulkan::DeviceIdentity id;
+        std::string error;
+        if (renderNode.empty() || !vulkan::VulkanDevice::identify(renderNode, id, error) ||
+            !id.encodesAv1)
+            continue;
+        gpu.codecs.push_back(Codec::Av1);
+        if (added.empty()) added.push_back(Codec::Av1);
+        log::info("[native] " + gpu.name +
+                  ": AV1 offered to this session, through Vulkan Video (the chain it asks for), "
+                  "once the pixel proof passes");
+    }
+#else
+    (void)caps;
+    (void)config;
+#endif
+    return added;
 }
 
 VirtualGamepad probeVirtualGamepad()

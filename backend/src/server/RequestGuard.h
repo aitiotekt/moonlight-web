@@ -19,6 +19,7 @@
 
 #include "common/Types.h"
 
+#include <QByteArray>
 #include <QMap>
 #include <QString>
 
@@ -110,6 +111,7 @@ struct Context
     bool hostSession = false;  ///< valid host-key session cookie
     bool adminSession = false; ///< session that unlocked admin with the remote password
     bool adminKeyOk = false;   ///< request carries the current admin key
+    bool adminLocked = false;  ///< launched with --noadmin: nobody administers
     QString publicDomain;      ///< the domain we answer to, "" when none
 };
 
@@ -154,5 +156,22 @@ enum class AdminTokenReply
 /// feed ConnectionGuard and eventually ban a legitimate remote user from their
 /// own server.
 AdminTokenReply adminTokenReply(const Decision& decision, const Context& ctx, bool authenticated);
+
+/// Whether --noadmin refuses this request outright. adminPrivilege already
+/// closes every "localhost only" route; these are the ones that change what a
+/// booth offers without being admin routes: every change to the host list
+/// (add, scan, remove, rename, pair, restart its service, set up its backend,
+/// its seats — anything but waking a host and playing on it), the
+/// self-update, letting a new device or guest in (PIN login, share slots, a
+/// guest's PIN), the admin unlock and the system actions. shareAllowed
+/// (share_in_booth_mode, issue #40) lets the share slots and a guest's PIN
+/// through, and nothing else.
+bool lockedByNoAdmin(const QString& method, const QString& path, bool shareAllowed = false);
+
+/// Whether a session arrives over a tunnel whose browser key is not the one it
+/// was paired with (HttpServer::tunnelKeyRefused): @p boundKey is the session's
+/// key, empty for a session older than key binding. A request off the tunnel
+/// carries no key and is never refused here.
+bool tunnelKeyRefused(bool viaTunnel, const QByteArray& tunnelKey, const QByteArray& boundKey);
 
 } // namespace RequestGuard

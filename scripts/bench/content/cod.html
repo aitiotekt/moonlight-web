@@ -87,6 +87,50 @@ function tuneToFps() {
 }
 v.addEventListener("playing", tuneToFps, { once: true });
 setTimeout(() => { applyRate(); v.play().catch(e => console.log("play refused: " + e)); }, 3000);
+
+// ?band=time: the host's steady clock at each of the page's frames, over the
+// top-left corner of the clip, for the client's content-age probe — the same
+// band as scroll.html's (see there), so the release comparison measures the
+// age on the footage it measures everything else on (13/10/2026). Nothing is
+// drawn until mwBand.calibrate(offsetMs) (scripts/bench/content-age/age.py).
+if (q.get("band") === "time") {
+  const dpr = window.devicePixelRatio || 1;
+  const bandW = Math.round(window.innerWidth * dpr);
+  const c = document.createElement("canvas");
+  c.width = Math.round(40 * bandW / 100);
+  c.height = Math.round(2 * bandW / 100);
+  c.style.cssText = "position:fixed;left:0;top:0;z-index:10;image-rendering:pixelated;" +
+    "display:none;width:" + c.width / dpr + "px;height:" + c.height / dpr + "px";
+  document.body.appendChild(c);
+  const g = c.getContext("2d");
+  let offsetMs = null;
+  window.mwBand = {
+    calibrate(o) {
+      offsetMs = o;
+      c.style.display = "block";
+      return "band calibrated: " + bandW + " px wide, offset " + o.toFixed(3) + " ms";
+    },
+    width: bandW,
+  };
+  const check = (u) => (((u & 255) + ((u >>> 8) & 255) + ((u >>> 16) & 255) + (u >>> 24)) ^ 0xa5) & 255;
+  const draw = (t) => {
+    if (offsetMs !== null) {
+      const units = Math.floor((t + offsetMs) * 100) % 4294967296;
+      const k = check(units);
+      const r1 = Math.round(bandW / 100), r2 = Math.round(2 * bandW / 100);
+      for (let bit = 0; bit < 40; bit++) {
+        const one = bit < 32 ? Math.floor(units / 2 ** bit) % 2 === 1 : ((k >> (bit - 32)) & 1) === 1;
+        const x0 = Math.round(bit * bandW / 100), x1 = Math.round((bit + 1) * bandW / 100);
+        g.fillStyle = one ? "#fff" : "#000";
+        g.fillRect(x0, 0, x1 - x0, r1);
+        g.fillStyle = one ? "#000" : "#fff";
+        g.fillRect(x0, r1, x1 - x0, r2 - r1);
+      }
+    }
+    requestAnimationFrame(draw);
+  };
+  requestAnimationFrame(draw);
+}
 </script>
 <script src="escape.js"></script>
 </body>

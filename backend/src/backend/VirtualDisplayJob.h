@@ -20,6 +20,7 @@
 #include "backend/VirtualDisplay.h"
 
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QJsonObject>
 #include <QList>
 #include <QObject>
@@ -70,22 +71,60 @@ public:
     ///
     /// @p width × @p height is the size the client asked the display to have
     /// ("Match my screen"); 0×0 takes whatever mode is there, which is what
-    /// every other resolution choice does. @p refresh is the rate the
-    /// client's own screen runs at, which the display takes whatever the
-    /// resolution choice; 0 is the default rate. A display already on in
+    /// every other resolution choice does. @p refreshMilliHz is the rate the
+    /// stream chose for the display (main.cpp: 240 Hz on Windows, or the
+    /// client's screen matched under `vddmatch`), which the display takes
+    /// whatever the resolution choice; 0 is the default rate. A display already on in
     /// another mode is put through the operation again — the driver's mode
     /// list is rewritten and the node restarted — because a mode that is not
     /// the client's is the one thing this choice cannot live with.
-    void activate(int width, int height, int refresh, Callback cb);
-    void activate(Callback cb) { activate(0, 0, 0, std::move(cb)); }
+    ///
+    /// @p hdr: the viewer asked for HDR. macOS makes its display able to
+    /// show it (EDR) only then — an SDR stream off a display declared in
+    /// BT.2020 would come out washed. Windows ignores it: its display is SDR.
+    void activate(int width, int height, int refreshMilliHz, bool hdr, Callback cb);
+    void activate(Callback cb) { activate(0, 0, 0, false, std::move(cb)); }
+
+    /// For an invited guest, who arrives with no owner stream on it: turn the
+    /// display on, in that mode, when it is off. On already — whatever its
+    /// mode — or on its way on, it is left as it is and answers once it is
+    /// there: another guest may be watching it, and a new mode would take it
+    /// from them for as long as the driver restarts. SDR (Windows' display
+    /// is, and a guest's stream is). Cancels a pending releaseSoon().
+    void activateIfOff(int width, int height, int refreshMilliHz, Callback cb);
 
     /// Turn it off (previous primary back, disable). @p cb may be null.
     void deactivate(Callback cb);
 
-    /// Turn it off in a few seconds unless activate() comes first.
-    void releaseSoon();
+    /// Turn it off in a few seconds unless activate() comes first. A longer
+    /// @p graceMs holds it for a stream that is coming back (its worker
+    /// crashed, and the page starts it again); a pending longer grace is never
+    /// cut short by a later call.
+    void releaseSoon(int graceMs = 0);
+
+    /// Asked when that grace runs out: true while a stream still shows the
+    /// display, which then stays on. A take-over asks for the display
+    /// (cancelling the grace) BEFORE the stream it replaces is torn down, and
+    /// that teardown starts the grace again — under the new stream.
+    void setInUse(std::function<bool()> inUse) { m_InUse = std::move(inUse); }
+
+    /// Asked when the display is about to go off for good (no stream left
+    /// once the grace ran out; on Linux, at the stream's end): closes what
+    /// was opened on it, so it does not land on a physical screen instead
+    /// (HostAppLauncher: Steam leaves Big Picture). True when it closed
+    /// something — the display then waits kCloseSettleMs before going off,
+    /// for that window to be gone.
+    void setBeforeRelease(std::function<bool()> beforeRelease)
+    {
+        m_BeforeRelease = std::move(beforeRelease);
+    }
+    static constexpr int kCloseSettleMs = 3000;
 
     bool running() const;
+
+    /// The rate, in millihertz, this process last turned the display on at
+    /// and that it is still on at; 0 when it is off or that rate is unknown.
+    int activeRefreshMilliHz() const { return m_ActiveRefresh; }
 
     /// {state, action, error?, started_at, finished_at?, display?}
     QJsonObject statusJson() const;
@@ -98,16 +137,20 @@ private:
         VirtualDisplay::Request::Action action;
         int width = 0;
         int height = 0;
-        int refresh = 0;
+        int refreshMilliHz = 0;
+        bool hdr = false;
         Callback cb;
     };
 
-    void enqueue(VirtualDisplay::Request::Action action, int width, int height, int refresh,
-                 Callback cb);
+    void enqueue(VirtualDisplay::Request::Action action, int width, int height, int refreshMilliHz,
+                 bool hdr, Callback cb);
     void startNext();
     void setState(State s);
     void fail(const QString& error);
     void succeed(const VirtualDisplay::Result& res);
+    /// Windows: the guard that brings the other displays back if this
+    /// process dies during an exclusive stream (VirtualDisplayApply::guard).
+    void startGuard();
     void settle(bool ok, const QString& error);
 
     void dispatch();
@@ -128,13 +171,18 @@ private:
     /// second viewer asking for the same one joins instead of switching it.
     int m_ActiveWidth = 0;
     int m_ActiveHeight = 0;
-    int m_ActiveRefresh = 0;
+    int m_ActiveRefresh = 0; ///< millihertz
+    bool m_ActiveHdr = false;
     QDateTime m_StartedAt;
     QDateTime m_FinishedAt;
 
     QTimer m_Poll;
     QTimer m_Deadline;
     QTimer m_Release;
+    /// Since when runTask() waits for the task's previous run to end.
+    QElapsedTimer m_TaskBusySince;
+    std::function<bool()> m_InUse;
+    std::function<bool()> m_BeforeRelease;
     QByteArray m_HelperOut;
     // The service path runs the node stage as SYSTEM and the desktop stages
     // in the console session, one child each; these are the ones still to run.
@@ -142,4 +190,7 @@ private:
     // macOS: the request was applied in this process and the poll is waiting
     // for the OS to list the display; this is the result to deliver then.
     std::optional<VirtualDisplay::Result> m_InProcessResult;
+    /// The mode the caller asked for, while fail() walks the request towards
+    /// the default one (VirtualDisplay::fallbackTowardsDefault).
+    std::optional<VirtualDisplay::Request> m_AskedBeforeFallback;
 };

@@ -181,3 +181,29 @@ describe('WebRtcDataChannel ride-out watchdog', () => {
         expect(t._rideOutSince).toBe(0);
     });
 });
+
+describe('WebRtcDataChannel — frames of the RTP audio road', () => {
+    it('hands the frame id on and asks nothing when a frame was given up on', () => {
+        const t = transport();
+        t.connected = true;
+        t.healsByInvalidation = true;
+        const seen = [];
+        t.onVideo = (frame, key, ts, frameId) => seen.push(frameId);
+        t._onRtpVideoFrame(new Uint8Array([1]), true, 10, false, 41);
+        // 42 never came: the next frame arrives marked lost, id 43.
+        t._onRtpVideoFrame(new Uint8Array([2]), false, 11, true, 43);
+        expect(seen).toEqual([41, 43]);
+        expect(idrRequests(t)).toBe(0);
+    });
+
+    it('without a frame id, a loss still asks for a keyframe on any host', () => {
+        const t = transport();
+        t.connected = true;
+        t.healsByInvalidation = true;
+        t.onVideo = vi.fn();
+        t._onRtpVideoFrame(new Uint8Array([1]), true, 10, false);
+        t._onRtpVideoFrame(new Uint8Array([2]), false, 11, true);
+        expect(idrRequests(t)).toBe(1);
+        expect(t.onVideo).toHaveBeenCalledTimes(1);
+    });
+});

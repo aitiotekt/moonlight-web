@@ -1,0 +1,22 @@
+{
+  "meta.title": "连接你的主机 — MoonlightWeb",
+  "meta.description": "在任意浏览器中输入代码即可打开你的 MoonlightWeb 主机——专为没有地址栏、无法输入主机链接的设备而设计。",
+  "crumbs": "<a href=\"/\">首页</a> / 连接主机",
+  "kicker": "连接主机",
+  "h1": "打开你的主机",
+  "lead": "输入主机代码，即可在此浏览器中打开它。专为<strong>没有地址栏</strong>、无法输入主机链接的设备设计。",
+  "label": "主机代码",
+  "open": "打开",
+  "err": "这不是主机代码：主机代码由 26 个字母和数字组成，即主机链接的末尾部分。",
+  "hint": "直接粘贴完整链接也可以。",
+  "last.label": "最近从这里打开：",
+  "last.forget": "忘记",
+  "h2.where": "代码在哪里？",
+  "p.where": "在主机电脑上，设置好<strong>互联网访问</strong>后，MoonlightWeb 会显示其链接，例如 <code>stream.moonlightweb.top/a1b2c3d4e5f6g7h8j9k0m1n2</code>。代码就是最后一个 <code>/</code> 之后的部分：26 个字母和数字。",
+  "h2.once": "每台设备只需一次",
+  "p.once": "主机用 PIN 码解锁后，此浏览器会记住它。如果你解锁了两台或更多主机，可在应用内的菜单中切换，无需重新输入。本页也会记住最近从这里打开的代码。",
+  "x.faq.t": "阅读常见问题",
+  "x.faq.d": "大多数问题这里已有答案。",
+  "x.guides.t": "设置主机",
+  "x.guides.d": "在要串流的电脑上安装 MoonlightWeb。"
+}

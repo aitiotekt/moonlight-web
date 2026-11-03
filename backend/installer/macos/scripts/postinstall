@@ -132,6 +132,51 @@ fi
     || echo "WARN: chown app-data failed"
 echo "chowned app-data to $CONSOLE_USER"
 
+# ── 2a bis) Hand the app bundle to the user too, the way Chrome and Firefox own
+#    theirs in /Applications. The app runs as them, and owning its bundle is
+#    what lets it update itself from the web UI without a password prompt
+#    (SelfUpdater's "bundle" path: it checks the new app's signature against
+#    its own before copying it in). Nothing root ever runs comes from in there:
+#    the firewall entry below only names the binary.
+if [ "$CONSOLE_UID" != "0" ]; then
+    /usr/sbin/chown -R "$CONSOLE_USER" "$APP" || echo "WARN: chown app bundle failed"
+    echo "chowned $APP to $CONSOLE_USER"
+fi
+
+# ── 2a ter) Remove the copy an older package left in ~/Applications. Before
+#    the package stopped being relocatable (12/10/2026), Installer upgraded a
+#    bundle it found there in place, so such a Mac now has two: the stale one
+#    shows up in Launchpad and Spotlight, and opening it runs an old build
+#    beside the new one. Only this edition's bundle, and only once it proves to
+#    be ours (our identifier, our executable name); anything else of that name
+#    is left alone. A copy still running is stopped first.
+OLD_APP="$CONSOLE_HOME/Applications/$APP_NAME.app"
+OLD_EXE="$OLD_APP/Contents/MacOS/$APP_NAME"
+if [ "$CONSOLE_UID" != "0" ] && [ -d "$OLD_APP" ] && [ ! "$OLD_APP" -ef "$APP" ]; then
+    OLD_ID="$(/usr/bin/defaults read "$OLD_APP/Contents/Info" CFBundleIdentifier 2>/dev/null)"
+    case "$OLD_ID" in
+        com.moonlightweb.*)
+            if [ -x "$OLD_EXE" ]; then
+                OLD_PATTERN="^$OLD_EXE( |\$)"
+                if /usr/bin/pgrep -u "$CONSOLE_UID" -f "$OLD_PATTERN" >/dev/null; then
+                    /usr/bin/pkill -TERM -u "$CONSOLE_UID" -f "$OLD_PATTERN"
+                    for _ in 1 2 3 4 5 6 7 8 9 10; do
+                        /usr/bin/pgrep -u "$CONSOLE_UID" -f "$OLD_PATTERN" >/dev/null || break
+                        /bin/sleep 0.5
+                    done
+                    /usr/bin/pkill -KILL -u "$CONSOLE_UID" -f "$OLD_PATTERN" 2>/dev/null
+                    echo "stopped the old copy running from $OLD_APP"
+                fi
+                /bin/rm -rf "$OLD_APP" && echo "removed the old copy $OLD_APP ($OLD_ID)" \
+                    || echo "WARN: could not remove $OLD_APP"
+            else
+                echo "left $OLD_APP alone: no $APP_NAME executable inside"
+            fi
+            ;;
+        *) echo "left $OLD_APP alone: identifier '$OLD_ID' is not ours" ;;
+    esac
+fi
+
 # ── 2b) Allow the app through the macOS application firewall. It is per-app
 #    (not per-port), so this covers every port the server ever binds — 443, a
 #    per-instance parity port (e.g. when another device already forwards 443 on
@@ -150,9 +195,36 @@ fi
 #    user while they are still sitting at this Mac: the native engine's probe
 #    asks for the permission on startup, and TCC only shows that prompt for a
 #    running program. Nothing here can grant it on their behalf.
+#
+#    An update lands on a running app: the bundle on disk is new, the process
+#    is not, and `open -a` only brings the old one forward. So this edition's
+#    own LaunchAgent, when it is running, is restarted in place
+#    (`kickstart -k`: launchd stops it and starts the new binary, --autostart,
+#    no browser). Otherwise any instance of this edition's binary, started by
+#    hand, is asked to quit before the launch. The other edition's app and
+#    agent have their own names and are never touched.
 if [ "$CONSOLE_UID" != "0" ]; then
-    /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" \
-        /usr/bin/open -a "$APP" || echo "WARN: could not launch the app"
+    if /bin/launchctl print "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null \
+            | /usr/bin/grep -q 'state = running'; then
+        /bin/launchctl kickstart -k "gui/$CONSOLE_UID/$AGENT_LABEL" \
+            && echo "restarted the running $AGENT_LABEL" \
+            || echo "WARN: could not restart $AGENT_LABEL"
+    else
+        # Whole command line anchored on the exact path: MoonlightWeb and
+        # MoonlightWebDev never match each other.
+        PATTERN="^$EXE( |\$)"
+        if /usr/bin/pgrep -u "$CONSOLE_UID" -f "$PATTERN" >/dev/null; then
+            /usr/bin/pkill -TERM -u "$CONSOLE_UID" -f "$PATTERN"
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+                /usr/bin/pgrep -u "$CONSOLE_UID" -f "$PATTERN" >/dev/null || break
+                /bin/sleep 0.5
+            done
+            /usr/bin/pkill -KILL -u "$CONSOLE_UID" -f "$PATTERN" 2>/dev/null
+            echo "stopped the running $APP_NAME"
+        fi
+        /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" \
+            /usr/bin/open -a "$APP" || echo "WARN: could not launch the app"
+    fi
 fi
 
 # ── Cleanup: the hand-off is short-lived by design; it no longer carries any

@@ -20,6 +20,15 @@
 #     never touched the rendezvous. Here each service is rebuilt with --no-deps,
 #     and only if its own directory differs between the two commits.
 #
+#   - Restarting Caddy closes every WebSocket of stream.: the host lines and
+#     the browsers', one by one. When a browser's goes before its host's, the
+#     rendezvous tells that host "the browser left", and the host takes down a
+#     tunnel a stream may still be using — a stream on the host's own LAN too.
+#     So the rendezvous is stopped before Caddy restarts and started after: a
+#     SIGTERM ends it without those goodbyes, and hosts reconnect by themselves
+#     within seconds. Images are built first, while everything still serves,
+#     so that window is a container restart, not a compile.
+#
 #   - Nothing is asked interactively. These lines get pasted into a terminal,
 #     and a prompt in the middle of a paste eats the next pasted line as its
 #     answer. The dry run IS the confirmation step.
@@ -32,7 +41,36 @@ set -Eeuo pipefail
 # --quiet fetch refusing a tag did exactly that — reads like a hang.
 trap 'echo "deploy-prod.sh: stopped at line $LINENO — \"$BASH_COMMAND\" failed (exit $?)" >&2' ERR
 
+# Who is on the line. The rendezvous counts the host lines it holds and the
+# browser sessions on them (/healthz "online" and "sessions"). A rendezvous
+# older than "sessions" leaves the browsers to Caddy, which counts the
+# requests open to the rendezvous (admin API, num_requests) — a WebSocket is
+# one long request, so that is host lines plus browsers. Best effort: a stack
+# that does not answer prints "unknown" and stops nothing.
+line_census() {
+    local health online browsers open
+    health="$(docker exec moonlight-mw-rendezvous wget -qO- http://127.0.0.1:8090/healthz 2>/dev/null)" || health=""
+    online="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["online"])' <<<"$health" 2>/dev/null)" || online=""
+    browsers="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["sessions"])' <<<"$health" 2>/dev/null)" || browsers=""
+    if [[ -n "$online" && -z "$browsers" ]]; then
+        open="$(docker exec moonlight-caddy wget -qO- http://127.0.0.1:2019/reverse_proxy/upstreams 2>/dev/null \
+            | python3 -c 'import json, sys; print(sum(u.get("num_requests", 0) for u in json.load(sys.stdin) if u["address"].startswith("mw-rendezvous:")))' 2>/dev/null)" || open=""
+        [[ -n "$open" ]] && browsers=$((open > online ? open - online : 0))
+    fi
+    if [[ -z "$online" || -z "$browsers" ]]; then
+        echo "  host lines / browsers: unknown (the rendezvous or Caddy did not answer)"
+        return 0
+    fi
+    echo "  host lines online : $online"
+    echo "  browsers connected: $browsers"
+}
+
 main() {
+    # Nothing here reads stdin, and nothing may. backup-prod.sh's `docker
+    # compose exec` keeps it open (-T only drops the TTY): fed a script through
+    # `ssh box bash -s < script`, it swallowed the rest of that script after
+    # the checkout, and in a terminal it would take the next pasted line.
+    exec </dev/null
     local ref="${1:-}" mode="${2:-}"
     if [[ -z "$ref" || "$ref" == "-h" || "$ref" == "--help" ]]; then
         sed -n '2,7p' "$0"
@@ -129,6 +167,8 @@ main() {
         && notes+=("bootstrap/ is bind-mounted: served on the next request, nothing to rebuild")
     grep -q '^website/' <<<"$changed" \
         && notes+=("website/ is bind-mounted: served on the next request, nothing to rebuild")
+    grep -q '^website/' <<<"$changed" \
+        && notes+=("website/ changed: once it is served, resubmit sitemap.xml in Search Console and request indexing of the new or changed pages")
     grep -q '^deploy/powerdns/pdns/' <<<"$changed" \
         && notes+=("pdns/ changed: bind-mounted, takes effect on 'docker compose restart pdns' (DNS blips for a second — pick the moment)")
     grep -q '^deploy/powerdns/dnsdist/' <<<"$changed" \
@@ -148,10 +188,35 @@ main() {
         printf '  - %s\n' "${notes[@]}"
     fi
 
+    local restarts_caddy=0
+    [[ " ${rebuild[*]} " == *" caddy "* ]] && restarts_caddy=1
+    if ((restarts_caddy)); then
+        echo
+        echo "Caddy restarts: the rendezvous (and staging's, if it runs) is stopped"
+        echo "just before and started just after. Streams carry on; a browser page"
+        echo "loaded before srv-2026-10-14-b1 still loses its tunnel — on the line now:"
+        line_census
+    fi
+
     if ((!apply)); then
         echo
         echo "dry run — nothing was changed. Re-run with --apply to do the above."
         exit 0
+    fi
+
+    # Cold backup before anything moves (backup-prod.sh: dated ZIP, three
+    # kept). No backup, no deploy. A checkout older than the backup script
+    # takes it from the target tag, so the first deploy that ships it is
+    # covered too.
+    echo
+    if [[ -f backup-prod.sh ]]; then
+        bash ./backup-prod.sh
+    elif git cat-file -e "$target:deploy/powerdns/backup-prod.sh" 2>/dev/null; then
+        git show "$target:deploy/powerdns/backup-prod.sh" > /tmp/mw-backup-prod.sh
+        bash /tmp/mw-backup-prod.sh
+    else
+        echo "refusing: neither this checkout nor $ref has backup-prod.sh — no backup, no deploy" >&2
+        exit 1
     fi
 
     echo
@@ -159,12 +224,50 @@ main() {
     git checkout --quiet --detach "$target"
     echo "now on $(git describe --tags --always HEAD)"
 
-    local svc
+    if ((${#rebuild[@]})); then
+        echo
+        echo "building ${rebuild[*]} while everything still serves…"
+        docker compose build "${rebuild[@]}"
+    fi
+
+    local held_rdv=0 held_dev=0
+    if ((restarts_caddy)); then
+        echo
+        echo "before Caddy restarts:"
+        line_census
+        echo "stopping the rendezvous first, so that it tells no host its browser left…"
+        docker compose stop mw-rendezvous
+        held_rdv=1
+        # stream.dev's lines run through this Caddy too.
+        if [[ "$(docker inspect -f '{{.State.Running}}' mw-dev-rendezvous 2>/dev/null)" == true ]]; then
+            docker stop mw-dev-rendezvous >/dev/null
+            held_dev=1
+        fi
+    fi
+
+    # Caddy comes before mw-rendezvous in the list. A failure does not end the
+    # script here: a stopped rendezvous must be started again whatever happens.
+    local svc failed=""
     for svc in "${rebuild[@]}"; do
         echo
-        echo "rebuilding $svc…"
-        docker compose up -d --no-deps --build "$svc"
+        echo "restarting $svc on its new image…"
+        docker compose up -d --no-deps "$svc" || { failed="$svc"; break; }
     done
+
+    if ((held_rdv)); then
+        echo
+        echo "starting the rendezvous again…"
+        docker compose start mw-rendezvous
+        ((held_dev)) && docker start mw-dev-rendezvous >/dev/null
+        # Hosts retry their line within seconds; give them that, then count.
+        sleep 20
+        echo "after:"
+        line_census
+    fi
+    if [[ -n "$failed" ]]; then
+        echo "deploy-prod.sh: '$failed' did not come up on its new image — see above" >&2
+        exit 1
+    fi
 
     echo
     docker compose ps

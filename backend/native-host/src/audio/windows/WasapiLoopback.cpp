@@ -34,11 +34,13 @@
 #include <mmdeviceapi.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <future>
+#include <string>
 #include <vector>
 
 namespace mw::native::audio {
@@ -185,8 +187,11 @@ struct LoopbackDevice
 
 } // namespace
 
-WasapiLoopback::WasapiLoopback(AudioCallback onPacket)
+WasapiLoopback::WasapiLoopback(AudioCallback onPacket, int frameSamples, int graceUs)
     : m_OnPacket(std::move(onPacket))
+    , m_FrameSamples(AudioPacer::isFrameSamples(frameSamples) ? frameSamples
+                                                              : AudioPacer::kFrameSamples)
+    , m_GraceUs(std::max(0, graceUs))
 {}
 
 WasapiLoopback::~WasapiLoopback()
@@ -265,7 +270,7 @@ void WasapiLoopback::runLoop()
 
     OpusEncoder encoder;
     std::string error;
-    if (!encoder.open(error)) {
+    if (!encoder.open(error, m_FrameSamples)) {
         resolveFirst(error);
         if (coOwned) CoUninitialize();
         return;
@@ -277,10 +282,10 @@ void WasapiLoopback::runLoop()
         if (coOwned) CoUninitialize();
         return;
     }
-    log::info("[native] audio: WASAPI loopback on the default output, 48 kHz stereo -> Opus 5 ms "
-              "(" +
-              std::string(OpusEncoder::libraryVersion()) + "), endpoint buffer " +
-              std::to_string(device->bufferFrames) + " frames");
+    const int frameMs = m_FrameSamples / (AudioPacer::kSampleRate / 1000);
+    log::info("[native] audio: WASAPI loopback on the default output, 48 kHz stereo -> Opus " +
+              std::to_string(frameMs) + " ms (" + std::string(OpusEncoder::libraryVersion()) +
+              "), endpoint buffer " + std::to_string(device->bufferFrames) + " frames");
     resolveFirst(std::string());
 
     // Pro Audio: the class the OS reserves for exactly this loop. Refused in
@@ -306,9 +311,16 @@ void WasapiLoopback::runLoop()
                          nullptr, FALSE);
     }
 
-    AudioPacer pacer(4);
+    // Four 5 ms frames of slack, 20 ms; longer frames (`audioframe=`) keep the
+    // 20 ms, never fewer than two frames. The tick above stays at 5 ms either
+    // way: it is how often the endpoint is drained, not the frame.
+    AudioPacer pacer(std::max(2, 20 / frameMs), m_FrameSamples);
+    if (m_GraceUs > 0) pacer.setUnderrunGraceUs(m_GraceUs);
     pacer.start(steadyNowUs());
-    std::vector<float> frame(AudioPacer::kFrameFloats);
+    // What the pacer holds behind each frame it sends, summed over the minute:
+    // the sound's wait in the host, which the grace trades against silence.
+    int64_t heldSamples = 0, heldFrames = 0;
+    std::vector<float> frame(pacer.frameFloats());
     std::vector<uint8_t> packet;
     int64_t lastReopenAttemptUs = 0;
     int64_t lastReportUs = steadyNowUs();
@@ -350,34 +362,64 @@ void WasapiLoopback::runLoop()
             }
         }
 
+        // With a grace (`audiograce=<ms>`), a frame owed while the loopback's
+        // packet is a little late waits for it, that long at most: the next
+        // wake, on the endpoint's event or the 5 ms tick, asks again. Without
+        // it, silence goes out at once and the late packet, arriving on top
+        // of a queue the clock no longer drains, costs a dropped frame later.
         const int due = pacer.dueFrames(now);
         for (int i = 0; i < due; ++i) {
-            pacer.pop(frame.data());
+            bool captured = true;
+            if (m_GraceUs > 0) {
+                const AudioPacer::Take got = pacer.take(frame.data(), now);
+                if (got == AudioPacer::Take::Deferred) break;
+                captured = got == AudioPacer::Take::Frame;
+            } else {
+                captured = pacer.pop(frame.data());
+            }
+            heldSamples += static_cast<int64_t>(pacer.queuedSamples());
+            heldFrames++;
             const size_t n = encoder.encode(frame.data(), packet);
             if (n == 0) continue;
             AudioPacket out;
             out.data = packet.data();
             out.size = n;
-            out.samplesPerChannel = AudioPacer::kFrameSamples;
+            out.samplesPerChannel = m_FrameSamples;
             out.capturedUs = now;
+            out.queuedFrames = static_cast<int>(pacer.queuedFrames());
+            out.peak = AudioPacer::peakOf(frame.data(), frame.size());
+            out.silence = !captured;
             m_OnPacket(out);
             m_Packets.fetch_add(1, std::memory_order_relaxed);
         }
 
         // Once a minute, and only when there is something to say: the two
-        // counters that tell a saturated thread from a quiet host.
+        // counters that tell a saturated thread from a quiet host. A bench's
+        // own grace (`audiograce=`) reports every minute, to be compared.
         if (now - lastReportUs >= 60'000'000) {
             lastReportUs = now;
             const int64_t dropped = pacer.droppedFrames();
             const int64_t underruns = pacer.underruns();
-            if (dropped != reportedDropped || pacer.reanchors() > 0) {
+            if (dropped != reportedDropped || pacer.reanchors() > 0 ||
+                m_GraceUs != kDefaultGraceUs) {
+                // Held behind each frame sent, in tenths of a millisecond.
+                const int64_t heldTenthsMs =
+                    heldFrames > 0 ? heldSamples * 10'000 / (heldFrames * AudioPacer::kSampleRate)
+                                   : 0;
                 log::info("[native] audio: " + std::to_string(dropped - reportedDropped) +
                           " frames dropped (queue full), " +
                           std::to_string(underruns - reportedUnderruns) +
-                          " sent as silence, in the last minute");
+                          " sent as silence, in the last minute; " +
+                          std::to_string(heldTenthsMs / 10) + "." +
+                          std::to_string(heldTenthsMs % 10) + " ms held on average" +
+                          (m_GraceUs > 0 ? " (grace " + std::to_string(m_GraceUs) +
+                                               " us: " + std::to_string(pacer.deferrals()) +
+                                               " waits for a late capture so far)"
+                                         : std::string()));
             }
             reportedDropped = dropped;
             reportedUnderruns = underruns;
+            heldSamples = heldFrames = 0;
         }
     }
 

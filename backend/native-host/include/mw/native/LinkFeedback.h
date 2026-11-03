@@ -53,6 +53,23 @@ struct LinkFeedback
     /// check on the rest; 0 when unknown.
     int receivedFps = 0;
 
+    /// SCTP chunks the host sent again in the window, per thousand it sent.
+    /// Filled by the host (DataChannelRelay). On a Mac in Wi-Fi they are mostly
+    /// datagrams the browser's full socket dropped, and each one shrinks the
+    /// congestion window: the frames then wait inside usrsctp, ~20 ms more than
+    /// on Ethernet, with no rise the receiver's minimum delay would show (plan
+    /// Wi-Fi W1 bis). The rate governor cuts on it (`retrcut=`, 3 by default
+    /// on the Windows host).
+    int retransPermille = 0;
+
+    /// Frames the relay shed in the window because the video's send buffer
+    /// had stayed backed up past its tolerance (SendBacklog: "link not
+    /// draining"). Filled by the host. They never got a frame number, so the
+    /// receiver sees no gap: the link overflowed at the rate in force, which
+    /// the governor takes as overuse unless the bench's ovfgood=0 says not to
+    /// (plan « Gels du lien », G).
+    int overflows = 0;
+
     /// The receiver's first report after its page was hidden or frozen. The
     /// gaps it names were frames the host's own sender evicted because nobody
     /// was draining them, and the silence before it was the browser's, not the

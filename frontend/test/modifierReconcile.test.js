@@ -51,6 +51,7 @@ function keySink(overrides = {}) {
         handleKeyUp: StreamView.prototype.handleKeyUp,
         _sendKeyEvent: StreamView.prototype._sendKeyEvent,
         _reconcileModifiers: StreamView.prototype._reconcileModifiers,
+        _markAltGrCtrl: StreamView.prototype._markAltGrCtrl,
         _forgetHeldKey: StreamView.prototype._forgetHeldKey,
         _holdsThroughStall: StreamView.prototype._holdsThroughStall,
         _releaseKeysHeldUnderMeta: StreamView.prototype._releaseKeysHeldUnderMeta,
@@ -264,5 +265,134 @@ describe('the closing beat of the held-input heartbeat', () => {
         // A forced beat with nothing held must not then owe a closing one.
         v._sendInputState();
         expect(v.sent.length).toBe(1);
+    });
+});
+
+describe('a Windows AltGr', () => {
+    // Chrome on Windows: AltGr is a left Ctrl and a right Alt going down
+    // together, and from the right Alt on, getModifierState says AltGraph and
+    // neither Control nor Alt. Read as up, the Ctrl was let go of as the Alt
+    // went down, then the Alt at the next key with nothing between: Notepad
+    // turned its KeyTips on at each @ (29/10/2026).
+    const VK_RMENU = 0xa5; // the right Alt: AltGr on a European layout
+
+    function pressAltGr(v) {
+        v.handleKeyDown(evState('ControlLeft', 'Control', ['Control'], { ctrlKey: true }));
+        v.handleKeyDown(
+            evState('AltRight', 'AltGraph', ['AltGraph'], { ctrlKey: true, altKey: true }),
+        );
+    }
+
+    it('keeps its Ctrl and Alt down for the character it types', () => {
+        const v = keySink();
+        pressAltGr(v);
+        v.handleKeyDown(evState('Digit0', '@', ['AltGraph'], { ctrlKey: true, altKey: true }));
+
+        expect(v.sent.filter((m) => m.type === 'keyup')).toEqual([]);
+        expect(v.sent.slice(0, 2).map((m) => [m.type, m.keyCode])).toEqual([
+            ['keydown', VK_LCTRL],
+            ['keydown', VK_RMENU],
+        ]);
+        expect(v._heldPhysKeys.has('ControlLeft')).toBe(true);
+        expect(v._heldPhysKeys.has('AltRight')).toBe(true);
+    });
+
+    it('still lets go of a Shift the event says is up', () => {
+        const v = keySink();
+        v.handleKeyDown(evState('ShiftLeft', 'Shift', ['Shift'], { shiftKey: true }));
+        v.handleKeyDown(evState('ControlLeft', 'Control', ['Shift', 'Control'], { ctrlKey: true }));
+        v.handleKeyDown(
+            evState('AltRight', 'AltGraph', ['Shift', 'AltGraph'], { ctrlKey: true, altKey: true }),
+        );
+        v.sent.length = 0;
+        v.handleKeyDown(evState('Digit0', '@', ['AltGraph'], { ctrlKey: true, altKey: true }));
+
+        expect(v.sent[0]).toMatchObject({ type: 'keyup', code: 'ShiftLeft' });
+    });
+
+    it('lets go of its Ctrl and Alt once AltGraph is gone too', () => {
+        const v = keySink();
+        pressAltGr(v);
+        v.sent.length = 0;
+        // Both key-ups lost: the next plain key says nothing is held.
+        v.handleKeyDown(evState('KeyA', 'a', []));
+
+        expect(
+            v.sent
+                .filter((m) => m.type === 'keyup')
+                .map((m) => m.keyCode)
+                .sort(),
+        ).toEqual([VK_LCTRL, VK_RMENU].sort());
+    });
+});
+
+describe('the left Ctrl Windows puts under an AltGr', () => {
+    // Windows sends it with the right Alt, in the same millisecond. Held, it
+    // kept AltGr+E from typing € on a Linux host (issue #44, 29/10/2026): its
+    // release goes out marked, for the server to pass to a positional host
+    // only, and the key stays held here, marked, for the heartbeat.
+    const VK_RMENU = 0xa5;
+
+    function at(e, t) {
+        e.timeStamp = t;
+        return e;
+    }
+
+    function pressAltGrAt(v, ctrlAt, altAt) {
+        v.handleKeyDown(
+            at(evState('ControlLeft', 'Control', ['Control'], { ctrlKey: true }), ctrlAt),
+        );
+        v.handleKeyDown(
+            at(
+                evState('AltRight', 'AltGraph', ['AltGraph'], { ctrlKey: true, altKey: true }),
+                altAt,
+            ),
+        );
+    }
+
+    it('goes up, marked, before the right Alt goes down', () => {
+        const v = keySink();
+        pressAltGrAt(v, 1000, 1000);
+
+        expect(v.sent.map((m) => [m.type, m.keyCode, !!m.altGrCtrl])).toEqual([
+            ['keydown', VK_LCTRL, false],
+            ['keyup', VK_LCTRL, true],
+            ['keydown', VK_RMENU, false],
+        ]);
+        // Still held here, marked: the heartbeat names it, and the native host
+        // keeps it down.
+        expect(v._heldPhysKeys.get('ControlLeft').altGrCtrl).toBe(true);
+    });
+
+    it('is told apart from a Ctrl a hand pressed first', () => {
+        const v = keySink();
+        pressAltGrAt(v, 1000, 1250);
+
+        expect(v.sent.filter((m) => m.altGrCtrl)).toEqual([]);
+        expect(v._heldPhysKeys.get('ControlLeft').altGrCtrl).toBeFalsy();
+    });
+
+    it('is not a Linux AltGr, which has no Ctrl', () => {
+        const v = keySink();
+        v.handleKeyDown(at(evState('AltRight', 'AltGraph', ['AltGraph']), 1000));
+
+        expect(v.sent.map((m) => [m.type, m.keyCode])).toEqual([['keydown', VK_RMENU]]);
+    });
+
+    it('is named as such in the heartbeat', () => {
+        const v = keySink({
+            _heldMouseButtons: new Set(),
+            _gamepadManager: null,
+            _lastBeatHadState: false,
+            _sendToHost: (m) => v.sent.push(m),
+            _sendInputState: StreamView.prototype._sendInputState,
+        });
+        pressAltGrAt(v, 1000, 1001);
+        v.sent.length = 0;
+        v._sendInputState();
+
+        const keys = v.sent[0].keys;
+        expect(keys.find((k) => k.code === 'ControlLeft').altGrCtrl).toBe(true);
+        expect(keys.find((k) => k.code === 'AltRight').altGrCtrl).toBe(false);
     });
 });

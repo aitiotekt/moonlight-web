@@ -42,15 +42,23 @@ class UpdateChecker;
  *
  *   Windows  scheduled task "MoonlightWeb Update" (registered elevated by the
  *            installer, RunLevel=HighestAvailable, no trigger) → `schtasks /Run`
- *            elevates with NO UAC prompt. Its action points at a fixed staging
- *            path under %LocalAppData% (per-user, so no other local account can
- *            plant an executable that we would then run elevated).
+ *            elevates with NO UAC prompt. Its action is our own exe under
+ *            {app} with --update-apply (UpdateApply.h): it copies what we
+ *            staged under %LocalAppData% somewhere the user cannot write and
+ *            runs it only once it matches GitHub's digest (and our signer).
  *            Fallback: launch the installer directly → UAC on the host desktop.
  *   Linux    AppImage → replace the file in place, no root at all. Running as
- *            root (systemd system unit) → dpkg/rpm directly.
+ *            root (systemd system unit) → dpkg/rpm directly. A .deb/.rpm of
+ *            the production edition → its root helper upgrades it from our
+ *            signed repository, through a polkit action the package grants
+ *            to the active session without a password.
  *            Fallback: pkexec → polkit prompt on the host desktop.
- *   macOS    root → `installer -pkg`. Fallback: osascript "with administrator
- *            privileges" → password prompt on the host desktop.
+ *   macOS    bundle owned by the user (the .pkg's postinstall hands it over)
+ *            → unpack the .pkg, check the app's signature against ours, copy
+ *            it over the bundle: no root at all. Root → `installer -pkg`.
+ *            Fallback (a root-owned bundle, i.e. any install made before the
+ *            hand-over): osascript "with administrator privileges" → password
+ *            prompt on the host desktop.
  *
  * capabilityJson() reports which path applies so the UI can warn ("a
  * confirmation is required on the host PC") instead of hanging on a prompt
@@ -81,6 +89,12 @@ public:
     // string once the download is under way, or a human-readable error.
     QString start();
 
+    // Where the downloaded installer is staged. On Windows the elevated
+    // --update-apply helper (UpdateApply.h) picks it up from this same path,
+    // copies it somewhere the user cannot write and verifies the copy.
+    static QString stagingDir();
+    static QString stagedFileName(const QString& assetName);
+
 private:
     enum class State
     {
@@ -105,9 +119,21 @@ private:
     // last check. Refetch and replay the download once; true when that is under
     // way (the caller must return), false when it is not worth trying again.
     bool retryOnStaleMetadata(const QString& reason);
+    // Installing state, pseudo-progress, then runInstaller().
+    void startInstallPhase();
     void runInstaller();
     void onInstallerFinished(int exitCode, bool crashed);
     void armWatchdog();
+#ifndef Q_OS_WIN
+    // Start the detached install → kill us → relaunch sequence. False (and the
+    // update failed) when even that could not start.
+    bool launchDetached(const QString& install);
+#endif
+#ifdef Q_OS_MACOS
+    // The "bundle" path: unpack the .pkg, check the app it carries against our
+    // own designated requirement, then copy it over the user-owned bundle.
+    void prepareBundle();
+#endif
 #ifdef Q_OS_WIN
     // Run the installer from a transient LocalSystem task so it is NOT a child
     // of this process. Empty on success, else the error to report.
@@ -120,14 +146,8 @@ private:
     // may still be picked up by a prompt waiting on the host desktop.
     void fail(const QString& message, bool dropStaged = true);
 
-    // Where the downloaded installer is staged. On Windows this MUST match the
-    // path baked into the elevated scheduled task's action (see moonlightweb.iss
-    // RegisterUpdateTask) or the task runs nothing.
-    static QString stagingDir();
-    static QString stagedFileName(const QString& assetName);
-
     // Preferred elevation path for this machine ("scheduled-task", "service",
-    // "appimage", "root", "direct", "pkexec", "osascript"). Empty when the
+    // "appimage", "bundle", "repo", "root", "direct", "pkexec", "osascript"). Empty when the
     // platform has no unattended path at all.
     static QString elevationMethod();
     static bool methodNeedsHostConfirmation(const QString& method);
@@ -155,7 +175,7 @@ private:
     QTimer* m_installTick = nullptr;       // pseudo-progress while the installer runs
     int m_installElapsedMs = 0;            // drives the install easing curve
     QTimer* m_watchdog = nullptr;          // gives up when the installer never lands
-    QProcess* m_installer = nullptr;       // Windows: kept to read its exit code
+    QProcess* m_installer = nullptr;       // Windows installer / macOS unpack: exit code
     QTimer* m_recheckGuard = nullptr;      // bounds the wait on a forced check
     QMetaObject::Connection m_recheckWait; // that check's one-shot subscription
     bool m_recheckDone = false;            // one retry per start(), never a loop

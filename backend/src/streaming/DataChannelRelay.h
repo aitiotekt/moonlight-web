@@ -21,14 +21,26 @@
 
 #include "RelayBase.h"
 #include "HostLagTracker.h"
+#include "HostUploadCap.h"
+#include "HostUplink.h"
+#include "HostUplinkReader.h"
 #include "LinkFreezeLog.h"
 #include "SendBacklog.h"
 #include "FrameSender.h"
+#include "LinkLoss.h"
+#include "MwsrZoneBlock.h"
+#include "RelayFrameLog.h"
+#include "SctpCounters.h"
+#include "AroadPacer.h"
+#include "mw/native/EncoderTuning.h"
 #include <QByteArray>
 #include <QElapsedTimer>
+#include <QJsonObject>
 #include <QMutex>
 #include <QTimer>
 #include <array>
+#include <deque>
+#include <vector>
 #include <memory>
 #include <atomic>
 #include <string>
@@ -44,6 +56,7 @@ class Track;
 } // namespace rtc
 
 class IMediaEngine;
+class SctpFlood;
 
 // WebRTC DataChannel relay that replaces StreamRelay.
 // Forwards video/audio from the media engine + input from the browser over a
@@ -97,6 +110,8 @@ public:
     bool addRemoteCandidate(const std::string& candidate, const std::string& mid) override;
 
     void stop() override;
+
+    void endFromSignaling() override;
 
     /// Hides RelayBase::setInputPolicy: in direct-input mode the policy is read
     /// on a libdatachannel thread while the session pushes updates onto the
@@ -159,6 +174,26 @@ public:
     /// the relay moves to its own thread, like the flags above.
     void setStreamBitrateKbps(int kbps) { m_StreamBitrateKbps = kbps; }
 
+    /// The bench's link keys of a native session (plan Idées Punktfunk, A0):
+    /// its losses (`loss=`, `burst=`), usrsctp's congestion module (`sctpcc=`)
+    /// and a flood on channel id 3 (`flood=`, SctpFlood.h). All off unless a
+    /// bench set them in MW_NATIVE_TUNING or native_tuning. Set once before
+    /// prepare(), like the flags above.
+    void setLinkBench(const mw::native::EncoderTuning& tuning);
+
+    /// The silent video section (`rxbuf=`) for a session the native host does
+    /// not serve, which takes none of setLinkBench's other keys. Before
+    /// prepare().
+    void setRxBufVideo(bool on) { m_RxBufVideo = on; }
+
+    /// Which codecs ride an RTP video track instead of the video DataChannel
+    /// (POC Ultra U1.4): `native:h264+hevc+av1+ultra;other:h264+hevc+av1`, the
+    /// section matching @p nativeHost applies. Matched against the engine's
+    /// negotiated codec when the offer is built; empty = the DataChannel, as
+    /// before. The browser may still refuse the track (no Encoded Transform):
+    /// the video then stays on the DataChannel. Set once before prepare().
+    void setRtpVideoPolicy(const QString& spec, bool nativeHost);
+
 private:
     /// Both halves of the bargain, asked at the moment a gap happens.
     ///
@@ -183,16 +218,35 @@ private:
     // engine's direct sink. `data` may be a BORROWED buffer
     // (QByteArray::fromRawData over the encoder's output): valid until this
     // returns, never to be kept — the one place that keeps a frame (the
-    // buffered keyframe) copies explicitly.
+    // buffered keyframe) copies explicitly, and without its zones.
+    //
+    // `zones`: MWSR's zones of the frame, borrowed as `data` is, from the
+    // native engine's direct sink; null for every other frame.
     void handleVideoFrame(const QByteArray& data, bool isKeyframe, int frameNumber,
-                          qint64 presentationTimeUs);
+                          qint64 presentationTimeUs, const mwsrzoneblock::Zones* zones = nullptr);
 
     // Best-effort exit notice ({"type": ...}) on the input DC before stop().
     void sendExitNotice(const char* type);
 
+    // hidcaps on the input DC, when it is open: whether this host recreates
+    // WebHID devices for this player, and why not.
+    void sendHidCaps();
+    void onHidPolicyChanged() override;
+
+    // inputcaps on the input DC, when it is open: whether this player's
+    // keyboard and mouse reach the host.
+    void sendInputCaps();
+    void onKeyboardMousePolicyChanged() override { sendInputCaps(); }
+
     void setupPeerConnection(const rtc::Configuration& config);
     void createDataChannels();
-    void onInputMessage(const std::string& message);
+    // @p recvUs: the host's steady clock (µs) when the message came off the
+    // channel; 0 for "now". Echoed to the client for a stamped message.
+    void onInputMessage(const std::string& message, int64_t recvUs = 0);
+    // The reply to an input message that carried a `stamp` (T7 of the radios
+    // plan): when it arrived and when its handling ended, on the host's
+    // steady clock, so the client can split a click into its way up and the rest.
+    void sendInputStamp(double id, int64_t recvUs);
     void handleKeyEvent(const std::string& type, const std::string& body);
     void handleMouseMove(const std::string& body);
     void handleMouseButton(const std::string& body);
@@ -238,6 +292,9 @@ private:
     // Deltas a GameStream engine may leave waiting on the sender thread before
     // the oldest is evicted (the native engine keeps one). See the constructor.
     static constexpr size_t kGameStreamQueuedDeltas = 2;
+    // A guest of the shared feed: the pipe's bursts, not the link (handleVideoFrame).
+    static constexpr size_t kFeedGuestQueuedDeltas = 3;
+    bool m_SenderDepthKnown = false; // under m_VideoMutex
 
     // presentationTimeUs: the frame's own capture time (from the decode unit),
     // carried through the queued signal. -1 = unknown → fall back to the shim's
@@ -251,9 +308,12 @@ private:
     // In direct mode the chunks are built here, on the calling thread, from
     // `data` (which may be borrowed — see handleVideoFrame), and the sender
     // only sends. Otherwise the frame is queued whole and the sender cuts it.
+    //
+    // `zones` go ahead of the bitstream as the side block (MwsrZoneBlock.h),
+    // in direct mode only: the queued frames are a GameStream engine's.
     void sendFragmented(const QByteArray& data, bool isKeyframe,
                         std::shared_ptr<rtc::DataChannel>& dc, qint64 presentationTimeUs = -1,
-                        int frameNumber = -1);
+                        int frameNumber = -1, const mwsrzoneblock::Zones* zones = nullptr);
 
     // Send a previously buffered keyframe (arrived before Video DC was open).
     // Called from the Video DC onOpen callback (marshaled to the relay thread).
@@ -269,6 +329,9 @@ private:
     // a fresh cooldown, instead of when the backed-off timer would have.
     // Caller holds m_VideoMutex.
     void requestIdrOnDrain();
+    /// The bench's pacing (`pace=`), told to the sender once the stream's
+    /// bitrate is known: at prepare().
+    void applyPacing();
 
     IMediaEngine* m_Shim;
 
@@ -319,7 +382,157 @@ private:
     // FEC + PLC) on the same PeerConnection as the video DataChannel — a lost
     // packet no longer head-of-line-blocks the audio (the periodic dropouts).
     std::shared_ptr<rtc::Track> m_AudioTrack;
+    // POC Ultra U1.4: the video on an RTP track (setRtpVideoPolicy). The
+    // browser takes each frame off it by Encoded Transform, before its own
+    // decoder. The RTP timestamp carries the frame's backendTs in ms as is (the
+    // client reads it raw; nothing on that side runs the 90 kHz clock).
+    QString m_RtpVideoSpec;
+    bool m_RtpVideoNativeHost = false;
+    std::shared_ptr<rtc::Track> m_VideoTrack;
+    bool m_RtpVideoAudioRoad = false; // the bench's `aroad`: frames cut in Opus packets
+    bool m_UltraAudioRoad = false;    // the same for the Ultra track
+    uint16_t m_UltraAudioRoadSeq = 0;
+    uint16_t m_RtpAudioRoadSeq = 0;
+    bool m_RtpVideoSentKeyframe = false;         // deltas wait for the first keyframe on the track
+    std::atomic<bool> m_RtpVideoAccepted{false}; // set from the answer
+    std::atomic<bool> m_UltraRtpAccepted{false};
+    std::atomic<int> m_RtpPliCount{0};
+    std::vector<int> m_RtpSendUs, m_RtpLateUs; // under m_VideoMutex
+    // The Ultra synthetic stream on its own RTP track (VP8 envelope, every
+    // frame a keyframe so none depends on another), when "ultra" is named.
+    std::shared_ptr<rtc::Track> m_UltraTrack;
+    /// True once the answer accepted the video track: frames go there.
+    bool rtpVideoActive() const;
+    void createRtpVideoTracks();
+    // `frameNumber`: the engine's, for a reference invalidation when the page
+    // names the frame lost (-1 when unknown, as for the buffered keyframe).
+    void sendRtpVideo(const QByteArray& frameData, bool isKeyframe, int64_t presentationTimeUs,
+                      int frameNumber = -1);
+    // What the audio road sent lately, per track, for the page's NACKs (U1.4
+    // quater): the chunks of the last frames as they went, with their RTP
+    // timestamp.
+    struct AudioRoadHistory
+    {
+        struct Frame
+        {
+            uint16_t seq = 0;
+            uint32_t timestamp = 0;
+            std::vector<std::vector<std::byte>> chunks;
+        };
+        std::mutex mutex;
+        std::deque<Frame> frames;
+        size_t maxFrames = 60;
+        int resent = 0;
+    };
+    AudioRoadHistory m_VideoRoadHistory, m_UltraRoadHistory;
+    // `frameId`: the video's wire frame id (the DataChannel's sequence), so
+    // the page can name a lost frame to a host that heals by invalidation.
+    void sendAudioRoad(const std::shared_ptr<rtc::Track>& track, AudioRoadHistory& history,
+                       uint16_t seq, const uint8_t* data, size_t size, bool isKeyframe,
+                       uint32_t timestamp, uint32_t frameId = 0);
+    void resendAudioRoad(const QJsonObject& msg);
+    // The road's paced sender (AroadPacer.h), made with the road's tracks;
+    // null with aroadpace=0. Its first sends and resends, counted for the
+    // rate governor next to SCTP's retransmissions (linkstats).
+    std::unique_ptr<AroadPacer> m_AroadPacer;
+    double m_AroadPace = -1;
+    int m_AroadWindowKb = 0;
+    // Bytes of the frame per packet (aroadchunk=, POC Ultra P-B).
+    size_t m_AroadChunk = 1100;
+    int64_t m_AroadAcks = 0;
+    std::atomic<int64_t> m_AroadSent{0}, m_AroadResent{0};
+    // The resends' budget (AroadPacer.h): a fifth of what the road sent,
+    // another share with the bench key aroadbudget=.
+    std::mutex m_AroadBudgetMutex;
+    AroadResendBudget m_AroadBudget{0.2, 16 * 1024};
+    int64_t m_LinkAroadSent = 0, m_LinkAroadResent = 0;
     std::shared_ptr<rtc::DataChannel> m_InputDc;
+    // The HID passthrough's reports (id 4, unordered, never retransmitted): a
+    // lost one is repaired by the next, the page repeats an unchanged report.
+    std::shared_ptr<rtc::DataChannel> m_HidDc;
+
+    // The bench's link keys (setLinkBench). m_Loss is the video path's, under
+    // m_VideoMutex; the rest is read once, at setup.
+    LinkLoss m_Loss;
+    int m_SctpCongestion = -1;
+    int m_FloodKbps = 0;
+    int m_FloodBytes = 0;
+    bool m_FloodLikeVideo = false;
+    std::shared_ptr<rtc::DataChannel> m_FloodDc;
+    std::unique_ptr<SctpFlood> m_Flood;
+    // POC Ultra U1.1 (`ultra=synthetic:<KiB>`, `ultrachannel=`): a synthetic
+    // Ultra stream on channel id 5, one message train per video frame sent,
+    // through a FrameSender of its own so that it never evicts the video.
+    // Read at setup; the payload is made once, incompressible.
+    int m_UltraSynthKb = 0;
+    bool m_UltraUnordered = false;
+    std::shared_ptr<rtc::DataChannel> m_UltraDc;
+    std::unique_ptr<FrameSender> m_UltraSender;
+    std::vector<uint8_t> m_UltraPayload;
+    uint32_t m_UltraSeq = 0;
+    std::atomic<bool> m_UltraOpen{false};
+    /// One synthetic Ultra frame, stamped @p backendTs like the video frame it
+    /// follows. On the capture thread, never blocking (the sender's thread sends).
+    void sendUltraSynthetic(uint32_t backendTs);
+    // `relaylog=1`: each video frame's way through the relay (RelayFrameLog.h),
+    // written next to the log at the end of the session. Made at setup, before
+    // any frame; null otherwise, and every hook below is one null check.
+    std::unique_ptr<RelayFrameLog> m_FrameLog;
+    // The video channel, for that log's sender-side probe of bufferedAmount:
+    // set once when the channel is made, and expiring with it.
+    std::weak_ptr<rtc::DataChannel> m_FrameLogDc;
+    // SCTP's smoothed round trip, sampled each second for that log.
+    std::atomic<int> m_SrttMs{-1};
+    // `audiolog=1` (plan « le son et la priorité des paquets », A0): each audio
+    // packet's way through the host (AudioPathLog.h, process-wide), written
+    // next to the log at the end of the session. Set before any packet.
+    bool m_AudioLog = false;
+    /// clicktrace=1: a log line per stamped input (see sendInputStamp).
+    bool m_ClickTraceLog = false;
+    // `pace=`, `paceburst=` (plan Wi-Fi W2 A): the sender hands a frame's
+    // chunks to SCTP at this many times the stream's bitrate, this many KB at
+    // a time; chunks no bigger than that run. Set at setup, before any frame.
+    int m_PaceMultiple = 0;
+    int m_PaceBurstKb = 0;
+    size_t m_ChunkPayload = 16000;
+    // `sctpbuf=`, `linkhold=` (plan Wi-Fi W2 C): usrsctp's send buffer in KB,
+    // really (0: libdatachannel's 256 KiB), and after how long video waiting
+    // outside it has the native session hold its pictures (0: never). Set at
+    // setup.
+    int m_SctpBufferKb = 0;
+    int m_LinkHoldMs = 0;
+    // `sctpburst=` (plan Wi-Fi W2.5): usrsctp's max burst, in packets; 0 no
+    // limit, -1 libdatachannel's 10. Set at setup, by setLinkBench, which the
+    // native host's sessions always call.
+    int m_SctpMaxBurst = -1;
+    // The native host's own max burst when `sctpburst=` is not said: no limit
+    // (plan Wi-Fi W2.5). Windows, 04/10/2026: the click of a Mac in Wi-Fi
+    // 66.9 -> 58.5 ms, p90 98 -> 69. Linux, the same night: a frame ~6 ms
+    // younger on a clean link. macOS, 05/10: to an N95 in Wi-Fi, a frame's
+    // time in usrsctp ~22 -> ~11 ms. libdatachannel's own is 10.
+    static constexpr int kNativeSctpMaxBurst = 0;
+    // `sctpss=` (plan Wi-Fi W2.3): usrsctp's stream scheduler, -1 its own.
+    int m_SctpScheduler = -1;
+    // `sctpmtu=` (plan Wi-Fi W2.6): the connection's path MTU in bytes, 0
+    // libdatachannel's 1280. Set at setup.
+    int m_SctpMtu = 0;
+    // `rxbuf=` (plan « Gels du lien », point 1): a silent video section in
+    // the offer, for the browser's receive buffer (setupPeerConnection). On
+    // by default since 20/10: setLinkBench for the native host,
+    // setRxBufVideo for a GameStream host's sessions.
+    bool m_RxBufVideo = false;
+    std::shared_ptr<rtc::Track> m_RxBufTrack;
+    // `hostcap=` (plan « le stream passe avant un gros envoi du PC hôte »,
+    // S1): the host's other uploads capped while the channels are open, 0
+    // none. Set at setup by setLinkBench; the cap set when the channels open,
+    // removed in the destructor (HostUploadCap.h).
+    unsigned m_HostCapMbps = 0;
+    mw::hostcap::Cap m_HostCap;
+    // usrsctp's counters at the last link report, for the share of chunks
+    // sent again in each report window (LinkFeedback::retransPermille).
+    // Relay thread only.
+    mw::sctp::Counters m_LinkSctp{};
+    bool m_LinkSctpSet = false;
 
     // Audio RTP timestamp (48 kHz Opus clock), advanced by samplesPerFrame per
     // packet for a smooth, jitter-free clock; serialized with track teardown.
@@ -328,6 +541,33 @@ private:
 
     std::atomic<bool> m_Connected{false};
     std::atomic<bool> m_Stopping{false};
+    // usrsctp's counters when the channels opened, so the destructor can
+    // report the session's own. Written once in onOpen, then the flag is raised.
+    mw::sctp::Counters m_SctpAtOpen{};
+    std::atomic<bool> m_SctpAtOpenSet{false};
+    // usrsctp's counters at every stats tick, the last kFreezeSctpKeepMs of
+    // them: what SCTP repaired around each freeze, for its [LinkFreeze] line.
+    // Relay thread only.
+    std::deque<std::pair<qint64, mw::sctp::Counters>> m_FreezeSctp;
+    static constexpr qint64 kFreezeSctpKeepMs = 30000;
+    /// One [LinkFreeze] line per freeze the log hands out at @p nowMs (see
+    /// LinkFreezeLog::takeClosed; @p all: the session is over).
+    void logClosedFreezes(qint64 nowMs, bool all);
+    // What the host sends besides this stream, read at every stats tick from
+    // the adapter the route to the client takes (HostUplink.h): for the
+    // [LinkFreeze] lines and the [HostUpload] ones. Relay thread only.
+    mw::hostuplink::Adapter m_UplinkAdapter;
+    std::string m_UplinkRemote;
+    mw::hostuplink::Meter m_Uplink;
+    mw::hostuplink::Notice m_UplinkNotice;
+    int m_UplinkRecheckTicks = 0;
+    /// Ticks between two looks at the selected pair: a new path re-picks the
+    /// adapter.
+    static constexpr int kUplinkRecheckTicks = 10;
+    /// One reading of the adapter and of the stream's bytes at @p nowMs.
+    void sampleHostUplink(qint64 nowMs);
+    /// The [HostUpload] line for @p ev, if it is one.
+    void logHostUplink(const mw::hostuplink::Notice::Event& ev);
     // Bidirectional clipboard sync (only when the streamed host is this
     // machine). Written once on the main thread before the relay moves to its
     // dedicated thread, read from relay/libdatachannel threads afterwards.
@@ -354,6 +594,8 @@ private:
 
     // Backpressure counters (diagnostic logging)
     int m_DeltaDroppedCount = 0; // Delta frames dropped due to full SCTP buffer
+    // Of those, the ones named to the encoder (namedrops, plan §9-25).
+    int m_NamedDeltaDropCount = 0;
     // Deltas dropped by the awaiting-IDR gate. This is the BULK of a stall:
     // one delta hits a full buffer, the gate closes, and every frame after it
     // is discarded here — at 60 fps, ~60 per second — while m_DeltaDroppedCount

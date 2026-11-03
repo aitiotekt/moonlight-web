@@ -92,7 +92,10 @@ public:
 
     // ── Feeds: what the engine just applied ──────────────────────────────────
 
-    void noteKey(const HeldKey& key, bool down);
+    /// Returns true for a press of a key already held: the client's auto-repeat
+    /// (or a press the watchdog has not released yet), which an engine whose
+    /// host repeats on its own does not forward.
+    bool noteKey(const HeldKey& key, bool down);
     /// `button` is the browser's 1..32 numbering; `hold` marks a press to keep
     /// through a brief stall (aim/fire in gaming mode).
     void noteButton(int button, bool down, bool hold);

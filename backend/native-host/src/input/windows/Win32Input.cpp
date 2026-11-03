@@ -26,10 +26,15 @@
 // IShellDispatch::MinimizeAll — the one lever an unelevated process has over an
 // elevated window. See releaseBlock().
 #include <shldisp.h>
+// ImmGetDefaultIMEWnd: whether an input method is open where text goes.
+#include <imm.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <cwctype>
+#include <iterator>
 #include <string>
 #include <chrono>
 #include <thread>
@@ -44,35 +49,6 @@ namespace {
 /// The value is protocol, not implementation — it cannot drift without the
 /// protocol itself changing.
 constexpr uint8_t kFlagNonNormalized = 0x01;
-
-/// Keys whose scancode needs the 0xE0 prefix. MAPVK_VK_TO_VSC_EX reports the
-/// prefix for most of them, but not consistently across layouts and Windows
-/// versions — NumLock in particular comes back as a bare 0x45, which without
-/// the extended flag is Pause instead. Naming them is cheap insurance.
-bool isExtendedKey(int vk)
-{
-    switch (vk) {
-    case VK_RCONTROL:
-    case VK_RMENU:
-    case VK_INSERT:
-    case VK_DELETE:
-    case VK_HOME:
-    case VK_END:
-    case VK_PRIOR:
-    case VK_NEXT:
-    case VK_LEFT:
-    case VK_RIGHT:
-    case VK_UP:
-    case VK_DOWN:
-    case VK_NUMLOCK:
-    case VK_DIVIDE:
-    case VK_LWIN:
-    case VK_RWIN:
-    case VK_APPS:
-    case VK_SNAPSHOT: return true;
-    default: return false;
-    }
-}
 
 /// Send one batch, reporting the first refusal and then staying quiet.
 ///
@@ -149,18 +125,32 @@ std::string narrow(const wchar_t* wide)
 ///  - Policy: a window at high integrity or above runs as administrator, and
 ///    a viewer without that standing on this machine is not let into it even
 ///    when the OS would allow it (SessionConfig::allowElevatedInput).
+///
+/// A window that cannot be read is UNKNOWN, level -1, and the policy holds it
+/// back like an administrator's (gateReason): no window at all is what a worker
+/// that does not follow the input desktop sees while the secure desktop has it
+/// (a UAC prompt), and a token it may not open is a process of SYSTEM's. Our
+/// own windows are the one exception, and say so.
 Win32Input::WindowStanding standingOf(HWND window)
 {
     Win32Input::WindowStanding standing;
+    standing.name = "(no window MoonlightWeb can read: the secure desktop, or a process "
+                    "of SYSTEM's)";
     if (!window) return standing;
 
     DWORD pid = 0;
     ::GetWindowThreadProcessId(window, &pid);
-    if (pid == 0 || pid == ::GetCurrentProcessId()) return standing;
+    if (pid == 0) return standing;
+    if (pid == ::GetCurrentProcessId()) {
+        standing.ours = true;
+        standing.name.clear();
+        return standing;
+    }
 
     HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process) return standing;
     standing.level = integrityLevel(process);
+    if (standing.level >= 0) standing.name.clear();
 
     if (standing.level >= SECURITY_MANDATORY_HIGH_RID) {
         wchar_t title[256] = {};
@@ -177,13 +167,71 @@ Win32Input::WindowStanding standingOf(HWND window)
     return standing;
 }
 
-/// The top-level window under the pointer: what a click would land on.
+/// The top-level window at @p p: what a click there would land on.
+HWND windowAt(POINT p)
+{
+    HWND hit = ::WindowFromPoint(p);
+    return hit ? ::GetAncestor(hit, GA_ROOT) : nullptr;
+}
+
+/// The top-level window under the pointer.
 HWND windowUnderCursor()
 {
     POINT p = {};
     if (!::GetCursorPos(&p)) return nullptr;
-    HWND hit = ::WindowFromPoint(p);
-    return hit ? ::GetAncestor(hit, GA_ROOT) : nullptr;
+    return windowAt(p);
+}
+
+/// The pointer placed at @p absX, @p absY, in SendInput's absolute coordinates
+/// over the whole virtual desktop.
+INPUT absoluteMove(LONG absX, LONG absY)
+{
+    INPUT input = {};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = absX;
+    input.mi.dy = absY;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    return input;
+}
+
+/// One button's edge as SendInput takes it; false for a button there is none of.
+bool buttonInput(int button, bool down, INPUT& input)
+{
+    input = {};
+    input.type = INPUT_MOUSE;
+    switch (button) {
+    case 1: input.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP; break;
+    case 2: input.mi.dwFlags = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP; break;
+    case 3: input.mi.dwFlags = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP; break;
+    case 4:
+        input.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+        input.mi.mouseData = XBUTTON1;
+        break;
+    case 5:
+        input.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+        input.mi.mouseData = XBUTTON2;
+        break;
+    default: return false;
+    }
+    return true;
+}
+
+bool isModifierKey(int vk)
+{
+    switch (vk) {
+    case VK_SHIFT:
+    case VK_LSHIFT:
+    case VK_RSHIFT:
+    case VK_CONTROL:
+    case VK_LCONTROL:
+    case VK_RCONTROL:
+    case VK_MENU:
+    case VK_LMENU:
+    case VK_RMENU:
+    case VK_LWIN:
+    case VK_RWIN: return true;
+    default: return false;
+    }
 }
 
 int64_t steadyNowUs()
@@ -223,6 +271,135 @@ bool isMouse(InputEvent::Type type)
 void sendOne(INPUT& input)
 {
     sendBatch(&input, 1);
+}
+
+/// UTF-8 to code points. What is not valid UTF-8 — a lone surrogate, a stray
+/// byte — is dropped: the payload comes from a browser and is valid in every
+/// case that matters.
+std::u32string decodeUtf8Text(const std::string& utf8)
+{
+    std::u32string out;
+    if (utf8.empty()) return out;
+    const int size = static_cast<int>(utf8.size());
+    const int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), size, nullptr, 0);
+    if (n <= 0) return out;
+    std::wstring wide(static_cast<size_t>(n), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), size, wide.data(), n);
+    out.reserve(wide.size());
+    for (size_t i = 0; i < wide.size(); ++i) {
+        const wchar_t c = wide[i];
+        if (c >= 0xD800 && c < 0xDC00 && i + 1 < wide.size() && wide[i + 1] >= 0xDC00 &&
+            wide[i + 1] < 0xE000) {
+            out += static_cast<char32_t>(0x10000 + ((c - 0xD800) << 10) + (wide[i + 1] - 0xDC00));
+            ++i;
+        } else if (c < 0xD800 || c >= 0xE000) {
+            out += static_cast<char32_t>(c);
+        }
+    }
+    return out;
+}
+
+std::string utf8Of(char32_t ch)
+{
+    std::string out;
+    if (ch < 0x80) {
+        out += static_cast<char>(ch);
+    } else if (ch < 0x800) {
+        out += static_cast<char>(0xC0 | (ch >> 6));
+        out += static_cast<char>(0x80 | (ch & 0x3F));
+    } else if (ch < 0x10000) {
+        out += static_cast<char>(0xE0 | (ch >> 12));
+        out += static_cast<char>(0x80 | ((ch >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (ch & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (ch >> 18));
+        out += static_cast<char>(0x80 | ((ch >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((ch >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (ch & 0x3F));
+    }
+    return out;
+}
+
+/// A plan's step as SendInput takes it: the scancode of the host's layout
+/// when there is one, so Raw Input and DirectInput see the key; the virtual
+/// key as is when the layout has no position for it.
+INPUT toInput(const WinKeyEvent& e)
+{
+    INPUT input = {};
+    input.type = INPUT_KEYBOARD;
+    if (e.kind == WinKeyEvent::Kind::Unicode) {
+        input.ki.wScan = e.unit;
+        input.ki.dwFlags = KEYEVENTF_UNICODE | (e.up ? KEYEVENTF_KEYUP : 0);
+        return input;
+    }
+    input.ki.dwFlags = e.up ? KEYEVENTF_KEYUP : 0;
+    if (e.scan == 0) {
+        input.ki.wVk = e.vk;
+        return input;
+    }
+    input.ki.wScan = e.scan;
+    input.ki.dwFlags |= KEYEVENTF_SCANCODE;
+    if (e.extended || isExtendedKey(e.vk)) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    return input;
+}
+
+/// One plan, one SendInput: nothing the person at the host types gets in
+/// between its keys.
+void sendPlan(const std::vector<WinKeyEvent>& plan)
+{
+    if (plan.empty()) return;
+    std::vector<INPUT> inputs;
+    inputs.reserve(plan.size());
+    for (const WinKeyEvent& e : plan)
+        inputs.push_back(toInput(e));
+    sendBatch(inputs.data(), static_cast<int>(inputs.size()));
+}
+
+/// The layout the foreground window types with, and that window. 0 with no
+/// window to ask: a window losing activation, a desktop this thread does not
+/// see — and then nothing about the host's layout is to be trusted.
+uintptr_t foregroundLayout(HWND& window)
+{
+    window = ::GetForegroundWindow();
+    if (!window) return 0;
+    const DWORD thread = ::GetWindowThreadProcessId(window, nullptr);
+    if (!thread) return 0;
+    return reinterpret_cast<uintptr_t>(::GetKeyboardLayout(thread));
+}
+
+/// Whether an input method is open on @p window: there, keys are composed
+/// into something else (a, then あ), so text is better left as text. Asked
+/// only for the languages whose layouts come with one — Japanese, Chinese,
+/// Korean — through the window every thread has for it. A window that does
+/// not answer counts as open: Unicode is what always went.
+bool imeOpen(HWND window, uintptr_t hkl)
+{
+    const WORD primary = PRIMARYLANGID(static_cast<LANGID>(hkl & 0xFFFF));
+    if (primary != LANG_JAPANESE && primary != LANG_CHINESE && primary != LANG_KOREAN) return false;
+    HWND ime = ::ImmGetDefaultIMEWnd(window);
+    if (!ime) return false;
+    // IMC_GETOPENSTATUS, which today's SDK headers no longer name: the
+    // question every IME window still answers through WM_IME_CONTROL.
+    constexpr WPARAM kGetOpenStatus = 0x0005;
+    DWORD_PTR open = 0;
+    if (!::SendMessageTimeoutW(ime, WM_IME_CONTROL, kGetOpenStatus, 0, SMTO_ABORTIFHUNG, 50, &open))
+        return true;
+    return open != 0;
+}
+
+std::string windowClass(HWND window)
+{
+    if (!window) return "(none)";
+    wchar_t name[128] = {};
+    if (::GetClassNameW(window, name, 128) <= 0) return "(unknown)";
+    return narrow(name);
+}
+
+std::string hkl8(uintptr_t hkl)
+{
+    char buffer[16];
+    std::snprintf(buffer, sizeof(buffer), "0x%08X", static_cast<unsigned>(hkl & 0xFFFFFFFFu));
+    return buffer;
 }
 
 /// Short name for the log line that says which kinds of input ever arrived.
@@ -305,6 +482,15 @@ INPUT makeKeyInput(int vk, bool down, bool nonNormalized)
 //             its US label because that is how bindings are written. A real
 //             key press scores OK; Unicode text scores KO, and always will —
 //             it types the character perfectly and presses nothing.
+//
+// Never on the secure desktop, switch or no switch: what is typed there is the
+// lock screen's PIN or a UAC prompt's password (NativeHost::
+// secureDesktopHasInput). A desktop this process cannot read counts as that one.
+
+bool diagnosing()
+{
+    return keyboardDiagnostics() && platform::inputDesktopName() == "Default";
+}
 
 std::string toUtf8(const std::wstring& text)
 {
@@ -460,6 +646,52 @@ void reportPosition(int vk, UINT mapped, HKL layout)
               usKeyLabel(mapped) + "'");
 }
 
+/// A character from the fidelity path, as the layout's table resolved it.
+void reportCharPlan(char32_t ch, const WinRecipe& recipe, uintptr_t hkl)
+{
+    const HKL layout = reinterpret_cast<HKL>(hkl);
+    switch (recipe.kind) {
+    case WinRecipe::Kind::Key:
+        reportChar(static_cast<wchar_t>(ch), recipe.key.vk,
+                   recipe.key.scan | (recipe.key.extended ? 0xE000u : 0u), recipe.key.mods, layout);
+        return;
+    case WinRecipe::Kind::DeadKey:
+        log::info("[KBD] host '" + utf8Of(ch) + "' -> dead key VK " + hexByte(recipe.key.vk) +
+                  modifierText(recipe.key.mods) + ", scancode " + hexByte(recipe.key.scan) +
+                  ", then VK " + hexByte(recipe.base.vk) + modifierText(recipe.base.mods) +
+                  ", scancode " + hexByte(recipe.base.scan) +
+                  " | Notepad: OK composed by the layout | Game: OK real keys");
+        return;
+    case WinRecipe::Kind::Unicode: reportCharAsText(utf8Of(ch)); return;
+    }
+}
+
+/// A chord of the touch keyboard's bar: the key it pressed. A shortcut is read
+/// by virtual key, so that is the verdict; the US label says where the key is.
+void reportChord(char32_t ch, const WinStroke& key)
+{
+    log::info("[KBD] host chord '" + utf8Of(ch) + "' -> VK " + hexByte(key.vk) + ", scancode " +
+              hexByte(key.scan) + " (US '" + usKeyLabel(key.scan) +
+              "'), modifiers as the viewer holds them | Shortcut: OK read on VK " +
+              hexByte(key.vk));
+}
+
+/// A soft keyboard's text: what went as keys, through dead keys, as Unicode.
+void reportText(const std::string& utf8, const WinTextCounts& counts, uintptr_t hkl,
+                const std::string& whole)
+{
+    const std::string line = "[KBD] host text '" + utf8 + "' -> " + std::to_string(counts.keys) +
+                             " key(s), " + std::to_string(counts.deadKeys) +
+                             " dead-key sequence(s), " + std::to_string(counts.unicode) +
+                             " as Unicode on layout " + hkl8(hkl) +
+                             (whole.empty() ? std::string() : " (" + whole + ")") +
+                             " | Console: " + (counts.unicode ? "KO for the Unicode ones" : "OK");
+    if (counts.unicode)
+        log::warning(line);
+    else
+        log::info(line);
+}
+
 /// Map a desktop point to SendInput's absolute space: 0..65535 across the
 /// WHOLE virtual desktop, not across one screen.
 bool desktopToAbsolute(int64_t desktopX, int64_t desktopY, LONG& outX, LONG& outY)
@@ -520,6 +752,52 @@ bool contains(const capture::DesktopRect& rect, const POINT& p)
     return p.x >= rect.left && p.x < rect.right && p.y >= rect.top && p.y < rect.bottom;
 }
 
+/// The mice Windows lists for Raw Input, a mouse made through VHF told apart:
+/// one made with no hardware ids, as ours are (VhidDevice.cpp), enumerates
+/// under HID_DEVICE_SYSTEM_VHF, which no mouse plugged into the host does.
+/// Mouse Keys are no device and are not counted.
+struct MiceListed
+{
+    int physical = 0;
+    int virtualHid = 0;
+};
+
+MiceListed listMice()
+{
+    MiceListed mice;
+    std::vector<RAWINPUTDEVICELIST> list;
+    UINT count = 0;
+    // A device that comes or goes between the two calls leaves the second one
+    // short of room: asked again.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (::GetRawInputDeviceList(nullptr, &count, sizeof(RAWINPUTDEVICELIST)) != 0) return mice;
+        if (count == 0) return mice;
+        list.resize(count);
+        const UINT got = ::GetRawInputDeviceList(list.data(), &count, sizeof(RAWINPUTDEVICELIST));
+        if (got == static_cast<UINT>(-1)) {
+            list.clear();
+            continue;
+        }
+        list.resize(got);
+        break;
+    }
+    for (const RAWINPUTDEVICELIST& device : list) {
+        if (device.dwType != RIM_TYPEMOUSE) continue;
+        wchar_t name[512] = {};
+        UINT chars = static_cast<UINT>(std::size(name) - 1);
+        const bool named = ::GetRawInputDeviceInfoW(device.hDevice, RIDI_DEVICENAME, name,
+                                                    &chars) != static_cast<UINT>(-1);
+        std::wstring upper(name);
+        for (wchar_t& c : upper)
+            c = static_cast<wchar_t>(std::towupper(c));
+        if (named && upper.find(L"HID_DEVICE_SYSTEM_VHF") != std::wstring::npos)
+            ++mice.virtualHid;
+        else
+            ++mice.physical;
+    }
+    return mice;
+}
+
 } // namespace
 
 Win32Input::Win32Input(const capture::DesktopRect& displayRect, VigemGamepad::RumbleSink onRumble)
@@ -578,6 +856,17 @@ bool Win32Input::start(std::string& error)
     // Settled BEFORE m_Started, which is what opens inject() to callers: the
     // other order lets the first events through on the caller's thread while
     // this is still false, and those are the ones that would miss the desktop.
+    // Before m_Started as well: the first relative move may come at once.
+    startVirtualMouse();
+
+    // The table of the layout the keys will be typed in, read now rather than
+    // on the first character: 1 to 8 ms once per layout (WinTextKeys), which a
+    // first keystroke should not wait for. Another layout later pays it once.
+    {
+        HWND window = nullptr;
+        WinKeyLayout::of(foregroundLayout(window));
+    }
+
     m_Follow = platform::runningAsSystem();
     if (m_Follow) {
         m_FollowerQuit = false;
@@ -622,10 +911,37 @@ void Win32Input::stop()
     // would sit in the Windows game controller list forever, and the next game
     // to start would see a controller nobody is holding.
     m_Gamepad.reset();
+    // After the release above, which went through it for what it held: the
+    // host has no pointing device again, as before the stream.
+    if (m_Mouse) {
+        m_Mouse.reset();
+        log::info("[native] input: our mouse let go of");
+    }
     const uint64_t gated = m_Gated.load(std::memory_order_relaxed);
     log::info("[native] input: " + std::to_string(m_Injected.load(std::memory_order_relaxed)) +
               " event(s) injected this session" +
               (gated ? ", " + std::to_string(gated) + " press(es) dropped at the gate" : ""));
+    {
+        // What the soft keyboard's text became, in one line: counts and why
+        // Unicode was needed, never a character (a PIN goes through here).
+        std::lock_guard<std::mutex> lock(m_TextMutex);
+        const WinTextCounts& t = m_Text;
+        if (t.keys || t.deadKeys || t.unicode || t.dropped) {
+            std::string why;
+            for (const std::string& reason : m_TextUnicodeWhy)
+                why += (why.empty() ? " (" : "; ") + reason;
+            if (!why.empty()) why += ")";
+            log::info("[native] input: text: " + std::to_string(t.keys) + " char(s) as keys, " +
+                      std::to_string(t.deadKeys) + " dead-key sequence(s), " +
+                      std::to_string(t.unicode) + " as Unicode" + why +
+                      (t.dropped
+                           ? ", " + std::to_string(t.dropped) + " control character(s) dropped"
+                           : std::string()));
+        }
+        m_Text = WinTextCounts{};
+        m_TextUnicodeWhy.clear();
+        m_TextWindowSaid = false;
+    }
     m_Started = false;
 }
 
@@ -641,6 +957,14 @@ void Win32Input::forgetHeld()
         buttons = m_HeldButtons.size();
         m_HeldKeys.clear();
         m_HeldButtons.clear();
+        m_HeldScan.clear();
+        m_CharKeys.clear();
+        // Our mouse is told, unlike SendInput: a device keeps its buttons
+        // across the switch, and its next report would release them anyway.
+        if (m_MouseButtons) {
+            m_MouseButtons = 0;
+            sendThroughMouseLocked(0, 0, 0, 0);
+        }
     }
     if (keys || buttons)
         log::info("[native] input: the desktop switched while " + std::to_string(keys) +
@@ -651,17 +975,46 @@ void Win32Input::releaseAll()
 {
     std::set<int> keys;
     std::set<int> buttons;
+    std::map<int, uint16_t> scans;
+    uint8_t mouseButtons = 0;
     {
         std::lock_guard<std::mutex> lock(m_HeldMutex);
         keys.swap(m_HeldKeys);
         buttons.swap(m_HeldButtons);
+        scans.swap(m_HeldScan);
+        // A character's key is in m_HeldKeys too; one that is not any more
+        // still goes up, at its own scancode.
+        for (const auto& [ch, key] : m_CharKeys) {
+            (void)ch;
+            if (keys.insert(key.vk).second)
+                scans[key.vk] = static_cast<uint16_t>(key.scan | (key.extended ? 0xE000 : 0));
+        }
+        m_CharKeys.clear();
+        // What our mouse holds goes up through it, in one report.
+        mouseButtons = m_MouseButtons;
+        if (mouseButtons) {
+            m_MouseButtons = 0;
+            sendThroughMouseLocked(0, 0, 0, 0);
+        }
     }
 
     if (keys.empty() && buttons.empty()) return;
 
     // Non-normalized is irrelevant on release: what matters is that the same
-    // key goes up, and makeKeyInput derives that from the VK either way.
+    // key goes up, and makeKeyInput derives that from the VK either way —
+    // except for a character's key, which went down at the host layout's own
+    // scancode for it, and goes up at that one.
     for (int vk : keys) {
+        auto scan = scans.find(vk);
+        if (scan != scans.end()) {
+            WinKeyEvent up;
+            up.up = true;
+            up.vk = static_cast<uint8_t>(vk);
+            up.scan = static_cast<uint8_t>(scan->second & 0xFF);
+            up.extended = (scan->second & 0xFF00) != 0;
+            sendPlan({up});
+            continue;
+        }
         INPUT input = makeKeyInput(vk, false, false);
         sendOne(input);
     }
@@ -669,7 +1022,7 @@ void Win32Input::releaseAll()
     // deduplicating path would look at them, decide these buttons are already
     // up, and release nothing at all.
     for (int button : buttons)
-        sendMouseButton(button, false);
+        if (!(mouseButtons & systemmouse::buttonBit(button))) sendMouseButton(button, false);
 
     log::info("[native] input: released " + std::to_string(keys.size()) + " key(s) and " +
               std::to_string(buttons.size()) + " button(s) at session end");
@@ -688,6 +1041,8 @@ void Win32Input::inject(const InputEvent& event)
     // and reaching it means SendInput itself has stopped returning, in which
     // case the newest events are the ones worth keeping.
     constexpr size_t kMaxQueued = 4096;
+    if (m_ClickTrace && event.type == InputEvent::Type::MouseButtonDown)
+        m_PressQueuedUs.store(steadyNowUs(), std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(m_QueueMutex);
         if (m_Queue.size() >= kMaxQueued) {
@@ -768,7 +1123,14 @@ void Win32Input::injectNow(const InputEvent& event)
     // the injection. Reported once per change, not once per drop.
     if (isPress(event.type)) {
         const bool mouse = isMouse(event.type);
-        HWND target = mouse ? windowUnderCursor() : nullptr;
+        if (!m_AllowElevated && !event.resync) settleAfterSwitch(!mouse);
+        HWND target = nullptr;
+        if (mouse && anchored()) {
+            POINT placed = {static_cast<LONG>(m_PlacedX), static_cast<LONG>(m_PlacedY)};
+            target = windowAt(placed);
+        } else if (mouse) {
+            target = windowUnderCursor();
+        }
         if (!target) target = ::GetForegroundWindow();
         const WindowStanding& standing = cachedStanding(target, mouse ? m_UnderCursor : m_Focused);
         if (*gateReason(standing)) {
@@ -777,15 +1139,29 @@ void Win32Input::injectNow(const InputEvent& event)
             return;
         }
     }
+    // Ctrl+Alt+Suppr opens the secure desktop, which locks the host, signs
+    // its user out or starts Task Manager: an administrator's act, held back
+    // from a viewer the policy holds back (share_guests_admin_windows lets
+    // them through with the rest).
+    if (event.type == InputEvent::Type::SecureAttention && !m_AllowElevated) {
+        m_Gated.fetch_add(1, std::memory_order_relaxed);
+        log::warning("[native] input: Ctrl+Alt+Suppr not sent — this viewer is not let into "
+                     "administrator windows, and the secure desktop is one");
+        return;
+    }
+    // A foreground that cannot be read is said only by a press it held back,
+    // just above: one that comes and goes as a window loses activation would
+    // otherwise flash the viewer's strip at every motion.
     HWND foreground = ::GetForegroundWindow();
-    reportGate(cachedStanding(foreground, m_Focused), foreground);
+    const WindowStanding& focused = cachedStanding(foreground, m_Focused);
+    if (focused.level >= 0 || focused.ours) reportGate(focused, foreground);
     m_Injected.fetch_add(1, std::memory_order_relaxed);
 
     switch (event.type) {
     case InputEvent::Type::KeyDown: injectKey(event, true); break;
     case InputEvent::Type::KeyUp: injectKey(event, false); break;
-    case InputEvent::Type::CharDown: injectChar(event.text, true); break;
-    case InputEvent::Type::CharUp: injectChar(event.text, false); break;
+    case InputEvent::Type::CharDown: injectChar(event, true); break;
+    case InputEvent::Type::CharUp: injectChar(event, false); break;
     case InputEvent::Type::Utf8Text: injectText(event.text); break;
     case InputEvent::Type::MouseMoveRelative: injectMouseMove(event.deltaX, event.deltaY); break;
     case InputEvent::Type::MouseMoveAbsolute: injectMousePosition(event); break;
@@ -817,6 +1193,63 @@ void Win32Input::injectNow(const InputEvent& event)
         if (m_Gamepad) m_Gamepad->remove(event);
         break;
     }
+    if (!m_AllowElevated && !event.resync) noteSwitch(event);
+}
+
+/// What may switch windows under a viewer the gate holds back. Windows does it
+/// a little after the keys that ask for it — Alt+Tab when Alt goes up — so a
+/// press sent right behind them would be checked against the window that is
+/// leaving, and land in the one that comes: an administrator's, perhaps
+/// (security review M2, 26/10/2026). Noted here, waited for by the next press
+/// (settleAfterSwitch).
+void Win32Input::noteSwitch(const InputEvent& event)
+{
+    switch (event.type) {
+    case InputEvent::Type::KeyUp:
+        // Alt+Tab, Alt+Esc, the Start menu: the switch lands as Alt or the
+        // Windows key goes up.
+        if (event.keyCode == VK_MENU || event.keyCode == VK_LMENU || event.keyCode == VK_RMENU ||
+            event.keyCode == VK_LWIN || event.keyCode == VK_RWIN)
+            m_SwitchUs = steadyNowUs();
+        break;
+    case InputEvent::Type::KeyDown:
+    case InputEvent::Type::CharDown: {
+        // Any key with Alt or the Windows key held (Alt+F4, Win+1), and
+        // Ctrl+Esc or Ctrl+Shift+Esc, which opens Task Manager — an
+        // administrator's window wherever its user is one.
+        if (event.type == InputEvent::Type::KeyDown && isModifierKey(event.keyCode)) break;
+        std::lock_guard<std::mutex> lock(m_HeldMutex);
+        const WinHeldMods held = heldModsLocked();
+        if (held.alt || held.win || (held.ctrl && event.keyCode == VK_ESCAPE))
+            m_SwitchUs = steadyNowUs();
+        break;
+    }
+    case InputEvent::Type::MouseButtonUp:
+        // A click activates the window it lands on, the taskbar's included —
+        // a switch for the keyboard. Not while the viewer moves relatively,
+        // as a game does: keys pressed with a click there would all wait.
+        if (!m_Relative) m_ClickUs = steadyNowUs();
+        break;
+    default: break;
+    }
+}
+
+void Win32Input::settleAfterSwitch(bool keyboard)
+{
+    // Long enough for the shell's switch, measured by nobody but generous;
+    // short enough that a key typed right after Alt+Tab is barely late.
+    constexpr int64_t kSettleUs = 100000;
+    const int64_t since = std::max<int64_t>(m_SwitchUs, keyboard ? m_ClickUs : 0);
+    m_SwitchUs = 0;
+    if (keyboard) m_ClickUs = 0;
+    if (since == 0) return;
+    const int64_t waitUs = since + kSettleUs - steadyNowUs();
+    if (waitUs > 0) std::this_thread::sleep_for(std::chrono::microseconds(waitUs));
+}
+
+bool Win32Input::anchored() const
+{
+    return !m_AllowElevated && !m_Relative && m_Placed;
 }
 
 void Win32Input::injectKey(const InputEvent& event, bool down)
@@ -824,6 +1257,8 @@ void Win32Input::injectKey(const InputEvent& event, bool down)
     const int vk = event.keyCode;
     if (vk <= 0 || vk > 0xFF) return;
 
+    bool charKey = false;
+    uint16_t charScan = 0;
     {
         std::lock_guard<std::mutex> lock(m_HeldMutex);
         // A heartbeat re-press of a key we never let go of would be an extra
@@ -832,10 +1267,32 @@ void Win32Input::injectKey(const InputEvent& event, bool down)
         // path is suppressed.
         if (down && event.resync && m_HeldKeys.count(vk)) return;
 
-        if (down)
+        if (down) {
             m_HeldKeys.insert(vk);
-        else
+        } else {
             m_HeldKeys.erase(vk);
+            // A character's key, released by its position: it went down at
+            // the host layout's scancode, and goes up at that one, as at the
+            // session's end (releaseAll). The US one would leave it down for
+            // whatever reads scancodes, and nothing would let go of it later.
+            auto scan = m_HeldScan.find(vk);
+            if (scan != m_HeldScan.end()) {
+                charKey = true;
+                charScan = scan->second;
+                m_HeldScan.erase(scan);
+            }
+            for (auto it = m_CharKeys.begin(); it != m_CharKeys.end();)
+                it = it->second.vk == vk ? m_CharKeys.erase(it) : std::next(it);
+        }
+    }
+    if (charKey) {
+        WinKeyEvent up;
+        up.up = true;
+        up.vk = static_cast<uint8_t>(vk);
+        up.scan = static_cast<uint8_t>(charScan & 0xFF);
+        up.extended = (charScan & 0xFF00) != 0;
+        sendPlan({up});
+        return;
     }
 
     // The modifier mask that rides along is NOT applied. The browser sends a
@@ -846,7 +1303,7 @@ void Win32Input::injectKey(const InputEvent& event, bool down)
     INPUT input = makeKeyInput(vk, down, nonNormalized);
     sendOne(input);
 
-    if (down && keyboardDiagnostics() && !nonNormalized) {
+    if (down && !nonNormalized && diagnosing()) {
         // Positional path: the key's US position went out untouched and the
         // host's layout decides. What it decided is exactly what the viewer
         // wants to know when the wrong character appears.
@@ -856,168 +1313,211 @@ void Win32Input::injectKey(const InputEvent& event, bool down)
     }
 }
 
-void Win32Input::injectChar(const std::string& utf8, bool down)
+WinHeldMods Win32Input::heldModsLocked() const
 {
-    // One character the client's layout produced, which its US key position
-    // would not produce here. VkKeyScanExW answers in the layout of the FOREGROUND
-    // window's thread — the layout the character will actually be interpreted
-    // in, which is the whole point, and which is also why it is read on every
-    // keystroke rather than cached: the user can switch layouts mid-stream.
-    if (utf8.empty()) return;
-    wchar_t wide[2] = {};
-    const int units =
-        ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), wide, 2);
-    // A single UTF-16 unit only: a surrogate pair has no key on any layout, and
-    // an emoji is not something a key press can express.
-    if (units != 1) {
-        if (down) {
-            injectText(utf8);
-            if (keyboardDiagnostics()) reportCharAsText(utf8);
-        }
-        return;
-    }
-
-    const HKL layout =
-        ::GetKeyboardLayout(::GetWindowThreadProcessId(::GetForegroundWindow(), nullptr));
-    const SHORT scan = ::VkKeyScanExW(wide[0], layout);
-    const int vk = scan & 0xFF;
-    const int needed = (scan >> 8) & 0xFF;
-    if (scan == -1 || vk == 0) {
-        // The host's layout cannot reach this character with any combination.
-        // Fall back to the Unicode path, which needs no key at all — the
-        // character still appears, it simply is not a key press.
-        if (down) {
-            injectText(utf8);
-            if (keyboardDiagnostics()) reportCharAsText(utf8);
-        }
-        return;
-    }
-
-    // The scancode MUST come from the same layout the virtual key came from.
-    //
-    // makeKeyInput's usScanCode() is deliberately US: it is fed virtual keys the
-    // BROWSER normalized to a US position, and only the US table leads back to
-    // that position. Here the virtual key came out of VkKeyScanExW, which speaks
-    // the HOST's layout — so the two tables must not be mixed. They were, and on
-    // a French host it typed the character's US neighbour: 'a' resolved to VK_A,
-    // whose US scancode is 0x1E, which a French layout reads as 'q'. The exact
-    // bug this whole path exists to fix, inverted.
-    const auto hostKeyInput = [layout](int keyVk, bool press) {
-        INPUT input = {};
-        input.type = INPUT_KEYBOARD;
-        input.ki.dwFlags = press ? 0 : KEYEVENTF_KEYUP;
-        const UINT mapped =
-            ::MapVirtualKeyExW(static_cast<UINT>(keyVk), MAPVK_VK_TO_VSC_EX, layout);
-        const UINT prefix = (mapped >> 8) & 0xFF;
-        const UINT scan = mapped & 0xFF;
-        if (scan == 0) {
-            // No position for it on this layout — let the virtual key carry it
-            // and Windows work the scancode out on its own.
-            input.ki.wVk = static_cast<WORD>(keyVk);
-            return input;
-        }
-        input.ki.wScan = static_cast<WORD>(scan);
-        input.ki.dwFlags |= KEYEVENTF_SCANCODE;
-        if (prefix == 0xE0 || isExtendedKey(keyVk)) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-        return input;
+    const auto held = [this](int a, int b, int c) {
+        return m_HeldKeys.count(a) || m_HeldKeys.count(b) || m_HeldKeys.count(c);
     };
+    WinHeldMods mods;
+    mods.shift = held(VK_SHIFT, VK_LSHIFT, VK_RSHIFT);
+    mods.ctrl = held(VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
+    mods.alt = held(VK_MENU, VK_LMENU, VK_RMENU);
+    mods.win = m_HeldKeys.count(VK_LWIN) || m_HeldKeys.count(VK_RWIN);
+    return mods;
+}
 
-    // Bits of the high byte: 1 Shift, 2 Ctrl, 4 Alt — the LEVEL modifiers the
-    // character needs on THIS layout. They are the layout's decision, not the
-    // viewer's hand's: the viewer pressed Shift for their own layout, where "1"
-    // on AZERTY is Shift+&, and on a US host that same character is VK_1 with
-    // nothing held. Left in place, the viewer's Shift turned every AZERTY digit
-    // into a US symbol on the way through — "!" for "1", "@" for "2". So a level
-    // modifier the viewer holds and the character does not need is lifted for
-    // the key's duration and put back afterwards, if the viewer still holds it
-    // then: m_HeldKeys knows, because nothing pressed here is ever recorded in
-    // it. AltGr is Ctrl+Alt to Windows and is treated as one level modifier —
-    // lifted only when both are held and neither is wanted. A Ctrl or an Alt
-    // held ALONE is a chord (Ctrl+A) and stays exactly as it is: the character
-    // keeps its own key, the chord keeps its modifier.
-    const bool needShift = (needed & 1) != 0;
-    const bool needCtrl = (needed & 2) != 0;
-    const bool needAlt = (needed & 4) != 0;
+void Win32Input::injectChar(const InputEvent& event, bool down)
+{
+    // One character the client's layout produced. It is resolved in the layout
+    // of the FOREGROUND window's thread — the layout the character will actually
+    // be interpreted in, which is the whole point — read on every keystroke:
+    // the user can switch layouts mid-stream. WinKeyLayout keeps what each
+    // layout types, so that read costs a lookup.
+    const std::u32string text = decodeUtf8Text(event.text);
+    if (text.empty()) return;
+    if (text.size() != 1) {
+        // More than one character for one key: something the client composed
+        // and could not split. Typed whole on the press; nothing is held.
+        if (down) injectText(event.text);
+        return;
+    }
+    const char32_t ch = text[0];
+    HWND window = nullptr;
+    const uintptr_t hkl = foregroundLayout(window);
+    const std::shared_ptr<const WinKeyLayout> layout = WinKeyLayout::of(hkl);
+    if (event.chord) {
+        injectChord(event, ch, layout.get(), down);
+        return;
+    }
 
-    // What surrounds the key: on a press these go out before it, on a release
-    // they are undone after it, in reverse. `press` is the direction for a
-    // modifier the character needs; a lifted one goes the other way.
-    std::vector<INPUT> around;
-    around.reserve(5);
+    std::vector<WinKeyEvent> plan;
+    if (!down) {
+        // The key its press went down on. None: it was typed whole on the
+        // press (an AltGr symbol, a dead key and its base, or Unicode), or a
+        // desktop switch forgot it — either way there is nothing to let go of.
+        std::lock_guard<std::mutex> lock(m_HeldMutex);
+        auto it = m_CharKeys.find(ch);
+        if (it == m_CharKeys.end()) return;
+        const WinStroke key = it->second;
+        m_CharKeys.erase(it);
+        m_HeldKeys.erase(key.vk);
+        m_HeldScan.erase(key.vk);
+        // The key alone: its levels went back on the press.
+        planKeyEdge(key, false, WinHeldMods{}, plan);
+    } else {
+        const bool caps = (::GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+        const WinRecipe recipe = layout && !layout->ime() ? layout->recipe(ch, caps) : WinRecipe{};
+        std::lock_guard<std::mutex> lock(m_HeldMutex);
+        WinHeldMods held = heldModsLocked();
+        // AltGr, or a Mac's Option, composed it: their Ctrl and Alt are a
+        // level here. Otherwise a Ctrl, an Alt or the Windows key held makes
+        // the key a shortcut.
+        held.altLevel = event.altGraph;
+        const bool shortcut = (held.ctrl || held.alt || held.win) && !held.altLevel;
+        WinStroke letter;
+        const bool byLetter = shortcut && layout && !layout->ime() && layout->letterKey(ch, letter);
+        if (byLetter) {
+            // A shortcut names a key, and a program reads it by virtual key:
+            // Ctrl+A is the key this layout calls A, under exactly what the
+            // viewer holds, Caps Lock or not, where Ctrl+a typed as a
+            // character would add or lift a Shift, or be Unicode on a layout
+            // with no "a" at all (Russian). The client sends a shortcut's
+            // other keys by their position.
+            m_CharKeys[ch] = letter;
+            m_HeldKeys.insert(letter.vk);
+            m_HeldScan[letter.vk] =
+                static_cast<uint16_t>(letter.scan | (letter.extended ? 0xE000 : 0));
+            planChordEdge(letter, true, plan);
+            if (diagnosing()) reportChord(ch, letter);
+        } else if (recipe.kind == WinRecipe::Kind::Key) {
+            // Held like the key it is. Nothing pressed here is ever recorded
+            // as the viewer's own modifier: m_HeldKeys gets the character's
+            // key, never the levels around it, which go back at once. An
+            // AltGr symbol is typed whole, and nothing of it is held.
+            if (planKeyEdge(recipe.key, true, held, plan)) {
+                m_CharKeys[ch] = recipe.key;
+                m_HeldKeys.insert(recipe.key.vk);
+                m_HeldScan[recipe.key.vk] =
+                    static_cast<uint16_t>(recipe.key.scan | (recipe.key.extended ? 0xE000 : 0));
+            }
+        } else if (layout && !layout->ime()) {
+            // A dead key and its base, or no key at all: typed whole now.
+            planText(*layout, text, caps, held, plan);
+        } else {
+            planUnicode(text, plan);
+        }
+        if (diagnosing() && !byLetter) reportCharPlan(ch, recipe, hkl);
+    }
+    sendPlan(plan);
+}
+
+void Win32Input::injectChord(const InputEvent& event, char32_t ch, const WinKeyLayout* layout,
+                             bool down)
+{
+    // The key that carries the character on the host's layout, at whatever
+    // level: Ctrl+z is the Z key. Sent as a US position it was the key where
+    // QWERTY has Z, which an AZERTY host reads as W — Ctrl+W closed the tab
+    // (22/10/2026). The release lets go of the key its press went down on.
+    WinStroke key;
+    bool have = false;
     {
         std::lock_guard<std::mutex> lock(m_HeldMutex);
-        const auto held = [this](int a, int b, int c) {
-            return m_HeldKeys.count(a) || m_HeldKeys.count(b) || m_HeldKeys.count(c);
-        };
-        const bool viewerShift = held(VK_SHIFT, VK_LSHIFT, VK_RSHIFT);
-        const bool viewerCtrl = held(VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
-        const bool viewerAlt = held(VK_MENU, VK_LMENU, VK_RMENU);
-
-        if (viewerShift && !needShift) around.push_back(hostKeyInput(VK_SHIFT, !down));
-        if (viewerCtrl && viewerAlt && !needCtrl && !needAlt) {
-            around.push_back(hostKeyInput(VK_CONTROL, !down));
-            around.push_back(hostKeyInput(VK_MENU, !down));
+        if (!down) {
+            auto it = m_CharKeys.find(ch);
+            if (it != m_CharKeys.end()) {
+                key = it->second;
+                have = true;
+                m_CharKeys.erase(it);
+            }
         }
-        if (needShift && !viewerShift) around.push_back(hostKeyInput(VK_SHIFT, down));
-        if (needCtrl && !viewerCtrl) around.push_back(hostKeyInput(VK_CONTROL, down));
-        if (needAlt && !viewerAlt) around.push_back(hostKeyInput(VK_MENU, down));
-
-        if (down)
-            m_HeldKeys.insert(vk);
-        else
-            m_HeldKeys.erase(vk);
     }
-    // The character's own key sits inside the modifiers: pressed after they are
-    // set up, released before they are put back.
-    std::vector<INPUT> inputs;
-    inputs.reserve(around.size() + 1);
-    if (down) {
-        inputs = around;
-        inputs.push_back(hostKeyInput(vk, true));
-    } else {
-        inputs.push_back(hostKeyInput(vk, false));
-        inputs.insert(inputs.end(), around.rbegin(), around.rend());
+    if (!have && layout) have = layout->chordKey(ch, key);
+    if (!have) {
+        // No key for it on this layout (a Cyrillic one, say): its US
+        // position, as before. Shortcuts there are read by virtual key, and
+        // those layouts keep the Latin ones at the US places.
+        if (event.keyCode <= 0) return;
+        InputEvent positional = event;
+        positional.type = down ? InputEvent::Type::KeyDown : InputEvent::Type::KeyUp;
+        positional.keyFlags = 0;
+        injectKey(positional, down);
+        return;
     }
-    sendBatch(inputs.data(), static_cast<int>(inputs.size()));
-
-    if (down && keyboardDiagnostics())
-        reportChar(wide[0], vk,
-                   ::MapVirtualKeyExW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC_EX, layout), needed,
-                   layout);
+    {
+        std::lock_guard<std::mutex> lock(m_HeldMutex);
+        if (down) {
+            m_CharKeys[ch] = key;
+            m_HeldKeys.insert(key.vk);
+            m_HeldScan[key.vk] = static_cast<uint16_t>(key.scan | (key.extended ? 0xE000 : 0));
+        } else {
+            m_HeldKeys.erase(key.vk);
+            m_HeldScan.erase(key.vk);
+        }
+    }
+    std::vector<WinKeyEvent> plan;
+    planChordEdge(key, down, plan);
+    sendPlan(plan);
+    if (down && diagnosing()) reportChord(ch, key);
 }
 
 void Win32Input::injectText(const std::string& utf8)
 {
-    if (utf8.empty()) return;
+    // Text from a soft keyboard, typed as the keys of the host's layout — the
+    // classic console drops a character injected as itself (KEYEVENTF_UNICODE),
+    // administrator or not, and games never see one (WinTextKeys.h). Unicode
+    // stays for what no key types, and for the whole text where keys would be
+    // turned into something else: an input method open (Japanese, Chinese,
+    // Korean), or no foreground window to read the layout of.
+    const std::u32string text = decodeUtf8Text(utf8);
+    if (text.empty()) return;
 
-    const int needed =
-        ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), nullptr, 0);
-    if (needed <= 0) return;
-
-    std::vector<wchar_t> wide(static_cast<size_t>(needed));
-    if (::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), wide.data(),
-                              needed) != needed)
-        return;
-
-    // KEYEVENTF_UNICODE delivers the character itself rather than a key, which
-    // is what a soft keyboard needs: the host layout is irrelevant and no
-    // scancode has to exist for the glyph. Surrogate pairs are two units and
-    // Windows expects them as two consecutive events, which falls out of
-    // walking the UTF-16 sequence.
-    std::vector<INPUT> inputs;
-    inputs.reserve(wide.size() * 2);
-    for (wchar_t unit : wide) {
-        INPUT down = {};
-        down.type = INPUT_KEYBOARD;
-        down.ki.wScan = static_cast<WORD>(unit);
-        down.ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs.push_back(down);
-
-        INPUT up = down;
-        up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        inputs.push_back(up);
+    HWND window = nullptr;
+    const uintptr_t hkl = foregroundLayout(window);
+    const std::shared_ptr<const WinKeyLayout> layout = WinKeyLayout::of(hkl);
+    std::string whole; // why all of it goes as Unicode
+    if (!layout)
+        whole = "no foreground window to read the layout of";
+    else if (layout->ime() || imeOpen(window, hkl))
+        whole = "an input method was open";
+    const bool caps = (::GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+    WinHeldMods held;
+    {
+        std::lock_guard<std::mutex> lock(m_HeldMutex);
+        held = heldModsLocked();
     }
-    sendBatch(inputs.data(), static_cast<int>(inputs.size()));
+
+    // One SendInput per piece: a paste stays in order and in one block up to
+    // the piece's size, and a very long one does not become one call of tens
+    // of thousands of events. A \r\n is never cut in two Enters.
+    constexpr size_t kPiece = 256;
+    WinTextCounts counts;
+    for (size_t at = 0; at < text.size();) {
+        size_t n = std::min<size_t>(kPiece, text.size() - at);
+        if (at + n < text.size() && text[at + n - 1] == U'\r' && text[at + n] == U'\n') ++n;
+        const std::u32string piece = text.substr(at, n);
+        std::vector<WinKeyEvent> plan;
+        counts +=
+            whole.empty() ? planText(*layout, piece, caps, held, plan) : planUnicode(piece, plan);
+        sendPlan(plan);
+        at += n;
+    }
+    noteText(counts, whole.empty() ? "no key on layout " + hkl8(hkl) : whole, window, hkl);
+    if (diagnosing()) reportText(utf8, counts, hkl, whole);
+}
+
+void Win32Input::noteText(const WinTextCounts& counts, const std::string& unicodeWhy, void* window,
+                          uintptr_t hkl)
+{
+    std::lock_guard<std::mutex> lock(m_TextMutex);
+    m_Text += counts;
+    if (counts.unicode) m_TextUnicodeWhy.insert(unicodeWhy);
+    if (m_TextWindowSaid) return;
+    m_TextWindowSaid = true;
+    // The kind of window, never its title: a class names the program family
+    // (ConsoleWindowClass is the classic console, CASCADIA_HOSTING_WINDOW_CLASS
+    // Windows Terminal), which is what a "nothing typed" report needs.
+    log::info("[native] input: first text, into a window of class \"" +
+              windowClass(static_cast<HWND>(window)) + "\" on layout " + hkl8(hkl));
 }
 
 void Win32Input::injectMouseMove(int deltaX, int deltaY)
@@ -1036,11 +1536,21 @@ void Win32Input::injectMouseMove(int deltaX, int deltaY)
     // should not touch the host's mouse until the viewer does.
     bringCursorOntoDisplay();
 
+    // Through our mouse when there is one: a game reading Raw Input by device
+    // sees it move. A placement above went through SendInput all the same,
+    // and lands first.
+    m_Relative = true;
+    if (m_Mouse) {
+        std::lock_guard<std::mutex> lock(m_HeldMutex);
+        if (sendThroughMouseLocked(deltaX, deltaY, 0, 0)) return;
+    }
+
     // Relative motion passes through the pointer speed and acceleration the
     // host has configured, exactly as a local mouse would. That is the right
     // default — a game reading raw input bypasses it anyway, and a desktop user
     // expects their own settings — but it does mean two hosts with different
-    // pointer settings feel different for the same client movement.
+    // pointer settings feel different for the same client movement. Our
+    // mouse's reports go through the same settings.
     INPUT input = {};
     input.type = INPUT_MOUSE;
     input.mi.dx = deltaX;
@@ -1075,7 +1585,10 @@ const Win32Input::WindowStanding& Win32Input::cachedStanding(void* window, Stand
 
 const char* Win32Input::gateReason(const WindowStanding& standing) const
 {
-    if (standing.level < 0) return "";
+    if (standing.ours) return "";
+    // Unknown is closed to a viewer the policy holds back, never open: that
+    // is where a UAC prompt is, for a worker that cannot see it (standingOf).
+    if (standing.level < 0) return m_AllowElevated ? "" : "policy";
     const int ours = ownIntegrityLevel();
     // The OS's refusal first: it applies whatever the policy says, and naming
     // it tells the operator what to change (run elevated), where "policy"
@@ -1108,6 +1621,9 @@ void Win32Input::reportGate(const WindowStanding& standing, void* window, bool f
             std::string(reason) == "uipi"
                 ? "runs elevated and MoonlightWeb does not (UIPI) — nothing reaches it until "
                   "another window takes focus, or MoonlightWeb runs elevated"
+            : standing.level < 0
+                ? "cannot be told apart from an administrator's, and this viewer is not one "
+                  "here — presses are dropped until a window that can be read takes focus"
                 : "runs as administrator and this viewer is not one here — presses are dropped "
                   "until another window takes focus";
         log::warning("[native] input gate closed: the window " + standing.name + " " + why);
@@ -1310,6 +1826,14 @@ void Win32Input::injectMousePosition(const InputEvent& event)
         const int64_t width = m_DisplayRect.width();
         if (RecentreDetector::isReentryJump(verdict.deltaX, verdict.deltaY, width)) return;
         if (verdict.deltaX == 0 && verdict.deltaY == 0) return;
+        // Nothing is placed any more: the buttons may go through our mouse.
+        m_Relative = true;
+        if (m_Mouse) {
+            std::lock_guard<std::mutex> lock(m_HeldMutex);
+            if (sendThroughMouseLocked(static_cast<int>(verdict.deltaX),
+                                       static_cast<int>(verdict.deltaY), 0, 0))
+                return;
+        }
         INPUT input = {};
         input.type = INPUT_MOUSE;
         input.mi.dx = static_cast<LONG>(verdict.deltaX);
@@ -1323,11 +1847,19 @@ void Win32Input::injectMousePosition(const InputEvent& event)
     LONG absY = 0;
     if (!desktopToAbsolute(x, y, absX, absY)) return;
 
-    INPUT input = {};
-    input.type = INPUT_MOUSE;
-    input.mi.dx = absX;
-    input.mi.dy = absY;
-    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    // A placement: the clicks that follow go through SendInput behind it.
+    if (m_Relative) {
+        m_Relative = false;
+        m_WheelNotches.reset();
+        m_PanNotches.reset();
+    }
+    // Kept for the press that follows: see anchored().
+    m_Placed = true;
+    m_PlacedX = x;
+    m_PlacedY = y;
+    m_PlacedAbsX = absX;
+    m_PlacedAbsY = absY;
+    INPUT input = absoluteMove(absX, absY);
     sendOne(input);
 }
 
@@ -1354,35 +1886,61 @@ void Win32Input::injectMouseButton(int button, bool down)
     else
         m_HeldButtons.erase(button);
 
-    sendMouseButton(button, down);
+    // Through our mouse while the viewer moves relatively; released the way it
+    // was pressed, whatever the viewer does in between.
+    //
+    // Never for a viewer the policy holds back from administrator windows: a
+    // device's report is hardware input, which reaches the secure desktop and
+    // its UAC prompt, and lands wherever the pointer is when Windows reads it,
+    // not where the gate looked. SendInput reaches neither. Their motion still
+    // goes through our mouse, which shows the pointer and clicks nothing.
+    const uint8_t bit = systemmouse::buttonBit(button);
+    const bool throughMouse =
+        m_Mouse && (down ? m_Relative && m_AllowElevated : (m_MouseButtons & bit) != 0);
+    const int64_t startUs = m_ClickTrace && down ? steadyNowUs() : 0;
+    if (throughMouse) {
+        m_MouseButtons = static_cast<uint8_t>(down ? m_MouseButtons | bit : m_MouseButtons & ~bit);
+        // Refused: the mouse is let go of with what it held, and a press goes
+        // the old way. A release has nothing left to do — Windows let go of
+        // the device's buttons with it.
+        if (!sendThroughMouseLocked(0, 0, 0, 0) && down) {
+            m_HeldButtons.insert(button);
+            sendMouseButton(button, true);
+        }
+    } else if (down && anchored()) {
+        // With the position the gate looked at, in the same SendInput: a
+        // placement still on its way cannot move the press anywhere else.
+        INPUT batch[2] = {absoluteMove(m_PlacedAbsX, m_PlacedAbsY), {}};
+        if (buttonInput(button, true, batch[1])) sendBatch(batch, 2);
+    } else {
+        sendMouseButton(button, down);
+    }
+    if (startUs)
+        m_ClickTrace->press(m_Follow ? m_PressQueuedUs.load(std::memory_order_relaxed) : 0, startUs,
+                            steadyNowUs());
 }
 
 void Win32Input::sendMouseButton(int button, bool down)
 {
     INPUT input = {};
-    input.type = INPUT_MOUSE;
-
-    switch (button) {
-    case 1: input.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP; break;
-    case 2: input.mi.dwFlags = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP; break;
-    case 3: input.mi.dwFlags = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP; break;
-    case 4:
-        input.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
-        input.mi.mouseData = XBUTTON1;
-        break;
-    case 5:
-        input.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
-        input.mi.mouseData = XBUTTON2;
-        break;
-    default: return;
-    }
-
-    sendOne(input);
+    if (buttonInput(button, down, input)) sendOne(input);
 }
 
 void Win32Input::injectScroll(int amount, bool horizontal)
 {
     if (amount == 0) return;
+
+    // Through our mouse while the viewer moves relatively, in whole notches:
+    // a report carries no less. Not for a viewer held back from administrator
+    // windows, as a button is not (injectMouseButton).
+    if (m_Mouse && m_Relative && m_AllowElevated) {
+        const int notches = (horizontal ? m_PanNotches : m_WheelNotches).take(amount);
+        if (notches == 0) return;
+        std::lock_guard<std::mutex> lock(m_HeldMutex);
+        if (sendThroughMouseLocked(0, 0, horizontal ? 0 : notches, horizontal ? notches : 0))
+            return;
+        amount = notches * systemmouse::kNotch;
+    }
 
     // Already in 120-unit notches: the relay quantizes high-resolution wheel
     // deltas upstream, for every transport, so re-scaling here would apply the
@@ -1391,6 +1949,12 @@ void Win32Input::injectScroll(int amount, bool horizontal)
     input.type = INPUT_MOUSE;
     input.mi.dwFlags = horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL;
     input.mi.mouseData = static_cast<DWORD>(amount);
+    if (anchored()) {
+        // Where the gate looked, as a click is (injectMouseButton).
+        INPUT batch[2] = {absoluteMove(m_PlacedAbsX, m_PlacedAbsY), input};
+        sendBatch(batch, 2);
+        return;
+    }
     sendOne(input);
 }
 
@@ -1419,6 +1983,92 @@ void Win32Input::syncLockKeys(const InputEvent& event)
         INPUT tap[2] = {down, up};
         sendBatch(tap, 2);
     }
+}
+
+void Win32Input::startVirtualMouse()
+{
+    if (m_MouseMode == 0) return;
+    if (m_MouseMode < 0 && listMice().physical > 0) return; // the host has one of its own
+
+    auto device = makeVirtualHid(false);
+    // No name: DirectInput's OEMName (VhidDevice.cpp) is for game controllers.
+    VirtualHidIdentity identity;
+    identity.descriptor = systemmouse::descriptor();
+    std::string why;
+    if (!device || !device->create(identity, why)) {
+        log::info("[native] input: no mouse of our own (" + why +
+                  ": a driver older than 0.1.2.0, none, or a worker that is not elevated) — "
+                  "SendInput as before, and Mouse Keys show the pointer");
+        return;
+    }
+    m_Mouse = std::move(device);
+    m_MouseMadeUs = steadyNowUs();
+    m_MouseLookedUs = 0;
+    m_MouseListed = false;
+    m_MouseUnlistedSaid = false;
+    log::info(std::string("[native] input: ") +
+              (m_MouseMode > 0 ? "a mouse of our own made beside the host's (vmouse=1)"
+                               : "no pointing device on this host — a mouse of our own made") +
+              ": Windows shows the pointer, games read a device; absolute positions stay "
+              "SendInput");
+}
+
+bool Win32Input::sendThroughMouseLocked(int dx, int dy, int notches, int panNotches)
+{
+    if (!m_Mouse) return false;
+    for (const systemmouse::Report& report :
+         systemmouse::reports(m_MouseButtons, dx, dy, notches, panNotches)) {
+        if (!m_Mouse->input(report.data(), report.size())) {
+            dropVirtualMouseLocked();
+            return false;
+        }
+    }
+    return true;
+}
+
+void Win32Input::dropVirtualMouseLocked()
+{
+    log::warning("[native] input: our mouse refused a report (error " +
+                 std::to_string(::GetLastError()) + ") — let go of, SendInput from here on");
+    // Windows releases a device's buttons when the device goes.
+    for (int button = 1; button <= 5; ++button)
+        if (m_MouseButtons & systemmouse::buttonBit(button)) m_HeldButtons.erase(button);
+    m_MouseButtons = 0;
+    m_Mouse.reset();
+}
+
+/// Whether our mouse is what shows the pointer: made, and listed by Windows —
+/// or made a moment ago, the time Windows takes to list a device, so the
+/// stream's first second does not turn Mouse Keys on for nothing. Listed
+/// means any mouse made through VHF, another stream's as well: either shows
+/// the pointer. Looked at four times a second at most.
+bool Win32Input::showsPointer()
+{
+    // Read under the lock: the input thread lets go of our mouse when it
+    // refuses a report (dropVirtualMouseLocked), and this runs on the capture's.
+    {
+        std::lock_guard<std::mutex> lock(m_HeldMutex);
+        if (!m_Mouse) return false;
+    }
+    constexpr int64_t kLookEveryUs = 250 * 1000;
+    constexpr int64_t kGraceUs = 3 * 1000 * 1000;
+    const int64_t nowUs = steadyNowUs();
+    if (m_MouseLookedUs == 0 || nowUs - m_MouseLookedUs >= kLookEveryUs) {
+        m_MouseLookedUs = nowUs;
+        const bool listed = listMice().virtualHid > 0;
+        if (listed && !m_MouseListed && !m_MouseUnlistedSaid)
+            log::info("[native] input: Windows lists our mouse, " +
+                      std::to_string((nowUs - m_MouseMadeUs) / 1000) + " ms after it was made");
+        m_MouseListed = listed;
+    }
+    if (m_MouseListed) return true;
+    if (nowUs - m_MouseMadeUs < kGraceUs) return true;
+    if (!m_MouseUnlistedSaid) {
+        m_MouseUnlistedSaid = true;
+        log::warning("[native] input: Windows does not list our mouse 3 s after it was made — "
+                     "Mouse Keys show the pointer");
+    }
+    return false;
 }
 
 } // namespace mw::native::input

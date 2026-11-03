@@ -149,6 +149,20 @@ inline int intraRefreshDistanceFrames(int fps)
     return intraRefreshPeriodFrames(fps) * kIntraRefreshSpacing;
 }
 
+/// The QP VA-API's rate control never goes below — NVENC's and AMF's floor
+/// (Bruno, 05/10/2026, design §32.28). Under Mesa 26 radeonsi's CBR refines a
+/// still page below it until the budget is full: 13.7 Mbit/s of 20 in HEVC,
+/// 17.3 in H.264, on a text page with a turning square; at 18, 0.5 and 0.25
+/// (bench §8o.19). Mesa 23.2 settled on its own, and a floor changed nothing
+/// there.
+constexpr int kVaapiMinQp = 18;
+
+/// The floor for the bench key vaminqp=: 0 is the engine's own, -1 none.
+inline int vaapiMinQp(int key)
+{
+    return key < 0 ? 0 : key > 0 ? key : kVaapiMinQp;
+}
+
 /// The rate frames are REALLY produced at, and what the encoder should be told
 /// about it (plan v2, E4).
 ///

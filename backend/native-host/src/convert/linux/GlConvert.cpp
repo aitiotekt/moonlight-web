@@ -18,6 +18,7 @@
 #include "GlConvert.h"
 
 #include "../../core/Log.h"
+#include "../../platform/linux/ScopedCapability.h"
 #include "../../platform/macos/FrameFit.h"
 
 #include <EGL/egl.h>
@@ -25,7 +26,17 @@
 #include <drm_fourcc.h>
 #include <fcntl.h>
 #include <gbm.h>
+#include <linux/capability.h>
 #include <unistd.h>
+
+// EGL_IMG_context_priority. eglext.h has carried the names since 2016; these
+// are for a header older than that — the values are the extension's.
+#ifndef EGL_CONTEXT_PRIORITY_LEVEL_IMG
+#define EGL_CONTEXT_PRIORITY_LEVEL_IMG 0x3100
+#define EGL_CONTEXT_PRIORITY_HIGH_IMG 0x3101
+#define EGL_CONTEXT_PRIORITY_MEDIUM_IMG 0x3102
+#define EGL_CONTEXT_PRIORITY_LOW_IMG 0x3103
+#endif
 
 // gl2ext.h defines nothing of its own: it needs GL_APIENTRY and the GL types
 // from a core header first, and an alphabetical sort puts it before gl3.h. Kept
@@ -72,12 +83,22 @@ uniform sampler2D CursorInvert;
 // xy: the cursor's top-left in source UV. zw: its size in source UV.
 uniform vec4 CursorRect;
 uniform float CursorEnabled;
+// xy: the picture's top-left in the texture's UV. zw: its size. (0,0,1,1) but
+// for a screen of an X11 desktop over several, which reads its window of the
+// root window's buffer (KmsFrame::sourceX).
+uniform vec4 SourceRect;
 
 // The desktop with the mouse pointer drawn on it. See ColorConvert.cpp: the
 // scanout buffer does not contain the pointer (it is on its own hardware
 // plane), so it is put back here, costing one fetch on the pixels it covers.
 vec3 Scene(vec2 p) {
-    vec3 rgb = texture(Source, p).rgb;
+    // Held half a texel inside the picture, so a bilinear read at its edge
+    // never takes a pixel of the screen beside it; for a whole texture that
+    // is the edge clamp the sampler already does.
+    vec2 texel = 1.0 / vec2(textureSize(Source, 0));
+    vec2 q = clamp(SourceRect.xy + p * SourceRect.zw, SourceRect.xy + 0.5 * texel,
+                   SourceRect.xy + SourceRect.zw - 0.5 * texel);
+    vec3 rgb = texture(Source, q).rgb;
     if (CursorEnabled < 0.5) return rgb;
     vec2 c = (p - CursorRect.xy) / CursorRect.zw;
     if (c.x < 0.0 || c.y < 0.0 || c.x > 1.0 || c.y > 1.0) return rgb;
@@ -123,6 +144,9 @@ constexpr char kScaleBody[] = R"GLSL(
 precision highp float;
 in vec2 uv;
 uniform sampler2D Source;
+// Where the picture starts in the input: a screen's window of an X11 root
+// (KmsFrame::sourceX) for the horizontal pass, 0,0 for the vertical one.
+uniform ivec2 Offset;
 out vec4 o;
 
 vec3 srgbToLinear(vec3 c) {
@@ -141,7 +165,7 @@ float lanczos2(float x) {
     return 2.0 * sin(px) * sin(px * 0.5) / (px * px);
 }
 vec3 fetch(int x, int y) {
-    vec3 c = texelFetch(Source, ivec2(x, y), 0).rgb;
+    vec3 c = texelFetch(Source, ivec2(x, y) + Offset, 0).rgb;
 #if MW_DECODE
     c = srgbToLinear(c);
 #endif
@@ -411,8 +435,39 @@ bool GlConvert::createContext(const std::string& renderNode, std::string& error)
         error = "no ES3 EGL config";
         return false;
     }
-    const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-    d->context = eglCreateContext(d->display, config, EGL_NO_CONTEXT, contextAttribs);
+    // The conversion's place on the GPU (plan §9-18, bench §8o.1). A context
+    // at the game's priority waits for the game's frame in flight AND for the
+    // next one: 46 ms under a load that saturates a Radeon 780M. At HIGH it
+    // goes ahead of the next one: 23 ms. amdgpu, like i915 and xe, grants a
+    // context above normal only to CAP_SYS_NICE, which the package's launcher
+    // hands over and the app keeps permitted only — raised on this thread for
+    // the one call, since the priority is fixed when the context is made.
+    //
+    // Asked for only when held. The driver's answer proves nothing: Mesa 23.2
+    // reads back HIGH for a context the kernel refused (-13), measured
+    // 28/09/2026. Holding the capability is the proof.
+    const bool priorityExtension = std::strstr(extensions, "EGL_IMG_context_priority") != nullptr;
+    const bool mayRaise = platform::ScopedCapability::permitted(CAP_SYS_NICE);
+    const EGLint plainAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    const EGLint highAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                                  EGL_CONTEXT_PRIORITY_HIGH_IMG, EGL_NONE};
+    m_HighPriority = false;
+    if (priorityExtension && mayRaise) {
+        platform::ScopedCapability nice(CAP_SYS_NICE);
+        d->context = eglCreateContext(d->display, config, EGL_NO_CONTEXT, highAttribs);
+        m_HighPriority = d->context != EGL_NO_CONTEXT && nice.effective();
+        m_Priority = m_HighPriority                 ? "high (CAP_SYS_NICE)"
+                     : d->context == EGL_NO_CONTEXT ? "normal (the driver refused a high one)"
+                                                    : "normal (CAP_SYS_NICE could not be raised)";
+    } else {
+        m_Priority = !priorityExtension
+                         ? "normal (the driver has no EGL_IMG_context_priority)"
+                         : "normal (no CAP_SYS_NICE: the package's launcher hands it over)";
+    }
+    // A driver that refuses the attribute rather than lowering it: the
+    // conversion at normal priority beats no conversion at all.
+    if (d->context == EGL_NO_CONTEXT)
+        d->context = eglCreateContext(d->display, config, EGL_NO_CONTEXT, plainAttribs);
     if (d->context == EGL_NO_CONTEXT ||
         !eglMakeCurrent(d->display, EGL_NO_SURFACE, EGL_NO_SURFACE, d->context)) {
         error = "could not create or bind an ES3 context";
@@ -420,7 +475,56 @@ bool GlConvert::createContext(const std::string& renderNode, std::string& error)
     }
     log::info(std::string("[native] GL conversion on ") +
               reinterpret_cast<const char*>(glGetString(GL_RENDERER)) + " (" +
-              reinterpret_cast<const char*>(glGetString(GL_VERSION)) + ")");
+              reinterpret_cast<const char*>(glGetString(GL_VERSION)) + "), priority " + m_Priority);
+    return true;
+}
+
+bool GlConvert::importableModifiers(const std::string& renderNode, uint32_t fourcc,
+                                    std::vector<uint64_t>& modifiers, std::string& error)
+{
+    modifiers.clear();
+    const auto query = reinterpret_cast<PFNEGLQUERYDMABUFMODIFIERSEXTPROC>(
+        eglGetProcAddress("eglQueryDmaBufModifiersEXT"));
+    if (!loadEntryPoints() || !query) {
+        error = "EGL cannot list the DMA-BUF modifiers it imports";
+        return false;
+    }
+    // A display of its own, no context: nothing is drawn, and the one the
+    // conversion makes later belongs to the thread that converts.
+    const int fd = ::open(renderNode.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        error = "cannot open the render node " + renderNode;
+        return false;
+    }
+    gbm_device* gbm = gbm_create_device(fd);
+    EGLDisplay display =
+        gbm ? pGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, nullptr) : EGL_NO_DISPLAY;
+    EGLint major = 0, minor = 0;
+    const bool up = display != EGL_NO_DISPLAY && eglInitialize(display, &major, &minor);
+    const char* extensions = up ? eglQueryString(display, EGL_EXTENSIONS) : nullptr;
+    EGLint count = 0;
+    bool listed = extensions &&
+                  std::strstr(extensions, "EGL_EXT_image_dma_buf_import_modifiers") != nullptr &&
+                  query(display, static_cast<EGLint>(fourcc), 0, nullptr, nullptr, &count);
+    if (listed && count > 0) {
+        std::vector<EGLuint64KHR> all(static_cast<size_t>(count));
+        std::vector<EGLBoolean> externalOnly(static_cast<size_t>(count));
+        listed = query(display, static_cast<EGLint>(fourcc), count, all.data(), externalOnly.data(),
+                       &count);
+        // External-only means sampled through samplerExternalOES, which the
+        // conversion's shaders do not use: such a buffer would import and then
+        // fail to bind.
+        for (EGLint i = 0; listed && i < count; ++i)
+            if (!externalOnly[static_cast<size_t>(i)])
+                modifiers.push_back(all[static_cast<size_t>(i)]);
+    }
+    if (up) eglTerminate(display);
+    if (gbm) gbm_device_destroy(gbm);
+    ::close(fd);
+    if (!listed) {
+        error = "EGL on " + renderNode + " lists no DMA-BUF modifiers";
+        return false;
+    }
     return true;
 }
 
@@ -773,9 +877,11 @@ bool GlConvert::convert(const capture::KmsFrame& frame, const capture::CursorSta
     // or three buffers; an image per frame is a few microseconds, and caching
     // by fb_id is a refinement for when a measurement asks for it.
     if (d->sourceImage != EGL_NO_IMAGE_KHR) pDestroyImage(d->display, d->sourceImage);
+    // At the buffer's size, which is the picture's but for a screen of an X11
+    // desktop over several: sampled below through its window.
     d->sourceImage =
         importPlanes(d->display, frame.planeCount, frame.fds, frame.offsets, frame.pitches,
-                     frame.fourcc, frame.modifier, frame.width, frame.height);
+                     frame.fourcc, frame.modifier, frame.importWidth(), frame.importHeight());
     if (d->sourceImage == EGL_NO_IMAGE_KHR) {
         error = "EGL refused the scanout buffer (0x" + std::to_string(eglGetError()) + ")";
         return false;
@@ -798,18 +904,21 @@ bool GlConvert::convert(const capture::KmsFrame& frame, const capture::CursorSta
         glBeginQuery(GL_TIME_ELAPSED_EXT, d->resampleQuery);
     }
     if (resampled) {
-        const auto scale = [&](GLuint program, GLuint fbo, GLuint input, int x, int y, int w,
-                               int h) {
+        const auto scale = [&](GLuint program, GLuint fbo, GLuint input, int x, int y, int w, int h,
+                               int offsetX, int offsetY) {
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             glViewport(x, y, w, h);
             glUseProgram(program);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, input);
             glUniform1i(glGetUniformLocation(program, "Source"), 0);
+            glUniform2i(glGetUniformLocation(program, "Offset"), offsetX, offsetY);
             glDrawArrays(GL_TRIANGLES, 0, 3);
         };
+        // The horizontal pass reads the picture where it sits in the scanout;
+        // the vertical one reads the intermediate, which is the picture alone.
         scale(d->scaleHProgram, d->scaledMidFbo, d->sourceTexture, 0, 0, m_PictureWidth,
-              m_SourceHeight);
+              m_SourceHeight, frame.sourceX, frame.sourceY);
         if (m_Letterboxed) {
             glBindFramebuffer(GL_FRAMEBUFFER, d->scaledFbo);
             glViewport(0, 0, m_OutputWidth, m_OutputHeight);
@@ -817,7 +926,7 @@ bool GlConvert::convert(const capture::KmsFrame& frame, const capture::CursorSta
             glClear(GL_COLOR_BUFFER_BIT);
         }
         scale(d->scaleVProgram, d->scaledFbo, d->scaledMidTexture, m_PictureX, m_PictureY,
-              m_PictureWidth, m_PictureHeight);
+              m_PictureWidth, m_PictureHeight, 0, 0);
     }
     if (timed) glEndQuery(GL_TIME_ELAPSED_EXT);
     const GLuint scene = resampled ? d->scaledTexture : d->sourceTexture;
@@ -845,6 +954,18 @@ bool GlConvert::convert(const capture::KmsFrame& frame, const capture::CursorSta
         rect[2] *= sx;
         rect[3] *= sy;
     }
+    // The picture inside what the conversion samples: the scaled picture is all
+    // picture; the scanout is too, but for a screen's window of an X11 root.
+    float sourceRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    if (!resampled && (frame.sourceX || frame.sourceY || frame.importWidth() != frame.width ||
+                       frame.importHeight() != frame.height)) {
+        const float bw = static_cast<float>(frame.importWidth());
+        const float bh = static_cast<float>(frame.importHeight());
+        sourceRect[0] = static_cast<float>(frame.sourceX) / bw;
+        sourceRect[1] = static_cast<float>(frame.sourceY) / bh;
+        sourceRect[2] = static_cast<float>(frame.width) / bw;
+        sourceRect[3] = static_cast<float>(frame.height) / bh;
+    }
 
     const auto pass = [&](GLuint program, GLuint fbo, int w, int h) {
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -861,6 +982,7 @@ bool GlConvert::convert(const capture::KmsFrame& frame, const capture::CursorSta
         glUniform1i(glGetUniformLocation(program, "CursorInvert"), 2);
         glUniform4fv(glGetUniformLocation(program, "CursorRect"), 1, rect);
         glUniform1f(glGetUniformLocation(program, "CursorEnabled"), drawCursor ? 1.0f : 0.0f);
+        glUniform4fv(glGetUniformLocation(program, "SourceRect"), 1, sourceRect);
         glDrawArrays(GL_TRIANGLES, 0, 3);
     };
     pass(d->lumaProgram, d->lumaFbo, m_OutputWidth, m_OutputHeight);
@@ -912,6 +1034,8 @@ void GlConvert::stop()
     if (d->gbm) gbm_device_destroy(d->gbm);
     if (d->renderFd >= 0) ::close(d->renderFd);
     d = std::make_unique<Impl>();
+    m_HighPriority = false;
+    m_Priority.clear();
 }
 
 } // namespace mw::native::convert

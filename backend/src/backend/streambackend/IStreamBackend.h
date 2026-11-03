@@ -25,6 +25,7 @@
 #include <QString>
 #include <QVector>
 #include <functional>
+#include <optional>
 
 // Everything a launch/resume needs, flattened so the interface owns no
 // dependency on StreamConfig (which only carries static defaults — the real
@@ -47,6 +48,28 @@ struct LaunchRequest
     /// Only the native engine acts on it — a GameStream host has no say in how
     /// its encoder recovers.
     bool rideOutLoss = false;
+    /// The client's decoder takes the encoder's reference repairs. Only the
+    /// native engine acts on it, as on rideOutLoss.
+    bool refInvalidation = true;
+    /// The client cuts each decoded frame to the size the host announces.
+    /// Only the native engine acts on it, as on rideOutLoss.
+    bool cropsToFrame = false;
+    /// The display a native display card stands for, resolved by the server
+    /// for a stream worker (NativeHostBackend::displayKeyForApp): the cards
+    /// are numbered in the server's settings file, which a SYSTEM worker does
+    /// not read. Empty when the server found none. Absent, the backend
+    /// resolves appId itself. Only the native engine reads it.
+    std::optional<QString> displayKey;
+    /// Whether the owner's app whose card is appId is still in the settings,
+    /// as the server found it for a stream worker — for the same reason as
+    /// displayKey. Absent, the backend looks it up itself. Only the native
+    /// engine reads it.
+    std::optional<bool> hostAppKnown;
+    /// The display our virtual display took the primary role from (its
+    /// DisplayInfo::key), as the server recorded it on turning it on, for a
+    /// stream worker — for the same reason as displayKey. Absent, the backend
+    /// reads it itself. Only the native engine reads it.
+    std::optional<QString> previousPrimary;
     QByteArray rikey;
     int rikeyid = 0;
     QString clientUniqueId;
@@ -106,6 +129,18 @@ struct BackendCapabilities
     // Sunshine web-UI password, so a plain GameStream host — whose only restart
     // path is Sunshine's Basic-Auth REST — stays false and shows nothing.
     bool restartService = false;
+    // The app keeps running on the host when the stream stops, and a later
+    // launch of the same app joins it again — Moonlight's own model: Stop
+    // disconnects, "Quit app" is a separate, explicit action. True for a plain
+    // GameStream host (Sunshine and its forks), which runs one app at a time and
+    // names it in serverinfo (`currentgame`). False where the app is not ours to
+    // keep: Wolf reaps its sessions, the native host has displays, not apps.
+    bool resumableApps = false;
+    // Which app runs is a per-device answer: each device has a seat of its own
+    // (MultiSeat), so the host-wide `currentgame` the poll reads means nothing,
+    // and the running app is asked per device (runningAppForDevice) — never
+    // stored on the host.
+    bool runningAppPerDevice = false;
 };
 
 // Why a call failed. Callers map this to HTTP; keeping the kind distinct from
@@ -153,6 +188,8 @@ using BackendJsonCallback =
 // but has nothing to name — an unambiguous "no", distinct from ok == false.
 using BackendStringCallback =
     std::function<void(bool ok, const BackendError& error, const QString& value)>;
+// One number from the backend, e.g. the running app id (0 = none).
+using BackendIntCallback = std::function<void(bool ok, const BackendError& error, int value)>;
 
 // A source of streamable seats and apps.
 //
@@ -197,6 +234,32 @@ public:
     // down a *different* player's stream. StreamSession has always passed it.
     virtual void quit(const QString& seatId, const QString& clientUniqueId,
                       BackendVoidCallback cb) = 0;
+
+    // The app running on the seat right now, asked of the host rather than read
+    // from the last poll: 0 when none. Only meaningful when
+    // capabilities().resumableApps is true; others answer Unsupported.
+    virtual void runningApp(const QString& seatId, BackendIntCallback cb)
+    {
+        Q_UNUSED(seatId);
+        cb(false,
+           BackendError::make(BackendError::Unsupported,
+                              QStringLiteral("This backend does not report its running app")),
+           0);
+    }
+
+    // The app running for one device: on its own seat where devices have one
+    // (capabilities().runningAppPerDevice), otherwise the host's, as above. A
+    // device that has no seat runs nothing: 0, and no seat is claimed for it.
+    virtual void runningAppForDevice(const QString& deviceId, BackendIntCallback cb)
+    {
+        Q_UNUSED(deviceId);
+        runningApp(QString(), std::move(cb));
+    }
+
+    // Give back what this device holds on the host — its seat, where devices
+    // have one. Called once the device has neither a stream nor a running app;
+    // nothing to do elsewhere.
+    virtual void releaseDevice(const QString& deviceId) { Q_UNUSED(deviceId); }
 
     // Restart the streaming service this backend fronts, through its own
     // control API — never by asking the host for credentials. Only meaningful

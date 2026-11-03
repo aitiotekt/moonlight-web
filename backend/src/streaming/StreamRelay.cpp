@@ -19,7 +19,12 @@
 #include "ClipboardBridge.h"
 #include "InputMessageCodec.h"
 #include "IMediaEngine.h"
+#include "MicUplink.h"
 #include "NativeMediaEngine.h"
+
+extern "C" {
+#include "Limelight.h"
+}
 
 #include <QCoreApplication>
 #include <QThread>
@@ -90,6 +95,46 @@ StreamRelay::StreamRelay(IMediaEngine* engine, quint16 wsPort, const QSslConfigu
                 m_WsClient->sendTextMessage(
                     QString::fromUtf8(QJsonDocument(m).toJson(QJsonDocument::Compact)));
             });
+
+    // The guests' shared feed changes codec (native host) — see DataChannelRelay.
+    connect(m_Shim, &IMediaEngine::sharedFeedCodecChanged, this, [this](QString codec) {
+        if (!m_WsClient || m_WsClient->state() != QAbstractSocket::ConnectedState) return;
+        QJsonObject m;
+        m["type"] = "feedcodec";
+        m["codec"] = codec;
+        m_WsClient->sendTextMessage(
+            QString::fromUtf8(QJsonDocument(m).toJson(QJsonDocument::Compact)));
+    });
+
+    // The pointer the client draws (native host, desktop mode): its shape, then
+    // where it is — see DataChannelRelay for both messages. Without them a wss
+    // client that asked the host to leave the picture clean drew a plain arrow
+    // that never changed shape.
+    connect(m_Shim, &IMediaEngine::cursorShapeChanged, this,
+            [this](QByteArray png, int hotspotX, int hotspotY, bool visible, QString kind,
+                   double scale) {
+                if (!m_WsClient || m_WsClient->state() != QAbstractSocket::ConnectedState) return;
+                QJsonObject m;
+                m["type"] = "cursor";
+                m["visible"] = visible;
+                m["hotspotX"] = hotspotX;
+                m["hotspotY"] = hotspotY;
+                m["scale"] = scale;
+                if (!kind.isEmpty()) m["kind"] = kind;
+                if (!png.isEmpty()) m["png"] = QString::fromLatin1(png.toBase64());
+                m_WsClient->sendTextMessage(
+                    QString::fromUtf8(QJsonDocument(m).toJson(QJsonDocument::Compact)));
+            });
+    connect(m_Shim, &IMediaEngine::cursorMoved, this, [this](double x, double y, bool visible) {
+        if (!m_WsClient || m_WsClient->state() != QAbstractSocket::ConnectedState) return;
+        QJsonObject m;
+        m["type"] = "cursorpos";
+        m["x"] = x;
+        m["y"] = y;
+        m["visible"] = visible;
+        m_WsClient->sendTextMessage(
+            QString::fromUtf8(QJsonDocument(m).toJson(QJsonDocument::Compact)));
+    });
 
     bool secure = !sslConfig.isNull();
     m_WsServer = new QWebSocketServer(
@@ -207,6 +252,9 @@ void StreamRelay::stop()
         return;
     }
     m_Stopping = true;
+
+    // The microphone's device first: nothing more will come for it.
+    if (m_Mic) m_Mic->stop();
 
     if (m_StatsTimer) m_StatsTimer->stop();
 
@@ -510,6 +558,11 @@ void StreamRelay::onNewWsConnection()
         qWarning() << "[StreamRelay] nextPendingConnection returned null";
         return;
     }
+    // Bounded: Qt takes a message of up to 2 GB by default, and buffers all of
+    // it before anyone sees a byte. 16 MiB is far past anything this socket
+    // legitimately carries.
+    m_WsClient->setMaxAllowedIncomingMessageSize(16 * 1024 * 1024);
+    m_WsClient->setMaxAllowedIncomingFrameSize(16 * 1024 * 1024);
 
     m_ClipboardSettings.reset();
     if (m_ClipboardEnabled) ClipboardBridge::instance()->setSubscription(this, false);
@@ -517,6 +570,7 @@ void StreamRelay::onNewWsConnection()
     qInfo() << "[StreamRelay] WS client created, connecting signals...";
 
     connect(m_WsClient, &QWebSocket::textMessageReceived, this, &StreamRelay::onWsTextMessage);
+    connect(m_WsClient, &QWebSocket::binaryMessageReceived, this, &StreamRelay::onWsBinaryMessage);
     connect(m_WsClient, &QWebSocket::disconnected, this, &StreamRelay::onWsDisconnected);
 
     // Log WS errors (QWebSocket::errorOccurred exists only since Qt 6.5)
@@ -622,20 +676,14 @@ void StreamRelay::onWsTextMessage(const QString& message)
         // Shared codec, so this transport resolves IntlBackslash/IntlRo and the
         // client's keyboard layout like the others instead of passing the raw
         // VK through.
-        const InputMsg::KeyPlan plan = InputMsg::resolveKey(msg, m_Shim->keyboardMode());
-        InputMsg::logKey(msg, m_Shim->keyboardMode(), plan, down);
-        if (plan.isText()) {
-            m_Shim->sendKeyChar(plan.text, down, InputMsg::modifierMask(msg));
-        } else {
-            m_Shim->sendKeyEvent(plan.keyCode, down, InputMsg::modifierMask(msg), plan.flags,
-                                 msg["hold"].toBool(false));
-        }
+        InputMsg::sendKey(*m_Shim, msg, down);
     } else if (type == "inputstate") {
         // Client heartbeat of its held-input state — full contract in
-        // IMediaEngine's input-watchdog contract.
-        m_Shim->syncHeldInputs(InputMsg::parseHeldKeys(msg, m_Shim->keyboardMode()),
-                               static_cast<quint32>(msg["buttons"].toInt(0)),
-                               msg["buttonsHold"].toBool(false));
+        // IMediaEngine's input-watchdog contract. Filtered by the guest's
+        // policy, or a viewer could press keys with it.
+        const InputMsg::HeldState held = InputMsg::readHeldState(
+            msg, m_Shim->keyboardMode(), m_Shim->layoutFidelity(), m_InputPolicy);
+        m_Shim->syncHeldInputs(held.keys, held.buttons, held.buttonsHold);
     } else if (type == "mousemove") {
         // Absolute mouse position (non-gaming mode) — same handling as
         // DataChannelRelay, otherwise the host cursor never moves in WSS.
@@ -665,12 +713,24 @@ void StreamRelay::onWsTextMessage(const QString& message)
     } else if (type == "secureattention") {
         // Ctrl+Alt+Suppr: the one combination a browser can never deliver — the
         // OS running the viewer eats it first — so it arrives as a message of
-        // its own, from a button. Whether it reaches the host's secure desktop
+        // its own, from the touch keyboard bar (Ctrl and Alt down, then Del).
+        // Whether it reaches the host's secure desktop
         // depends on the host (IMediaEngine::sendSecureAttention).
         m_Shim->sendSecureAttention();
     } else if (type == "textinput") {
-        // Virtual/soft keyboard text (UTF-8) — forwarded as a text event.
-        m_Shim->sendUtf8Text(msg["text"].toString());
+        // Virtual/soft keyboard text: as text, or as US keys on a host that
+        // cannot type text without an input method (InputMsg::planText).
+        // What was left to that input method is named back to the page, which
+        // says once why it may not arrive.
+        const QString viaIme = InputMsg::sendText(*m_Shim, msg["text"].toString());
+        if (!viaIme.isEmpty() && m_WsClient &&
+            m_WsClient->state() == QAbstractSocket::ConnectedState) {
+            QJsonObject m;
+            m["type"] = "textviaime";
+            m["text"] = viaIme;
+            m_WsClient->sendTextMessage(
+                QString::fromUtf8(QJsonDocument(m).toJson(QJsonDocument::Compact)));
+        }
     } else if (type == "locksync") {
         // Align the host's toggle locks (Num/Caps/Scroll) with the client's,
         // sent once per session on the browser's first real keyboard event.
@@ -680,6 +740,13 @@ void StreamRelay::onWsTextMessage(const QString& message)
         // The way out of a closed input gate — native host only, full
         // reasoning in DataChannelRelay's handler.
         if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim)) native->releaseInputBlock();
+    } else if (type == "cursormode") {
+        // Who draws the pointer — native host only, full reasoning in
+        // DataChannelRelay's handler. Ignored here until 04/10/2026: on wss the
+        // host kept burning its pointer into a desktop-mode picture that the
+        // browser was drawing its own on, and the viewer saw two.
+        if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim))
+            native->setCompositeCursor(msg["composite"].toBool(true), msg["cursorPx"].toInt(0));
     } else if (type == "framefloor") {
         // How fast the client wants frames while the host's screen is still —
         // native host only, full reasoning in DataChannelRelay's handler.
@@ -727,9 +794,21 @@ void StreamRelay::onWsTextMessage(const QString& message)
         // stayed plugged into the native host until the session ended.
         m_Shim->sendControllerRemoval(static_cast<uint8_t>(msg["index"].toInt(0)),
                                       static_cast<uint16_t>(msg["mask"].toInt(0)));
+    } else if (type == "linkstats") {
+        // The page reports its link on every transport; only the WebRTC
+        // relay has a governor to feed, so here it is simply not news.
     } else {
         qWarning() << "[StreamRelay] Unknown input type:" << type;
     }
+}
+
+void StreamRelay::onWsBinaryMessage(const QByteArray& message)
+{
+    // The only binary the page sends is its microphone (MicRtp.h): input is
+    // text. Without a granted microphone there is nothing to hand it to.
+    if (m_Mic)
+        m_Mic->onSocketFrame(reinterpret_cast<const uint8_t*>(message.constData()),
+                             static_cast<size_t>(message.size()));
 }
 
 void StreamRelay::onWsDisconnected()
@@ -791,6 +870,11 @@ void StreamRelay::onShimConnectionTerminated(int errorCode)
             << "m_Running=" << m_Running << "m_Stopping=" << m_Stopping
             << "frames sent=" << m_FrameCount;
     m_StreamStarted = false;
+
+    // Graceful termination: the host ended the stream on purpose (the app was
+    // closed there). Tell the browser before the socket drops. Any other code
+    // is the host side failing, not this socket: say that instead.
+    sendExitNotice(errorCode == ML_ERROR_GRACEFUL_TERMINATION ? "host-ended" : "host-lost");
 
     // Always emit sessionEnded so cleanup runs, regardless of error code.
     // Graceful termination (code 0) still needs relay/shim cleanup.

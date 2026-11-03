@@ -19,9 +19,12 @@
 #include "core/FrameCadence.h"
 #include "native_test_framework.h"
 
+#include <atomic>
+
 using mw::native::alignCadence;
 using mw::native::AlignedCadence;
 using mw::native::FrameCadence;
+using mw::native::storeClientRefresh;
 
 void run_cadence_align_tests()
 {
@@ -204,5 +207,42 @@ void run_cadence_align_tests()
         FrameCadence off = FrameCadence::fromIntervalNs(0, 165);
         CHECK(!off.enabled());
         CHECK(off.admit(12345));
+    }
+
+    SECTION("storeClientRefresh — both values kept, bounded, a move said");
+    {
+        std::atomic<int> milliHz{60000};
+        std::atomic<bool> vsync{false};
+        // The same screen said again: nothing to re-choose.
+        CHECK(!storeClientRefresh(milliHz, vsync, 60000, false));
+
+        // A renderer that paints at the vsync, said with a rate the host had
+        // not: both moved, both kept. A && between the two exchanges once
+        // kept the rate and dropped the vsync.
+        CHECK(storeClientRefresh(milliHz, vsync, 144000, true));
+        CHECK_EQ(milliHz.load(), 144000);
+        CHECK(vsync.load());
+
+        // The vsync alone, then the rate alone.
+        CHECK(storeClientRefresh(milliHz, vsync, 144000, false));
+        CHECK_EQ(milliHz.load(), 144000);
+        CHECK(!vsync.load());
+        CHECK(storeClientRefresh(milliHz, vsync, 120000, false));
+        CHECK_EQ(milliHz.load(), 120000);
+        CHECK(!vsync.load());
+
+        // A rate still unknown, with the vsync now known: kept at zero.
+        milliHz.store(0);
+        CHECK(storeClientRefresh(milliHz, vsync, 0, true));
+        CHECK_EQ(milliHz.load(), 0);
+        CHECK(vsync.load());
+
+        // Bounded: under 1 Hz is unknown, over 1000 Hz is 1000 Hz.
+        CHECK(!storeClientRefresh(milliHz, vsync, 999, true));
+        CHECK(!storeClientRefresh(milliHz, vsync, -5, true));
+        CHECK_EQ(milliHz.load(), 0);
+        CHECK(storeClientRefresh(milliHz, vsync, 5000000, true));
+        CHECK_EQ(milliHz.load(), 1000000);
+        CHECK(!storeClientRefresh(milliHz, vsync, 2000000, true));
     }
 }

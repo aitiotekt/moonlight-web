@@ -30,13 +30,14 @@ OUT=$(realpath "$3")
 EDITION=${4:-prod}
 
 # PORTS: what postinst opens in an active firewall (and prerm closes), in ufw's
-# notation (postinst turns a range's ':' into firewalld's '-'). 48010:48033/udp
-# is the stream media block: one pinned port per slot, 48010 + slot, for the 24
-# slots planSlotPorts() gives the default signaling port (backend/src/main.cpp).
+# notation (postinst turns a range's ':' into firewalld's '-'). 48550:48573/udp
+# is the stream media block: one pinned port per slot, 48550 + slot, for the 24
+# slots (mw::routerports::kMediaBasePort / kMediaPortCount). postinst also
+# reserves it from the kernel's ephemeral ports (MEDIA_RANGE below).
 # The DEV edition listens on its own TCP ports and leaves the media block alone:
 # production opens it, and a DEV uninstall closing it would cut production off.
 case "$EDITION" in
-    prod) NAME=moonlightweb;     APP=MoonlightWeb;    PORTS="443/tcp 80/tcp 48010:48033/udp" ;;
+    prod) NAME=moonlightweb;     APP=MoonlightWeb;    PORTS="443/tcp 80/tcp 48550:48573/udp" ;;
     dev)  NAME=moonlightweb-dev; APP=MoonlightWebDev; PORTS="48443/tcp 48080/tcp" ;;
     *) echo "error: edition must be prod or dev (got '$EDITION')" >&2; exit 1 ;;
 esac
@@ -65,13 +66,14 @@ EOF
 # as (`moonlightweb --status`, `--new-pin`, `--enable-internet`).
 #
 # It points at the LAUNCHER, not the binary — as do the .desktop entry and the
-# systemd unit. The KMS screen capture needs CAP_SYS_ADMIN, and the file
-# capability cannot sit on MoonlightWeb itself: glibc runs a binary that gains a
-# capability in secure mode, where the $ORIGIN rpath linuxdeploy wrote is
-# refused and the bundled Qt is never found (measured: "error while loading
-# shared libraries" on Ubuntu 22.04). moonlightweb-launch links libc only,
-# carries the capability, and execs MoonlightWeb next to it with the capability
-# in the ambient set — see moonlightweb-launch.c. postinst sets it below.
+# systemd unit. The KMS screen capture needs CAP_SYS_ADMIN (and a GPU context
+# above normal priority CAP_SYS_NICE), and a file capability cannot sit on
+# MoonlightWeb itself: glibc runs a binary that gains a capability in secure
+# mode, where the $ORIGIN rpath linuxdeploy wrote is refused and the bundled Qt
+# is never found (measured: "error while loading shared libraries" on Ubuntu
+# 22.04). moonlightweb-launch links libc only, carries the capabilities, and
+# execs MoonlightWeb next to it with them in the ambient set — see
+# moonlightweb-launch.c. postinst sets them below.
 ln -sfn "$PREFIX/bin/moonlightweb-launch" "$PKG/usr/bin/$NAME"
 
 # systemd unit for headless installs. Vendor directory, not /etc/systemd/system:
@@ -108,7 +110,7 @@ cat > "$PKG/usr/share/applications/$APPID.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=$APP
-Comment=Sunshine streaming client for the browser
+Comment=Stream your gaming PC to any browser
 Exec=$PREFIX/bin/moonlightweb-launch
 Icon=$NAME
 Categories=Network;Game;
@@ -117,23 +119,42 @@ Terminal=false
 StartupWMClass=$APP
 EOF
 
+# KWin's grant (KDE Plasma 6, whose portal makes no virtual display): KWin
+# makes the virtual display through a restricted protocol it hands only to a
+# program an installed .desktop names — by the binary's own path, which it
+# reads from /proc. The binary, then, not the launcher: the session asks
+# through a helper that runs it with every capability dropped, since KWin
+# cannot read a process that holds one. Not a menu entry (NoDisplay). KWin
+# reads it at login: it counts from the next one after the install.
+cat > "$PKG/usr/share/applications/$APPID.KWin.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$APP virtual display
+Exec=$PREFIX/bin/$APP
+NoDisplay=true
+Terminal=false
+X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1
+EOF
+
 # AppStream metadata: what GNOME Software / KDE Discover / Ubuntu App Center
 # actually index. Without it the app is installable but invisible in every
 # graphical software centre. The same file is compiled into the repository
 # index by the `linux-repo` job (see .github/workflows/release.yml).
-sed -e "s/@MW_VERSION@/$VERSION/g" -e "s/@MW_DATE@/$(date -u +%Y-%m-%d)/g" \
-    -e "s/top\.moonlightweb\.MoonlightWeb/$APPID/g" \
-    -e "s|^  <name>MoonlightWeb</name>|  <name>$APP</name>|" \
-    -e "s|<binary>moonlightweb</binary>|<binary>$NAME</binary>|" \
-    "$(dirname "$0")/top.moonlightweb.MoonlightWeb.metainfo.xml" \
-    > "$PKG/usr/share/metainfo/$APPID.metainfo.xml"
+bash "$(dirname "$0")/make-metainfo.sh" "$APP" "$NAME" "$VERSION" \
+    "$PKG/usr/share/metainfo/$APPID.metainfo.xml"
 
-# Catches a malformed template before it reaches a user's software centre.
-# Advisory only: appstreamcli is not installed on every build host, and its
-# newer releases add warnings that would otherwise break packaging.
-if command -v appstreamcli >/dev/null 2>&1; then
-    appstreamcli validate --no-net "$PKG/usr/share/metainfo/$APPID.metainfo.xml" \
-        || echo "warning: AppStream validation reported issues (not fatal)"
+# In-app updates without a password (SelfUpdater's "repo" path): a root helper
+# that upgrades the package from its signed repository, the polkit action that
+# lets the active session run it without one, and the repository's public key
+# for the postinst to configure that repository. Production only — the DEV
+# edition is not in the repository and never updates itself.
+if [ "$EDITION" = prod ]; then
+    install -m 0755 "$(dirname "$0")/moonlightweb-update" "$PKG$PREFIX/bin/moonlightweb-update"
+    mkdir -p "$PKG/usr/share/polkit-1/actions" "$PKG$PREFIX/share/keys"
+    install -m 0644 "$(dirname "$0")/top.moonlightweb.update.policy" \
+        "$PKG/usr/share/polkit-1/actions/top.moonlightweb.update.policy"
+    install -m 0644 "$(dirname "$0")/moonlightweb-repo.gpg" "$PKG$PREFIX/share/keys/moonlightweb.gpg"
+    install -m 0644 "$(dirname "$0")/moonlightweb-repo.asc" "$PKG$PREFIX/share/keys/moonlightweb.asc"
 fi
 
 # Post-install / pre-remove hooks shared by both package formats.
@@ -142,20 +163,21 @@ cat > "$ROOT/postinst.sh" <<'EOF'
 update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 gtk-update-icon-cache -q /usr/share/icons/hicolor >/dev/null 2>&1 || true
 
-# The capability the screen capture needs, on the launcher (never on the
-# binary — see make-packages.sh). Neither dpkg nor rpm restores file
-# capabilities from the payload, so it is set here, first, on every install and
-# upgrade. Permitted only (+p), Sunshine's posture: the app raises it into the
-# effective set of one thread around the one ioctl that checks it. setcap lives
-# in /usr/sbin (or /sbin on an unmerged system), which a package manager's PATH
-# does not always include. Loud on failure: the symptom otherwise is a host card
-# that never appears, with the reason buried in a log.
+# The capabilities the native engine needs, on the launcher (never on the
+# binary — see make-packages.sh): CAP_SYS_ADMIN for the screen capture,
+# CAP_SYS_NICE for a GPU context above normal priority. Neither dpkg nor rpm
+# restores file capabilities from the payload, so they are set here, first, on
+# every install and upgrade. Permitted only (+p), Sunshine's posture: the app
+# raises one into the effective set of one thread around the one call that
+# checks it. setcap lives in /usr/sbin (or /sbin on an unmerged system), which a
+# package manager's PATH does not always include. Loud on failure: the symptom
+# otherwise is a host card that never appears, with the reason buried in a log.
 PATH="$PATH:/usr/sbin:/sbin"
-if ! setcap cap_sys_admin+p /opt/moonlightweb/bin/moonlightweb-launch 2>/dev/null; then
-    echo "warning: could not set cap_sys_admin on /opt/moonlightweb/bin/moonlightweb-launch" >&2
+if ! setcap cap_sys_admin,cap_sys_nice+p /opt/moonlightweb/bin/moonlightweb-launch 2>/dev/null; then
+    echo "warning: could not set cap_sys_admin,cap_sys_nice on /opt/moonlightweb/bin/moonlightweb-launch" >&2
     echo "         (is setcap installed? libcap2-bin on Debian/Ubuntu, libcap on Fedora," >&2
     echo "         libcap-progs on openSUSE). Until it is set, this machine cannot host" >&2
-    echo "         its own screen:  sudo setcap cap_sys_admin+p /opt/moonlightweb/bin/moonlightweb-launch" >&2
+    echo "         its own screen:  sudo setcap cap_sys_admin,cap_sys_nice+p /opt/moonlightweb/bin/moonlightweb-launch" >&2
 fi
 
 # Apply the uinput rule now rather than at the next boot, and load the module so
@@ -165,24 +187,100 @@ fi
 udevadm control --reload-rules >/dev/null 2>&1 || true
 udevadm trigger --subsystem-match=misc --sysname-match=uinput >/dev/null 2>&1 || true
 modprobe uinput >/dev/null 2>&1 || true
+# The same for uhid, the HID passthrough's devices.
+udevadm trigger --subsystem-match=misc --sysname-match=uhid >/dev/null 2>&1 || true
+modprobe uhid >/dev/null 2>&1 || true
+
+# The stream's media block, the one production owns (empty in the DEV edition).
+MEDIA_RANGE=48550-48573
 
 # Open the server ports in the system firewall (best-effort). Unlike Windows /
 # macOS, Linux netfilter firewalls are port-based (no per-program rule), and this
 # runs before the app picks a port, so we open the defaults: 443/tcp + 80/tcp
-# (HTTPS + HTTP→HTTPS redirect) and 48010-48033/udp (the stream's media ports).
+# (HTTPS + HTTP→HTTPS redirect) and 48550-48573/udp (the stream's media ports).
 # Without the media block the page loads and every stream dies at ICE. A
 # non-default or per-instance parity port under an *active* firewall would need
 # a manual rule. firewalld (Fedora/RHEL — active by default) and ufw
 # (Debian/Ubuntu) only; the AUR hook (moonlightweb-bin.install) does the same.
+# 48010:48033/udp was the media block up to 0.3.0, on Sunshine's RTSP port: an
+# upgrade closes it.
 if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    for p in 443/tcp 80/tcp 48010:48033/udp; do
+    for p in 443/tcp 80/tcp 48550:48573/udp; do
         firewall-cmd --permanent --add-port="$(echo "$p" | tr : -)" >/dev/null 2>&1 || true
     done
+    [ -n "$MEDIA_RANGE" ] && firewall-cmd --permanent --remove-port=48010-48033/udp >/dev/null 2>&1
     firewall-cmd --reload >/dev/null 2>&1 || true
 elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
-    for p in 443/tcp 80/tcp 48010:48033/udp; do
+    for p in 443/tcp 80/tcp 48550:48573/udp; do
         ufw allow "$p" >/dev/null 2>&1 || true
     done
+    [ -n "$MEDIA_RANGE" ] && ufw delete allow 48010:48033/udp >/dev/null 2>&1
+fi
+
+# Reserve the media block from the kernel's ephemeral ports (32768-60999 by
+# default), so no outgoing connection is handed one of them at random and the
+# stream never has to leave the block the firewall opens. The setting is a single
+# list for the whole machine: what is already reserved is kept, and the merged
+# list is written to sysctl.d so it survives a reboot. Best-effort: a container
+# cannot write it, and the app then falls back within the block on its own.
+if [ -n "$MEDIA_RANGE" ]; then
+    key=net.ipv4.ip_local_reserved_ports
+    if cur=$(sysctl -n "$key" 2>/dev/null); then
+        case ",$cur," in
+            *",$MEDIA_RANGE,"*) new=$cur ;;
+            *) new=${cur:+$cur,}$MEDIA_RANGE ;;
+        esac
+        if sysctl -w "$key=$new" >/dev/null 2>&1; then
+            {
+                echo "# Written by the MoonlightWeb package: keeps the kernel from handing its"
+                echo "# stream media ports ($MEDIA_RANGE) out as ephemeral ports. Removed with it."
+                echo "$key = $(sysctl -n "$key")"
+            } > /etc/sysctl.d/60-moonlightweb.conf 2>/dev/null || true
+        fi
+    fi
+fi
+
+# The package's own signed repository, added when none is configured — the way
+# Chrome's package adds Google's. A .deb or .rpm installed by hand then gets its
+# updates the same way as one installed from the repository: through the
+# system's updater, and through the app itself without a password (the update
+# helper only upgrades from here). Written exactly as install.sh writes it, so
+# either one finds the other's files in place. The key comes from the package,
+# not the network. Empty in the DEV edition, which is not in the repository.
+REPO_KEYS=/opt/moonlightweb/share/keys
+REPO_URL=https://packages.moonlightweb.top
+if [ -n "$REPO_KEYS" ] && [ -d "$REPO_KEYS" ]; then
+    if command -v apt-get >/dev/null 2>&1 && [ -d /etc/apt/sources.list.d ]; then
+        if [ ! -s /etc/apt/sources.list.d/moonlightweb.sources ]; then
+            install -d -m 0755 /etc/apt/keyrings
+            install -m 0644 "$REPO_KEYS/moonlightweb.gpg" /etc/apt/keyrings/moonlightweb.gpg
+            cat > /etc/apt/sources.list.d/moonlightweb.sources <<SOURCES
+Types: deb
+URIs: $REPO_URL/deb
+Suites: stable
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/moonlightweb.gpg
+SOURCES
+        fi
+    else
+        repo_dir=""
+        [ -d /etc/yum.repos.d ] && repo_dir=/etc/yum.repos.d
+        [ -d /etc/zypp/repos.d ] && repo_dir=/etc/zypp/repos.d
+        if [ -n "$repo_dir" ] && [ ! -s "$repo_dir/moonlightweb.repo" ]; then
+            install -d -m 0755 /etc/pki/rpm-gpg
+            install -m 0644 "$REPO_KEYS/moonlightweb.asc" /etc/pki/rpm-gpg/RPM-GPG-KEY-moonlightweb
+            cat > "$repo_dir/moonlightweb.repo" <<REPO
+[moonlightweb]
+name=MoonlightWeb
+baseurl=$REPO_URL/rpm
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-moonlightweb
+REPO
+        fi
+    fi
 fi
 
 # Upgrade over a headless install: the service owns the binary we just replaced.
@@ -200,8 +298,16 @@ fi
 # Best-effort: start MoonlightWeb inside the active graphical session so the
 # first-run setup page opens right after install (postinst runs as root with no
 # display; systemd-run --user runs the app under the user's session manager).
-# Skipped when already running (e.g. upgrade) or when no session user is found —
-# the Apps menu entry covers those.
+# Skipped when already running (an upgrade whose old app is still exiting) or
+# when no session user is found — the Apps menu entry covers those.
+# On an upgrade, prerm has stopped the app and nobody clicked anything: it comes
+# back as from the login item (--autostart), without opening its admin page in
+# a browser on the desktop. deb: `configure <old-version>`; rpm: $1 >= 2.
+launchargs=""
+case "${1:-}" in
+    configure) [ -n "${2:-}" ] && launchargs="--autostart" ;;
+    [2-9]) launchargs="--autostart" ;;
+esac
 started=""
 if pgrep -f /opt/moonlightweb/bin/MoonlightWeb >/dev/null 2>&1; then
     started=1
@@ -238,10 +344,10 @@ else
         [ -n "$wl" ] && setenv="$setenv --setenv=WAYLAND_DISPLAY=$wl"
         [ -n "$dp" ] && setenv="$setenv --setenv=DISPLAY=$dp"
 
-        # $setenv is deliberately unquoted: it must split into separate flags
-        # (values are socket/display names — no whitespace).
+        # $setenv and $launchargs are deliberately unquoted: they must split into
+        # separate flags, or vanish when empty (no whitespace in their values).
         if $asuser systemd-run --user --collect --quiet $setenv \
-            /opt/moonlightweb/bin/moonlightweb-launch >/dev/null 2>&1; then
+            /opt/moonlightweb/bin/moonlightweb-launch $launchargs >/dev/null 2>&1; then
             started=1
             break
         fi
@@ -320,14 +426,35 @@ if [ "${1:-}" != "upgrade" ] && [ "${1:-0}" != "1" ]; then
     fi
 
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        for p in 443/tcp 80/tcp 48010:48033/udp; do
+        for p in 443/tcp 80/tcp 48550:48573/udp; do
             firewall-cmd --permanent --remove-port="$(echo "$p" | tr : -)" >/dev/null 2>&1 || true
         done
         firewall-cmd --reload >/dev/null 2>&1 || true
     elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
-        for p in 443/tcp 80/tcp 48010:48033/udp; do
+        for p in 443/tcp 80/tcp 48550:48573/udp; do
             ufw delete allow "$p" >/dev/null 2>&1 || true
         done
+    fi
+
+    # The repository postinst added (production only; see there). Left on an
+    # upgrade, which needs it; taken away with the package.
+    REPO_KEYS=/opt/moonlightweb/share/keys
+    if [ -n "$REPO_KEYS" ]; then
+        rm -f /etc/apt/sources.list.d/moonlightweb.sources /etc/apt/keyrings/moonlightweb.gpg \
+              /etc/yum.repos.d/moonlightweb.repo /etc/zypp/repos.d/moonlightweb.repo \
+              /etc/pki/rpm-gpg/RPM-GPG-KEY-moonlightweb
+    fi
+
+    # Give the media block back to the kernel's ephemeral ports (see postinst).
+    MEDIA_RANGE=48550-48573
+    if [ -n "$MEDIA_RANGE" ] && [ -f /etc/sysctl.d/60-moonlightweb.conf ]; then
+        PATH="$PATH:/usr/sbin:/sbin"
+        rm -f /etc/sysctl.d/60-moonlightweb.conf
+        key=net.ipv4.ip_local_reserved_ports
+        if cur=$(sysctl -n "$key" 2>/dev/null); then
+            new=$(printf ',%s,' "$cur" | sed -e "s/,$MEDIA_RANGE,/,/" -e 's/^,//' -e 's/,$//')
+            sysctl -w "$key=$new" >/dev/null 2>&1 || true
+        fi
     fi
 fi
 exit 0
@@ -337,7 +464,9 @@ if [ "$EDITION" = dev ]; then
     sed -i -e "s|/opt/moonlightweb/bin/MoonlightWeb|$PREFIX/bin/$APP|g" \
            -e "s|/opt/moonlightweb/|$PREFIX/|g" \
            -e "s|moonlightweb\.service|$NAME.service|g" \
-           -e "s|443/tcp 80/tcp 48010:48033/udp|$PORTS|g" \
+           -e "s|443/tcp 80/tcp 48550:48573/udp|$PORTS|g" \
+           -e "s|^\( *\)MEDIA_RANGE=.*|\1MEDIA_RANGE=|" \
+           -e "s|^\( *\)REPO_KEYS=.*|\1REPO_KEYS=|" \
            -e "s|moonlightweb --|$NAME --|g" \
            -e "s|enable --now moonlightweb\$|enable --now $NAME|" \
            -e "s|the moonlightweb service|the $NAME service|" \
@@ -370,11 +499,23 @@ fi
 # and audio — libdrm, libva (+ its DRM backend), GLESv2, GBM and the PipeWire
 # client library. Deliberately NOT bundled (release.yml excludes them from the
 # AppDir: their driver and module paths are compiled in, so a copy from the
-# build host would find nothing on another distro). NEEDED entries of the
-# executable, so the process does not start without them. libpipewire is only
-# the client library: a machine still on PulseAudio has it too, and the host
-# then streams silent with an explicit log rather than not starting.
+# build host would find nothing on another distro). libdrm, EGL, GLESv2 and
+# GBM are NEEDED entries of the executable; libva, libva-drm and libpipewire are
+# not since 29/09/2026 — they are opened on first use, so the AppImage starts
+# without them — but a package is installed to work, so it still pulls all of
+# them: without libva the host encodes on the CPU, without libpipewire it has
+# no sound. libpipewire is only the client library: a machine still on
+# PulseAudio has it too, and the host then streams silent with an explicit log.
 # libcap2-bin provides setcap for the postinst above.
+#
+# Third group, only recommended: the Vulkan loader and Mesa's Vulkan drivers
+# (the split route's conversion and the Vulkan Video chain, plan Phase 13).
+# The native host opens libvulkan.so.1 with dlopen, never links it: without
+# it, GL converts and VA-API encodes, as they always have. apt, dnf and zypper
+# install recommended packages by default, so a machine without Vulkan gets it
+# with MoonlightWeb, silently; one set to skip them still streams. dav1d too:
+# the AV1 Vulkan Video encoder's pixel proof reads its stream back with it
+# (C13.12, opened at run time) — without it, no AV1 through Vulkan.
 deb_depends=(
     --depends libgl1 --depends libopengl0 --depends libegl1
     --depends libfontconfig1 --depends libfreetype6
@@ -382,6 +523,8 @@ deb_depends=(
     --depends libdrm2 --depends libva2 --depends libva-drm2
     --depends libgles2 --depends libgbm1 --depends libpipewire-0.3-0
     --depends libcap2-bin
+    --deb-recommends libvulkan1 --deb-recommends mesa-vulkan-drivers
+    --deb-recommends "libdav1d7 | libdav1d6 | libdav1d5"
 )
 # RPM resolves soname provides, which every RPM distro generates the same way —
 # unlike package names, which differ between Fedora (libglvnd-glx) and openSUSE
@@ -397,13 +540,20 @@ rpm_depends=(
     --depends "libdrm.so.2()(64bit)" --depends "libva.so.2()(64bit)"
     --depends "libva-drm.so.2()(64bit)" --depends "libGLESv2.so.2()(64bit)"
     --depends "libgbm.so.1()(64bit)" --depends "libpipewire-0.3.so.0()(64bit)"
+    --rpm-tag "Recommends: libvulkan.so.1()(64bit)"
+    # Mesa's AMD and Intel Vulkan drivers, by the sonames both distros generate:
+    # Fedora's mesa-vulkan-drivers provides the two, openSUSE splits them into
+    # libvulkan_radeon and libvulkan_intel.
+    --rpm-tag "Recommends: libvulkan_radeon.so()(64bit)"
+    --rpm-tag "Recommends: libvulkan_intel.so()(64bit)"
+    --rpm-tag "Recommends: libdav1d.so.7()(64bit)"
 )
 
 common=(
     -s dir -n "$NAME" -v "$VERSION"
     --license GPL-3.0 --vendor MoonlightWeb
     --url "https://moonlightweb.top/"
-    --description "Sunshine streaming client for the browser (self-contained, bundled Qt runtime)"
+    --description "Stream your gaming PC to any device with a browser (self-contained, bundled Qt runtime)"
     --maintainer "MoonlightWeb"
     --after-install "$ROOT/postinst.sh"
     --before-remove "$ROOT/prerm.sh"

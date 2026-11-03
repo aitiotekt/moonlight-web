@@ -17,12 +17,17 @@
 
 #include "RelayBase.h"
 
+#include "IMediaEngine.h"
+#include "IcePriority.h"
+#include "MicRtp.h"
+#include "MicUplink.h"
 #include "server/NetClassify.h"
 
 #include <rtc/rtc.hpp>
 
 #include <QDebug>
 #include <QHostAddress>
+#include <QJsonDocument>
 #include <QString>
 
 namespace {
@@ -47,7 +52,7 @@ bool looksIpv6(const std::string& candStr)
            candStr.find(':', firstSpace + 1) != std::string::npos;
 }
 
-/// "host 192.168.1.66:48010/UDP" — enough to tell a direct path from one that
+/// "host 192.168.1.66:48550/UDP" — enough to tell a direct path from one that
 /// leaves through the router and comes back (same public IP on both ends).
 QString describeCandidate(const rtc::Candidate& c)
 {
@@ -96,6 +101,48 @@ void RelayBase::logSelectedCandidatePair(rtc::PeerConnection& pc, const char* lo
             << describeCandidate(remote);
 }
 
+void RelayBase::wireMicUplink(rtc::Track& audioTrack, const char* logTag)
+{
+    if (!m_Mic) return;
+    std::weak_ptr<MicUplink> weak = m_Mic;
+    audioTrack.onMessage([weak](rtc::message_variant message) {
+        const auto* bytes = std::get_if<rtc::binary>(&message);
+        if (!bytes || bytes->empty()) return;
+        if (const auto mic = weak.lock())
+            mic->onPacket(reinterpret_cast<const uint8_t*>(bytes->data()), bytes->size());
+    });
+    qInfo() << logTag << "Audio offered sendrecv: the viewer's microphone plays into"
+            << QString::fromStdString(m_Mic->deviceName());
+}
+
+void RelayBase::logMicAnswer(const std::string& sdp, const char* logTag) const
+{
+    if (!m_Mic) return;
+    const mw::mic::AudioAnswer answer = mw::mic::readAudioAnswer(sdp);
+    if (!answer.found || !answer.sends)
+        qInfo() << logTag
+                << "Microphone: the browser answered without sending (no track, or "
+                   "the page has the setting off)";
+    else if (!answer.hasSsrc)
+        qWarning() << logTag
+                   << "Microphone: the browser sends, but its answer names no SSRC — "
+                      "libdatachannel cannot route that RTP to the track";
+    else
+        qInfo() << logTag << "Microphone: the browser will send on the audio section";
+}
+
+void RelayBase::stopMic()
+{
+    if (m_Mic) m_Mic->stop();
+}
+
+std::string RelayBase::micOpusFmtp() const
+{
+    std::string fmtp = "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1";
+    if (m_Mic) fmtp += ";maxaveragebitrate=128000;maxplaybackrate=48000";
+    return fmtp;
+}
+
 void RelayBase::emitLocalCandidate(const rtc::Candidate& candidate, const char* logTag)
 {
     rtc::Candidate modCandidate = candidate;
@@ -141,8 +188,15 @@ void RelayBase::emitLocalCandidate(const rtc::Candidate& candidate, const char* 
                 emit signalingIceCandidate(candidate.candidate(), std::string(candidate.mid()));
             try {
                 modCandidate.changeAddress(m_PublicIP, m_PublicPort);
+                // A reflexive address's priority, below the LAN host candidate
+                // just emitted: a same-LAN peer then prefers the direct pair to
+                // the router's hairpin instead of racing them (IcePriority.h).
+                const uint32_t priority = mw::ice::srflxPriority(candidate.priority());
+                modCandidate = rtc::Candidate(
+                    mw::ice::withPriority(modCandidate.candidate(), priority), candidate.mid());
                 qInfo() << logTag << "Host candidate ->" << QString::fromStdString(m_PublicIP)
-                        << ":" << m_PublicPort << (m_EmitLanCandidate ? "(+ LAN)" : "");
+                        << ":" << m_PublicPort << "priority" << priority
+                        << (m_EmitLanCandidate ? "(+ LAN)" : "");
             } catch (const std::exception& e) {
                 qWarning() << logTag << "Failed to rewrite candidate:" << e.what();
             }
@@ -187,4 +241,22 @@ void RelayBase::emitLocalCandidate(const rtc::Candidate& candidate, const char* 
 
     emit signalingIceCandidate(std::string(modCandidate.candidate()),
                                std::string(modCandidate.mid()));
+}
+
+QByteArray RelayBase::inputCapsMessage(const InputMsg::Policy& policy)
+{
+    return QJsonDocument(QJsonObject{{QStringLiteral("type"), QStringLiteral("inputcaps")},
+                                     {QStringLiteral("keyboardMouse"), policy.keyboardMouse}})
+        .toJson(QJsonDocument::Compact);
+}
+
+QJsonObject RelayBase::hidCapsMessage(const InputMsg::Policy& policy, IMediaEngine& engine)
+{
+    const QString why =
+        !policy.hid ? QStringLiteral("not allowed for this player") : engine.hidUnavailableReason();
+    return QJsonObject{{QStringLiteral("type"), QStringLiteral("hidcaps")},
+                       {QStringLiteral("available"), why.isEmpty()},
+                       {QStringLiteral("ffb"), why.isEmpty() && engine.hidForceFeedback()},
+                       {QStringLiteral("hidpp"), why.isEmpty() && engine.hidRelaysHidpp()},
+                       {QStringLiteral("why"), why}};
 }

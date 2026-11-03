@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<!-- Generated from /server-access/index.html and _i18n/fr/server-access/index.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Se connecter à votre hôte — MoonlightWeb</title>
+<meta name="description" content="Ouvrez votre hôte MoonlightWeb depuis n’importe quel navigateur en tapant son code — pour les appareils sans barre d’adresse, où son lien ne peut pas être tapé.">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow">
+<meta name="theme-color" content="#05080d">
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="Se connecter à votre hôte — MoonlightWeb">
+<meta property="og:description" content="Ouvrez votre hôte MoonlightWeb depuis n’importe quel navigateur en tapant son code — pour les appareils sans barre d’adresse, où son lien ne peut pas être tapé.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://moonlightweb.top/fr/server-access/">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/fr/server-access/">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/server-access/">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/server-access/">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/server-access/">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/server-access/">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/server-access/">
+<!-- /i18n:alternates -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<link rel="stylesheet" href="/assets/pages.css?v={{(fileStat `/assets/pages.css`).ModTime.Unix}}">
+<!-- Shared header/footer styling -->
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<style>
+  .access{padding:24px; margin:1.6rem 0 1rem}
+  .access label{display:block; font-weight:700; margin-bottom:.6rem}
+  .access .row{display:flex; gap:10px; flex-wrap:wrap}
+  .access input{
+    flex:1 1 280px; min-width:0; font:1.05rem var(--mono); letter-spacing:.04em;
+    color:var(--txt); background:var(--bg); border:1px solid var(--line);
+    border-radius:8px; padding:12px 14px;
+  }
+  .access input:focus{outline:none; border-color:var(--cyan); box-shadow:0 0 0 3px rgba(25,211,255,.18)}
+  .access input[aria-invalid="true"]{border-color:var(--magenta)}
+  .access .btn{flex:0 0 auto; font-size:1rem; padding:12px 22px; cursor:pointer}
+  .access .err{color:var(--magenta); font-size:.92rem; margin:.7rem 0 0}
+  .access .hint{color:var(--muted); font-size:.88rem; margin:.7rem 0 0}
+  .last{display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:0 0 1rem; color:var(--muted); font-size:.95rem}
+  .last .btn{max-width:100%}
+  .last .btn code{color:inherit; background:none; border:0; padding:0; font-size:.95rem; overflow-wrap:anywhere}
+  /* The example link is one long word: it must break rather than widen the page on a phone. */
+  main p code{overflow-wrap:anywhere}
+  .last button{
+    background:none; border:0; padding:0; color:var(--muted); font:inherit; font-size:.85rem;
+    text-decoration:underline; cursor:pointer;
+  }
+  [hidden]{display:none !important}
+</style>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/fr/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/fr/" data-nav="home">Accueil</a><a href="/fr/guides/" data-nav="guides">Guides</a><a href="/fr/faq.html" data-nav="faq">FAQ</a><a href="/fr/contact.html" data-nav="contact">Contact</a><a href="/fr/server-access/" data-nav="connect" aria-current="page">Se connecter</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/server-access/">English</option><option value="fr" data-href="/fr/server-access/" selected>Français</option><option value="de" data-href="/de/server-access/">Deutsch</option><option value="zh" data-href="/zh/server-access/" lang="zh">中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<main>
+<div class="wrap">
+  <nav class="crumbs" aria-label="Breadcrumb" data-i18n-html="crumbs"><a href="/fr/">Accueil</a> / Se connecter</nav>
+  <span class="kicker" data-i18n="kicker">Se connecter</span>
+  <h1 data-i18n="h1">Ouvrir votre hôte</h1>
+  <p class="lead" data-i18n-html="lead">Tapez le code de votre hôte pour l’ouvrir dans ce navigateur. Pensé pour les appareils <strong>sans barre d’adresse</strong>, où le lien de l’hôte ne peut pas être tapé.</p>
+
+  <form class="access cyb" id="access-form" novalidate>
+    <label for="host-code" data-i18n="label">Code de l’hôte</label>
+    <div class="row">
+      <input id="host-code" name="code" type="text" inputmode="text" autocomplete="off"
+             autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="300"
+             placeholder="a1b2c3d4e5f6g7h8j9k0m1n2" aria-describedby="code-err code-hint">
+      <button class="btn btn-primary" type="submit" data-umami-event="server-access-open"
+              data-i18n="open">Ouvrir</button>
+    </div>
+    <p class="err" id="code-err" hidden data-i18n="err">Ce n’est pas un code d’hôte : il fait 26 lettres et chiffres, la fin du lien de l’hôte.</p>
+    <p class="hint" id="code-hint" data-i18n="hint">Le lien complet collé tel quel fonctionne aussi.</p>
+  </form>
+
+  <p class="last" id="last" hidden>
+    <span data-i18n="last.label">Dernier ouvert d’ici :</span>
+    <a class="btn btn-primary" id="last-open" href="#" data-umami-event="server-access-last"><code id="last-code"></code></a>
+    <button type="button" id="last-forget" data-i18n="last.forget">Oublier</button>
+  </p>
+
+  <h2 data-i18n="h2.where">Où trouver le code ?</h2>
+  <p data-i18n-html="p.where">Sur le PC hôte, MoonlightWeb affiche son lien une fois l’<strong>accès Internet</strong> configuré, par exemple <code>stream.moonlightweb.top/a1b2c3d4e5f6g7h8j9k0m1n2</code>. Le code est la partie après le dernier <code>/</code> : 26 lettres et chiffres.</p>
+
+  <h2 data-i18n="h2.once">Une seule fois par appareil</h2>
+  <p data-i18n-html="p.once">Une fois un hôte déverrouillé avec son code PIN, ce navigateur s’en souvient. Si vous en déverrouillez deux ou plus, vous passez de l’un à l’autre par un menu dans l’application, sans rien retaper. Cette page retient aussi le dernier code ouvert d’ici.</p>
+
+  <div class="xlinks">
+    <a class="cyb" href="/fr/faq.html"><strong data-i18n="x.faq.t">Lire la FAQ</strong><span data-i18n="x.faq.d">La plupart des questions y trouvent déjà réponse.</span></a>
+    <a class="cyb" href="/fr/guides/"><strong data-i18n="x.guides.t">Installer un hôte</strong><span data-i18n="x.guides.d">Installez MoonlightWeb sur le PC à diffuser.</span></a>
+  </div>
+</div>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/fr/">Accueil</a> · <a href="/fr/guides/">Guides</a> · <a href="/fr/faq.html">FAQ</a> · <a href="/fr/contact.html">Contact</a> · <a href="/fr/server-access/">Se connecter</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>Un café</span></a></span><span class="foot-play">Jouer depuis : <a href="/fr/play/chromebook.html">Chromebook</a> · <a href="/fr/play/iphone-ipad.html">iPhone et iPad</a> · <a href="/fr/play/tv.html">TV</a> · <a href="/fr/sunshine-web-client.html">Client web pour Sunshine</a> · <a href="/fr/browser-game-streaming.html">Pourquoi un client web</a></span></div></footer>
+
+
+<script>
+/* A host's code is the rendezvous id its link ends with: 26 Crockford base32
+   characters, 128 random bits. Read the way the rendezvous reads it: case,
+   hyphens and spaces fold away, and the letters a person mistakes for digits
+   (i, l, o) become them, u becomes v. Opened by navigating, not by a form
+   action: the site's CSP has form-action 'self', and the host's page lives on
+   the rendezvous host.
+
+   Guessing codes is not a threat this page has to answer: the page asks no
+   server anything, the rendezvous limits how fast an address may try, and a
+   code only locates a machine — opening it still takes the host's PIN. */
+(function () {
+  var ID_SHAPE = /^[0-9abcdefghjkmnpqrstvwxyz]{26}$/;
+  var LAST_KEY = 'mw_server_access_last';
+  var PROD = 'https://stream.moonlightweb.top/';
+  /* A pasted link keeps the rendezvous host it names (another
+     stream.<name>.moonlightweb.top is a test rendezvous). */
+  var HOST = /(?:^|[^a-z0-9.-])(stream\.(?:[a-z0-9-]+\.)?moonlightweb\.top)(?![a-z0-9.-])/;
+  var BASE = /^https:\/\/stream\.(?:[a-z0-9-]+\.)?moonlightweb\.top\/$/;
+
+  var form = document.getElementById('access-form');
+  var input = document.getElementById('host-code');
+  var err = document.getElementById('code-err');
+  var last = document.getElementById('last');
+  var lastOpen = document.getElementById('last-open');
+  var lastCode = document.getElementById('last-code');
+
+  function normalise(part) {
+    return part.replace(/[-\s]/g, '').replace(/[il]/g, '1').replace(/o/g, '0').replace(/u/g, 'v');
+  }
+
+  /* The code alone, or the whole link pasted in — with or without https://,
+     a trailing slash or a #fragment. Null when there is no code in it. */
+  function parse(raw) {
+    var s = String(raw || '').trim().toLowerCase();
+    if (!s) return null;
+    var host = HOST.exec(s);
+    var base = host ? 'https://' + host[1] + '/' : PROD;
+    var whole = normalise(s);
+    if (ID_SHAPE.test(whole)) return { base: base, id: whole };
+    var parts = s.replace(/\s+/g, '').split(/[\/#?]+/);
+    for (var i = parts.length - 1; i >= 0; i--) {
+      var id = normalise(parts[i]);
+      if (ID_SHAPE.test(id)) return { base: base, id: id };
+    }
+    return null;
+  }
+
+  function readLast() {
+    try { return JSON.parse(localStorage.getItem(LAST_KEY) || 'null'); } catch (e) { return null; }
+  }
+
+  function open(target) {
+    try { localStorage.setItem(LAST_KEY, JSON.stringify(target)); } catch (e) { /* private mode */ }
+    location.href = target.base + target.id;
+  }
+
+  function showLast() {
+    var t = readLast();
+    if (!t || !ID_SHAPE.test(t.id || '') || !BASE.test(t.base || '')) {
+      last.hidden = true;
+      return;
+    }
+    lastCode.textContent = t.id;
+    lastOpen.href = t.base + t.id;
+    last.hidden = false;
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var target = parse(input.value);
+    err.hidden = !!target;
+    input.setAttribute('aria-invalid', target ? 'false' : 'true');
+    if (target) open(target);
+    else input.focus();
+  });
+  input.addEventListener('input', function () {
+    if (err.hidden) return;
+    err.hidden = true;
+    input.setAttribute('aria-invalid', 'false');
+  });
+  lastOpen.addEventListener('click', function (e) {
+    var t = readLast();
+    if (!t) return;
+    e.preventDefault();
+    open(t);
+  });
+  document.getElementById('last-forget').addEventListener('click', function () {
+    try { localStorage.removeItem(LAST_KEY); } catch (e) { /* nothing stored */ }
+    showLast();
+  });
+  showLast();
+})();
+</script>
+
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+</body>
+</html>

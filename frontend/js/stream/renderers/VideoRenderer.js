@@ -47,6 +47,16 @@ export class VideoRenderer {
     lastDraw = { submitMs: 0, waitMs: 0, path: '' };
 
     /**
+     * Content-age probe (stream/ContentAgeProbe.js): called with this
+     * renderer and the drawn frame's timestamp at the end of every draw that
+     * put a picture on the canvas — the moment the probe dates it. Null when
+     * nothing listens. The main-thread Canvas2D and WebGL renderers call it;
+     * the others never do.
+     * @type {((renderer: VideoRenderer, timestamp: number) => void)|null}
+     */
+    afterDraw = null;
+
+    /**
      * Async factory — subclasses implement it: set up the context and resources.
      * @param {HTMLCanvasElement|OffscreenCanvas} canvas
      * @param {object} opts
@@ -85,6 +95,54 @@ export class VideoRenderer {
     }
 
     /**
+     * An encoded frame of the stream, before its decode: its size and whether
+     * it is a key frame. The mwsr kernel's gaze zone reads the picture's
+     * motion from the delta frames (stream/GazeZone.js); inert elsewhere, so
+     * the decode paths can call it blind.
+     * @param {number} bytes
+     * @param {boolean} key
+     */
+    noteEncodedFrame(bytes, key) {}
+
+    /**
+     * Whether this renderer wants each frame's QP (noteFrameQp): mwsr 3, the
+     * debug menu's (DeblockShader.js), and nothing else. The decode paths read
+     * no slice header while it is false, which is always here.
+     * @returns {boolean}
+     */
+    get wantsFrameQp() {
+        return false;
+    }
+
+    /**
+     * The QP of an encoded frame, by the timestamp its chunk goes to the
+     * decoder with (SliceQp.js; null when its header could not be read).
+     * Called only while wantsFrameQp says so.
+     * @param {number} timestamp
+     * @param {number|null} qp
+     */
+    noteFrameQp(timestamp, qp) {}
+
+    /**
+     * Whether this renderer reads the native host's zones (noteFrameZones):
+     * the WebGPU mwsr kernel, when the page asked the host for them at /start
+     * (BrowserDetect.mwsrMapWanted). False here: the zones then go nowhere.
+     * @returns {boolean}
+     */
+    get wantsFrameZones() {
+        return false;
+    }
+
+    /**
+     * MWSR's zones of an encoded frame (stream/MwsrZoneBlock.js), by the
+     * timestamp its chunk goes to the decoder with. Called only while
+     * wantsFrameZones says so, and only for a frame that carried them.
+     * @param {number} timestamp
+     * @param {{cols: number, rows: number, scale: number, codes: Uint8Array}} zones
+     */
+    noteFrameZones(timestamp, zones) {}
+
+    /**
      * Click-to-photon probe support (see stream/LatencyProbe.js). A canvas that
      * presents through a desynchronized swap chain (WebGL2 here) cannot be
      * read back with drawImage once it is on screen — the drawing buffer is
@@ -97,6 +155,15 @@ export class VideoRenderer {
     set probeActive(on) {}
     get probePixels() {
         return undefined;
+    }
+    /**
+     * When the frame `probePixels` was read from went to the canvas
+     * (performance.now()), or null. The read itself is a GPU round trip, 4-5 ms
+     * on the 780M (09/10/2026): the probe dates the flag from here, not from
+     * the end of the read, so its own cost stays out of the click it measures.
+     */
+    get probeDrawnAt() {
+        return null;
     }
 
     /**
@@ -128,6 +195,17 @@ export class VideoRenderer {
         return true;
     }
 
+    /**
+     * True once the renderer has given up putting frames on its canvas: the
+     * WebGPU one, when no frame has reached it for a run of frames or its
+     * device was lost for good (WebGpuRenderer._noteFrame). The page then
+     * moves the picture to another renderer rather than leave it black
+     * (StreamView._replaceFailedRenderer). The others never set it.
+     */
+    get failed() {
+        return false;
+    }
+
     /** Renderer kind for the stats overlay: 'canvas2d' | 'webgpu'. */
     get kind() {
         return 'base';
@@ -140,6 +218,18 @@ export class VideoRenderer {
      * returns exactly what they observed before (`undefined` → `false`).
      */
     get hdrActive() {
+        return false;
+    }
+
+    /**
+     * True when the last draw put the frame on the canvas at exactly its own
+     * size without running the selected enhancer pass (upscaler-mwsr.md §5):
+     * the shader renderers copy such a frame instead of resampling it. The
+     * overlay then says so (« Off (1:1) »), and the enhancer ladder holds,
+     * since a window of copies says nothing about the pass. False wherever no
+     * pass exists.
+     */
+    get passthrough() {
         return false;
     }
 }

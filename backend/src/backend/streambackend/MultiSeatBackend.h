@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "../MultiSeatApiClient.h"
 #include "../NvComputer.h"
 #include "IStreamBackend.h"
@@ -87,10 +89,21 @@ public:
     /// Independent seats, created on demand. No native co-op: co-op on
     /// MultiSeat is MoonlightWeb's own ShareManager, since seats are separate
     /// Windows sessions rather than one shared instance.
+    ///
+    /// Each seat is an Apollo of its own, so the app a device left running on
+    /// its seat waits there for it, as on a plain GameStream host — but which
+    /// app that is depends on the device, never on the host.
     BackendCapabilities capabilities() const override
     {
-        return BackendCapabilities{/*multiUser*/ true, /*provisioning*/ true, /*lobbies*/ false,
-                                   /*restartService*/ true};
+        // Named, not positional: a positional `true` meant for restartService
+        // used to land in concurrentApps, the field before it.
+        BackendCapabilities caps;
+        caps.multiUser = true;
+        caps.provisioning = true;
+        caps.restartService = true;
+        caps.resumableApps = true;
+        caps.runningAppPerDevice = true;
+        return caps;
     }
 
     /// No handshake: MultiSeat's API is key-authenticated. This just proves the
@@ -113,6 +126,11 @@ public:
     void resume(const QString& seatId, const LaunchRequest& req, BackendMediaCallback cb) override;
     void quit(const QString& seatId, const QString& clientUniqueId,
               BackendVoidCallback cb) override;
+    /// The app on this device's own seat; 0 when the device holds no seat.
+    void runningAppForDevice(const QString& deviceId, BackendIntCallback cb) override;
+    /// The device's seat goes back to the pool (the decision of 05/10/2026: a
+    /// seat is free again once it has neither a game nor a stream).
+    void releaseDevice(const QString& deviceId) override;
 
     void restartService(BackendVoidCallback cb) override;
     void provisionSeat(const QJsonObject& params, BackendSeatCallback cb) override;
@@ -139,6 +157,11 @@ private:
     NvComputer* seatHost(const MultiSeatSeat& seat, const QString& address);
 
     void pairSeat(const MultiSeatSeat& seat, const QString& address, BackendVoidCallback cb);
+    /// What the seat's Apollo says it is (appversion, GfeVersion, codecs), read
+    /// once into its synthetic host before the first stream: moonlight-common-c
+    /// refuses a connection whose server version it cannot parse.
+    void fillSeatVersion(const MultiSeatSeat& seat, const QString& address,
+                         std::function<void()> done);
 
     QString seatPairingKey(const QString& seatId, const char* field) const;
 

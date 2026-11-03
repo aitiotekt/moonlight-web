@@ -77,7 +77,15 @@ export class SessionKeyMapper {
                     (MODIFIER_FLAGS[source] || MODIFIER_FLAGS[this.mappings[source]]),
             );
             return mappedModifier && !MODIFIER_FLAGS[msg.code]
-                ? { ...msg, char: null, nonUs: false }
+                ? {
+                      ...msg,
+                      char: null,
+                      nonUs: false,
+                      dead: false,
+                      chord: false,
+                      altGraph: false,
+                      altGrCtrl: false,
+                  }
                 : { ...msg };
         }
         return {
@@ -87,6 +95,10 @@ export class SessionKeyMapper {
             key: code,
             char: null,
             nonUs: false,
+            dead: false,
+            chord: false,
+            altGraph: false,
+            altGrCtrl: false,
             hold: this.holdsThroughStall ? this.holdsThroughStall(code) : !!msg.hold,
         };
     }

@@ -21,6 +21,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QEventLoop>
@@ -42,6 +43,8 @@
 #include <QDateTime>
 #include <QHostInfo>
 #include <QHostAddress>
+#include <QNetworkInterface>
+#include <QSysInfo>
 #include <QJsonArray>
 #include <QRandomGenerator>
 
@@ -61,6 +64,11 @@
 #include <memory>
 #include <utility>
 #include "server/AppSettings.h"
+#include "common/DetachedProcess.h"
+#include "server/ClientUniqueId.h"
+#include "server/LogArchive.h"
+#include "server/routes/LogRoutes.h"
+#include "common/RunFlags.h"
 #include "server/CertManager.h"
 #include "server/Provisioning.h"
 #include "server/HttpServer.h"
@@ -71,9 +79,11 @@
 #include "server/NetClassify.h"
 #include "server/ShareManager.h"
 #include "server/SessionPool.h"
+#include "server/SingleSessionHosts.h"
 #include "server/StreamActivity.h"
 #include "server/routes/AuthRoutes.h"
 #include "server/routes/HostRoutes.h"
+#include "server/routes/HostAppRoutes.h"
 #include "server/routes/ShareRoutes.h"
 #include "server/routes/SystemRoutes.h"
 #include "common/Logger.h"
@@ -92,6 +102,9 @@
 #include "backend/streambackend/NativeProbeService.h"
 #include "backend/VirtualDisplay.h"
 #include "backend/VirtualDisplayApply.h"
+#include "backend/VirtualHidApply.h"
+#include "common/InheritedEnvironment.h"
+#include "network/UpdateApply.h"
 #include "backend/VirtualDisplayJob.h"
 #include "backend/streambackend/NativeHostBackend.h"
 #include "Limelight.h" // SCM_* codec-support masks
@@ -100,10 +113,17 @@
 #include "streaming/StreamRelay.h"
 #include "streaming/TransportPriorities.h"
 #include "streaming/ConsoleSession.h"
+#include "streaming/SharedFeed.h"
+#include "streaming/StreamEnds.h"
 #include "streaming/StreamWorkerHost.h"
 #include "streaming/WorkerService.h"
 #include "streaming/worker/StreamWorkerMain.h"
+#include "server/HostAppImage.h"
+#include "server/HostAppLauncher.h"
+#include "server/LauncherDetect.h"
+#include "network/AddressRace.h"
 #include "network/InternetAccessManager.h"
+#include "network/MdnsAdvertiser.h"
 #include "network/RendezvousClient.h"
 #include "network/RouterPortAllocator.h"
 #include "network/RouterPortPools.h"
@@ -137,6 +157,11 @@ static int g_LastOwnerAppId = 0;
 // when its turn comes and stands down. File scope for the same reason as the
 // two above.
 static QHash<int, quint64> g_SlotLaunchGeneration;
+// The quit commands of the native host's apps opened on "MoonlightWeb Virtual
+// Display" since it came on: run when it goes off (setBeforeRelease), or the
+// program would land on a physical screen — Big Picture full screen on the
+// owner's monitor. Sunshine closes Big Picture at the stream's end too.
+static QStringList g_HostAppCloseOnRelease;
 
 // Load KEY=VALUE pairs from a .env file into the process environment.
 // Supports PEM blocks: if a value starts with "-----BEGIN", lines are
@@ -146,10 +171,23 @@ static QHash<int, quint64> g_SlotLaunchGeneration;
 static void loadEnvFile()
 {
     // Look for .env next to the executable first (production / installed build),
-    // then at the project root (Qt Creator dev build).
-    QString path = QCoreApplication::applicationDirPath() + "/.env";
+    // then at the project root — but only for a binary still inside that tree
+    // (build/, build-dev/). PROJECT_ROOT is where the binary was COMPILED: an
+    // installed package built on a machine that keeps its sources read that
+    // tree's .env and took its MW_DOMAIN, so a DEV edition held its line on
+    // production instead of staging (UM790Pro, 29/09/2026).
+    const QString appDir = QCoreApplication::applicationDirPath();
+    QString path = appDir + "/.env";
     if (!QFile::exists(path)) {
-        path = QStringLiteral(PROJECT_ROOT) + ".env";
+        const QString root = QDir::cleanPath(QStringLiteral(PROJECT_ROOT));
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+        const Qt::CaseSensitivity cs = Qt::CaseInsensitive;
+#else
+        const Qt::CaseSensitivity cs = Qt::CaseSensitive;
+#endif
+        const QString dir = QDir::cleanPath(appDir);
+        if (dir.compare(root, cs) != 0 && !dir.startsWith(root + QLatin1Char('/'), cs)) return;
+        path = root + QStringLiteral("/.env");
     }
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return;
@@ -291,7 +329,7 @@ static void writeAdminShortcut(const QString& url)
                                     QFileDevice::ExeOwner | QFileDevice::ReadGroup |
                                     QFileDevice::ExeGroup | QFileDevice::ReadOther |
                                     QFileDevice::ExeOther);
-    QProcess::startDetached(
+    mw::startDetached(
         QStringLiteral("gio"),
         {QStringLiteral("set"), path, QStringLiteral("metadata::trusted"), QStringLiteral("true")});
 #elif defined(Q_OS_WIN)
@@ -420,7 +458,7 @@ static bool arecordRunning()
 static void openInBrowser(const QString& url)
 {
 #if defined(Q_OS_LINUX)
-    if (QProcess::startDetached(QStringLiteral("xdg-open"), {url})) return;
+    if (mw::startDetached(QStringLiteral("xdg-open"), {url})) return;
     // xdg-open missing (minimal desktop): fall through to Qt's opener.
 #endif
     QDesktopServices::openUrl(QUrl(url));
@@ -676,7 +714,10 @@ static int runStatusCommand(quint16 persistedHttpsPort)
     // reaches the server from another device, has to be told about it here.
     // "------" is the sentinel for "no PIN set" (AuthManager::clearPin).
     const QString pin = auth.value("pin").toString();
-    if (pin.isEmpty() || pin == QLatin1String("------"))
+    if (auth.value("admin_locked").toBool(false))
+        out << "  Booth mode     on (--noadmin) — no admin page, no new device; restart\n"
+            << "                 without the flag to change anything\n";
+    else if (pin.isEmpty() || pin == QLatin1String("------"))
         out << "  Access PIN     none set — create one with:  moonlightweb --new-pin\n";
     else if (auth.value("pin_consumed").toBool(false))
         out << "  Access PIN     already used — issue a new one with:  moonlightweb --new-pin\n";
@@ -687,10 +728,13 @@ static int runStatusCommand(quint16 persistedHttpsPort)
     // the only way anyone reaches it. There is no built-in default: until one is
     // set the door is shut, and the operator has no other way to find that out.
     if (auth.value("remote_admin_enabled").toBool(false)) {
-        if (auth.value("admin_password_set").toBool(false))
+        if (auth.value("admin_password_set").toBool(false)) {
             out << "  Admin password set   (change it with:  moonlightweb "
-                   "--set-admin-password)\n";
-        else
+                   "--set-admin-password,\n"
+                << "                 remove it with:  moonlightweb --clear-admin-password)\n";
+            if (auth.value("remote_admin_internet").toBool(false))
+                out << "                 also accepted from the internet, through the link\n";
+        } else
             out << "  Admin password none set — no computer on your network can open the admin\n"
                 << "                 page. Set one with:  moonlightweb --set-admin-password\n";
     }
@@ -838,6 +882,56 @@ static int runSetAdminPasswordCommand(quint16 persistedHttpsPort)
         << "  A computer on this network can now open the admin page at the server's\n"
         << "  URL and unlock it with this password. Machines that used a previous\n"
         << "  password have been signed out.\n\n";
+    out.flush();
+    return 0;
+}
+
+// `moonlightweb --clear-admin-password`: forget the password, so no other
+// computer can open the admin page until a new one is set. Asks first unless
+// --yes is given.
+static int runClearAdminPasswordCommand(quint16 persistedHttpsPort, bool assumeYes)
+{
+    QTextStream out(stdout);
+    const QString base = findRunningInstance(persistedHttpsPort);
+    if (base.isEmpty()) {
+        out << "MoonlightWeb is not running — start it first "
+               "(sudo systemctl start moonlightweb).\n";
+        out.flush();
+        return 1;
+    }
+
+    if (!assumeYes) {
+        out << "Remove the admin password? No other computer will be able to open the\n"
+               "admin page until a new one is set. Type yes to confirm: ";
+        out.flush();
+        QTextStream in(stdin);
+        if (in.readLine().trimmed().compare(QStringLiteral("yes"), Qt::CaseInsensitive) != 0) {
+            out << "Nothing was changed.\n";
+            out.flush();
+            return 1;
+        }
+    }
+
+    QJsonObject body;
+    body["clear"] = true;
+    const LoopbackReply reply = loopbackAdminPost(
+        base, "/api/admin/password", QJsonDocument(body).toJson(QJsonDocument::Compact));
+    if (!reply.ok) {
+        const QString apiError = reply.json.value("error").toString();
+        out << "Failed: "
+            << (!apiError.isEmpty()
+                    ? apiError
+                    : (reply.error.isEmpty() ? QStringLiteral("HTTP %1").arg(reply.httpStatus)
+                                             : reply.error))
+            << "\n";
+        out.flush();
+        return 1;
+    }
+
+    out << "\n  Admin password removed.\n"
+        << "\n"
+        << "  Only this machine can open the admin page now. Machines that unlocked it\n"
+        << "  with the password have been signed out of it.\n\n";
     out.flush();
     return 0;
 }
@@ -1060,6 +1154,14 @@ static int runTrayClient(QApplication& app, quint16 persistedHttpsPort, bool own
 
     TrayManager tray(nullptr);
     tray.setClientMode(true);
+    // A service started with --noadmin: its tray offers nothing that changes it.
+    {
+        const QString base = port == 443 ? QStringLiteral("https://127.0.0.1")
+                                         : QStringLiteral("https://127.0.0.1:%1").arg(port);
+        const LoopbackReply status =
+            loopbackRequest(base, QStringLiteral("/api/auth/status"), QByteArray(), 5000);
+        tray.setAdminLocked(status.ok && status.json.value("admin_locked").toBool(false));
+    }
     tray.setUrlProvider([&port](const QString& path) { return trayClientUrl(port, path); });
 
     // The internet link has to be asked for rather than computed: this process
@@ -1214,6 +1316,75 @@ static QStringList filterTransportsByCodec(const QStringList& transports, VideoC
     return result;
 }
 
+// Where a stream's browser is, for the ICE plan. The socket peer answers it for
+// a browser that reaches us itself. Behind a reverse proxy — Tailscale Funnel,
+// cloudflared, nginx, on this machine or elsewhere on the LAN — the peer is the
+// proxy, and a phone on 4G would read as loopback or LAN: no STUN, no ICE-TCP,
+// and a UDP rung that can only reach it by luck. Two signs of a proxy: a
+// loopback peer under a name that is not ours (a local proxy passes the
+// visitor's Host along), and the forwarding headers proxies add. Either one
+// can only move a browser to "public", never grant anything, so a forged
+// header costs its sender nothing but the LAN shortcut. A bare-hostname LAN
+// browser sends neither and keeps its LAN plan.
+static NetClassify::Kind streamClientKind(const HttpRequest& req)
+{
+    const NetClassify::Kind kind = NetClassify::classify(req.clientAddress);
+    if (kind != NetClassify::Kind::Loopback && kind != NetClassify::Kind::Private) return kind;
+    const bool localProxy = kind == NetClassify::Kind::Loopback && !req.hostTrusted;
+    const bool forwarded = req.headers.contains(QStringLiteral("x-forwarded-for")) ||
+                           req.headers.contains(QStringLiteral("forwarded")) ||
+                           req.headers.contains(QStringLiteral("cf-connecting-ip")) ||
+                           req.headers.contains(QStringLiteral("tailscale-funnel-request"));
+    if (!localProxy && !forwarded) return kind;
+    qInfo() << "[Session] Browser behind a reverse proxy (peer" << req.clientAddress << ", Host"
+            << req.headers.value(QStringLiteral("host")) << ") — planning ICE for the internet";
+    return NetClassify::Kind::Public;
+}
+
+// A Public browser that is in fact on the host's own network: one on the LAN
+// that came in through a public link, whose address is then the one the
+// rendezvous tunnel settled on (NetClassify::sharesHostNetwork). It is shown
+// the LAN host candidate beside the public ones, and nothing else changes.
+static bool streamClientSameNetwork(const HttpRequest& req, NetClassify::Kind kind,
+                                    const QStringList& hostPublicIpv4)
+{
+    if (kind != NetClassify::Kind::Public) return false;
+    if (!NetClassify::sharesHostNetwork(req.clientAddress, hostPublicIpv4,
+                                        QNetworkInterface::allAddresses()))
+        return false;
+    qInfo() << "[Session] Browser on the host's own network (" << req.clientAddress
+            << ") — the LAN candidate is offered beside the public ones";
+    return true;
+}
+
+// A browser whose STUN probe got no answer (frontend/js/api/UdpProbe.js) sits
+// on a network that lets no UDP out: each UDP rung would run to its ICE
+// deadline, ten seconds apiece, before the chain reached one that can connect.
+// Dropped — but only for a browser planned for the internet. On a LAN, STUN can
+// fail for want of an internet while the host is one UDP hop away, and the
+// verdict is the browser's word, so it is only ever allowed to shorten a chain
+// that already had to go the long way. Never down to nothing. The bench switch
+// debug_ice_drop_udp drops them too, for every browser: with no UDP candidate
+// crossing, a UDP rung could only run to its deadline.
+static void dropUdpRungsWhenBlocked(QStringList& chain, const QJsonObject& body,
+                                    NetClassify::Kind clientKind, bool viaTunnel)
+{
+    const bool debugDrop = AppSettings().debugIceDropUdp();
+    if (!debugDrop) {
+        if (!body.value(QStringLiteral("udp_blocked")).toBool(false)) return;
+        if (!viaTunnel && clientKind != NetClassify::Kind::Public) return;
+    }
+    QStringList kept;
+    for (const QString& m : chain)
+        if (!m.endsWith(QStringLiteral("-udp"))) kept.append(m);
+    if (kept.isEmpty() || kept.size() == chain.size()) return;
+    if (debugDrop)
+        qWarning() << "[Session] DEBUG debug_ice_drop_udp is ON — UDP rungs skipped:" << kept;
+    else
+        qInfo() << "[Session] The browser's STUN probe got no answer — UDP rungs skipped:" << kept;
+    chain = kept;
+}
+
 // Default ports of a DEV identity (the DEV build, or --dev): see Edition.h.
 using mw::edition::kDevHttpPort;
 using mw::edition::kDevHttpsPort;
@@ -1221,33 +1392,38 @@ using mw::edition::kDevSignalingPort;
 // WebRTC media UDP port base (all modes). Each concurrent slot binds a distinct
 // port (base + slot) so simultaneous streams never collide on it; the router
 // forwards an external port to it, claimed per slot by RouterPortAllocator.
-// Slot 0 keeps the historical 48010. The dev firewall rule opens
-// base..base+kMaxSlots-1.
+// The packages and the dev firewall rule open base..base+kSlotHardCeiling-1.
 static constexpr quint16 kMediaBasePort = mw::routerports::kMediaBasePort;
 
-// First port above the signaling base that belongs to somebody else: the
-// MultiSeat seat range documented above, and Wolf's video ping (48100, audio
-// 48200) whenever Wolf shares the machine — which the Linux build does. The
-// slot plan takes ten ports per slot, so it walks into this range fast and has
-// to stop before it.
-static constexpr quint16 kForeignPortFloor = 48100;
 // Ceiling independent of the port plan: enough for the largest per-backend cap
 // on two hosts at once (see concurrentSessionCap) plus the reserved block. It
-// is a ceiling, not an allocation — the pool creates slots on demand.
-static constexpr int kSlotHardCeiling = 24;
+// is a ceiling, not an allocation — the pool creates slots on demand. One media
+// port per slot, so it is the size of the media block.
+static constexpr int kSlotHardCeiling = mw::routerports::kMediaPortCount;
 // How long the Sunshine /cancel of a worker that ended on its own is held back,
 // waiting for the same browser to relaunch (see the worker's ended handler).
 // The transport chain relaunches within a second; a closed tab waits this out.
 static constexpr int kHostCancelGraceMs = 10000;
+// The same grace, and the virtual display's, when the worker crashed under a
+// healthy stream: the page learns it only when its link times out, a few
+// seconds later, then asks why and starts the stream again (StreamEnds).
+static constexpr int kCrashGraceMs = 20000;
 
 // Where a slot's two signaling ports live, and how many slots fit.
 //
 // Slot 0 keeps the historical base; slots 1.. take two consecutive ports from a
-// second base placed after the media block, so the two ranges can never
-// overlap. They used to: with the old base + 10*slot spacing, slot 1's pair
-// (48011/48012) landed exactly on the media ports of slots 1 and 2, and since
-// the media socket also binds TCP under ICE-TCP, that candidate silently failed
-// to bind. Starting after the media block costs nothing and ends the class.
+// second base, just above slot 0's own ports (base, +1 relay, +2 control) and
+// pushed past every block it would land on: the media block, and the ports the
+// streaming servers sharing the machine listen on. It used to start right
+// after the media block, which production and --dev share: once the block
+// moved above the --dev base, both instances would have started their slots at
+// the same port.
+//
+// The foreign blocks: Sunshine and Apollo's stock ports (47984-48010, RTSP on
+// 48010), and MultiSeat's seats (48100 - 5 onwards, thirty ports a seat, eight
+// seats) with Wolf's video and audio pings (48100, 48200) among them.
+// Production lands at 48011-48058, --dev (48501) past the media block, at
+// 48574-48621.
 struct SlotPortPlan
 {
     quint16 extraBase = 0;
@@ -1256,17 +1432,29 @@ struct SlotPortPlan
 
 static SlotPortPlan planSlotPorts(quint16 signalingBase, quint16 mediaBase, int ceiling)
 {
-    for (int n = ceiling; n >= 1; --n) {
-        // Clear of slot 0's own ports (base, +1 relay, +2 control) AND of the
-        // media block, whichever ends later.
-        const int extra = qMax<int>(signalingBase + 4, mediaBase + n);
-        const int top = extra + 2 * (n - 1) + 1;
-        // A block that already starts above the reserved range has nothing left
-        // to walk into: the --dev base (48501) is in that case.
-        if (extra >= kForeignPortFloor || top < kForeignPortFloor)
-            return SlotPortPlan{static_cast<quint16>(extra), n};
+    struct Block
+    {
+        int first, last;
+    };
+    const Block kTaken[] = {
+        {47984, 48010},
+        {48095, 48399},
+        {mediaBase, mediaBase + ceiling - 1},
+    };
+    int extra = signalingBase + 4;
+    for (bool moved = true; moved;) {
+        moved = false;
+        const int top = extra + 2 * (ceiling - 1) + 1;
+        for (const Block& b : kTaken)
+            if (extra <= b.last && top >= b.first) {
+                extra = b.last + 1;
+                moved = true;
+            }
     }
-    return SlotPortPlan{static_cast<quint16>(signalingBase + 4), 1};
+    // Only a signaling base picked by hand near the top of the port space can
+    // run out of room; it gets what fits there.
+    const int n = qBound(1, (65535 - extra + 1) / 2, ceiling);
+    return SlotPortPlan{static_cast<quint16>(extra), n};
 }
 
 // How many sessions one host may serve at once, by the software it runs.
@@ -1285,10 +1473,16 @@ static int concurrentSessionCap(const QString& backendType)
 
 int main(int argc, char* argv[])
 {
+    // Before anything reads the environment: a mode an installer task runs
+    // elevated carries the user's own HKCU\Environment, and Qt and OpenSSL
+    // would load code from where it points (InheritedEnvironment.h).
+    if (mw::inheritedenv::isElevatedHelper(argc, argv)) mw::inheritedenv::scrub();
+
     // First, while this is still the only thread: if the Linux launcher handed
-    // us CAP_SYS_ADMIN (KMS capture), keep it permitted, run without it
-    // effective, and hand it to nothing we spawn except the native worker. See
-    // common/LinuxCapabilities.h. Logged below, once the log exists.
+    // us CAP_SYS_ADMIN (KMS capture) and CAP_SYS_NICE (GPU priority), keep them
+    // permitted, run without them effective, and hand them to nothing we spawn
+    // except the native worker. See common/LinuxCapabilities.h. Logged below,
+    // once the log exists.
     const QString capabilityNote = mw::confineCapabilities();
 
     // Before QApplication: on a headless Linux host this swaps the xcb platform
@@ -1369,10 +1563,15 @@ int main(int argc, char* argv[])
                                                    "--worker-service-remove",
                                                    "--native-probe",
                                                    "--vdisplay-apply",
+                                                   "--vdisplay-guard",
+                                                   "--vhid-apply",
+                                                   "--update-apply",
+                                                   "--open-on-desktop",
                                                    "--status",
                                                    "--new-pin",
                                                    "--enable-internet",
                                                    "--set-admin-password",
+                                                   "--clear-admin-password",
                                                    "--help",
                                                    "--help-all",
                                                    "-h",
@@ -1410,7 +1609,7 @@ int main(int argc, char* argv[])
         // service passes the console user's instead, and it has to be read here
         // with the rest, before the first line is written.
         QString workerDataDir;
-        bool probe = false, worker = false, transient = false, vdisplay = false;
+        bool probe = false, worker = false, transient = false, vdisplay = false, vhid = false;
         bool service = false;
         for (int i = 1; i < argc; ++i) {
             // --log <path> and --log=<path>, the two spellings QCommandLineParser
@@ -1423,8 +1622,12 @@ int main(int argc, char* argv[])
                 probe = true;
             else if (qstrcmp(argv[i], "--stream-worker") == 0)
                 worker = true;
-            else if (qstrcmp(argv[i], "--vdisplay-apply") == 0)
+            else if (qstrcmp(argv[i], "--vdisplay-apply") == 0 ||
+                     qstrcmp(argv[i], "--vdisplay-guard") == 0)
                 vdisplay = true;
+            else if (qstrcmp(argv[i], "--vhid-apply") == 0 ||
+                     qstrncmp(argv[i], "--vhid-apply=", 13) == 0)
+                vhid = true;
             else if (qstrcmp(argv[i], "--worker-service") == 0)
                 service = true;
             else if (qstrcmp(argv[i], "--worker-data-dir") == 0 && i + 1 < argc)
@@ -1435,8 +1638,12 @@ int main(int argc, char* argv[])
                 // Commands that print and exit. Both spellings again: --status
                 // and --native-bench=<spec>. Matching the bare prefix would also
                 // swallow a future --status-something, so require the boundary.
-                for (const char* flag : {"--native-bench", "--status", "--new-pin",
-                                         "--set-admin-password", "--enable-internet"}) {
+                // --update-apply too: it opens its own log once the directory
+                // only administrators can write exists (UpdateApply.h).
+                for (const char* flag :
+                     {"--native-bench", "--status", "--new-pin", "--set-admin-password",
+                      "--clear-admin-password", "--enable-internet", "--update-apply",
+                      "--open-on-desktop"}) {
                     const size_t n = qstrlen(flag);
                     if (qstrncmp(argv[i], flag, int(n)) == 0 &&
                         (argv[i][n] == '\0' || argv[i][n] == '='))
@@ -1477,6 +1684,9 @@ int main(int argc, char* argv[])
             // The elevated helper: its own file, so a driver install that went
             // wrong can be read without the server's log interleaved.
             Logger::instance()->setLogFile(logDir + QStringLiteral("/moonlightweb-vdisplay.log"));
+        } else if (vhid) {
+            // The HID driver's install, the same way.
+            Logger::instance()->setLogFile(logDir + QStringLiteral("/moonlightweb-vhid.log"));
         } else if (!transient) {
             Logger::instance()->setLogFile(logDir + QStringLiteral("/moonlightweb.log"));
         }
@@ -1542,6 +1752,11 @@ int main(int argc, char* argv[])
                                        "Started automatically at login (don't open the browser)");
     parser.addOption(autostartOption);
 
+    QCommandLineOption noAdminOption(
+        "noadmin", "Booth mode: stream the hosts already set up, with no admin page, no host "
+                   "changes and no new device, even from this machine");
+    parser.addOption(noAdminOption);
+
     // Internal: run as a per-session stream worker child process (spawned by the
     // parent server; hosts one relay graph + moonlight-common-c instance).
     QCommandLineOption streamWorkerOption("stream-worker",
@@ -1594,11 +1809,17 @@ int main(int argc, char* argv[])
         "Set the password another computer on this network uses to open the admin page, then exit");
     parser.addOption(setAdminPasswordOption);
 
+    QCommandLineOption clearAdminPasswordOption(
+        "clear-admin-password",
+        "Remove the admin password, so only this machine opens the admin page, then exit");
+    parser.addOption(clearAdminPasswordOption);
+
     QCommandLineOption enableInternetOption(
         "enable-internet", "Enable the Internet link (asks for consent), then exit");
     parser.addOption(enableInternetOption);
 
-    QCommandLineOption yesOption("yes", "Accept the --enable-internet agreement non-interactively");
+    QCommandLineOption yesOption("yes", "Accept the --enable-internet agreement, or confirm "
+                                        "--clear-admin-password, non-interactively");
     parser.addOption(yesOption);
 
     // The native engine's measuring instrument: capture + encode one display
@@ -1637,6 +1858,40 @@ int main(int argc, char* argv[])
     QCommandLineOption vdisplayDirOption("vdisplay-dir",
                                          "With --vdisplay-apply: the staging directory", "dir");
     parser.addOption(vdisplayDirOption);
+    // Left behind by a server whose stream turned the other displays off:
+    // brings them back if that server dies (VirtualDisplayApply::guard).
+    QCommandLineOption vdisplayGuardOption(
+        "vdisplay-guard", "Watch a server whose stream turned the other displays off (internal).",
+        "server");
+    parser.addOption(vdisplayGuardOption);
+
+    // "MoonlightWeb Virtual HID", the HID passthrough's Windows driver: the
+    // installer's elevated half (VirtualHidApply.h).
+    QCommandLineOption vhidApplyOption(
+        "vhid-apply",
+        "Install or remove the HID passthrough's driver (internal: run by the installer).",
+        "install|uninstall");
+    parser.addOption(vhidApplyOption);
+    QCommandLineOption vhidDirOption("vhid-dir",
+                                     "With --vhid-apply: the driver package's directory", "dir");
+    parser.addOption(vhidDirOption);
+
+    // The elevated half of the Update button on Windows: the action of the
+    // installer's "MoonlightWeb Update" task (UpdateApply.h).
+    QCommandLineOption updateApplyOption(
+        "update-apply", "Verify and run the staged update installer (internal: started by the "
+                        "elevated scheduled task).");
+    parser.addOption(updateApplyOption);
+
+    // The console-session half of opening one of the native host's apps from
+    // the session-0 service of older installs (HostAppLauncher).
+    QCommandLineOption openOnDesktopOption(
+        "open-on-desktop",
+        "Open a native host app's command on this desktop (internal: started "
+        "by the service as the console user).",
+        "command");
+    openOnDesktopOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(openOnDesktopOption);
 
     // Development instance: isolated state (see the applicationName switch at
     // startup), no single-instance lock, and alternate default ports — so it can
@@ -1645,7 +1900,70 @@ int main(int argc, char* argv[])
                                         "alternate ports, no single-instance lock)");
     parser.addOption(devOption);
 
+    // Settings kept where configuration management wants them. Only the one
+    // file moves: sessions, certificates, logs and the lock stay in the data
+    // directory. The operator commands above need it too (--status reads the
+    // port from it).
+    QCommandLineOption configOption(
+        "config",
+        "Read and write the settings from this file instead of settings.json in the "
+        "data directory. Created if absent",
+        "path");
+    parser.addOption(configOption);
+
+    // Diagnostic modes for this run (common/RunFlags.h). The admin page's
+    // boxes turn the same ones on for good; these leave settings.json alone.
+    QCommandLineOption debugOption(
+        "debug", "Debug mode for this run: the options of a debug build, the browsers' "
+                 "console sent to the client log");
+    parser.addOption(debugOption);
+    QCommandLineOption verboseOption(
+        "verbose", "Verbose logs for this run: DEBUG lines, libdatachannel and Qt network "
+                   "diagnostics, and the browsers' pipeline diagnostics");
+    parser.addOption(verboseOption);
+
     parser.process(app);
+    mw::run::setDebugFromCli(parser.isSet(debugOption));
+    mw::run::setVerboseFromCli(parser.isSet(verboseOption));
+
+    // Before anything builds an AppSettings — every branch below reads it.
+    if (parser.isSet(configOption)) {
+        const QString path = parser.value(configOption);
+        const QFileInfo info(path);
+        if (path.isEmpty() || info.isDir()) {
+            Logger::error(QStringLiteral("--config needs a file path, got \"%1\"").arg(path));
+            return 1;
+        }
+        // A file that is there but does not parse would read as empty, and the
+        // first write — seedDocumentedDefaults at startup — would replace what
+        // someone wrote with the defaults. A managed file is written by hand or
+        // by a tool: say where it is broken and leave it alone.
+        if (info.exists()) {
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly)) {
+                Logger::error(QStringLiteral("--config: cannot read %1: %2")
+                                  .arg(QDir::toNativeSeparators(info.absoluteFilePath()),
+                                       file.errorString()));
+                return 1;
+            }
+            const QByteArray raw = file.readAll();
+            QJsonParseError err;
+            const QJsonDocument doc = QJsonDocument::fromJson(raw, &err);
+            if (!raw.trimmed().isEmpty() &&
+                (err.error != QJsonParseError::NoError || !doc.isObject())) {
+                Logger::error(QStringLiteral("--config: %1 is not a JSON object (%2 at offset %3)")
+                                  .arg(QDir::toNativeSeparators(info.absoluteFilePath()),
+                                       err.error != QJsonParseError::NoError
+                                           ? err.errorString()
+                                           : QStringLiteral("not an object"))
+                                  .arg(err.offset));
+                return 1;
+            }
+        }
+        AppSettings::setFileOverride(path);
+        Logger::info("Settings file: " + QDir::toNativeSeparators(AppSettings::fileOverride()) +
+                     " (--config)");
+    }
 
     // Logging was configured from raw argv before the crash handler was
     // installed — see the block above main's parser. Nothing to do here.
@@ -1660,6 +1978,15 @@ int main(int argc, char* argv[])
     if (parser.isSet(vdisplayApplyOption))
         return VirtualDisplayApply::run(parser.value(vdisplayStageOption),
                                         parser.value(vdisplayDirOption));
+    if (parser.isSet(vdisplayGuardOption))
+        return VirtualDisplayApply::guard(parser.value(vdisplayGuardOption));
+    if (parser.isSet(vhidApplyOption))
+        return VirtualHidApply::run(parser.value(vhidApplyOption), parser.value(vhidDirOption));
+    if (parser.isSet(updateApplyOption)) return UpdateApply::run();
+#ifdef Q_OS_WIN
+    if (parser.isSet(openOnDesktopOption))
+        return HostAppLauncher::runOpenOnDesktop(parser.value(openOnDesktopOption));
+#endif
 
     // ── The stream-worker launcher service ──────────────────────────────────
     // Before the lock too: the service is a second process of this binary, and
@@ -1732,11 +2059,24 @@ int main(int argc, char* argv[])
         return runNewPinCommand(appSettings.httpsPort(mw::edition::defaultHttpsPort()));
     if (parser.isSet(setAdminPasswordOption))
         return runSetAdminPasswordCommand(appSettings.httpsPort(mw::edition::defaultHttpsPort()));
+    if (parser.isSet(clearAdminPasswordOption))
+        return runClearAdminPasswordCommand(appSettings.httpsPort(mw::edition::defaultHttpsPort()),
+                                            parser.isSet(yesOption));
     if (parser.isSet(enableInternetOption))
         return runEnableInternetCommand(appSettings.httpsPort(mw::edition::defaultHttpsPort()),
                                         parser.isSet(yesOption));
 
     appSettings.seedDocumentedDefaults(); // write documented file-only keys if absent
+    appSettings.migrateHostApps();        // the betas' gamescope_apps → host_apps
+
+    // The admin page's diagnostic boxes, on top of this run's flags.
+    mw::run::setDebugSetting(appSettings.debugMode());
+    mw::run::setVerboseSetting(appSettings.verboseLogs());
+    mw::run::applyVerboseLogging();
+    if (mw::run::debug())
+        Logger::info(mw::run::debugFromCli() ? "Debug mode on (--debug)"
+                                             : "Debug mode on (admin page)");
+
     quint16 httpPort = appSettings.httpPort(devMode ? kDevHttpPort : 80);
     if (parser.isSet("port")) httpPort = parser.value("port").toUShort();
 
@@ -1839,6 +2179,15 @@ int main(int argc, char* argv[])
     Logger::info("[Auth] Access the admin page at https://localhost/");
     Logger::info("[Auth] Remote access requires a generated PIN");
     server.setAuthManager(&authManager);
+    const bool adminLocked = parser.isSet(noAdminOption);
+    server.setAdminLocked(adminLocked);
+    if (adminLocked)
+        Logger::info("[Auth] Booth mode (--noadmin): administration is off until a restart "
+                     "without the flag");
+    const bool boothShare = adminLocked && appSettings.shareInBoothMode();
+    server.setBoothShare(boothShare);
+    if (boothShare)
+        Logger::info("[Auth] Booth mode: sharing during a stream stays on (share_in_booth_mode)");
     server.setHomeScreenIdentity([&appSettings, &authManager](const HttpRequest& req) {
         return HttpServer::HomeScreenIdentity{
             appSettings.rendezvousId(), appSettings.displayName(),
@@ -1847,7 +2196,9 @@ int main(int argc, char* argv[])
     });
 
     QObject::connect(&authManager, &AuthManager::pinChanged, [](const QString& pin) {
-        Logger::info(QString("[Auth] PIN changed: %1").arg(pin));
+        // Never the PIN itself: it opens the instance, and logs get shared.
+        Logger::info(pin.isEmpty() ? QStringLiteral("[Auth] PIN cleared")
+                                   : QStringLiteral("[Auth] PIN changed"));
     });
 
     // Phase 5b: WebRTC DataChannel relay + signaling tracking
@@ -1889,10 +2240,10 @@ int main(int argc, char* argv[])
     // sessions (moonlight-common-c is process-global). Slot 0 is the owner's
     // primary stream (/ws, 48001/48002); slot 1 the standby used by the
     // frontend's seamless quality switching (/ws1, 48011/48012); slots 2..4
-    // belong to invited players (/ws2../ws4, 48021.. onwards), one each.
+    // belong to invited players (/ws2../ws4, 48013.. onwards), one each.
     //
-    // Ports follow the slot: signaling = base + 10 * slot, relay = that + 1.
-    // Slot 0 keeps the historical pair, which is why the formula starts there.
+    // Slot 0 keeps the historical pair; every other slot takes two consecutive
+    // ports from a second base, signaling then relay (see planSlotPorts).
     static constexpr int kOwnerSlots = 2; // 0 = primary, 1 = standby
     static constexpr int kTotalSlots = kOwnerSlots + ShareManager::kSlotCount;
     // Slots up to kTotalSlots are addressed directly by index: 0/1 by the owner
@@ -1926,10 +2277,94 @@ int main(int argc, char* argv[])
     auto anyOtherSlotLive = [&g_Pool](int slot, const QString& hostUuid) {
         return g_Pool.anyOtherLiveOnHost(slot, hostUuid);
     };
+    // Moonlight's model (issue #24): on a host whose app outlives the stream,
+    // a stream ending — Stop, a closed tab, a lost link — leaves the app
+    // running for the viewer to resume, and only an explicit "Quit app" sends
+    // the /cancel. Sunshine's /cancel is not scoped to anyone anyway: it ends
+    // every session and terminates the app for all.
+    auto appOutlivesStream = [&computerManager](const QString& hostUuid) {
+        std::unique_ptr<IStreamBackend> backend = computerManager.backendForHost(hostUuid);
+        return backend && backend->capabilities().resumableApps;
+    };
+    // Where each device runs its own app (MultiSeat: a seat, an Apollo, per
+    // device), quitting is the device's business, done through the backend
+    // under the seat's own certificate. Never the machine's GameStream server:
+    // a /cancel sent there reached no seat — the seat's app kept running — and
+    // would have ended whatever the machine itself was streaming (MultiSeat
+    // bench, 05/10/2026).
+    auto quitsPerDevice = [&computerManager](const QString& hostUuid) {
+        std::unique_ptr<IStreamBackend> backend = computerManager.backendForHost(hostUuid);
+        return backend && backend->capabilities().runningAppPerDevice;
+    };
+    auto quitDeviceApp = [&computerManager](const QString& hostUuid, const QString& uid,
+                                            std::function<void(bool ok, QString why)> done) {
+        std::shared_ptr<IStreamBackend> backend(computerManager.backendForHost(hostUuid).release());
+        if (!backend || uid.isEmpty()) {
+            if (done) done(false, QStringLiteral("No device to quit the app of"));
+            return;
+        }
+        // The callback keeps the backend alive: its replies are parented to it.
+        backend->quit(QString(), uid, [backend, done](bool ok, const BackendError& err) {
+            if (done) done(ok, err.message);
+        });
+    };
+    // The seat policy (Bruno, 05/10/2026): a device's seat is free again once
+    // it has neither a stream nor a running app. A game left running is never
+    // cut, and there is no idle timer. Asked after every stream end and quit.
+    auto releaseSeatIfIdle = [&computerManager, &g_Pool](const QString& hostUuid,
+                                                         const QString& uid) {
+        if (uid.isEmpty()) return;
+        std::shared_ptr<IStreamBackend> backend(computerManager.backendForHost(hostUuid).release());
+        if (!backend || !backend->capabilities().runningAppPerDevice) return;
+        auto streaming = [&g_Pool, hostUuid, uid]() {
+            for (int i = 0; i < g_Pool.size(); ++i) {
+                const SessionPool::Slot& sl = g_Pool.at(i);
+                if (sl.worker && sl.hostUuid == hostUuid && sl.clientUniqueId == uid) return true;
+            }
+            return false;
+        };
+        if (streaming()) return;
+        backend->runningAppForDevice(
+            uid, [backend, streaming, uid](bool ok, const BackendError&, int appId) {
+                // Unknown is not idle: keep the seat rather than hand a running
+                // game's account to someone else.
+                if (!ok || appId != 0 || streaming()) return;
+                backend->releaseDevice(uid);
+            });
+    };
+    // "MoonlightWeb Virtual Display" goes off only once nothing streams it,
+    // judged when its grace runs out rather than when a stream ends: a
+    // take-over's /start asks for it before the stream it replaces is torn
+    // down, and that teardown starts the grace again under the new stream.
+    VirtualDisplayJob::instance().setInUse([&g_Pool]() {
+        for (const SessionPool::Slot& sl : g_Pool) {
+            if (!sl.worker.isNull() && sl.hostUuid == NativeHostBackend::hostUuid() &&
+                NativeHostBackend::usesVirtualDisplay(sl.appId))
+                return true;
+        }
+        return false;
+    });
+    VirtualDisplayJob::instance().setBeforeRelease([]() {
+        if (g_HostAppCloseOnRelease.isEmpty()) return false;
+        for (const QString& command : std::as_const(g_HostAppCloseOnRelease)) {
+            qInfo().noquote() << "[Session] closing what the virtual display showed:" << command;
+            QString why;
+            if (!HostAppLauncher::open(command, &why))
+                qWarning().noquote() << "[Session] the app's quit command failed:" << why;
+        }
+        g_HostAppCloseOnRelease.clear();
+        return true;
+    });
     // Per-host result of the dual-stream capability probe (first standby
     // launch): missing = unknown (assume yes), false = host rejected a second
     // concurrent session → frontend falls back to the legacy relaunch.
     QHash<QString, bool> g_DualSupport;
+    // The hosts that answered a standby as streaming and never showed a
+    // picture on it (issue #36): kept on disk, never offered a second session
+    // again — the failed attempt can leave the app there unable to stream.
+    SingleSessionHosts g_SingleSessionHosts(
+        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
+        QStringLiteral("/dual-support.json"));
     // When a standby (slot 1) launch starts: if slot 0 dies within ~3s of it,
     // the host "took over" instead of adding a session → mark no-dual.
     qint64 g_LastStandbyStartMs = 0;
@@ -1957,6 +2392,9 @@ int main(int argc, char* argv[])
         g_PendingHostCancels.erase(it);
         return true;
     };
+    // How each recent stream ended, for the page that lost its link: a worker
+    // that crashed under it is started again, anything else ends as before.
+    StreamEnds g_StreamEnds;
 
     // Close a co-op backend's session host-side once its stream is over.
     //
@@ -1987,27 +2425,31 @@ int main(int argc, char* argv[])
     // down. Suppresses the slot's normal ended-cleanup (no Sunshine /cancel:
     // take-over and standby-restart both want the Sunshine session kept alive
     // for the /resume that follows). The host object self-deletes on exit.
-    auto detachWorkerSlot = [&g_Pool, &authManager, &anyOtherSlotLive](int i, bool takenOver,
-                                                                       bool sessionEnded = false) {
+    auto detachWorkerSlot = [&g_Pool, &authManager, &g_StreamEnds](int i, bool takenOver,
+                                                                   bool sessionEnded = false) {
         SessionPool::Slot& sl = g_Pool.at(i);
         StreamWorkerHost* old = g_Pool.workerAs<StreamWorkerHost>(i);
         const QString token = sl.sessionToken;
         const QString hostUuid = sl.hostUuid;
         // A stream on "MoonlightWeb Virtual Display" leaving by this door
-        // (quit, take-over, standby restart) bypasses the slot's ended
-        // handler, so the display's release is decided here: off, after the
-        // grace, unless another slot still streams it — and a take-over's
-        // own /start cancels the grace on its way in.
+        // (quit, take-over, standby restart, a guest's Leave) bypasses the
+        // slot's ended handler, so the display's release is decided here:
+        // off, after the grace, unless a slot still streams it by then — and
+        // a take-over's own /start cancels the grace on its way in. A stream
+        // on another app of this host does not keep it: nothing would turn
+        // it off once that one ends.
         const bool onVirtualDisplay = hostUuid == NativeHostBackend::hostUuid() &&
-                                      sl.appId == NativeHostBackend::virtualDisplayAppId();
+                                      NativeHostBackend::usesVirtualDisplay(sl.appId);
         sl.worker = nullptr;
         sl.clientUniqueId.clear();
         sl.hostUuid.clear();
         sl.sessionToken.clear();
         sl.appId = 0;
-        if (onVirtualDisplay && !anyOtherSlotLive(i, hostUuid))
-            VirtualDisplayJob::instance().releaseSoon();
+        if (onVirtualDisplay) VirtualDisplayJob::instance().releaseSoon();
         if (!old) return static_cast<StreamWorkerHost*>(nullptr);
+        // Whatever its worker does next, this stream was stopped here.
+        g_StreamEnds.end(old->streamId(), StreamEnds::State::Stopped,
+                         QDateTime::currentMSecsSinceEpoch());
         QObject::disconnect(old, &StreamWorkerHost::ended, nullptr, nullptr);
         QObject::connect(old, &StreamWorkerHost::ended, qApp, [token, &authManager]() {
             authManager.setSessionStreaming(token, false);
@@ -2028,6 +2470,12 @@ int main(int argc, char* argv[])
     // Owns the share state machine (link + PIN + permissions per player slot);
     // the stream side of it lives here because only main.cpp drives workers.
     ShareManager shareManager;
+    // The guests' shared feed of the native host (plan « flux commun des
+    // invités »): one worker encodes the owner's display once for every guest.
+    // Named per instance, so a --dev instance and the installed one never
+    // meet on a pipe.
+    SharedFeed sharedFeed(mw::edition::productName() +
+                          (mw::edition::devFlag() ? QStringLiteral("-dev") : QString()));
 
     // ── Who is watching this screen ────────────────────────────────────────
     //
@@ -2070,12 +2518,29 @@ int main(int argc, char* argv[])
 
     // Tear every player worker down and revoke their shares. Called when the
     // owner really stops — their session is the one the players resumed into.
-    auto endPlayerSessions = [&g_Pool, &detachWorkerSlot,
-                              &shareManager](ShareManager::EndReason reason) {
+    auto endPlayerSessions = [&g_Pool, &detachWorkerSlot, &shareManager,
+                              &sharedFeed](ShareManager::EndReason reason) {
         for (int i = kOwnerSlots; i < kTotalSlots; ++i)
             if (g_Pool.at(i).worker) detachWorkerSlot(i, false, true);
         shareManager.deactivateAll(reason);
+        sharedFeed.reset();
     };
+
+    // The feed died three times running: its guests leave, and rejoin on
+    // encoders of their own (their page's Join).
+    QObject::connect(&sharedFeed, &SharedFeed::failedForGood, qApp,
+                     [&g_Pool, &detachWorkerSlot](const QSet<int>& guestSlots) {
+                         for (int slot : guestSlots)
+                             if (slot >= kOwnerSlots && slot < kTotalSlots &&
+                                 g_Pool.at(slot).worker)
+                                 detachWorkerSlot(slot, false, false);
+                     });
+
+    // The owner picked another height for the guests' picture: the feed they
+    // are watching is rebuilt at it, and they follow (a guest encoding on its
+    // own keeps its size until it rejoins).
+    QObject::connect(&shareManager, &ShareManager::feedHeightChanged, &sharedFeed,
+                     &SharedFeed::resize);
 
     // The share manager decided a player's stream must end (the eight hours ran
     // out, or too many wrong PINs). It knows nothing about workers — this does.
@@ -2090,10 +2555,10 @@ int main(int argc, char* argv[])
     // picture, and a promotion must not cost them a reconnect. A slot with no
     // worker needs nothing: the policy travels in its config when it starts.
     QObject::connect(&shareManager, &ShareManager::permissionsChanged, qApp,
-                     [&g_Pool](int slot, bool gamepad, bool keyboardMouse) {
+                     [&g_Pool](int slot, bool gamepad, bool keyboardMouse, bool hid) {
                          if (slot < kOwnerSlots || slot >= kTotalSlots) return;
                          if (auto* worker = g_Pool.workerAs<StreamWorkerHost>(slot))
-                             worker->setInputPolicy(gamepad, keyboardMouse);
+                             worker->setInputPolicy(gamepad, keyboardMouse, hid);
                      });
 
     // Suspend host polling whenever a relay is active, so we stop hammering
@@ -2187,7 +2652,7 @@ int main(int argc, char* argv[])
             // Cancel the revoked browser's Sunshine session (keyed like /launch).
             // Nobody legitimately resumes it, so leaving it alive is pointless.
             NvComputer* host = computerManager.getHost(g_ActiveHostUuid);
-            if (host) {
+            if (host && host->takesHostCancel()) {
                 auto* identity = IdentityManager::get();
                 auto* quitReply = computerManager.http()->quitAppAsync(
                     host->activeAddress, host->activeHttpsPort, identity->getCertificate(),
@@ -2204,6 +2669,9 @@ int main(int argc, char* argv[])
     // slot's. Inert until a rendezvous line-up or a stream start asks for one,
     // and then only with UPnP on and Internet Access consented.
     RouterPortAllocator routerPorts(&appSettings);
+    // The one UPnP discovery of the process: Internet Access reads the
+    // gateway from the allocator rather than looking for it a second time.
+    internetAccess.setRouterPorts(&routerPorts);
     GeoIpService geoIpService(&appSettings);
     UpdateChecker updateChecker(QCoreApplication::applicationVersion(),
                                 appSettings.updateRelayAllowed());
@@ -2289,6 +2757,12 @@ int main(int argc, char* argv[])
         // the rest of this route and like /api/server/hostname next door, which
         // has always answered the same question to anyone who asked.
         obj["name"] = appSettings.displayName();
+        // The diagnostic modes, for every page including a guest's, which can
+        // reach nothing else before it joins: a page in debug mode sends its
+        // console to the client log, one in verbose mode prints its pipeline
+        // diagnostics.
+        obj["debug"] = mw::run::debug();
+        obj["verbose"] = mw::run::verbose();
         return HttpResponse::json(obj);
     });
 
@@ -2449,6 +2923,24 @@ int main(int argc, char* argv[])
     });
 
     registerHostRoutes(server, computerManager);
+    registerHostAppRoutes(server, appSettings);
+    // The game launchers installed on this PC get a card each, the first start
+    // after an install or an update (as Sunshine's installer gives Steam one).
+    seedDetectedLaunchers(appSettings);
+
+    // How the stream this page knows as ?stream= ended (StreamEnds), asked by a
+    // page whose link went before it starts the stream again or ends it. Only
+    // the page that started it gets an answer, on the same host and session:
+    // anything else reads as unknown, which ends the stream as it always has.
+    server.router()->get("/api/hosts/:id/stream-state", [&g_StreamEnds](const HttpRequest& req) {
+        const StreamEnds::Entry e =
+            g_StreamEnds.find(req.queryParams.value("stream"), QDateTime::currentMSecsSinceEpoch());
+        const bool asker = e.hostUuid == req.pathParams.value("id") &&
+                           !ShareManager::isPlayerSlot(e.slot) &&
+                           e.sessionToken == HttpServer::sessionTokenFromRequest(req);
+        return HttpResponse::json(
+            QJsonObject{{"state", StreamEnds::name(asker ? e.state : StreamEnds::State::Unknown)}});
+    });
 
     // Phase 5: Start streaming — launch app + RTSP handshake
     server.router()->postAsync("/api/hosts/:id/start", [&computerManager, signalingPort,
@@ -2456,13 +2948,15 @@ int main(int argc, char* argv[])
                                                         &g_ActiveMediaTrackRelay, &g_ActiveSession,
                                                         &g_ActiveRelayRoot, &g_ActiveClientUniqueId,
                                                         &g_ActiveHostUuid, &g_HostAspect, &g_Pool,
-                                                        &g_DualSupport, &g_LastStandbyStartMs,
-                                                        &g_LiveSunshineUids, &g_PendingHostCancels,
+                                                        &g_DualSupport, &g_SingleSessionHosts,
+                                                        &g_LastStandbyStartMs, &g_LiveSunshineUids,
+                                                        &g_PendingHostCancels, &g_StreamEnds,
                                                         &dropPendingHostCancel, &detachWorkerSlot,
-                                                        &slotSignalingPort, &slotWsPath,
-                                                        &anyOtherSlotLive, &reapCoopSession,
-                                                        &server, &appSettings, &authManager,
-                                                        &sessionMetrics, &routerPorts,
+                                                        &quitsPerDevice, &quitDeviceApp,
+                                                        &releaseSeatIfIdle, &slotSignalingPort,
+                                                        &slotWsPath, &anyOtherSlotLive,
+                                                        &reapCoopSession, &server, &appSettings,
+                                                        &authManager, &sessionMetrics, &routerPorts,
                                                         stunServer](const HttpRequest& req,
                                                                     ResponseCallback respond) {
         QString uuid = req.pathParams.value("id");
@@ -2501,6 +2995,16 @@ int main(int argc, char* argv[])
         // sessions then run side by side, each with its own ports and /wsN.
         int reqSlot = standby ? qBound(0, body["session_slot"].toInt(1), 1) : 0;
 
+        // A host already seen failing a standby is not asked again: the page
+        // keeps the live stream and takes the classic relaunch.
+        if (standby && g_SingleSessionHosts.contains(uuid)) {
+            respond(HttpResponse::json(
+                QJsonObject{{"status", QStringLiteral("dual_unavailable")},
+                            {"reason", QStringLiteral("host kept to one session")}},
+                200));
+            return;
+        }
+
         // A multi-user backend gives each device its own identity and its own
         // session upstream — Wolf pairs a certificate per device — so one
         // device's launch must not evict another's. Same-device take-over is
@@ -2508,12 +3012,18 @@ int main(int argc, char* argv[])
         // transport fallback.
         bool backendIsMultiUser = false;
         bool backendConcurrentApps = false;
+        bool backendResumable = false;
         QString backendType;
         if (auto probe = computerManager.backendForHost(uuid)) {
             backendIsMultiUser = probe->capabilities().multiUser;
             backendConcurrentApps = probe->capabilities().concurrentApps;
+            backendResumable = probe->capabilities().resumableApps;
             backendType = probe->type();
         }
+        // The viewer's "Quit the app when the stream stops" setting (it rides
+        // along with the other streaming settings): this stream ending on its
+        // own then still closes the app, as it always did.
+        const bool quitAppOnEnd = body["quit_app_on_stop"].toBool(false);
         // The pool stores the raw request value, so compare against the same.
         const QString reqDevice = body["client_uniqueid"].toString();
         const int reqAppId = body["appId"].toInt(0);
@@ -2607,6 +3117,45 @@ int main(int argc, char* argv[])
                     qInfo() << "[Session] Host" << uuid << "differs from slot 0 ("
                             << g_Pool.at(0).hostUuid << ") — using slot" << reqSlot;
             }
+        }
+
+        // ── Back after a worker crash ──────────────────────────────────────────
+        // The page lost its link, asked why (stream-state below) and heard that
+        // the worker crashed: it starts the stream again, naming the one it
+        // lost. Checked again here, before the take-over tears anything down,
+        // since the answer may have changed meanwhile: the page only ever comes
+        // back for its own stream, and a stream started on this host after the
+        // crash (another device's) keeps the host.
+        const QString reconnectOf = standby ? QString() : body["reconnect_of"].toString();
+        if (!reconnectOf.isEmpty()) {
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            const StreamEnds::Entry lost = g_StreamEnds.find(reconnectOf, now);
+            QString refused;
+            if (lost.state != StreamEnds::State::Crashed)
+                refused = QStringLiteral("that stream did not crash (%1)")
+                              .arg(StreamEnds::name(lost.state));
+            else if (lost.hostUuid != uuid || ShareManager::isPlayerSlot(lost.slot) ||
+                     lost.sessionToken != HttpServer::sessionTokenFromRequest(req))
+                refused = QStringLiteral("that stream was not this page's");
+            for (int i = 0; refused.isEmpty() && i < kOwnerSlots; ++i) {
+                if (!g_Pool.live(i) || g_Pool.at(i).hostUuid != uuid) continue;
+                if (slotHeldByAnotherDevice(i) || slotStreamsAnotherApp(i)) continue;
+                // This browser's own: an earlier try of this very restart.
+                if (g_Pool.at(i).clientUniqueId == reqDevice) continue;
+                const auto* w = g_Pool.workerAs<StreamWorkerHost>(i);
+                const StreamEnds::Entry there =
+                    g_StreamEnds.find(w ? w->streamId() : QString(), now);
+                if (there.state == StreamEnds::State::Live && there.atMs > lost.atMs)
+                    refused = QStringLiteral("this host has streamed elsewhere since");
+            }
+            if (!refused.isEmpty()) {
+                qInfo() << "[Session] Reconnect after a worker crash refused:" << refused;
+                respond(HttpResponse::json(
+                    QJsonObject{{"error", QStringLiteral("reconnect_refused")}}, 409));
+                return;
+            }
+            qInfo() << "[Session] Reconnecting after a worker crash (host" << uuid << ", slot"
+                    << lost.slot << ")";
         }
 
         // ── Take-over: this backend streams ONE session at a time ──────────────
@@ -2842,6 +3391,10 @@ int main(int argc, char* argv[])
         // Mobile clients request lower-bandwidth audio (10ms Opus frames).
         bool reqLowAudio = body.contains("low_audio") && body["low_audio"].toBool();
 
+        // The viewer's microphone, opt-in per device (Settings). Whether it is
+        // granted is the session's call (StreamSession::setMicRequested).
+        const bool reqMic = body["mic_enabled"].toBool(false);
+
         // Mute host PC speakers while streaming (localAudioPlayMode). Default true.
         bool reqMuteHost = body.contains("mute_host_audio") ? body["mute_host_audio"].toBool()
                                                             : appSettings.muteHostAudio();
@@ -2855,12 +3408,8 @@ int main(int argc, char* argv[])
         // Per-browser Sunshine unique ID (from the browser's localStorage).
         // Sanitized to hex (max 32 chars) before it reaches the launch URL.
         // Empty → StreamSession falls back to the shared Moonlight unique ID.
-        QString reqClientUniqueId;
-        for (const QChar& c : body["client_uniqueid"].toString()) {
-            QChar u = c.toUpper();
-            if (u.isDigit() || (u >= 'A' && u <= 'F')) reqClientUniqueId += u;
-            if (reqClientUniqueId.size() >= 32) break;
-        }
+        const QString reqClientUniqueId =
+            sanitizeClientUniqueId(body["client_uniqueid"].toString());
 
         // This browser is back for the session its last worker left behind.
         if (!reqClientUniqueId.isEmpty() && dropPendingHostCancel(reqClientUniqueId, host->uuid))
@@ -2871,7 +3420,7 @@ int main(int argc, char* argv[])
                 << "codec=" << AppSettings::videoCodecToString(reqCodec)
                 << "gaming=" << reqGamingMode << "bitrate=" << reqBitrate << "height=" << reqHeight
                 << "fps=" << reqFps << "yuv444=" << reqYuv444 << "hdr=" << reqHdr
-                << "videoEnhancement=" << reqVideoEnhancement;
+                << "videoEnhancement=" << reqVideoEnhancement << "mic=" << reqMic;
 
         // Determine signaling host from the browser's Host header.
         // Works for both LAN (localhost:443) and remote access via moonlightweb.top.
@@ -2895,8 +3444,11 @@ int main(int argc, char* argv[])
         // it — which is what silently denied internet sessions their STUN
         // server. Hand the verdict down instead of a derived bool, so the two
         // questions it answers (need STUN? may we show the LAN candidate?)
-        // cannot drift apart again.
-        const NetClassify::Kind clientKind = NetClassify::classify(req.clientAddress);
+        // cannot drift apart again. A reverse proxy is seen through here too
+        // (streamClientKind).
+        const NetClassify::Kind clientKind = streamClientKind(req);
+        const bool clientSameNetwork =
+            streamClientSameNetwork(req, clientKind, {routerPorts.publicIp()});
 
         // ── Session census ─────────────────────────────────────────────────────
         // The shape of this session, for the aggregate counts (SessionMetrics.h:
@@ -2922,6 +3474,8 @@ int main(int argc, char* argv[])
         //
         // transport_mode values:
         //   "auto"                 → automatic fallback chain (see below)
+        //   "all"                  → same chain as "auto"; only makes the admin
+        //                            selector offer "wss" as well
         //   "webrtc-media-udp"     → MediaTrack + UDP only
         //   "webrtc-dc-udp"       → DataChannel + UDP only
         //   "webrtc-media-tcp"    → MediaTrack + UDP+TCP
@@ -2936,6 +3490,7 @@ int main(int argc, char* argv[])
         // transport_index to walk the fallback chain on relaunch.
         if (body.contains("transport_mode") && !body["transport_mode"].toString().isEmpty())
             transportMode = body["transport_mode"].toString();
+        if (transportMode == QStringLiteral("all")) transportMode = QStringLiteral("auto");
 
         // Index into the fallback chain that this attempt targets (the browser
         // increments it and relaunches when a transport fails to connect).
@@ -2996,6 +3551,7 @@ int main(int argc, char* argv[])
                         << transportChain;
             }
         }
+        dropUdpRungsWhenBlocked(transportChain, body, clientKind, req.viaTunnel);
 
         qInfo() << "[Session] Transport chain:" << transportChain
                 << "requested index=" << reqTransportIndex;
@@ -3021,6 +3577,29 @@ int main(int argc, char* argv[])
                 << ":" << chainMode << "internal=" << internalTransport
                 << "iceTcp=" << enableIceTcp;
 
+        // The browser's codec (Settings → Video codec, « PyroWave (Wired LAN
+        // only) »): asked as ultra_codec by a page that decodes it, for a native
+        // Windows host that codes it (NativeHostBackend::pyrowaveSupported, on
+        // its card), when the frames reach the page (the DataChannel's
+        // transport, not the <video> of webrtc-media). Anything else streams
+        // as if it had not been asked: the codec the page sent beside it. Its
+        // frames ride the audio road (ultra-lan-poc.md §6.41), and it codes
+        // 8-bit SDR only: no HDR asked. A bench's own native_tuning and
+        // rtp_video still come after.
+        const bool nativePyrowave = backendType == QStringLiteral("native") &&
+                                    body["ultra_codec"].toString() == QLatin1String("pyrowave") &&
+                                    internalTransport == QLatin1String("webrtc") &&
+                                    NativeHostBackend::pyrowaveSupported();
+        QString nativeTuningSpec = appSettings.nativeTuning();
+        QString rtpVideoSpec = appSettings.rtpVideo();
+        if (nativePyrowave) {
+            reqHdr = false;
+            nativeTuningSpec = QStringLiteral("pipeline=d3d12,enc12=pyrowave") +
+                               (nativeTuningSpec.isEmpty() ? QString() : "," + nativeTuningSpec);
+            if (rtpVideoSpec.isEmpty()) rtpVideoSpec = QStringLiteral("native:h264+hevc+av1+aroad");
+            qInfo() << "[Session] PyroWave (the browser's codec, wired LAN): D3D12, audio road";
+        }
+
         // ── Helper: attach lifecycle relay tracking for a new session ───────────
         // Adds the standard relay-created and session-ended connections that
         // maintain the global relay pointers (g_ActiveRelay, etc.) and send a
@@ -3032,48 +3611,49 @@ int main(int argc, char* argv[])
             const QString& quitUid = reqClientUniqueId;
 
             // WSS mode: StreamRelay tracking
-            QObject::connect(s, &StreamSession::streamRelayCreated,
-                             [&g_ActiveStreamRelay, &g_ActiveRelayRoot, &g_ActiveClientUniqueId,
-                              &g_ActiveHostUuid, &computerManager, &authManager, sessionToken, host,
-                              quitUid](StreamRelay* r) {
-                                 qInfo() << "[main] streamRelayCreated, relay=" << r;
-                                 g_ActiveStreamRelay = r;
-                                 g_ActiveRelayRoot = r;
-                                 g_ActiveClientUniqueId = quitUid;
-                                 g_ActiveHostUuid = host->uuid;
-                                 authManager.setSessionStreaming(sessionToken, true);
+            QObject::connect(
+                s, &StreamSession::streamRelayCreated,
+                [&g_ActiveStreamRelay, &g_ActiveRelayRoot, &g_ActiveClientUniqueId,
+                 &g_ActiveHostUuid, &computerManager, &authManager, sessionToken, host,
+                 quitUid](StreamRelay* r) {
+                    qInfo() << "[main] streamRelayCreated, relay=" << r;
+                    g_ActiveStreamRelay = r;
+                    g_ActiveRelayRoot = r;
+                    g_ActiveClientUniqueId = quitUid;
+                    g_ActiveHostUuid = host->uuid;
+                    authManager.setSessionStreaming(sessionToken, true);
 
-                                 // Context = qApp so the lambda runs on the main thread: the relay
-                                 // emits sessionEnded from its dedicated thread, but quitAppAsync()
-                                 // touches the shared QNAM that lives on the main thread.
-                                 QObject::connect(
-                                     r, &StreamRelay::sessionEnded, qApp,
-                                     [r, &g_ActiveStreamRelay, &computerManager, &authManager,
-                                      sessionToken, host, quitUid]() {
-                                         qInfo() << "[main] StreamRelay sessionEnded";
-                                         authManager.setSessionStreaming(sessionToken, false);
-                                         auto* identity = IdentityManager::get();
-                                         auto* quitReply = computerManager.http()->quitAppAsync(
-                                             host->activeAddress, host->activeHttpsPort,
-                                             identity->getCertificate(), identity->getPrivateKey(),
-                                             quitUid);
-                                         QObject::connect(quitReply, &QNetworkReply::finished,
-                                                          quitReply, &QNetworkReply::deleteLater);
-                                         // The StreamSession is ephemeral (self-deletes once
-                                         // streaming starts), so its own sessionEnded->quit()
-                                         // handler is gone by the time the client disconnects —
-                                         // this qApp lambda is the only surviving teardown owner.
-                                         // Stop the shim FIRST (while the relay is alive) so
-                                         // moonlight stops calling back before destruction (no
-                                         // UAF), then stop + deleteLater. destroyed() frees the
-                                         // signaling port and lets a deferred start() proceed.
-                                         if (r->mediaEngine()) r->mediaEngine()->stopConnection();
-                                         r->stop();
-                                         r->deleteLater();
-                                         if (g_ActiveStreamRelay == r)
-                                             g_ActiveStreamRelay = nullptr;
-                                     });
-                             });
+                    // Context = qApp so the lambda runs on the main thread: the relay
+                    // emits sessionEnded from its dedicated thread, but quitAppAsync()
+                    // touches the shared QNAM that lives on the main thread.
+                    QObject::connect(
+                        r, &StreamRelay::sessionEnded, qApp,
+                        [r, &g_ActiveStreamRelay, &computerManager, &authManager, sessionToken,
+                         host, quitUid]() {
+                            qInfo() << "[main] StreamRelay sessionEnded";
+                            authManager.setSessionStreaming(sessionToken, false);
+                            if (host->takesHostCancel()) {
+                                auto* identity = IdentityManager::get();
+                                auto* quitReply = computerManager.http()->quitAppAsync(
+                                    host->activeAddress, host->activeHttpsPort,
+                                    identity->getCertificate(), identity->getPrivateKey(), quitUid);
+                                QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
+                                                 &QNetworkReply::deleteLater);
+                            }
+                            // The StreamSession is ephemeral (self-deletes once
+                            // streaming starts), so its own sessionEnded->quit()
+                            // handler is gone by the time the client disconnects —
+                            // this qApp lambda is the only surviving teardown owner.
+                            // Stop the shim FIRST (while the relay is alive) so
+                            // moonlight stops calling back before destruction (no
+                            // UAF), then stop + deleteLater. destroyed() frees the
+                            // signaling port and lets a deferred start() proceed.
+                            if (r->mediaEngine()) r->mediaEngine()->stopConnection();
+                            r->stop();
+                            r->deleteLater();
+                            if (g_ActiveStreamRelay == r) g_ActiveStreamRelay = nullptr;
+                        });
+                });
 
             // WebRTC DataChannel mode: DataChannelRelay tracking
             QObject::connect(
@@ -3088,33 +3668,35 @@ int main(int argc, char* argv[])
                     authManager.setSessionStreaming(sessionToken, true);
 
                     // Context = qApp: see StreamRelay note above (run on main thread).
-                    QObject::connect(r, &DataChannelRelay::sessionEnded, qApp,
-                                     [r, &g_ActiveRelay, &computerManager, &authManager,
-                                      sessionToken, host, quitUid]() {
-                                         qInfo() << "[main] sessionEnded fired, relay=" << r;
-                                         authManager.setSessionStreaming(sessionToken, false);
-                                         auto* identity = IdentityManager::get();
-                                         auto* quitReply = computerManager.http()->quitAppAsync(
-                                             host->activeAddress, host->activeHttpsPort,
-                                             identity->getCertificate(), identity->getPrivateKey(),
-                                             quitUid);
-                                         QObject::connect(quitReply, &QNetworkReply::finished,
-                                                          quitReply, &QNetworkReply::deleteLater);
-                                         // The StreamSession is ephemeral (self-deletes once
-                                         // streaming starts), so its own sessionEnded->quit()
-                                         // handler is gone by the time the client disconnects —
-                                         // this qApp lambda is the only surviving teardown owner.
-                                         // Stop the shim FIRST (while the relay is alive) so
-                                         // moonlight stops calling back before destruction (no
-                                         // UAF), then stop + deleteLater. destroyed() frees the
-                                         // signaling port and lets a deferred start() proceed.
-                                         if (r->mediaEngine()) r->mediaEngine()->stopConnection();
-                                         r->stop();
-                                         r->deleteLater();
-                                         if (g_ActiveRelay == r) {
-                                             g_ActiveRelay = nullptr;
-                                         }
-                                     });
+                    QObject::connect(
+                        r, &DataChannelRelay::sessionEnded, qApp,
+                        [r, &g_ActiveRelay, &computerManager, &authManager, sessionToken, host,
+                         quitUid]() {
+                            qInfo() << "[main] sessionEnded fired, relay=" << r;
+                            authManager.setSessionStreaming(sessionToken, false);
+                            if (host->takesHostCancel()) {
+                                auto* identity = IdentityManager::get();
+                                auto* quitReply = computerManager.http()->quitAppAsync(
+                                    host->activeAddress, host->activeHttpsPort,
+                                    identity->getCertificate(), identity->getPrivateKey(), quitUid);
+                                QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
+                                                 &QNetworkReply::deleteLater);
+                            }
+                            // The StreamSession is ephemeral (self-deletes once
+                            // streaming starts), so its own sessionEnded->quit()
+                            // handler is gone by the time the client disconnects —
+                            // this qApp lambda is the only surviving teardown owner.
+                            // Stop the shim FIRST (while the relay is alive) so
+                            // moonlight stops calling back before destruction (no
+                            // UAF), then stop + deleteLater. destroyed() frees the
+                            // signaling port and lets a deferred start() proceed.
+                            if (r->mediaEngine()) r->mediaEngine()->stopConnection();
+                            r->stop();
+                            r->deleteLater();
+                            if (g_ActiveRelay == r) {
+                                g_ActiveRelay = nullptr;
+                            }
+                        });
                 });
 
             // WebRTC Media Track mode: MediaTrackRelay tracking
@@ -3137,12 +3719,14 @@ int main(int argc, char* argv[])
                          host, quitUid]() {
                             qInfo() << "[main] MediaTrackRelay sessionEnded, relay=" << r;
                             authManager.setSessionStreaming(sessionToken, false);
-                            auto* identity = IdentityManager::get();
-                            auto* quitReply = computerManager.http()->quitAppAsync(
-                                host->activeAddress, host->activeHttpsPort,
-                                identity->getCertificate(), identity->getPrivateKey(), quitUid);
-                            QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
-                                             &QNetworkReply::deleteLater);
+                            if (host->takesHostCancel()) {
+                                auto* identity = IdentityManager::get();
+                                auto* quitReply = computerManager.http()->quitAppAsync(
+                                    host->activeAddress, host->activeHttpsPort,
+                                    identity->getCertificate(), identity->getPrivateKey(), quitUid);
+                                QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
+                                                 &QNetworkReply::deleteLater);
+                            }
                             // The StreamSession is ephemeral (self-deletes once
                             // streaming starts), so its own sessionEnded->quit()
                             // handler is gone by the time the client disconnects —
@@ -3184,18 +3768,37 @@ int main(int argc, char* argv[])
             s->setStreamRelayPort(signalingPort + 1);
             s->setTransportMode(transportMode); // Full mode for response
             s->setEnableIceTcp(iceTcp);
+            s->setIceTcpPassive(AppSettings().iceTcpPassive());
+            s->setDebugIceDropUdp(AppSettings().debugIceDropUdp());
             s->setLowAudio(reqLowAudio);
             s->setMuteHostAudio(reqMuteHost);
+            s->setMicRequested(reqMic);
+            s->setMicDevice(appSettings.micDevice());
             s->setClientUniqueId(reqClientUniqueId);
             // The browser opts in: it decodes through a gap rather than asking
             // for a keyframe, which is what makes intra-refresh worth its cost.
             // Absent means today's behaviour, so an older cached frontend — and
             // every non-native host — is unaffected.
             s->setRideOutLoss(body["ride_out_loss"].toBool(false));
+            // The browser's decoder falls silent under reference repairs: one
+            // reference and keyframes for it. Absent (every other client, an
+            // older frontend) → the engine's own repairs, as before.
+            s->setRefInvalidation(body["ref_invalidation"].toBool(true));
+            // The browser cuts each decoded frame to the size the host says:
+            // an encoder may then pad the frame. Absent (an older frontend) →
+            // the picture is kept on the encoder's grid, as before.
+            s->setCropsToFrame(body["crops_to_frame"].toBool(false));
+            // The browser reads MWSR's zones: the native host's frames carry
+            // them. Absent (an older frontend, or one that keeps the law) →
+            // none, as before.
+            s->setMwsrZones(body["mwsr_map"].toBool(false));
             // The client's screen: its measured refresh and whether it paints
             // on vsync. Absent (an older frontend) → unknown, no alignment.
+            // And whether its tearing is real (Chromium on Windows): absent →
+            // no, and no admission window after a press.
             s->setClientPresentation(body["client_refresh_mhz"].toInt(0),
-                                     body["client_vsync"].toBool(false));
+                                     body["client_vsync"].toBool(false),
+                                     body["client_tearing_real"].toBool(false));
             // A rate chosen FOR the viewer states the ceiling it was chosen
             // against; one the viewer named states none.
             s->setMaxFps(reqFpsCeiling);
@@ -3204,15 +3807,34 @@ int main(int argc, char* argv[])
             s->setFollowDisplayShape(body["follow_display_shape"].toBool(false));
             s->setFrameFit(reqFitBox, reqAllowUpscale, reqMatchDisplay, reqFallbackW, reqFallbackH);
             s->setClientKind(clientKind);
+            s->setClientSameNetwork(clientSameNetwork);
             // See the worker path: the administrator-window gate.
             s->setViewerAdmin(req.isLocal);
             // The desktop portal consent this installation already holds, and
             // where a fresh one goes. In-process, so the settings file is right
             // here; the worker path does the same trip through a JSON event.
-            s->setPortalRestoreToken(appSettings.portalRestoreToken());
+            // The virtual display card holds a consent of its own (Linux).
+            const bool portalVirtual = host->backendType == NativeHostBackend::typeName() &&
+                                       NativeHostBackend::usesVirtualDisplay(appId);
+            s->setPortalRestoreToken(appSettings.portalRestoreToken(portalVirtual));
+            // The owner's virtual display is the desktop's primary while it
+            // streams, as the server makes it on Windows and macOS.
+            s->setVirtualPrimary(portalVirtual);
+            // One of the owner's apps in gamescope (Linux): what it runs.
+            {
+                QString gsName, gsCommand;
+                if (host->backendType == NativeHostBackend::typeName() &&
+                    NativeHostBackend::gamescopeAppFor(appId, &gsName, &gsCommand))
+                    s->setGamescopeApp(gsName, gsCommand);
+            }
+            // The admin's picture chain for a native Windows session.
+            s->setNativeVideoPipeline(appSettings.nativeVideoPipeline());
+            // The bench's knobs, when someone added them to the settings file.
+            s->setNativeTuning(nativeTuningSpec);
+            s->setRtpVideo(rtpVideoSpec);
             QObject::connect(s, &StreamSession::portalGrantReceived, qApp,
-                             [&appSettings](const QString& token) {
-                                 appSettings.setPortalRestoreToken(token);
+                             [&appSettings, portalVirtual](const QString& token) {
+                                 appSettings.setPortalRestoreToken(token, portalVirtual);
                                  qInfo() << "[Session] Desktop portal consent stored — this "
                                             "machine will not ask again";
                              });
@@ -3323,36 +3945,91 @@ int main(int argc, char* argv[])
             cfg["iceTcp"] = enableIceTcp;
             cfg["lowAudio"] = reqLowAudio;
             cfg["muteHostAudio"] = reqMuteHost;
+            // The viewer's microphone; the device it plays into travels with
+            // the other settings a SYSTEM worker cannot read (StreamWorkerHost).
+            cfg["mic"] = reqMic;
             // The browser's opt-in to decode through a gap instead of demanding
             // a keyframe. The worker owns the media engine, so the flag has to
             // travel with the config — setting it on the in-process session
             // alone would never reach the encoder.
             cfg["rideOutLoss"] = body["ride_out_loss"].toBool(false);
+            // And the reference repairs, the same way (setRefInvalidation).
+            cfg["refInvalidation"] = body["ref_invalidation"].toBool(true);
+            // And the cropping, the same way (setCropsToFrame).
+            cfg["cropsToFrame"] = body["crops_to_frame"].toBool(false);
+            // And MWSR's zones, the same way (setMwsrZones).
+            cfg["mwsrZones"] = body["mwsr_map"].toBool(false);
             cfg["fpsCeiling"] = reqFpsCeiling;
             cfg["clientRefreshMilliHz"] = body["client_refresh_mhz"].toInt(0);
             cfg["clientVsync"] = body["client_vsync"].toBool(false);
+            cfg["clientTearingReal"] = body["client_tearing_real"].toBool(false);
             cfg["followDisplayShape"] = body["follow_display_shape"].toBool(false);
             cfg["fitRequestedBox"] = reqFitBox;
             cfg["allowUpscale"] = reqAllowUpscale;
             cfg["matchClientDisplay"] = reqMatchDisplay;
             cfg["fallbackWidth"] = reqFallbackW;
             cfg["fallbackHeight"] = reqFallbackH;
-            // Whether this browser administers MoonlightWeb here (loopback, the
-            // host-key session, or the LAN admin password). The native host
-            // keeps everyone else out of windows that run as administrator.
-            cfg["viewerAdmin"] = req.isLocal;
+            // Whether the viewer may drive windows that run as administrator.
+            // This route is the owner's: the auth gate lets through only a
+            // local caller or a signed-in session (the PIN), and guests join
+            // through /api/share/player/*, which always says no. So the owner
+            // is trusted wherever they sign in from — an iPhone on 4G included,
+            // which the old test (admin privilege: loopback, host key or LAN
+            // admin password) left staring at the "minimize" warning.
+            cfg["viewerAdmin"] = true;
             // The consent the desktop portal already gave this installation.
             // Empty on every machine that reads its own scanout — which is all
             // of them but a Linux host with no capability (an AppImage).
-            cfg["portalRestoreToken"] = appSettings.portalRestoreToken();
+            // The virtual display card holds a consent of its own (Linux).
+            const bool portalVirtual = host->backendType == NativeHostBackend::typeName() &&
+                                       NativeHostBackend::usesVirtualDisplay(appId);
+            cfg["portalRestoreToken"] = appSettings.portalRestoreToken(portalVirtual);
+            // The owner's virtual display is the desktop's primary while it
+            // streams (Linux, where the session makes it; a guest never asks).
+            cfg["virtualPrimary"] = portalVirtual;
+            // One of the owner's apps in gamescope (Linux): what it runs.
+            {
+                QString gsName, gsCommand;
+                if (host->backendType == NativeHostBackend::typeName() &&
+                    NativeHostBackend::gamescopeAppFor(appId, &gsName, &gsCommand)) {
+                    cfg["gamescopeApp"] = gsName;
+                    cfg["gamescopeCommand"] = gsCommand;
+                }
+            }
+            // A display's card: its display, resolved here, where the cards
+            // are numbered — a SYSTEM worker does not read this settings file.
+            if (host->backendType == NativeHostBackend::typeName() &&
+                NativeHostBackend::isDisplayCard(appId)) {
+                QString why;
+                cfg["displayKey"] = NativeHostBackend::displayKeyForApp(appId, &why);
+                if (!why.isEmpty())
+                    qWarning() << "[Session] no display for app" << appId << ":" << why;
+            }
+            // One of the owner's apps: whether it is still in that file, for
+            // the same reason. Its screen the worker finds by itself.
+            if (host->backendType == NativeHostBackend::typeName() &&
+                NativeHostBackend::isHostAppCard(appId))
+                cfg["hostAppKnown"] = !NativeHostBackend::hostAppFor(appId).isEmpty();
+            // The admin's picture chain for a native Windows session.
+            cfg["nativeVideoPipeline"] = appSettings.nativeVideoPipeline();
+            // The bench's knobs, read here: a SYSTEM worker's own AppData is
+            // systemprofile's, where this settings file is not.
+            cfg["nativeTuning"] = nativeTuningSpec;
+            cfg["rtpVideo"] = rtpVideoSpec;
             cfg["clientUniqueId"] = reqClientUniqueId;
             cfg["clientKind"] = NetClassify::toString(clientKind);
+            cfg["clientSameNetwork"] = clientSameNetwork;
             cfg["autoMode"] = true;
             // Straight to /resume when joining a live app session: every
             // standby joins the running app by definition, and any uid we know
             // to be live resumes its own session (Sunshine rejects /launch
             // while an app runs; the launch↔resume self-heal stays as backup).
-            cfg["preferResume"] = standby || g_LiveSunshineUids.contains(reqClientUniqueId);
+            //
+            // Where the app outlives the stream, the session asks the host which
+            // app runs instead (Session::chooseByRunningApp): a uid known to be
+            // live says nothing about WHICH app it would resume.
+            cfg["preferResume"] =
+                standby || (!backendResumable && g_LiveSunshineUids.contains(reqClientUniqueId));
             cfg["serverHost"] = serverHost;
             cfg["serverHttpsPort"] = static_cast<int>(server.activeHttpsPort());
             // Every slot owns a port pair so all children can listen at once
@@ -3397,16 +4074,72 @@ int main(int argc, char* argv[])
             // the TTL above this IS persisted — it is a decision the person
             // made, and losing it means asking them again for nothing.
             QObject::connect(worker, &StreamWorkerHost::portalGrantReceived, qApp,
-                             [&appSettings](const QString& token) {
-                                 appSettings.setPortalRestoreToken(token);
+                             [&appSettings, portalVirtual](const QString& token) {
+                                 appSettings.setPortalRestoreToken(token, portalVirtual);
                                  qInfo() << "[Session] Desktop portal consent stored — this "
                                             "machine will not ask again";
                              });
+            // The capture's word on the virtual display it held (plan glissade,
+            // V): a rate above the 240 Hz every host runs, not held over the
+            // stream's dense content, is kept — `vddmatch` stays under it for
+            // a while from the next stream on (matchCapAfterRefusals), and a
+            // stream that holds it again clears it. Only for our own display:
+            // a physical one's rate is no choice of ours.
+            QObject::connect(
+                worker, &StreamWorkerHost::captureHoldReceived, qApp,
+                [&appSettings, portalVirtual](const QJsonObject& verdict) {
+                    const int milliHz = verdict["display_mhz"].toInt();
+                    const bool held = verdict["held"].toBool(true);
+                    qInfo().noquote()
+                        << "[Session] capture" << (held ? "held" : "did not hold")
+                        << "the display at" << VirtualDisplay::rateText(milliHz) << "Hz"
+                        << (held ? QString()
+                                 : QStringLiteral("(%1)").arg(verdict["why"].toString()));
+                    if (!portalVirtual ||
+                        milliHz <= VirtualDisplay::kRateMax * VirtualDisplay::kMilliHz)
+                        return;
+                    const QString gpu = verdict["gpu"].toString();
+                    if (held) {
+                        appSettings.clearVddMatchRefusal(gpu, milliHz);
+                        return;
+                    }
+                    const int count = appSettings.addVddMatchRefusal(
+                        gpu, milliHz, QCoreApplication::applicationVersion(),
+                        QDateTime::currentMSecsSinceEpoch());
+                    qInfo().noquote() << "[Session] vddmatch keeps the virtual display under"
+                                      << VirtualDisplay::rateText(milliHz) << "Hz on this host for"
+                                      << VirtualDisplay::refusalHoldMs(count) / 3600000
+                                      << "h (refusal" << count << "in a row), then tries it again";
+                });
+            // One of the owner's apps (AppSettings::hostApps): opened on the
+            // desktop once this stream shows it — the virtual display is on and
+            // primary by then, so the program lands where the viewer looks.
+            // Never by a standby leg: the stream it doubles already opened it.
+            const QString hostAppCommand = host->backendType == NativeHostBackend::typeName()
+                                               ? NativeHostBackend::desktopCommandFor(appId)
+                                               : QString();
+            // ... and closed again when that display goes off.
+            const bool hostAppOnVirtual =
+                !hostAppCommand.isEmpty() && NativeHostBackend::usesVirtualDisplay(appId);
+            const QString hostAppCloseCommand =
+                hostAppOnVirtual
+                    ? NativeHostBackend::hostAppFor(appId).value("quit_command").toString()
+                    : QString();
+            // Back after a crash, the app is still open where the crashed
+            // stream left it, unless that display went with the worker (a
+            // portal's), whose going closed it.
+            const bool hostAppStillOpen =
+                !reconnectOf.isEmpty() && !(hostAppOnVirtual && VirtualDisplay::livesInStream());
+            // What the page knows this stream by, to ask how it ended.
+            const QString streamId = StreamEnds::newId();
+            worker->setStreamId(streamId);
             QObject::connect(
                 worker, &StreamWorkerHost::responseReady, qApp,
-                [respond, worker, &g_Pool, &g_DualSupport, &g_LiveSunshineUids, &authManager,
-                 &sessionMetrics, sessionFacts, sessionStartedAt, reqSlot, standby, hostUuidCopy,
-                 uid, sessionToken](int code, QJsonObject bodyObj) {
+                [respond, worker, &g_Pool, &g_DualSupport, &g_SingleSessionHosts,
+                 &g_LiveSunshineUids, &g_StreamEnds, &authManager, &sessionMetrics, sessionFacts,
+                 sessionStartedAt, reqSlot, standby, hostUuidCopy, uid, sessionToken, streamId,
+                 hostAppCommand, hostAppOnVirtual, hostAppCloseCommand,
+                 hostAppStillOpen](int code, QJsonObject bodyObj) {
                     const bool ok =
                         code == 200 && bodyObj["status"].toString() == QLatin1String("streaming");
                     // Count a session once it actually carries a picture, and
@@ -3425,11 +4158,28 @@ int main(int argc, char* argv[])
                     }
                     if (ok) {
                         bodyObj["slot"] = reqSlot;
-                        bodyObj["dual_supported"] = g_DualSupport.value(hostUuidCopy, true);
+                        bodyObj["dual_supported"] = g_DualSupport.value(hostUuidCopy, true) &&
+                                                    !g_SingleSessionHosts.contains(hostUuidCopy);
+                        bodyObj["stream_id"] = streamId;
+                        g_StreamEnds.begin(streamId, hostUuidCopy, reqSlot, uid, sessionToken,
+                                           QDateTime::currentMSecsSinceEpoch());
                         authManager.setSessionStreaming(sessionToken, true);
                         g_LiveSunshineUids.insert(uid);
                         // A successful standby launch IS the capability probe.
                         if (standby) g_DualSupport[hostUuidCopy] = true;
+                        if (!standby && !hostAppStillOpen && !hostAppCommand.isEmpty()) {
+                            QString why;
+                            const bool opened =
+                                hostAppOnVirtual
+                                    ? HostAppLauncher::openOnVirtualDisplay(hostAppCommand, &why)
+                                    : HostAppLauncher::open(hostAppCommand, &why);
+                            if (!opened)
+                                qWarning().noquote()
+                                    << "[Session] the app could not be opened:" << why;
+                            else if (!hostAppCloseCommand.isEmpty() &&
+                                     !g_HostAppCloseOnRelease.contains(hostAppCloseCommand))
+                                g_HostAppCloseOnRelease.append(hostAppCloseCommand);
+                        }
                         respond(HttpResponse::json(bodyObj, 200));
                         return;
                     }
@@ -3461,11 +4211,26 @@ int main(int argc, char* argv[])
             QObject::connect(
                 worker, &StreamWorkerHost::ended, qApp,
                 [worker, &g_Pool, &g_DualSupport, &g_LastStandbyStartMs, &g_LiveSunshineUids,
-                 &g_PendingHostCancels, &dropPendingHostCancel, &anyOtherSlotLive, &computerManager,
-                 &authManager, &reapCoopSession, &sessionMetrics, sessionFacts, sessionStartedAt,
-                 reqSlot, host, hostUuidCopy, uid, sessionToken, coopSessionId]() {
+                 &g_PendingHostCancels, &g_StreamEnds, &dropPendingHostCancel, &anyOtherSlotLive,
+                 &computerManager, &authManager, &reapCoopSession, &sessionMetrics, sessionFacts,
+                 sessionStartedAt, reqSlot, host, hostUuidCopy, uid, sessionToken, streamId,
+                 coopSessionId, backendResumable, quitAppOnEnd, &quitsPerDevice, &quitDeviceApp,
+                 &releaseSeatIfIdle]() {
                     qInfo() << "[main] Stream worker ended (slot" << reqSlot << ", uid=" << uid
                             << ")";
+                    // A crash under a stream that was flowing brings its page
+                    // back: it asks how this stream ended and starts it again,
+                    // and what the stream held waits longer for it below. One
+                    // that never streamed is a failed launch, as before.
+                    const qint64 endedAt = QDateTime::currentMSecsSinceEpoch();
+                    const bool comesBack =
+                        worker->crashed() &&
+                        g_StreamEnds.find(streamId, endedAt).state == StreamEnds::State::Live;
+                    g_StreamEnds.end(streamId,
+                                     worker->crashed() ? StreamEnds::State::Crashed
+                                                       : StreamEnds::State::Ended,
+                                     endedAt);
+                    const int holdMs = comesBack ? kCrashGraceMs : kHostCancelGraceMs;
                     // Pairs with the start above: a non-zero timestamp is proof
                     // this leg was the one counted.
                     if (*sessionStartedAt > 0) {
@@ -3506,12 +4271,53 @@ int main(int argc, char* argv[])
                     // drops the cancel (dropPendingHostCancel); a browser that
                     // does not come back still gets its app closed.
                     const bool siblingLive = anyOtherSlotLive(reqSlot, hostUuidCopy);
-                    if (!siblingLive) {
-                        // The native host is not a GameStream server and
-                        // keeps its immediate /cancel.
-                        const int graceMs = host->backendType == NativeHostBackend::typeName()
-                                                ? 0
-                                                : kHostCancelGraceMs;
+                    // Where the app outlives the stream, nothing is cancelled:
+                    // the viewer resumes it from its card, or quits it there —
+                    // unless they asked for the app to close with the stream.
+                    const bool keepApp = backendResumable && !quitAppOnEnd;
+                    // Each device on its own seat: the other devices streaming
+                    // this host are on other seats, and the app to quit is on
+                    // this device's — through the backend, never the machine.
+                    const bool perDevice = quitsPerDevice(hostUuidCopy);
+                    if (keepApp) {
+                        qInfo() << "[main] Stream ended — the app keeps running on the host "
+                                   "for a later resume";
+                        if (!siblingLive) computerManager.refreshRunningApp(hostUuidCopy);
+                        // Its seat goes back to the pool if the game ended too.
+                        if (perDevice) releaseSeatIfIdle(hostUuidCopy, uid);
+                    } else if (perDevice) {
+                        // Same grace as below, for the same relaunch: a transport
+                        // rung that failed comes back within it.
+                        dropPendingHostCancel(uid, hostUuidCopy);
+                        QTimer::singleShot(
+                            holdMs, qApp,
+                            [&g_Pool, &g_LiveSunshineUids, quitDeviceApp, releaseSeatIfIdle,
+                             hostUuidCopy, uid]() {
+                                for (int i = 0; i < g_Pool.size(); ++i) {
+                                    const SessionPool::Slot& s = g_Pool.at(i);
+                                    if (s.worker && s.hostUuid == hostUuidCopy &&
+                                        s.clientUniqueId == uid) {
+                                        qInfo() << "[main] The device came back — its seat's app "
+                                                   "stays";
+                                        return;
+                                    }
+                                }
+                                g_LiveSunshineUids.remove(uid);
+                                quitDeviceApp(
+                                    hostUuidCopy, uid,
+                                    [releaseSeatIfIdle, hostUuidCopy, uid](bool ok, QString why) {
+                                        if (!ok) qWarning() << "[main] Seat quit failed:" << why;
+                                        releaseSeatIfIdle(hostUuidCopy, uid);
+                                    });
+                            });
+                    } else if (!siblingLive && !host->takesHostCancel()) {
+                        // The native host is not a GameStream server: there is
+                        // no /cancel to send, and its engine stopped with the
+                        // worker.
+                        dropPendingHostCancel(uid, hostUuidCopy);
+                        g_LiveSunshineUids.remove(uid);
+                    } else if (!siblingLive) {
+                        const int graceMs = holdMs;
                         dropPendingHostCancel(uid, hostUuidCopy);
                         auto* timer = new QTimer(qApp);
                         timer->setSingleShot(true);
@@ -3566,7 +4372,7 @@ int main(int argc, char* argv[])
                     SessionPool::Slot& sl = g_Pool.at(reqSlot);
                     const bool onVirtualDisplay =
                         host->backendType == NativeHostBackend::typeName() &&
-                        sl.appId == NativeHostBackend::virtualDisplayAppId();
+                        NativeHostBackend::usesVirtualDisplay(sl.appId);
                     if (sl.worker == worker) {
                         sl.worker = nullptr;
                         sl.clientUniqueId.clear();
@@ -3577,14 +4383,25 @@ int main(int argc, char* argv[])
                     }
                     // The last stream on "MoonlightWeb Virtual Display" turns
                     // it off again — after a grace, so a reload comes back to
-                    // a display that never went.
-                    if (onVirtualDisplay && !siblingLive)
-                        VirtualDisplayJob::instance().releaseSoon();
+                    // a display that never went. Whether another stream still
+                    // shows it is the grace's own question, as on the guests'
+                    // path: a sibling streaming ANOTHER app of this host does
+                    // not keep it, and nobody else would ask again. Gated on
+                    // siblingLive until 04/10/2026, the virtual display stayed
+                    // on behind every stream that ran beside Display 1.
+                    if (onVirtualDisplay)
+                        VirtualDisplayJob::instance().releaseSoon(comesBack ? kCrashGraceMs : 0);
                 });
 
+            const bool virtualStream = host->backendType == NativeHostBackend::typeName() &&
+                                       NativeHostBackend::usesVirtualDisplay(appId);
             auto startWorker = [worker, respond, standby, reqSlot, appId, &g_Pool,
-                                &g_LastStandbyStartMs, hostUuidCopy, uid,
-                                sessionToken](QJsonObject cfg) {
+                                &g_LastStandbyStartMs, hostUuidCopy, uid, sessionToken,
+                                virtualStream](QJsonObject cfg) {
+                // On our virtual display: the display it took the primary role
+                // from, which turning it on (below) has just recorded in this
+                // settings file — a SYSTEM worker does not read it.
+                if (virtualStream) cfg["previousPrimary"] = NativeHostBackend::previousPrimary();
                 if (!worker->start(cfg)) {
                     worker->deleteLater();
                     // Spawn failure. For a standby attempt just report
@@ -3668,21 +4485,110 @@ int main(int argc, char* argv[])
             // passes 0 and takes the mode that is there.
             const int vdWidth = reqMatchDisplay ? reqWidth : 0;
             const int vdHeight = reqMatchDisplay ? reqHeight : 0;
-            // Its refresh rate is the stream's own — the client's screen rate
-            // under "Auto", what the viewer named otherwise: a display nobody
-            // looks at has no reason to run at anything but the cadence of the
-            // frames it exists to produce. Not the raw measurement: a panel at
-            // 144 Hz streaming an Auto 120 would leave the compositor
-            // presenting 24 frames a second into the void.
-            // Unmeasured (0) leaves the display's default rate.
-            const int vdRefresh = reqFps;
+            // Its refresh rate, on Windows, is 240 Hz whatever the stream's
+            // (decision A of plan framerate-hote, 30/09/2026), or a whole
+            // multiple of the client's screen under vddmatch (below). A
+            // picture the host renders waits for the compositor's next refresh
+            // before the capture sees it: up to a whole frame of a 60 Hz
+            // display, 4.2 ms at 240. The stream keeps its own cadence — the
+            // client's screen rate under "Auto" — and takes the first present
+            // of each of its intervals, so nothing more is encoded or sent.
+            // Measured: 6 to 17 ms off the age of what the client shows behind
+            // an Arc or an iGPU, neutral behind an RTX (bench §8p.4 sexies).
+            // Linux too, where the stream makes the portal's monitor itself and
+            // the engine applies the same rule (SessionConfig::virtualRefreshHz).
+            // Elsewhere (macOS), the stream's own rate: a display nobody looks
+            // at runs at the cadence of the frames it exists to produce;
+            // unmeasured (0) leaves the display's default rate.
+            //
+            // MW_VDD_REFRESH (bench only) sets it apart from both, up to the
+            // driver's own 500 Hz. Never set by the product.
+            constexpr bool vdFaster = VirtualDisplay::kFasterThanStream;
+            const int vdBenchRefresh = qEnvironmentVariableIntValue("MW_VDD_REFRESH");
+            int vdRefresh = VirtualDisplay::refreshForStream(reqFps, vdBenchRefresh, vdFaster) *
+                            VirtualDisplay::kMilliHz;
+            if (host->backendType == NativeHostBackend::typeName() &&
+                NativeHostBackend::usesVirtualDisplay(appId)) {
+                const char* why = vdBenchRefresh > 0 ? "(MW_VDD_REFRESH)"
+                                  : vdFaster         ? "(faster than the stream)"
+                                                     : "";
+                // Under `vddmatch` (plan glissade, section V; the product's on
+                // Windows since 16/10/2026), a whole multiple of the client's
+                // screen instead, to the millihertz: 240.000 beats against a
+                // "120 Hz" panel that runs at 119.872 and loses a picture
+                // every 7.8 s; 239.744 does not. Windows, where the
+                // display runs faster than the stream; never over the bench's
+                // MW_VDD_REFRESH. A display already on at a rate this process
+                // gave it stays at that rate: another stream may be on it.
+                QString matchWhy;
+                if (vdFaster && vdBenchRefresh <= 0) {
+                    mw::native::EncoderTuning vdTuning;
+                    int vdGpu = -1;
+                    QString vdTuningError;
+                    parseEncoderTuningSpec(effectiveTuningSpec(nativeTuningSpec), vdTuning, vdGpu,
+                                           vdTuningError);
+                    const bool vdMatch = vdTuning.vddMatch < 0 ? VirtualDisplay::kVddMatchProduct
+                                                               : vdTuning.vddMatch == 1;
+                    if (vdMatch) {
+                        const int clientMilliHz = body["client_refresh_mhz"].toInt(0);
+                        // Under the rates this host's capture did not hold
+                        // (captureHoldReceived above), on a GPU it still has;
+                        // the bench's vddmatchmax says it all by itself.
+                        int cap = VirtualDisplay::kMatchedRateMaxHz;
+                        if (vdTuning.vddMatchMaxHz > 0) {
+                            cap = vdTuning.vddMatchMaxHz;
+                        } else {
+                            QStringList gpus;
+                            for (const mw::native::GpuInfo& g :
+                                 NativeProbeService::instance().snapshot().gpus)
+                                gpus << QString::fromStdString(g.name);
+                            cap = VirtualDisplay::matchCapAfterRefusals(
+                                cap, appSettings.vddMatchRefused(),
+                                QCoreApplication::applicationVersion(), gpus,
+                                QDateTime::currentMSecsSinceEpoch());
+                        }
+                        const bool capLowered =
+                            vdTuning.vddMatchMaxHz <= 0 && cap < VirtualDisplay::kMatchedRateMaxHz;
+                        const int matched =
+                            VirtualDisplay::matchedRefreshMilliHz(clientMilliHz, reqFps, cap);
+                        const int active = VirtualDisplayJob::instance().activeRefreshMilliHz();
+                        if (active > 0 && VirtualDisplay::probe().active) {
+                            vdRefresh = active;
+                            matchWhy = QStringLiteral("(vddmatch: already on at that rate)");
+                        } else if (matched > 0) {
+                            vdRefresh = matched;
+                            matchWhy =
+                                QStringLiteral("(vddmatch: %1 x the client's %2 Hz%3)")
+                                    .arg(matched / clientMilliHz)
+                                    .arg(VirtualDisplay::rateText(clientMilliHz))
+                                    .arg(capLowered
+                                             ? QStringLiteral(", under %1 Hz: the capture did not "
+                                                              "hold more on this host")
+                                                   .arg(cap)
+                                             : QString());
+                        } else {
+                            matchWhy = QStringLiteral(
+                                           "(vddmatch: nothing fits a %1 Hz client, up to %2 Hz)")
+                                           .arg(VirtualDisplay::rateText(qMax(0, clientMilliHz)))
+                                           .arg(cap);
+                        }
+                    }
+                }
+                qInfo().noquote() << "[Session] virtual display at"
+                                  << VirtualDisplay::rateText(vdRefresh) << "Hz for a" << reqFps
+                                  << "fps stream"
+                                  << (matchWhy.isEmpty() ? QString::fromLatin1(why) : matchWhy);
+            }
+            // HDR asked (the native host asks it whenever this screen can show
+            // it): a Mac makes its display EDR-capable then, and only then.
+            const bool vdHdr = reqHdr;
             std::function<void()> readyThenStart = claimThenStart;
             if (host->backendType == NativeHostBackend::typeName() &&
-                appId == NativeHostBackend::virtualDisplayAppId()) {
+                NativeHostBackend::usesVirtualDisplay(appId)) {
                 readyThenStart = [claimThenStart, worker, respond, standby, reqSlot, generation,
-                                  vdWidth, vdHeight, vdRefresh]() {
+                                  vdWidth, vdHeight, vdRefresh, vdHdr]() {
                     VirtualDisplayJob::instance().activate(
-                        vdWidth, vdHeight, vdRefresh,
+                        vdWidth, vdHeight, vdRefresh, vdHdr,
                         [claimThenStart, worker, respond, standby, reqSlot,
                          generation](bool ok, const QString& error) {
                             if (g_SlotLaunchGeneration.value(reqSlot) != generation) {
@@ -3812,8 +4718,9 @@ int main(int argc, char* argv[])
         "/api/hosts/:id/quit",
         [&computerManager, &g_ActiveRelay, &g_ActiveStreamRelay, &g_ActiveMediaTrackRelay,
          &g_ActiveSession, &g_ActiveClientUniqueId, &g_ActiveHostUuid, &g_Pool, &g_LiveSunshineUids,
-         &dropPendingHostCancel, &detachWorkerSlot,
-         &endPlayerSessions](const HttpRequest& req, const ResponseCallback& respond) {
+         &g_DualSupport, &g_SingleSessionHosts, &dropPendingHostCancel, &detachWorkerSlot,
+         &appOutlivesStream, &anyOtherSlotLive, &endPlayerSessions, &quitsPerDevice, &quitDeviceApp,
+         &releaseSeatIfIdle](const HttpRequest& req, const ResponseCallback& respond) {
             QString uuid = req.pathParams.value("id");
             qInfo() << "[quit] ENTER — uuid=" << uuid << "relay=" << g_ActiveRelay.data()
                     << "relay valid=" << (!g_ActiveRelay.isNull());
@@ -3836,11 +4743,17 @@ int main(int argc, char* argv[])
             // Per-browser unique ID so the cancel targets this browser's own
             // session (must match the one used at /launch). Sanitized to hex.
             QJsonObject qbody = QJsonDocument::fromJson(req.body).object();
-            QString quitUniqueId;
-            for (const QChar& c : qbody["client_uniqueid"].toString()) {
-                QChar u = c.toUpper();
-                if (u.isDigit() || (u >= 'A' && u <= 'F')) quitUniqueId += u;
-                if (quitUniqueId.size() >= 32) break;
+            const QString quitUniqueId =
+                sanitizeClientUniqueId(qbody["client_uniqueid"].toString());
+
+            // The page retiring a standby that was answered as streaming and
+            // never showed a picture (issue #36): this host is kept to one
+            // session from now on, across restarts.
+            if (qbody["dual_failed"].toBool(false)) {
+                g_DualSupport[host->uuid] = false;
+                if (g_SingleSessionHosts.add(host->uuid))
+                    qWarning() << "[quit] Standby never showed a picture — host" << host->name
+                               << "kept to one session from now on";
             }
 
             // ── Worker-mode sessions ───────────────────────────────────────
@@ -3854,7 +4767,14 @@ int main(int argc, char* argv[])
             const int quitSlot = qbody.contains("session_slot")
                                      ? qBound(0, qbody["session_slot"].toInt(0), kOwnerSlots - 1)
                                      : -1;
-            const bool keepHostSession = qbody["keep_host_session"].toBool(false);
+            // Where the app outlives the stream (issue #24), a Stop is a
+            // disconnect like Moonlight's: the app keeps running for a later
+            // resume, and every guest keeps playing. quit_app — the viewer's
+            // "Quit the app when the stream stops" setting — asks for the old
+            // Stop, which ends the app for everyone.
+            const bool quitApp = qbody["quit_app"].toBool(false);
+            const bool keepHostSession = qbody["keep_host_session"].toBool(false) ||
+                                         (appOutlivesStream(host->uuid) && !quitApp);
 
             // The authenticated device asking to quit, read the same way /start
             // records it. Empty for localhost.
@@ -3902,9 +4822,38 @@ int main(int argc, char* argv[])
                 }
                 qInfo() << "[quit] Stopping stream worker slot" << i
                         << (keepHostSession ? "(keeping host session)" : "");
+                // The native host's apps outlive their stream (HostAppLauncher);
+                // quitting one runs its own way out, when it has one — Steam
+                // leaves Big Picture.
+                if (quitApp && host->backendType == NativeHostBackend::typeName()) {
+                    const QString quitCommand =
+                        NativeHostBackend::hostAppFor(sl.appId).value("quit_command").toString();
+                    QString why;
+                    if (!quitCommand.isEmpty() && !HostAppLauncher::open(quitCommand, &why))
+                        qWarning().noquote() << "[quit] the app's quit command failed:" << why;
+                    g_HostAppCloseOnRelease.removeAll(quitCommand);
+                }
                 // Suppressed ended-cleanup: this handler owns the Sunshine
                 // /cancel decision (keyed by quitUniqueId below; none at all
                 // when retiring).
+                detachWorkerSlot(i, false);
+                workerStopped = true;
+            }
+            // A stream of this device on this host in a slot past the owner's
+            // two — an app slot (the virtual display beside Display 1, a second
+            // MultiSeat device) — is this device's too. session_slot is taken as
+            // sent here: the owner bound above would turn slot 5 into 1.
+            const int rawSlot =
+                qbody.contains("session_slot") ? qbody["session_slot"].toInt(-1) : -1;
+            for (int i = kOwnerSlots; i < g_Pool.size() && !quitUniqueId.isEmpty(); ++i) {
+                const SessionPool::Slot& sl = g_Pool.at(i);
+                if (!sl.worker || sl.hostUuid != host->uuid || sl.clientUniqueId != quitUniqueId)
+                    continue;
+                if (rawSlot >= 0 && rawSlot != i) continue;
+                if (!quitSessionToken.isEmpty() && !sl.sessionToken.isEmpty() &&
+                    quitSessionToken != sl.sessionToken)
+                    continue;
+                qInfo() << "[quit] Stopping stream worker slot" << i << "(app slot of this device)";
                 detachWorkerSlot(i, false);
                 workerStopped = true;
             }
@@ -3980,12 +4929,45 @@ int main(int argc, char* argv[])
             // app session stays alive for the surviving leg — respond directly.
             if (keepHostSession) {
                 qInfo() << "[quit] EXIT — retired without Sunshine /cancel";
+                // Say at once that the app still runs: the host poll pauses
+                // while a stream runs, so its last answer predates the launch.
+                // Not while another leg streams — it would only add a request
+                // to a host that is encoding.
+                if (!anyOtherSlotLive(-1, host->uuid))
+                    computerManager.refreshRunningApp(host->uuid);
+                // A seat whose game already ended goes back to the pool.
+                releaseSeatIfIdle(host->uuid, quitUniqueId);
                 respond(HttpResponse::json(QJsonObject{{"status", "quit"}}));
                 return;
             }
 
             // Sent here and now, so a /cancel still held for this browser is moot.
             dropPendingHostCancel(quitUniqueId, host->uuid);
+            if (quitsPerDevice(host->uuid)) {
+                // The device's own seat, under its certificate (see quitDeviceApp).
+                g_LiveSunshineUids.remove(quitUniqueId);
+                const QString hostUuid = host->uuid;
+                quitDeviceApp(
+                    hostUuid, quitUniqueId,
+                    [respond, releaseSeatIfIdle, hostUuid, quitUniqueId](bool ok, QString why) {
+                        if (!ok) {
+                            qWarning() << "[quit] Quitting the seat's app failed:" << why;
+                            respond(HttpResponse::error(502, "Quit failed: " + why));
+                            return;
+                        }
+                        qInfo() << "[quit] EXIT — the device's seat quit its app";
+                        releaseSeatIfIdle(hostUuid, quitUniqueId);
+                        respond(HttpResponse::json(QJsonObject{{"status", "quit"}}));
+                    });
+                return;
+            }
+            if (!host->takesHostCancel()) {
+                // Stopping the worker above was the whole of it.
+                g_LiveSunshineUids.remove(quitUniqueId);
+                qInfo() << "[quit] EXIT — native host, no Sunshine /cancel";
+                respond(HttpResponse::json(QJsonObject{{"status", "quit"}}));
+                return;
+            }
             qInfo() << "[quit] Sending quitAppAsync to Sunshine ...";
             g_LiveSunshineUids.remove(quitUniqueId);
             auto* identity = IdentityManager::get();
@@ -3995,23 +4977,56 @@ int main(int argc, char* argv[])
             qInfo() << "[quit] quitAppAsync reply=" << reply;
 
             // Wait for quit to complete, then respond
-            QObject::connect(reply, &QNetworkReply::finished, [reply, respond]() {
-                reply->deleteLater();
-                if (reply->error() != QNetworkReply::NoError) {
-                    qWarning() << "[quit] Sunshine quit failed: error=" << reply->error()
-                               << "errorString=" << reply->errorString();
-                    qInfo() << "[quit] EXIT — returning 502";
-                    respond(HttpResponse::error(502, "Quit failed: " + reply->errorString()));
-                } else {
-                    QByteArray body = reply->readAll();
-                    qInfo() << "[quit] Sunshine quit OK, body size=" << body.size()
-                            << "body=" << body.left(200);
-                    QJsonObject result;
-                    result["status"] = "quit";
-                    qInfo() << "[quit] EXIT — returning 200 OK";
-                    respond(HttpResponse::json(result));
-                }
-            });
+            const QString hostUuid = host->uuid;
+            QObject::connect(
+                reply, &QNetworkReply::finished, [reply, respond, &computerManager, hostUuid]() {
+                    reply->deleteLater();
+                    computerManager.refreshRunningApp(hostUuid);
+                    if (reply->error() != QNetworkReply::NoError) {
+                        qWarning() << "[quit] Sunshine quit failed: error=" << reply->error()
+                                   << "errorString=" << reply->errorString();
+                        qInfo() << "[quit] EXIT — returning 502";
+                        respond(HttpResponse::error(502, "Quit failed: " + reply->errorString()));
+                    } else {
+                        QByteArray body = reply->readAll();
+                        qInfo() << "[quit] Sunshine quit OK, body size=" << body.size()
+                                << "body=" << body.left(200);
+                        QJsonObject result;
+                        result["status"] = "quit";
+                        qInfo() << "[quit] EXIT — returning 200 OK";
+                        respond(HttpResponse::json(result));
+                    }
+                });
+        });
+
+    // GET /api/hosts/:id/running-app — which app the host runs right now.
+    //
+    // Asked of the host, not read from the last poll, which pauses while any
+    // stream runs. The browser asks before launching on a host whose app
+    // outlives the stream: another app running is a question for the viewer
+    // (quit it, or resume it instead), and it has to be asked before /start,
+    // whose take-over would already have ended someone else's stream.
+    server.router()->getAsync(
+        "/api/hosts/:id/running-app",
+        [&computerManager](const HttpRequest& req, const ResponseCallback& respond) {
+            const QString uuid = req.pathParams.value("id");
+            if (!computerManager.getHost(uuid)) {
+                respond(HttpResponse::error(404, "Host not found"));
+                return;
+            }
+            // The device asking: where devices have seats of their own
+            // (MultiSeat), the running app is the one on its seat.
+            const QString device = sanitizeClientUniqueId(req.queryParams.value("client_uniqueid"));
+            computerManager.refreshRunningApp(
+                uuid,
+                [respond](bool ok, int appId) {
+                    if (!ok) {
+                        respond(HttpResponse::error(502, "The host did not say which app it runs"));
+                        return;
+                    }
+                    respond(HttpResponse::json(QJsonObject{{"currentGameId", appId}}));
+                },
+                device);
         });
 
     // POST /api/hosts/:id/stop-session — the escape hatch.
@@ -4024,11 +5039,50 @@ int main(int argc, char* argv[])
     // Sunshine session we know to be live, whoever started it.
     server.router()->postAsync(
         "/api/hosts/:id/stop-session",
-        [&computerManager, &g_Pool, &g_LiveSunshineUids, &detachWorkerSlot,
-         &endPlayerSessions](const HttpRequest& req, const ResponseCallback& respond) {
+        [&computerManager, &g_Pool, &g_LiveSunshineUids, &detachWorkerSlot, &endPlayerSessions,
+         &quitsPerDevice, &quitDeviceApp,
+         &releaseSeatIfIdle](const HttpRequest& req, const ResponseCallback& respond) {
             NvComputer* host = computerManager.getHost(req.pathParams.value("id"));
             if (!host) {
                 respond(HttpResponse::error(404, "Host not found"));
+                return;
+            }
+
+            // A host where each device has its own seat: "Quit" is the asking
+            // device's, on its seat. Its streams end, its seat's app is quit
+            // under the seat's certificate, and nothing of another device's —
+            // nor the machine's own GameStream server — is touched.
+            if (quitsPerDevice(host->uuid)) {
+                const QString uid = sanitizeClientUniqueId(
+                    QJsonDocument::fromJson(req.body).object()["client_uniqueid"].toString());
+                if (uid.isEmpty()) {
+                    respond(HttpResponse::error(
+                        400, "client_uniqueid is required: each device has its own seat here"));
+                    return;
+                }
+                qInfo() << "[stop-session] Quitting the app on this device's seat";
+                for (int i = 0; i < g_Pool.size(); ++i) {
+                    const SessionPool::Slot& sl = g_Pool.at(i);
+                    if (sl.worker && sl.hostUuid == host->uuid && sl.clientUniqueId == uid)
+                        detachWorkerSlot(i, false);
+                }
+                g_LiveSunshineUids.remove(uid);
+                const QString hostUuid = host->uuid;
+                quitDeviceApp(
+                    hostUuid, uid,
+                    [&computerManager, respond, releaseSeatIfIdle, hostUuid, uid](bool ok,
+                                                                                  QString why) {
+                        if (!ok) qWarning() << "[stop-session] Seat quit failed:" << why;
+                        computerManager.refreshRunningApp(
+                            hostUuid,
+                            [respond, releaseSeatIfIdle, hostUuid, uid](bool known, int appId) {
+                                QJsonObject out{{"status", QStringLiteral("stopped")}};
+                                if (known) out["currentGameId"] = appId;
+                                releaseSeatIfIdle(hostUuid, uid);
+                                respond(HttpResponse::json(out));
+                            },
+                            uid);
+                    });
                 return;
             }
 
@@ -4043,9 +5097,11 @@ int main(int argc, char* argv[])
             // trailing empty-uid /cancel sweeps a session this process never saw
             // (a previous run, a crash) — the case the button exists for.
             QStringList cancelQueue;
-            for (const QString& uid : g_LiveSunshineUids)
-                cancelQueue.append(uid);
-            cancelQueue.append(QString()); // unscoped sweep, always last
+            if (host->takesHostCancel()) {
+                for (const QString& uid : g_LiveSunshineUids)
+                    cancelQueue.append(uid);
+                cancelQueue.append(QString()); // unscoped sweep, always last
+            }
             g_LiveSunshineUids.clear();
             auto* identity = IdentityManager::get();
 
@@ -4062,7 +5118,15 @@ int main(int argc, char* argv[])
             *sendNext = [&computerManager, host, identity, cancelQueue, sendNext, respond,
                          idx = 0]() mutable {
                 if (idx >= cancelQueue.size()) {
-                    respond(HttpResponse::json(QJsonObject{{"status", QStringLiteral("stopped")}}));
+                    // Read back what the host runs now, so the card stops
+                    // offering to resume at once. Sunshine's /cancel is
+                    // synchronous, so this is 0 unless the app would not die.
+                    const QString hostUuid = host->uuid;
+                    computerManager.refreshRunningApp(hostUuid, [respond](bool ok, int appId) {
+                        QJsonObject out{{"status", QStringLiteral("stopped")}};
+                        if (ok) out["currentGameId"] = appId;
+                        respond(HttpResponse::json(out));
+                    });
                     return;
                 }
                 const QString uid = cancelQueue.at(idx++);
@@ -4114,15 +5178,18 @@ int main(int argc, char* argv[])
 
     // The owner's live context (host + app), taken from whichever owner slot is
     // up. Empty uuid means nothing is running and no player can join.
-    auto ownerContext = [&g_Pool, &g_ActiveHostUuid]() {
+    auto ownerContext = [&g_Pool, &g_LiveSunshineUids]() {
         for (int i = 0; i < kOwnerSlots; ++i)
             if (g_Pool.at(i).worker && !g_Pool.at(i).hostUuid.isEmpty())
                 return std::pair<QString, int>{g_Pool.at(i).hostUuid, g_Pool.at(i).appId};
-        // No owner leg left — they pressed Leave, or their stream dropped. The
-        // app is still on Sunshine, so fall back to what it was.
-        if (!g_LastOwnerHostUuid.isEmpty())
+        // No owner leg left — they pressed Leave, or their stream dropped. While
+        // the session is still held on Sunshine, the app is still up: fall back
+        // to what it was. Otherwise nothing runs, and the board's own choice of
+        // host and app decides (S9.2, 11/10: the last stream's display won over
+        // the one the owner had just picked, for every invitation after it).
+        if (!g_LastOwnerHostUuid.isEmpty() && !g_LiveSunshineUids.isEmpty())
             return std::pair<QString, int>{g_LastOwnerHostUuid, g_LastOwnerAppId};
-        return std::pair<QString, int>{g_ActiveHostUuid, 0};
+        return std::pair<QString, int>{};
     };
 
     // What a guest would get by pressing Join, resolved on the host their
@@ -4162,7 +5229,21 @@ int main(int argc, char* argv[])
     ShareRoutesDeps shareDeps;
     shareDeps.joinTarget = joinTarget;
     shareDeps.statsReporting = [&appSettings]() { return appSettings.sessionMetricsAllowed(); };
+    shareDeps.guestPicture = [&computerManager, &appSettings](const QString& hostUuid) {
+        ShareRoutesDeps::GuestPicture picture;
+        NvComputer* host = computerManager.getHost(hostUuid);
+        if (host && host->backendType == NativeHostBackend::typeName()) {
+            picture.ownerHeight = true;
+            picture.shared = SharedFeed::enabled(appSettings.sharedFeedEnabled());
+        }
+        return picture;
+    };
     shareDeps.currentOwnerContext = ownerContext;
+    shareDeps.ownerWatching = [&g_Pool](const QString& hostUuid) {
+        for (int i = 0; i < kOwnerSlots; ++i)
+            if (g_Pool.at(i).worker && g_Pool.at(i).hostUuid == hostUuid) return true;
+        return false;
+    };
     shareDeps.hostAppExists = [&computerManager](const QString& hostUuid, int appId) {
         NvComputer* host = computerManager.getHost(hostUuid);
         if (!host || appId <= 0) return false;
@@ -4221,23 +5302,134 @@ int main(int argc, char* argv[])
         return entry + QStringLiteral("#t=") + QString::fromLatin1(QUrl::toPercentEncoding(token));
     };
     shareDeps.remoteReachable = [&rendezvous]() { return rendezvous.isOnline(); };
-    shareDeps.stopPlayerStream = [&g_Pool, &detachWorkerSlot, &shareManager](int slot,
-                                                                             bool notifyEnded) {
+    // The Sunshine identity of each player slot's latest join. A join on a later
+    // rung of the transport chain is the same browser coming back after the
+    // previous rung failed, and reuses it — the app session that rung left
+    // behind is /resumed, not launched a second time over itself.
+    QHash<int, QString> g_PlayerUids;
+    // Who that latest join was (ShareManager::joinIdentity): the uid goes only
+    // to the same invitation on the same device.
+    QHash<int, QString> g_PlayerJoiners;
+    // An invited player's router hole lasts as long as the guest does, not as
+    // long as the process (an owner's slot keeps its hole until exit). Taken
+    // off the router once the slot has had no worker for the same grace a
+    // chain relaunch gets; a new start on the slot calls it off.
+    QHash<int, QPointer<QTimer>> g_GuestHoleRelease;
+    auto releaseGuestHoleSoon = [&g_GuestHoleRelease, &routerPorts, &g_Pool](int slot) {
+        if (QTimer* pending = g_GuestHoleRelease.value(slot)) pending->deleteLater();
+        auto* timer = new QTimer(qApp);
+        timer->setSingleShot(true);
+        g_GuestHoleRelease.insert(slot, timer);
+        QObject::connect(timer, &QTimer::timeout, qApp,
+                         [timer, slot, &g_GuestHoleRelease, &routerPorts, &g_Pool]() {
+                             timer->deleteLater();
+                             if (g_GuestHoleRelease.value(slot) != timer) return;
+                             g_GuestHoleRelease.remove(slot);
+                             // Back on the slot since: the hole is in use.
+                             if (g_Pool.at(slot).worker) return;
+                             routerPorts.releaseMediaPort(slot);
+                         });
+        timer->start(kHostCancelGraceMs);
+    };
+    auto keepGuestHole = [&g_GuestHoleRelease](int slot) {
+        if (QTimer* pending = g_GuestHoleRelease.take(slot)) pending->deleteLater();
+    };
+    // A worker a guest left is out of the slot at once but still holds the
+    // slot's ports until its process is gone. A join that follows straight
+    // away — the codec fallback leaves, then rejoins — waits for it.
+    QHash<int, QPointer<StreamWorkerHost>> g_PlayerRetiring;
+
+    // A guest's Sunshine session, /cancelled once nothing else streams its
+    // host — the app is shared — and held back for the grace: a guest that
+    // went is usually one rung of its transport chain, or its codec fallback,
+    // and the next join /resumes this uid (startPlayerStream drops it). The
+    // native host has no app to keep, and nothing to /cancel.
+    auto cancelGuestHostSessionSoon = [&g_PendingHostCancels, &dropPendingHostCancel,
+                                       &g_LiveSunshineUids, &computerManager, &anyOtherSlotLive,
+                                       &appOutlivesStream, &g_Pool](
+                                          int slot, const QString& boundHost, const QString& uid,
+                                          int graceMs = kHostCancelGraceMs) {
+        NvComputer* host = computerManager.getHost(boundHost);
+        if (!host || uid.isEmpty() || anyOtherSlotLive(slot, boundHost)) {
+            g_LiveSunshineUids.remove(uid);
+            return;
+        }
+        // The last guest leaving is not a reason to end the owner's game: the
+        // owner may have stepped away (Stop) and resume it later.
+        if (appOutlivesStream(boundHost)) {
+            qInfo() << "[share] Last guest left — the app keeps running for the owner";
+            computerManager.refreshRunningApp(boundHost);
+            return;
+        }
+        dropPendingHostCancel(uid, boundHost);
+        // The native host has no GameStream server to /cancel.
+        if (!host->takesHostCancel()) {
+            g_LiveSunshineUids.remove(uid);
+            return;
+        }
+        auto* timer = new QTimer(qApp);
+        timer->setSingleShot(true);
+        g_PendingHostCancels.insert(uid, {timer, boundHost});
+        QObject::connect(timer, &QTimer::timeout, qApp,
+                         [timer, &g_PendingHostCancels, &g_LiveSunshineUids, &computerManager,
+                          &anyOtherSlotLive, &g_Pool, slot, boundHost, uid]() {
+                             timer->deleteLater();
+                             auto it = g_PendingHostCancels.find(uid);
+                             if (it == g_PendingHostCancels.end() || it->timer != timer) return;
+                             g_PendingHostCancels.erase(it);
+                             g_LiveSunshineUids.remove(uid);
+                             NvComputer* h = computerManager.getHost(boundHost);
+                             if (!h || anyOtherSlotLive(slot, boundHost)) return;
+                             // A new guest on the same slot since, under a new uid: the
+                             // app is theirs now.
+                             if (g_Pool.at(slot).worker && g_Pool.at(slot).hostUuid == boundHost)
+                                 return;
+                             auto* identity = IdentityManager::get();
+                             auto* quitReply = computerManager.http()->quitAppAsync(
+                                 h->activeAddress, h->activeHttpsPort, identity->getCertificate(),
+                                 identity->getPrivateKey(), uid);
+                             QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
+                                              &QNetworkReply::deleteLater);
+                         });
+        timer->start(graceMs);
+    };
+    shareDeps.stopPlayerStream = [&g_Pool, &detachWorkerSlot, &shareManager, &g_PlayerRetiring,
+                                  &g_PlayerUids, &reapCoopSession, &cancelGuestHostSessionSoon,
+                                  &sharedFeed](int slot, bool notifyEnded) {
         if (slot < kOwnerSlots || slot >= kTotalSlots) return;
+        sharedFeed.release(slot);
         if (!g_Pool.at(slot).worker) return;
-        detachWorkerSlot(slot, false, notifyEnded);
+        // Read before the detach clears the slot. Leaving by this door skips
+        // the worker's ended handler, so what it would have closed on the
+        // host is closed here — without it, a guest who left a cold start
+        // left the game running on a screen nobody watches.
+        const QString boundHost = g_Pool.at(slot).hostUuid;
+        const QString coopSessionId = g_Pool.at(slot).coopSessionId;
+        g_Pool.at(slot).coopSessionId.clear();
+        g_PlayerRetiring.insert(slot, detachWorkerSlot(slot, false, notifyEnded));
+        reapCoopSession(boundHost, coopSessionId);
+        cancelGuestHostSessionSoon(slot, boundHost, g_PlayerUids.value(slot));
         // detachWorkerSlot severs the worker's ended() handlers, so the state
         // has to be settled here: without it a player who left would stay
         // "streaming" forever and never be able to rejoin their own slot.
         shareManager.setStreaming(slot, false);
     };
+    shareDeps.streamState = [&g_StreamEnds](int slot, const QString& streamId) {
+        const StreamEnds::Entry e =
+            g_StreamEnds.find(streamId, QDateTime::currentMSecsSinceEpoch());
+        return StreamEnds::name(e.slot == slot ? e.state : StreamEnds::State::Unknown);
+    };
     shareDeps.startPlayerStream = [&computerManager, &g_Pool, &g_LiveSunshineUids, &shareManager,
-                                   &detachWorkerSlot, &anyOtherSlotLive, &reapCoopSession,
-                                   &slotSignalingPort, &slotWsPath, &server, &appSettings,
-                                   &sessionMetrics, signalingPort, stunServer,
-                                   &g_HostAspect](int slot, int height, QString aspect,
-                                                  ShareManager::Permissions perms,
-                                                  QString serverHost, ResponseCallback respond) {
+                                   &detachWorkerSlot, &reapCoopSession, &slotSignalingPort,
+                                   &slotWsPath, &server, &appSettings, &sessionMetrics,
+                                   signalingPort, stunServer, &g_HostAspect, &routerPorts,
+                                   &g_PlayerUids, &g_PlayerJoiners, &cancelGuestHostSessionSoon,
+                                   &dropPendingHostCancel, &releaseGuestHoleSoon, &keepGuestHole,
+                                   &g_PlayerRetiring, &g_StreamEnds,
+                                   &sharedFeed](int slot, int height, QString aspect,
+                                                ShareManager::Permissions perms, QString serverHost,
+                                                int transportIndex, const HttpRequest& req,
+                                                ResponseCallback respond) {
         // The share is bound to ONE host at activation (ShareManager::activate).
         // A player is routed there and nowhere else — never to "whichever owner
         // slot is up", which is what let a link minted on one host reach a
@@ -4302,6 +5494,9 @@ int main(int argc, char* argv[])
         // state is settled anyway since detaching severs ended().)
         StreamWorkerHost* previousWorker = detachWorkerSlot(slot, false);
         if (previousWorker) shareManager.setStreaming(slot, false);
+        // Or the one the guest just left, if its process is still going.
+        if (!previousWorker) previousWorker = g_PlayerRetiring.value(slot).data();
+        g_PlayerRetiring.remove(slot);
 
         // Fixed profile: 60 fps, SDR, 4:2:0, HEVC→H.264 (Auto never resolves
         // to AV1). The width follows the HOST's screen aspect ("W:H", 16:9
@@ -4321,32 +5516,78 @@ int main(int argc, char* argv[])
             qRound(20000.0 * (static_cast<double>(height) * height) / (1080.0 * 1080.0));
         const int bitrateKbps = qMax(1000, autoKbps / 2);
 
+        // H.264 when the guest's browser could not decode what Auto picked —
+        // their codec fallback, the only codec choice a guest has.
+        const bool h264 = QJsonDocument::fromJson(req.body).object().value(
+                              QStringLiteral("codec")) == QStringLiteral("h264");
+        const VideoCodec codec = h264 ? VideoCodec::H264 : VideoCodec::Auto;
+
         // Players always get the enhancement-aware ordering: their profile
-        // runs SGSR1 until it proves too expensive (frontend governor).
-        const QStringList chain = filterTransportsByCodec(
-            TransportPriorities::orderedTransports(true), VideoCodec::Auto, host);
+        // runs SGSR1 until it proves too expensive (frontend governor). The
+        // H.264 rungs are the same list with the MediaTrack ones appended, so
+        // an index into one names the same transport in the other.
+        QStringList chain =
+            filterTransportsByCodec(TransportPriorities::orderedTransports(true), codec, host);
+        // Same rule as the owner's chain: through the rendezvous there is no
+        // TLS connection of ours to carry the wss rung.
+        if (req.viaTunnel) chain.removeAll(QStringLiteral("wss"));
+        dropUdpRungsWhenBlocked(chain, QJsonDocument::fromJson(req.body).object(),
+                                streamClientKind(req), req.viaTunnel);
         if (chain.isEmpty()) {
             respond(HttpResponse::error(502, "No usable transport"));
             return;
         }
+        // Past the end: the guest's browser walked every rung.
+        if (transportIndex >= chain.size()) {
+            respond(
+                HttpResponse::json(QJsonObject{{"error", QStringLiteral("no_transport")}}, 502));
+            return;
+        }
+        const QString mode = chain.at(transportIndex);
+        qInfo() << "[Session] Player slot" << slot << "transport chain:" << chain << "attempt"
+                << transportIndex + 1 << "/" << chain.size() << ":" << mode;
 
         // Its own Sunshine identity: a distinct uniqueid is what makes
         // Sunshine build a separate session_t instead of reassigning the
-        // owner's stream. 32 hex chars, like the browser-side ids.
-        const QString uid = QUuid::createUuid().toString(QUuid::Id128);
+        // owner's stream. 32 hex chars, like the browser-side ids. A later
+        // rung — or the codec fallback — keeps the one the stream started
+        // with, and gets back the app session it left: its /cancel is held
+        // (see the ended handler) and dropped here.
+        // So does a guest back after its worker crashed (the join route
+        // checked that it did). All three are the guest's own word, so the uid
+        // is kept for the same invitation on the same device only: a new
+        // guest on a row the owner closed and reopened, or another device of
+        // the invitation, joining within the grace, would otherwise call off
+        // the last guest's /cancel and pick up their app.
+        const bool reconnect =
+            !QJsonDocument::fromJson(req.body).object().value("reconnect_of").toString().isEmpty();
+        const QString joiner = shareManager.joinIdentity(
+            slot, HttpServer::cookieFromRequest(req, QLatin1String(ShareManager::kPlayerCookie)));
+        const bool sameJoiner = !joiner.isEmpty() && g_PlayerJoiners.value(slot) == joiner;
+        QString uid = (transportIndex > 0 || h264 || reconnect) && sameJoiner
+                          ? g_PlayerUids.value(slot)
+                          : QString();
+        const bool chainRelaunch = !uid.isEmpty();
+        if (!chainRelaunch) uid = QUuid::createUuid().toString(QUuid::Id128);
+        g_PlayerUids.insert(slot, uid);
+        g_PlayerJoiners.insert(slot, joiner);
+        if (chainRelaunch && dropPendingHostCancel(uid, hostUuid))
+            qInfo() << "[Session] Player relaunch within the grace window — keeping the host "
+                       "session (no /cancel)";
 
         // Session census, guest leg. Same rules as the owner's (see the
         // /start route): shape only, and nothing at all unless the instance
-        // allows it. A player has no request of their own here — the share
-        // activation starts this — so there is no User-Agent to classify and
-        // the network is assumed public, exactly as the config below does.
+        // allows it. The network is the guest's, as the config below reads it.
+        const NetClassify::Kind clientKind = streamClientKind(req);
+        const bool clientSameNetwork =
+            streamClientSameNetwork(req, clientKind, {routerPorts.publicIp()});
         auto sessionFacts = std::make_shared<SessionMetrics::Facts>();
         sessionFacts->height = height;
         sessionFacts->fps = 60;
         sessionFacts->bitrateKbps = bitrateKbps;
         sessionFacts->backend =
             host->backendType.isEmpty() ? QStringLiteral("gamestream") : host->backendType;
-        sessionFacts->net = QStringLiteral("public");
+        sessionFacts->net = QString::fromLatin1(NetClassify::toString(clientKind));
         sessionFacts->kind = QStringLiteral("player");
         auto sessionStartedAt = std::make_shared<qint64>(0);
 
@@ -4375,18 +5616,17 @@ int main(int argc, char* argv[])
         cfg["hostPairState"] = NvComputer::pairStateToString(host->pairState);
         cfg["hostServerCert"] = QString::fromUtf8(host->serverCertPem);
         cfg["appId"] = appId;
-        cfg["codec"] = static_cast<int>(VideoCodec::Auto);
+        cfg["codec"] = static_cast<int>(codec);
         cfg["codecOverridden"] = false;
         cfg["originalCodec"] = static_cast<int>(VideoCodec::Auto);
         cfg["gamingMode"] = true;
-        // No router hole for a guest: the owner's session owns the mapping,
-        // and a player joins on STUN. (A pool port for guests is a follow-up.)
-        cfg["internalTransport"] = chain.first().startsWith(QStringLiteral("webrtc-media"))
-                                       ? QStringLiteral("webrtc-media")
-                                   : chain.first().startsWith(QStringLiteral("webrtc-dc"))
-                                       ? QStringLiteral("webrtc")
-                                       : QStringLiteral("wss");
-        cfg["transportMode"] = chain.first();
+        // The router hole ("upnpPublicIp"/"upnpExternalPort") is added below,
+        // once the allocator has answered — the slot's own, as for the owner.
+        cfg["internalTransport"] =
+            mode.startsWith(QStringLiteral("webrtc-media")) ? QStringLiteral("webrtc-media")
+            : mode.startsWith(QStringLiteral("webrtc-dc"))  ? QStringLiteral("webrtc")
+                                                            : QStringLiteral("wss");
+        cfg["transportMode"] = mode;
         cfg["stunServer"] = stunServer;
         cfg["height"] = height;
         cfg["width"] = width;
@@ -4394,9 +5634,20 @@ int main(int argc, char* argv[])
         cfg["bitrateKbps"] = bitrateKbps;
         cfg["yuv444"] = false;
         cfg["hdr"] = false;
-        cfg["iceTcp"] = chain.first().endsWith(QStringLiteral("-tcp"));
+        cfg["iceTcp"] = mode.endsWith(QStringLiteral("-tcp"));
         cfg["lowAudio"] = false;
         cfg["muteHostAudio"] = false;
+        // The guest's browser decodes through a gap, as the owner's /start
+        // says it (ride_out_loss): a native host then refreshes their stream
+        // in a wave, and a lost frame costs no keyframe. The shared feed sets
+        // it below anyway; a guest encoding on its own — every guest of a
+        // Linux host — took keyframes on demand without it, one per loss
+        // (UM790Pro, 01/10/2026: 17 and 22 asked in 24 and 42 s). Absent, from
+        // an older cached player page: as before.
+        cfg["rideOutLoss"] = QJsonDocument::fromJson(req.body)
+                                 .object()
+                                 .value(QStringLiteral("ride_out_loss"))
+                                 .toBool(false);
         // A guest's width already follows the host's shape (above), and a
         // native host's display changing mode mid-stream is theirs to follow
         // as well: the encoder is rebuilt at the new shape, their decoder picks
@@ -4405,17 +5656,18 @@ int main(int argc, char* argv[])
         // macOS. Other engines ignore the flag.
         cfg["followDisplayShape"] = true;
         cfg["clientUniqueId"] = uid;
-        // No browser address reaches this path (a player is started from the
-        // share activation, not from their own request), so assume the most
-        // restrictive: no LAN candidate, and STUN available.
-        cfg["clientKind"] = NetClassify::toString(NetClassify::Kind::Public);
+        // Where the guest is, read off their join request exactly as the
+        // owner's /start reads theirs — a proxy in front included.
+        cfg["clientKind"] = NetClassify::toString(clientKind);
+        cfg["clientSameNetwork"] = clientSameNetwork;
         cfg["autoMode"] = true;
         // Resume into whatever the owner has up — Sunshine refuses /launch
         // while an app runs, and a guest joining a live session has no
         // business starting another. On a cold start there is nothing to
         // resume into, so this one guest does launch the app their
-        // invitation names, and only that one.
-        cfg["preferResume"] = !coldStart;
+        // invitation names, and only that one — once: a later rung of their
+        // chain resumes what the first one launched.
+        cfg["preferResume"] = !coldStart || (chainRelaunch && g_LiveSunshineUids.contains(uid));
         // The host the player typed, so the signaling URL they get back
         // points at the same place — an empty one made the browser fall
         // back to /ws and land on the owner's signaling server.
@@ -4428,24 +5680,91 @@ int main(int argc, char* argv[])
         // What this player may send. Enforced in the worker, where a forged
         // datachannel message cannot get around it.
         cfg["inputPolicy"] = perms.toJson();
-        // An invited player is never this machine's administrator, whatever
-        // the owner ticked: the host's administrator windows stay closed.
-        cfg["viewerAdmin"] = false;
+        // An invited player is not this machine's administrator, whatever the
+        // owner ticked on the board: the host's administrator windows stay
+        // closed to them — unless the owner opened them to every guest in the
+        // settings file (share_guests_admin_windows, wiki Security §6.4c). The
+        // policy above still decides whether they have a keyboard and a mouse
+        // at all; this only lifts the "policy" gate for those who do.
+        cfg["viewerAdmin"] = appSettings.shareGuestsAdminWindows();
         // See the owner path. The consent belongs to the MACHINE, not to the
         // viewer, so an invited player's session replays it too — otherwise
         // the host's own screen would raise a dialog nobody is there to answer.
-        cfg["portalRestoreToken"] = appSettings.portalRestoreToken();
+        const bool portalVirtual = host->backendType == NativeHostBackend::typeName() &&
+                                   NativeHostBackend::usesVirtualDisplay(appId);
+        cfg["portalRestoreToken"] = appSettings.portalRestoreToken(portalVirtual);
+        // An app of the owner's in gamescope: the guest joins its session,
+        // found by its name (GamescopeSession.h), and would start it the same.
+        {
+            QString gsName, gsCommand;
+            if (host->backendType == NativeHostBackend::typeName() &&
+                NativeHostBackend::gamescopeAppFor(appId, &gsName, &gsCommand)) {
+                cfg["gamescopeApp"] = gsName;
+                cfg["gamescopeCommand"] = gsCommand;
+            }
+        }
+        // A display's card: its display, resolved here, as the owner path.
+        if (host->backendType == NativeHostBackend::typeName() &&
+            NativeHostBackend::isDisplayCard(appId)) {
+            QString why;
+            cfg["displayKey"] = NativeHostBackend::displayKeyForApp(appId, &why);
+            if (!why.isEmpty()) qWarning() << "[Session] no display for app" << appId << ":" << why;
+        }
+        // An app of the owner's: whether it is still there, as the owner path.
+        if (host->backendType == NativeHostBackend::typeName() &&
+            NativeHostBackend::isHostAppCard(appId))
+            cfg["hostAppKnown"] = !NativeHostBackend::hostAppFor(appId).isEmpty();
+        // The host's own setting, whoever the viewer is: the chain is the
+        // machine's, not the session's.
+        cfg["nativeVideoPipeline"] = appSettings.nativeVideoPipeline();
+        // The machine's bench knobs too, as the owner path.
+        cfg["nativeTuning"] = appSettings.nativeTuning();
+        cfg["rtpVideo"] = appSettings.rtpVideo();
         // Gamepads from different sessions would all arrive as controller 0;
-        // offset each player so they land on distinct virtual pads.
+        // offset each player so they land on distinct virtual pads. A native
+        // host's session owns its pads and keeps the browser's numbers
+        // (NativeMediaEngine::setControllerOffset).
         cfg["gamepadOffset"] = slot - kOwnerSlots + 1;
         QJsonArray chainArr;
         for (const QString& m : chain)
             chainArr.append(m);
         cfg["transportChain"] = chainArr;
-        cfg["transportIndex"] = 0;
+        cfg["transportIndex"] = transportIndex;
+
+        // The guests' shared feed (plan « flux commun des invités »): on this
+        // machine's native host every guest watches one stream, encoded once
+        // by a worker of its own, instead of a capture and an encoder each.
+        // The guest's worker carries its pictures, and rides out a loss where
+        // the feed refreshes by intra-refresh (nobody's loss costs everyone a
+        // keyframe; elsewhere the keyframes are grouped and rationed). Every
+        // other host, and a switch turned off, keeps the encoder per guest
+        // exactly as it was. Joined once the display is there (below): the
+        // feed's worker looks for it as it starts.
+        const bool feedWanted = host->backendType == NativeHostBackend::typeName() &&
+                                SharedFeed::enabled(appSettings.sharedFeedEnabled());
+        SharedFeed::Spec feedSpec;
+        if (feedWanted) {
+            feedSpec.hostUuid = hostUuid;
+            feedSpec.appId = appId;
+            feedSpec.height = height;
+            feedSpec.width = width;
+            feedSpec.bitrateKbps = bitrateKbps;
+            feedSpec.h264 = h264;
+            feedSpec.videoPipeline = appSettings.nativeVideoPipeline();
+            feedSpec.tuning = appSettings.nativeTuning();
+            feedSpec.portalToken = appSettings.portalRestoreToken(portalVirtual);
+        }
+        auto feedTicket = std::make_shared<SharedFeed::Ticket>();
+        auto onFeed = std::make_shared<bool>(false);
+        auto joinFeed = [&sharedFeed, feedWanted, feedSpec, feedTicket, onFeed, slot]() {
+            if (feedWanted) *onFeed = sharedFeed.acquire(feedSpec, slot, *feedTicket);
+        };
 
         auto* worker = new StreamWorkerHost(qApp);
         QObject::connect(worker, &StreamWorkerHost::exited, worker, &QObject::deleteLater);
+        // As the owner's: what the guest's page asks about once its link goes.
+        const QString streamId = StreamEnds::newId();
+        worker->setStreamId(streamId);
 
         auto coopSessionId = std::make_shared<QString>();
         QObject::connect(worker, &StreamWorkerHost::coopSessionResolved, qApp,
@@ -4465,16 +5784,16 @@ int main(int argc, char* argv[])
 
         // See the owner path: a grant is persisted wherever it turns up.
         QObject::connect(worker, &StreamWorkerHost::portalGrantReceived, qApp,
-                         [&appSettings](const QString& token) {
-                             appSettings.setPortalRestoreToken(token);
+                         [&appSettings, portalVirtual](const QString& token) {
+                             appSettings.setPortalRestoreToken(token, portalVirtual);
                              qInfo() << "[Session] Desktop portal consent stored — this "
                                         "machine will not ask again";
                          });
 
         QObject::connect(worker, &StreamWorkerHost::responseReady, qApp,
-                         [respond, &g_LiveSunshineUids, &shareManager, &sessionMetrics,
-                          sessionFacts, sessionStartedAt, slot,
-                          uid](int code, QJsonObject bodyObj) {
+                         [respond, &g_LiveSunshineUids, &g_StreamEnds, &shareManager,
+                          &sessionMetrics, sessionFacts, sessionStartedAt, slot, uid, hostUuid,
+                          streamId](int code, QJsonObject bodyObj) {
                              const bool ok = code == 200 && bodyObj["status"].toString() ==
                                                                 QLatin1String("streaming");
                              sessionFacts->codec = bodyObj["videoCodec"].toString();
@@ -4487,6 +5806,9 @@ int main(int argc, char* argv[])
                              }
                              if (ok) {
                                  bodyObj["slot"] = slot;
+                                 bodyObj["stream_id"] = streamId;
+                                 g_StreamEnds.begin(streamId, hostUuid, slot, uid, QString(),
+                                                    QDateTime::currentMSecsSinceEpoch());
                                  g_LiveSunshineUids.insert(uid);
                                  shareManager.setStreaming(slot, true);
                              }
@@ -4495,10 +5817,20 @@ int main(int argc, char* argv[])
 
         QObject::connect(
             worker, &StreamWorkerHost::ended, qApp,
-            [worker, &g_Pool, &g_LiveSunshineUids, &shareManager, &anyOtherSlotLive,
-             &computerManager, &reapCoopSession, &sessionMetrics, sessionFacts, sessionStartedAt,
-             slot, host, uid, coopSessionId]() {
+            [worker, &g_Pool, &shareManager, &reapCoopSession, &sessionMetrics, &g_StreamEnds,
+             &cancelGuestHostSessionSoon, &sharedFeed, sessionFacts, sessionStartedAt, slot, host,
+             uid, coopSessionId, streamId]() {
                 qInfo() << "[main] Player worker ended (slot" << slot << ")";
+                // As the owner's: a crash under a flowing stream brings the
+                // guest's page back, and what the stream held waits longer.
+                const qint64 endedAt = QDateTime::currentMSecsSinceEpoch();
+                const bool comesBack =
+                    worker->crashed() &&
+                    g_StreamEnds.find(streamId, endedAt).state == StreamEnds::State::Live;
+                g_StreamEnds.end(streamId,
+                                 worker->crashed() ? StreamEnds::State::Crashed
+                                                   : StreamEnds::State::Ended,
+                                 endedAt);
                 if (*sessionStartedAt > 0) {
                     const qint64 ms = QDateTime::currentMSecsSinceEpoch() - *sessionStartedAt;
                     sessionMetrics.reportEnd(*sessionFacts, static_cast<int>(ms / 1000));
@@ -4511,20 +5843,13 @@ int main(int argc, char* argv[])
                 // co-op session belongs to this player alone, so closing
                 // it cannot disturb whoever else is on the lobby.
                 reapCoopSession(host->uuid, *coopSessionId);
-                // Same rule as the owner slots — the Sunshine app is shared,
-                // so /cancel only once nothing else is streaming.
-                if (!anyOtherSlotLive(slot, host->uuid)) {
-                    auto* identity = IdentityManager::get();
-                    auto* quitReply = computerManager.http()->quitAppAsync(
-                        host->activeAddress, host->activeHttpsPort, identity->getCertificate(),
-                        identity->getPrivateKey(), uid);
-                    QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
-                                     &QNetworkReply::deleteLater);
-                }
-                g_LiveSunshineUids.remove(uid);
+                // Same rule as the owner slots, and as Leave: see
+                // cancelGuestHostSessionSoon.
+                cancelGuestHostSessionSoon(slot, host->uuid, uid,
+                                           comesBack ? kCrashGraceMs : kHostCancelGraceMs);
                 SessionPool::Slot& sl = g_Pool.at(slot);
                 const bool onVirtualDisplay = host->backendType == NativeHostBackend::typeName() &&
-                                              sl.appId == NativeHostBackend::virtualDisplayAppId();
+                                              NativeHostBackend::usesVirtualDisplay(sl.appId);
                 if (sl.worker == worker) {
                     sl.worker = nullptr;
                     sl.clientUniqueId.clear();
@@ -4532,14 +5857,52 @@ int main(int argc, char* argv[])
                     sl.sessionToken.clear();
                     sl.coopSessionId.clear();
                     sl.appId = 0;
+                    // Off the shared feed — this slot's, not a newer join's
+                    // on it: the last guest leaving stops the feed soon.
+                    sharedFeed.release(slot);
                 }
-                if (onVirtualDisplay && !anyOtherSlotLive(slot, host->uuid))
-                    VirtualDisplayJob::instance().releaseSoon();
+                // Off after the grace unless a stream still shows it — the
+                // grace's own question. Not skipped for a stream on another
+                // app of this host: nobody would ask again, and the display a
+                // guest turned on stayed on under the owner's.
+                if (onVirtualDisplay)
+                    VirtualDisplayJob::instance().releaseSoon(comesBack ? kCrashGraceMs : 0);
             });
 
+        // However this worker goes — ended, left, ended by the owner — its
+        // slot's router hole follows it off the router after the grace.
+        QObject::connect(worker, &QObject::destroyed, qApp,
+                         [slot, &releaseGuestHoleSoon]() { releaseGuestHoleSoon(slot); });
+
         const QString hostUuidCopy = host->uuid;
-        auto startWorker = [worker, cfg, respond, slot, appId, &g_Pool, hostUuidCopy, uid]() {
-            if (!worker->start(cfg)) {
+        const bool virtualStream = host->backendType == NativeHostBackend::typeName() &&
+                                   NativeHostBackend::usesVirtualDisplay(appId);
+        auto startWorker = [worker, respond, slot, appId, &g_Pool, hostUuidCopy, uid, onFeed,
+                            feedTicket, &sharedFeed, virtualStream](QJsonObject withHole) {
+            // On our virtual display: the display it took the primary role
+            // from, as the owner path.
+            if (virtualStream) withHole["previousPrimary"] = NativeHostBackend::previousPrimary();
+            // On the shared feed, the guest's worker runs exactly as the feed's
+            // does, or its pipe would not let it in; a guest that cannot be
+            // started that way encodes on its own.
+            bool started = false;
+            if (*onFeed) {
+                QJsonObject fed = withHole;
+                fed["feedPipe"] = feedTicket->pipe;
+                fed["feedToken"] = QString::fromLatin1(feedTicket->token);
+                fed["feedSlot"] = slot;
+                fed["rideOutLoss"] = true;
+                started = worker->startAs(fed, feedTicket->launch);
+                if (!started) {
+                    qWarning() << "[Session] Player slot" << slot
+                               << "could not start as the shared feed runs — encoding on its own";
+                    sharedFeed.release(slot);
+                    started = worker->start(withHole);
+                }
+            } else {
+                started = worker->start(withHole);
+            }
+            if (!started) {
                 worker->deleteLater();
                 respond(HttpResponse::error(500, "Failed to spawn stream worker"));
                 return;
@@ -4551,14 +5914,124 @@ int main(int argc, char* argv[])
             sl.appId = appId;
         };
 
+        // The slot's router hole, claimed before the child exists so it can be
+        // told which external port the browser will aim at — the owner path's
+        // sequence, generation guard included: a newer join on the slot while
+        // the router is being asked stands this one down.
+        const quint64 generation = ++g_SlotLaunchGeneration[slot];
+        auto claimThenStart = [&routerPorts, &keepGuestHole, joinFeed, startWorker, cfg, slot,
+                               generation, worker, respond]() {
+            joinFeed();
+            keepGuestHole(slot);
+            routerPorts.claimMediaPort(
+                slot, static_cast<uint16_t>(kMediaBasePort + slot), qApp,
+                [&routerPorts, startWorker, cfg, slot, generation, worker,
+                 respond](const RouterPortAllocator::Claim& claim, const QString& why) {
+                    if (g_SlotLaunchGeneration.value(slot) != generation) {
+                        qInfo() << "[Session] Player join on slot" << slot
+                                << "superseded while its router hole was claimed — not spawning";
+                        worker->deleteLater();
+                        respond(HttpResponse::error(409, "Superseded by a newer join"));
+                        return;
+                    }
+                    QJsonObject withHole = cfg;
+                    if (claim.external != 0) {
+                        withHole["upnpPublicIp"] = routerPorts.publicIp();
+                        withHole["upnpExternalPort"] = static_cast<int>(claim.external);
+                    } else {
+                        qInfo() << "[Session] No router hole for this player stream —" << why;
+                    }
+                    startWorker(withHole);
+                });
+        };
+
+        // "MoonlightWeb Virtual Display" is off between streams, and turned on
+        // by the /start that opens it. A guest who opens an invitation on it
+        // with no owner streaming — the cold start above — turns it on the
+        // same way, or the worker found no display to show ("The virtual
+        // display is not on") and the page could only say it could not join.
+        // At the size of the picture the guests watch: nobody looks at this
+        // display but them. At the rate the owner's /start would give it.
+        // Already on — the owner's, another guest's, a grace running out — it
+        // is left as it is: a new mode would take it from whoever watches it.
+        std::function<void()> readyThenStart = claimThenStart;
+        if (host->backendType == NativeHostBackend::typeName() &&
+            NativeHostBackend::usesVirtualDisplay(appId)) {
+            // As the owner's /start: 240 Hz on Windows whatever the stream's.
+            const int vdRefresh =
+                VirtualDisplay::refreshForStream(60, qEnvironmentVariableIntValue("MW_VDD_REFRESH"),
+                                                 VirtualDisplay::kFasterThanStream) *
+                VirtualDisplay::kMilliHz;
+            readyThenStart = [claimThenStart, worker, respond, slot, generation, width, height,
+                              vdRefresh]() {
+                qInfo() << "[Session] Player slot" << slot << "on the virtual display — on at"
+                        << width << "x" << height << "@" << VirtualDisplay::rateText(vdRefresh)
+                        << "Hz unless it already is";
+                VirtualDisplayJob::instance().activateIfOff(
+                    width, height, vdRefresh,
+                    [claimThenStart, worker, respond, slot, generation](bool ok,
+                                                                        const QString& error) {
+                        if (g_SlotLaunchGeneration.value(slot) != generation) {
+                            worker->deleteLater();
+                            respond(HttpResponse::error(409, "Superseded by a newer join"));
+                            return;
+                        }
+                        if (!ok) {
+                            qWarning() << "[Session] Player slot" << slot
+                                       << "— the virtual display could not be turned on:" << error;
+                            worker->deleteLater();
+                            respond(HttpResponse::error(
+                                500, "The virtual display could not be turned on: " + error));
+                            return;
+                        }
+                        claimThenStart();
+                    });
+            };
+        }
+
         // Wait for this slot's previous child to release its ports.
         if (previousWorker)
-            QObject::connect(previousWorker, &QObject::destroyed, qApp, startWorker);
+            QObject::connect(previousWorker, &QObject::destroyed, qApp, readyThenStart);
         else
-            startWorker();
+            readyThenStart();
     };
 
     registerShareRoutes(server, shareManager, shareDeps);
+
+    // Diagnostics: the browsers' console (debug mode) and the "Download logs"
+    // archive. Static: its thread must be joined after the event loop, and
+    // before the Logger it reads the path of goes away.
+    static LogArchive logArchive;
+    // The names the archive replaces (LogScrubber): the hosts, this PC, the
+    // instance and the account the server runs as.
+    registerLogRoutes(server, logArchive, [&computerManager, &appSettings]() {
+        LogScrubber::Names names;
+        // This PC: its names, and every interface's address, so its own LAN,
+        // Tailscale and virtual adapters read as {A}.
+        names.thisMachine.names << AppSettings::machineName() << QSysInfo::machineHostName();
+        for (const QHostAddress& a : QNetworkInterface::allAddresses())
+            names.thisMachine.addresses << a.toString();
+        for (const QJsonValue& h : computerManager.getHostsJson()) {
+            const NvComputer* c =
+                computerManager.getHost(h.toObject().value(QStringLiteral("uuid")).toString());
+            if (!c) continue;
+            LogScrubber::Machine m;
+            m.names << c->name << c->customName;
+            for (const NvAddress* a :
+                 {&c->activeAddress, &c->localAddress, &c->remoteAddress, &c->manualAddress})
+                if (!a->isNull()) m.addresses << a->address();
+            // The host that is this PC is {A} too.
+            if (c->isLocalMachine()) {
+                names.thisMachine.names << m.names;
+                names.thisMachine.addresses << m.addresses;
+            } else {
+                names.hosts << m;
+            }
+        }
+        names.instance = appSettings.instanceName();
+        names.user = qEnvironmentVariable("USERNAME", qEnvironmentVariable("USER"));
+        return names;
+    });
 
     // /ws2../ws4 carry a player's video and input. Only the mw_player cookie
     // that matches THAT slot's live activation opens them — the session-cookie
@@ -4583,6 +6056,14 @@ int main(int argc, char* argv[])
     // Tell the manager which ports the server actually listens on, so its
     // hairpin test probes the right one.
     internetAccess.setPorts(server.httpPort(), server.activeHttpsPort());
+
+    // Announce this server on the LAN (_moonlightweb._tcp), so the TV app finds
+    // it without typing an address. Through the OS's own mDNS responder: binding
+    // UDP 5353 ourselves for good is what ComputerManager avoids.
+    MdnsAdvertiser mdnsAdvertiser;
+    mdnsAdvertiser.start(
+        MdnsAdvertiser::instanceName(QSysInfo::machineHostName(), mw::edition::isDev()),
+        server.activeHttpsPort());
 
     // URL for the host machine's own entry points (Desktop shortcut, installer
     // post-install page, Dock, tray, startup open).
@@ -4631,7 +6112,10 @@ int main(int argc, char* argv[])
         return p == 443 ? QStringLiteral("https://localhost%1").arg(path)
                         : QStringLiteral("https://localhost:%1%2").arg(p).arg(path);
     };
-    auto adminUrl = [entryUrl]() -> QString { return entryUrl(QStringLiteral("/admin")); };
+    // In booth mode there is no admin page to point at: the app's front door.
+    auto adminUrl = [entryUrl, adminLocked]() -> QString {
+        return entryUrl(adminLocked ? QString() : QStringLiteral("/admin"));
+    };
     // First-run provisioning written by the installer (authorize Internet
     // Access, pair the local Sunshine). Runs before the auto-start below so a
     // freshly authorized instance brings Internet Access up immediately. When it
@@ -4717,6 +6201,7 @@ int main(int argc, char* argv[])
         QNetworkRequest req{QUrl(url)};
         req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::NoLessSafeRedirectPolicy);
+        AddressRace::enableOn(req);
         req.setTransferTimeout(5000);
         entryProbeReply = entryProbeNam.get(req);
         QObject::connect(entryProbeReply, &QNetworkReply::finished, &app, [&]() {
@@ -4808,7 +6293,8 @@ int main(int argc, char* argv[])
     // `pending` is true while an empty url is only "not yet" (remoteLinkPending).
     server.router()->get(
         "/api/server/remote-link", [remoteLink, remoteLinkPending](const HttpRequest& req) {
-            if (!req.isLocal) return HttpResponse::error(403, "Only available from localhost");
+            if (!req.isLocal && !(req.adminLocked && req.isHostMachine))
+                return HttpResponse::error(403, "Only available from localhost");
             const QString path = req.queryParams.value(QStringLiteral("p"));
             static const QRegularExpression shape(QStringLiteral("^/[A-Za-z0-9_-]{1,32}$"));
             if (!path.isEmpty() && !shape.match(path).hasMatch())
@@ -4827,7 +6313,7 @@ int main(int argc, char* argv[])
     // nothing outside this machine has any business asking.
     server.router()->get("/api/server/stream-activity",
                          [streamActivity](const HttpRequest& req) -> HttpResponse {
-                             if (!req.isLocal)
+                             if (!req.isLocal && !(req.adminLocked && req.isHostMachine))
                                  return HttpResponse::error(403, "Only available from localhost");
                              return HttpResponse::json(streamActivity().toJson());
                          });
@@ -4876,7 +6362,8 @@ int main(int argc, char* argv[])
                           [&controlChannel, adminUrl](const HttpRequest& req) -> HttpResponse {
                               // Loopback only: this is the private IPC surface a second local
                               // launch uses, never something a remote peer should trigger.
-                              if (!req.isLocal) return HttpResponse::error(403, "local only");
+                              if (!req.isLocal && !(req.adminLocked && req.isHostMachine))
+                                  return HttpResponse::error(403, "local only");
                               QJsonObject obj;
                               if (controlChannel.hasClients()) {
                                   controlChannel.broadcastFocusAdmin();
@@ -4936,6 +6423,13 @@ int main(int argc, char* argv[])
     // It is created unconditionally: it does nothing at all until the rendezvous
     // line announces a browser, and the line only runs with consent.
     ControlTunnel controlTunnel(&server, &authManager, &appSettings, &rendezvous, &routerPorts);
+    // A device that signed in, or a player holding a live invitation, keeps its
+    // tunnel when the introduction server goes away under it (TunnelPeerPolicy).
+    controlTunnel.setKnownCaller([&server, &shareManager](const HttpRequest& req) {
+        return server.isAuthenticated(req) ||
+               shareManager.slotForCookie(
+                   HttpServer::cookieFromRequest(req, QStringLiteral("mw_player"))) >= 0;
+    });
 
     // Phase N: System tray icon. Its entries open the public domain (with the
     // host key) once Internet Access is live, https://localhost otherwise.
@@ -4947,7 +6441,11 @@ int main(int argc, char* argv[])
     trayManager.setUrlProvider([entryUrl](const QString& path) { return QUrl(entryUrl(path)); });
     trayManager.setRemoteLinkProvider(remoteLink);
     trayManager.setActivityProvider(streamActivity);
+    trayManager.setAdminLocked(adminLocked);
     if (hasGuiSession()) trayManager.init();
+    // A login item an earlier version wrote may name the bare binary, which
+    // comes back after a reboot unable to capture (Linux; see Autostart.h).
+    if (Autostart::isSupported()) Autostart::refreshLoginItem();
 
     // Click-to-photon latency flag: the overlay and its click source live on
     // their own thread, only while the setting is on, and only where there is a
@@ -4962,8 +6460,10 @@ int main(int argc, char* argv[])
     // own layout did with it, and neither can speak for the other.
     if (appSettings.keyboardDebug()) {
         InputMsg::setDebug(true);
+        InputMsg::setQuietProbe(&mw::native::NativeHost::secureDesktopHasInput);
         mw::native::NativeHost::setKeyboardDiagnostics(true);
-        qInfo() << "[KBD] keyboard diagnostics on — one line per printable key press";
+        qInfo() << "[KBD] keyboard diagnostics on — one line per printable key press, never on "
+                   "the secure desktop";
     }
 
     // The hairpin verdict decides between the domain and loopback, and it can
@@ -4980,10 +6480,11 @@ int main(int argc, char* argv[])
     // item / logon task / installer) and headless sessions stay silent.
     if (hasGuiSession() && !parser.isSet(autostartOption)) {
 #ifdef Q_OS_WIN
-        const QString path = QStringLiteral("/admin");
+        const QString path = adminLocked ? QString() : QStringLiteral("/admin");
 #else
-        const QString path =
-            appSettings.setupCompleted() ? QStringLiteral("/admin") : QStringLiteral("/setup");
+        const QString path = adminLocked                    ? QString()
+                             : appSettings.setupCompleted() ? QStringLiteral("/admin")
+                                                            : QStringLiteral("/setup");
 #endif
         // The internet link when the option is on and it answers, HTTPS loopback
         // otherwise — the same rule the tray's Server Settings follows, and for

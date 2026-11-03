@@ -453,5 +453,110 @@ void run_request_guard_tests()
 
         // No session at all is the only case that counts as fishing.
         CHECK(adminTokenReply(remote, plain, false) == AdminTokenReply::Deny);
+
+        // --noadmin: nobody gets the key, not even the host or an unlocked
+        // session — and the host, which has no session, is not fishing.
+        Context locked;
+        locked.adminLocked = true;
+        locked.adminSession = true;
+        CHECK(adminTokenReply(hostMachine, locked, false) == AdminTokenReply::Empty);
+        CHECK(adminTokenReply(remote, locked, true) == AdminTokenReply::Empty);
+        CHECK(adminTokenReply(remote, locked, false) == AdminTokenReply::Deny);
+    }
+
+    SECTION("RequestGuard — booth mode (--noadmin)");
+
+    {
+        // The host's own admin page, key and all, is no admin any more — but
+        // it is still the host machine, which is what lets it stream.
+        Request r;
+        r.method = "POST";
+        r.path = "/api/admin/settings";
+        r.headers = hdr({{"sec-fetch-site", "same-origin"},
+                         {"origin", "http://localhost"},
+                         {"host", "localhost"},
+                         {"content-type", "application/json"}});
+        r.bodySize = 2;
+        Context c;
+        c.peerLocal = true;
+        c.adminKeyOk = true;
+        c.adminLocked = true;
+        const Decision d = evaluate(r, c);
+        CHECK(d.outcome == Outcome::Allow);
+        CHECK(d.hostMachine);
+        CHECK(!d.adminPrivilege);
+        r.method = "GET";
+        CHECK(!evaluate(r, c).adminPrivilege);
+    }
+
+    // What the booth changes, refused.
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/manual"));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/scan"));
+    CHECK(lockedByNoAdmin("DELETE", "/api/hosts/uuid-1"));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/uuid-1/name"));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/uuid-1/pair/start"));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/uuid-1/pair"));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/uuid-1/restart"));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/uuid-1/backend"));
+    CHECK(lockedByNoAdmin("DELETE", "/api/hosts/uuid-1/backend"));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/uuid-1/seats"));
+    CHECK(lockedByNoAdmin("DELETE", "/api/hosts/uuid-1/seats/2/owner"));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/uuid-1/some-future-route"));
+    CHECK(lockedByNoAdmin("POST", "/api/update/start"));
+    CHECK(lockedByNoAdmin("POST", "/api/system/restart"));
+    CHECK(lockedByNoAdmin("POST", "/api/system/gamepad-driver/install"));
+    // No new device, no new guest.
+    CHECK(lockedByNoAdmin("POST", "/api/auth/validate"));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/admin-unlock"));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/regenerate"));
+    CHECK(lockedByNoAdmin("POST", "/api/share/slots/2/activate"));
+    CHECK(lockedByNoAdmin("POST", "/api/share/player/pin"));
+
+    // What the booth is for, allowed: read, wake, play, stop, leave.
+    CHECK(!lockedByNoAdmin("GET", "/api/hosts"));
+    CHECK(!lockedByNoAdmin("GET", "/api/hosts/uuid-1/apps"));
+    CHECK(!lockedByNoAdmin("POST", "/api/hosts/uuid-1/wol"));
+    CHECK(!lockedByNoAdmin("POST", "/api/hosts/uuid-1/start"));
+    CHECK(!lockedByNoAdmin("POST", "/api/hosts/uuid-1/quit"));
+    CHECK(!lockedByNoAdmin("POST", "/api/hosts/uuid-1/stop-session"));
+    CHECK(!lockedByNoAdmin("POST", "/api/auth/logout"));
+    CHECK(!lockedByNoAdmin("POST", "/api/share/player/join"));
+    CHECK(!lockedByNoAdmin("POST", "/api/logs/client"));
+
+    // share_in_booth_mode (issue #40): the share slots and a guest's PIN come
+    // back, and nothing else does.
+    CHECK(lockedByNoAdmin("POST", "/api/share/slots/2/activate", false));
+    CHECK(lockedByNoAdmin("POST", "/api/share/player/pin", false));
+    CHECK(!lockedByNoAdmin("POST", "/api/share/slots/2/activate", true));
+    CHECK(!lockedByNoAdmin("POST", "/api/share/slots/2/permissions", true));
+    CHECK(!lockedByNoAdmin("POST", "/api/share/slots/2/deactivate", true));
+    CHECK(!lockedByNoAdmin("POST", "/api/share/player/pin", true));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/validate", true));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/admin-unlock", true));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/regenerate", true));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/manual", true));
+    CHECK(lockedByNoAdmin("POST", "/api/hosts/uuid-1/pair", true));
+    CHECK(lockedByNoAdmin("POST", "/api/update/start", true));
+    CHECK(lockedByNoAdmin("POST", "/api/system/restart", true));
+
+    SECTION("RequestGuard — a session on another browser's key");
+
+    {
+        // HttpServer::tunnelKeyRefused: a session cookie over a tunnel whose
+        // browser key is not the one the session was bound to. The key cannot
+        // leave the browser it was made in, so the cookie did — copied out of
+        // the jar it is kept in, and replayed from somewhere else.
+        const QByteArray keyA("spki-of-browser-a");
+        const QByteArray keyB("spki-of-browser-b");
+        CHECK(!tunnelKeyRefused(true, keyA, keyA));
+        CHECK(tunnelKeyRefused(true, keyB, keyA));
+        // The tunnel names no key, and the session has one: refused too.
+        CHECK(tunnelKeyRefused(true, QByteArray(), keyA));
+        // A session older than key binding is let through, as before.
+        CHECK(!tunnelKeyRefused(true, keyB, QByteArray()));
+        // Off the tunnel there is no browser key to hold the session against.
+        CHECK(!tunnelKeyRefused(false, QByteArray(), keyA));
+        // A signalling socket opened through the tunnel carries the key alone.
+        CHECK(tunnelKeyRefused(false, keyB, keyA));
     }
 }

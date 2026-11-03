@@ -28,18 +28,28 @@ import { BackendClient } from '../api/BackendClient.js';
 import { Toast } from './Toast.js';
 import { StatsGraph } from './StatsGraph.js';
 import { AudioPipeline } from '../audio/AudioPipeline.js';
+import * as streamVolume from '../audio/streamVolume.js';
+import { MicUplink, loadMicDevice, micSupported } from '../audio/MicUplink.js';
 import { JitterController } from '../stream/JitterController.js';
 import { FramePacer } from '../stream/FramePacer.js';
-import { measureRefreshRate, onRefreshRateChange } from '../util/RefreshRate.js';
+import {
+    currentRefreshMilliHz,
+    measureRefreshRate,
+    onRefreshRateChange,
+} from '../util/RefreshRate.js';
 import { devicePixelSize } from '../util/StreamResolution.js';
 import { PeriodicStallDetector } from '../stream/PeriodicStallDetector.js';
 import { GamepadManager } from '../stream/GamepadManager.js';
+import { HidPassthrough } from '../hid/HidPassthrough.js';
+import { GamepadRemapDialog } from './GamepadRemapDialog.js';
+import { padKey, padName } from '../stream/gamepadMapping.js';
 import { armAudioPlayRetry } from '../util/audioAutoplay.js';
 import {
     NalParser,
     splitNals,
     buildDescription,
     getCodecString,
+    getPictureSize,
     toAvcc,
     H264_FALLBACK_CODEC_STRINGS,
     HEVC_FALLBACK_CODEC_STRINGS,
@@ -47,7 +57,9 @@ import {
     CODEC_H264,
     CODEC_HEVC,
     isHevcHdrProfile,
+    isChroma444Profile,
 } from '../util/Mp4Muxer.js';
+import { SliceQpReader } from '../util/SliceQp.js';
 import {
     findSequenceHeader,
     buildAv1DecoderConfigs,
@@ -60,15 +72,48 @@ import {
     IS_TOUCH_DEVICE,
     IS_MOBILE,
     IS_MOBILE_OR_TABLET,
+    IS_LOW_MEMORY,
+    IS_TV,
     IS_APPLE,
-    IS_WEBKIT,
+    IS_GECKO,
+    IS_IOS,
     SUPPORTS_CANVAS_TEARING,
-    isSnapdragonGpu,
+    decoderRidesOutGaps,
+    decodesThroughGaps,
+    hdrExtTonemapRoute,
+    hdrFramesOpaque,
+    mwsrGazeWanted,
+    mwsrMapWanted,
+    MWSR_SPLIT_VIEWS,
+    mwsrSplitWanted,
+    nextMwsrSplitView,
+    noteDecoderCannotRideOut,
+    noteDecoderRefusesReferenceRepairs,
+    noteHdrFramesOpaque,
     pickAutoEnhancer,
+    plainPresenterIsWebGpu,
     supportsDisplayHdr,
+    supportsGamingMode,
 } from '../util/BrowserDetect.js';
-import { createVideoRenderer, NO_WEBGPU_ALGOS } from '../stream/renderers/createRenderer.js';
-import { videoSinkCtor } from '../stream/renderers/videoSink.js';
+import { noteHevcFailed } from '../util/CodecAuto.js';
+import * as RemoteNav from './RemoteNav.js';
+import { StreamRemoteMenu } from './StreamRemoteMenu.js';
+import { RemotePointer } from '../stream/RemotePointer.js';
+import {
+    createVideoRenderer,
+    geckoPresentsOnPlainWebGl,
+    iosPresentsOnPlainWebGl,
+    NO_WEBGPU_ALGOS,
+    plainPicture,
+    presentsOnVsync,
+    rendererAfterFailure,
+} from '../stream/renderers/createRenderer.js';
+import {
+    RendererFallback,
+    rememberedPlainRenderer,
+    rememberPlainRenderer,
+} from '../stream/RendererFallback.js';
+import { tvPresentsThroughSink, videoSinkCtor } from '../stream/renderers/videoSink.js';
 import {
     PipelineDiag,
     MainThreadProbe,
@@ -76,8 +121,12 @@ import {
     formatMainThread,
 } from '../stream/PipelineDiag.js';
 import { shouldFlushAtKeyframe } from '../stream/DecodeQueuePolicy.js';
+import { DecodeDelay, DecodeQueueSignal } from '../stream/DecodeQueueSignal.js';
 import { DecodeRateGovernor } from '../stream/DecodeRateGovernor.js';
+import { SilentDecoderWatch } from '../stream/SilentDecoderWatch.js';
+import { ByteRate } from '../stream/ByteRate.js';
 import {
+    ENHANCER_LADDER,
     EnhancerGovernor,
     ladderRung,
     rendererAlgo,
@@ -85,8 +134,23 @@ import {
     rememberRung,
 } from '../stream/EnhancerGovernor.js';
 import { drawCapFor } from '../stream/RenderPacing.js';
+import { ContentAgeProbe } from '../stream/ContentAgeProbe.js';
+import { FrameLog } from '../stream/FrameLog.js';
+import { latencyHeadline } from '../stream/LatencyHeadline.js';
+import {
+    AudioStatsSampler,
+    findAudioPlayout,
+    findStreamAudioInbound,
+} from '../stream/AudioStats.js';
+import { cropToAnnounced } from '../stream/FrameCrop.js';
+import { VsyncGrid } from '../stream/VsyncGrid.js';
+import { CadenceStepper, autostepEnabled, stepMemory } from '../stream/CadenceStepper.js';
+import { frameMatchesAsked } from '../stream/AutoCeilingMeter.js';
 import { LatencyProbe } from '../stream/LatencyProbe.js';
+import { InputUplink } from '../stream/InputUplink.js';
+import { LINK_STALL_MS, LINK_STALL_PROBE_MS } from '../stream/CrashRelaunch.js';
 import { t } from '../i18n/i18n.js';
+import { VdGpuApartWatch, takeVdGpuApartNotice } from '../util/vdGpuApartNotice.js';
 
 /** @typedef {import('../types/transport.js').StreamTransport} StreamTransport */
 import { escapeHtml } from '../util/escapeHtml.js';
@@ -102,9 +166,17 @@ import {
     saveInput,
     SessionKeyMapper,
 } from '../util/SessionInput.js';
+import { GuestPresence } from './SharePresence.js';
+import { openSupportPage, showSupportButton } from '../util/supportNudge.js';
+import { BMC_LOGO } from './bmcLogo.js';
 import { StreamViewKeyboard } from './StreamViewKeyboard.js';
 import { StreamViewTouch } from './StreamViewTouch.js';
 import { StreamViewFullscreen } from './StreamViewFullscreen.js';
+import { flushClientLog, serverDiag } from '../util/ClientLog.js';
+import { UltraPlayer, presentMode, ultraPlayerSupported } from '../stream/ultra/UltraPlayer.js';
+
+// Set once the viewer has been told the microphone starts cut.
+const MIC_HINT_KEY = 'mw-mic-hint-seen';
 
 /**
  * Lane name → the i18n key the card already uses for that value. The graph
@@ -155,6 +227,27 @@ const GRAPH_LABEL_KEYS = {
 const CURSOR_USES_CLIENT_STYLE = false;
 
 /**
+ * Keeps "client now − the frame's backendTs" positive for DecodeDelay: the
+ * backendTs is the host's steady clock in ms, far ahead of performance.now().
+ * Only the excess over the minimum is read, so the shift cancels.
+ */
+const E2E_SHIFT = 2 ** 32;
+
+/**
+ * Frames per refresh a native host under cadence=deadline may send a canvas
+ * that tears (VsyncGrid budgetFps) — the bench switch `mw_vsyncgrid_budget`,
+ * 1 without it.
+ */
+function vsyncGridBudget() {
+    try {
+        const v = Number(localStorage.getItem('mw_vsyncgrid_budget'));
+        return v > 0 && v <= 8 ? v : 1;
+    } catch {
+        return 1;
+    }
+}
+
+/**
  * How wide the host's pointer should end up on a phone, in CSS pixels.
  *
  * A touch screen has no pointer of its own, so there the host draws the pointer
@@ -196,6 +289,13 @@ const PHONE_CURSOR_CSS_PX = 14;
  * into the corner. False is the previous behaviour.
  */
 const MOBILE_CURSOR_CLIENT_DRAWN = true;
+
+/**
+ * How long the mouse-gaming-mode reminder stays over the picture before it
+ * fades — about the time the shortcuts slide gets at launch, long enough to
+ * read four keys and a verb.
+ */
+const GAMING_HINT_SHOW_MS = 5000;
 
 /**
  * How long to wait for the host's first position before placing the pointer
@@ -409,6 +509,47 @@ class SlidingStats {
     }
 }
 
+/**
+ * The stream <video>'s poster: one transparent pixel. Without one, Android's
+ * WebView draws its own grey "play" picture over a <video> that has no frame
+ * yet — a huge blurred one behind the startup steps on a TV (Mi TV, 03/10/2026).
+ */
+export const BLANK_POSTER =
+    'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+/** The keys a remote's arrows arrive as, and the way each steers the pointer. */
+const REMOTE_POINTER_DIRS = {
+    ArrowUp: 'up',
+    ArrowDown: 'down',
+    ArrowLeft: 'left',
+    ArrowRight: 'right',
+};
+
+/**
+ * True for a mouse event the browser made up after a touch (Chromium says so
+ * in sourceCapabilities). The touch handlers have already acted on that tap.
+ * @param {MouseEvent & {sourceCapabilities?: {firesTouchEvents?: boolean}}} e
+ */
+export function firedByTouch(e) {
+    return !!(e && e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents);
+}
+
+/**
+ * The split screen's button: which view, never which side the grid is on.
+ * A lab control, in English like the debug menu.
+ * @param {string} view BrowserDetect.MWSR_SPLIT_VIEWS
+ * @returns {string}
+ */
+export function mwsrSplitLabel(view) {
+    const n = MWSR_SPLIT_VIEWS.indexOf(view) + 1;
+    const what = {
+        'centre-twice': 'centre ×2',
+        'left-twice': 'left half ×2',
+        halves: 'left | right',
+    };
+    return `Split ${n}/${MWSR_SPLIT_VIEWS.length} · ${what[view]}`;
+}
+
 export class StreamView {
     static get KEY_CODES() {
         return Object.keys(StreamView.WINDOWS_VK_BY_CODE);
@@ -424,7 +565,7 @@ export class StreamView {
         transport = 'webrtc',
         transportMode = undefined,
         isRemote = false,
-        showPerformanceStats = true,
+        showPerformanceStats = false,
         touchSensitivity = 2.0,
         tearing = false,
         videoWorker = 'auto',
@@ -442,11 +583,20 @@ export class StreamView {
         // the live one; input/wake-lock/overlays stay off until activate() flips
         // it to the visible, controlling view (called on its first frame).
         this._standby = opts.standby === true;
+        // "Quit the app when the stream stops" (settings). Off by default: on a
+        // host whose app outlives the stream, Stop only disconnects, as in
+        // Moonlight, and the app's card offers to resume or quit it.
+        this._quitAppOnStop = opts.quitAppOnStop === true;
+        // "Start streams in fullscreen" (settings) — see _applyFullscreenOnStart.
+        this._fullscreenOnStart = opts.fullscreenOnStart === true;
         // Backend stream slot this view runs on (0 = /ws ports, 1 = /ws1) and
         // the uniqueid it launched with — quit() scopes its /quit with them so
         // retiring one leg of a dual stream never cancels the other.
         this._sessionSlot = typeof opts.sessionSlot === 'number' ? opts.sessionSlot : 0;
         this._slotUniqueId = opts.slotUniqueId || null;
+        // What the host knows this stream by (/start's stream_id): the page
+        // asks it how the stream ended once the link goes (_handOffLinkLoss).
+        this.streamId = typeof opts.streamId === 'string' ? opts.streamId : '';
         // ── Player mode (invited guest) ─────────────────────────────────────
         // A player's view is the same stream pipeline with the owner's controls
         // taken away: Stop becomes Leave (their leaving must not end the game),
@@ -454,6 +604,10 @@ export class StreamView {
         // resolution means leaving and rejoining.
         this._playerMode = opts.playerMode === true;
         this._shareToken = opts.shareToken || null;
+        // The host codes PyroWave, this browser's codec for a wired LAN
+        // (/start's ultra_codec): this page decodes it on its own thread
+        // (_ultraMode).
+        this._ultraAsked = opts.ultraCodec === 'pyrowave';
         // A guest gets SGSR1 with a promise attached: it is dropped for good if
         // it costs more than 8ms per frame, measured after a 10s warm-up. The
         // owner's adaptive ladder (a share of their own frame budget) would make
@@ -464,13 +618,35 @@ export class StreamView {
         /** Called when the owner ended the shared session (backend notice). */
         this.onSessionEnded = opts.onSessionEnded || null;
         this._shareMenu = null;
+        /** @type {GuestPresence|null} a guest's header count (issue #47) */
+        this._presence = null;
         this._shareExitOverlay = null;
         this._stallPopinOverlay = null;
+        // A TV remote's menu (long press of OK), the press being held for it,
+        // and when it last closed (see handleKeyUp).
+        this._remoteMenu = null;
+        this._okHold = null;
+        this._remoteMenuClosedAt = 0;
+        this._okHoldEndedAt = 0;
+        // The menu's "Mouse": a remote's arrows steer the host's pointer and OK
+        // clicks (RemotePointer). Remembered by the device.
+        this._remotePointerOn = StreamView.readRemotePointerPref();
+        /** @type {RemotePointer|null} */
+        this._remotePointer = null;
+        // Who keeps the pads from reaching the host: the remap dialog, the
+        // remote's menu. Either may close while the other is still up.
+        this._padHolds = new Set();
         // Audio time-stretch (WSOLA) — server-controlled kill switch.
         this._audioTimeStretch = audioTimeStretch !== false;
         // Mobile only: direct touch-screen input (absolute finger position) in
-        // place of the relative trackpad model. Off by default.
-        this._touchScreen = touchScreen === true;
+        // place of the relative trackpad model. Off by default — but always on
+        // a TV: there the "touch" is the browser's own cursor (TV Bro, TCL)
+        // tapping where it points, and the trackpad model clicked wherever the
+        // host's pointer already was instead (03/10/2026, a Mi TV).
+        this._touchScreen = touchScreen === true || IS_TV;
+        // A TV's taps come from its browser's cursor: one off the picture is
+        // ignored (_tvTapOffPicture), not pinned to the nearest edge.
+        this._tvCursor = IS_TV;
         // YUV 4:4:4 chroma negotiated by the backend (vs default 4:2:0). Used
         // only to annotate the codec in the stats overlay.
         this._yuv444 = yuv444 === true;
@@ -478,6 +654,8 @@ export class StreamView {
         // words. A refused 4:4:4 used to look exactly like a 4:2:0 nobody asked
         // for: same overlay, same codec name, no notice anywhere.
         this._yuv444Declined = opts.chroma444Declined || null;
+        // The codec was « Auto »'s to choose (util/CodecAuto.js): said in the overlay.
+        this._codecAuto = opts.codecAuto === true;
         // HDR mode requested by the user. Actual HDR depends on both the
         // user's preference and Sunshine's negotiated format (HEVC Main10 /
         // AV1 10-bit). _hdrNegotiated is set after codec detection.
@@ -495,9 +673,9 @@ export class StreamView {
         this._transport = transport;
         this._transportMode = transportMode || transport;
         this._gamingMode = gamingMode;
-        // Force gaming mode off on touch devices — pointer lock and mouse
-        // capture are irrelevant when input is touch-based.
-        if (IS_TOUCH_DEVICE) {
+        // Force gaming mode off where there is no mouse to capture (a phone, a
+        // tablet without a trackpad). A touchscreen PC with one keeps it.
+        if (!supportsGamingMode()) {
             this._gamingMode = false;
         }
         this._upnpEnabled = upnpEnabled;
@@ -530,6 +708,7 @@ export class StreamView {
         try {
             this._useWorker =
                 workerWanted &&
+                !this._ultraAsked &&
                 !this._hdrEnabled &&
                 transport !== 'webrtc-media' &&
                 typeof Worker !== 'undefined' &&
@@ -553,20 +732,24 @@ export class StreamView {
         // is unavailable. Forwarded to the worker too (no localStorage there).
         //
         // The menu (debug builds) offers each upscaler in two flavours: on
-        // WebGPU ('sgsr', 'nis', 'fsr1') and on WebGL2 ('gl-sgsr', 'gl-nis',
-        // 'gl-fsr1'), plus 'smooth2d' (Canvas2D resampling at display size).
-        // None of the latter ask for WebGPU; createVideoRenderer routes them.
+        // WebGPU ('sgsr', 'nis', 'fsr1', 'mwsr') and on WebGL2 ('gl-sgsr',
+        // 'gl-nis', 'gl-fsr1', 'gl-mwsr'), plus 'smooth2d' (Canvas2D
+        // resampling at display size). None of the latter ask for WebGPU;
+        // createVideoRenderer routes them. 'mwsr' is MoonlightWeb's own
+        // (docs/design/upscaler-mwsr.md), the one 'auto' takes since v0.4.1.
         //
-        // The production matrix (decided 03/09/2026), 'auto' being the only
-        // value a release build ever saves:
-        //   SDR  Off  → Canvas2D            Auto → FSR1 WebGL2 (desktop)
-        //                                          SGSR1 WebGL2 (phone/tablet,
-        //                                          and any Snapdragon GPU)
-        //   HDR  Off  → WebGPU              Auto → FSR1 WebGPU
-        //                                          (SGSR1 WebGPU on Snapdragon)
+        // The production matrix ('auto' being the only value a release build
+        // ever saves; decided 03/09/2026, MWSR in it since Bruno's 24/10/2026
+        // on his device classes of 22/10, pickAutoEnhancer):
+        //   SDR  Off  → Canvas2D            Auto → MWSR WebGL2 (PC, Mac,
+        //             (WebGPU on an               Snapdragon, other phones)
+        //              entry-level Mali)           MWSR WebGPU (iPhone, iPad)
+        //                                          none (entry-level Mali)
+        //   HDR  Off  → WebGPU              Auto → MWSR WebGPU
         // In SDR the WebGL2 flavour won the click-to-photon runs in a window
-        // and keeps no WebGPU device alive; in HDR WebGPU is the one renderer
-        // with an HDR surface, so everything moves there.
+        // and keeps no WebGPU device alive, except on WebKit, whose WebGL2
+        // upload costs milliseconds of main thread per frame; in HDR WebGPU
+        // is the one renderer with an HDR surface, so everything moves there.
         // Display HDR capability — main thread only (matchMedia doesn't exist in
         // workers) and evaluated once at stream start (renderers can't hot-swap);
         // reflects the OS toggle too (Windows "HDR off" → matches false).
@@ -581,6 +764,11 @@ export class StreamView {
         // 'video' is the <video> sink, in SDR too.
         let forceCanvas2d = false;
         let forceVideo = false;
+        // The debug menu's mwsr 2 and 3 ('mwsr-db', 'mwsr-dbq'): mwsr on
+        // WebGPU with the deblocking of DeblockShader.js before it, at a fixed
+        // strength or one per frame from its QP. Never 'auto', never a release
+        // build (SettingsView keeps the menu to debug builds).
+        let mwsrDeblock = null;
         if (videoEnhancement === 'on') {
             let sel = videoEnhancementAlgo || 'auto';
             if (sel === 'canvas2d') {
@@ -589,12 +777,35 @@ export class StreamView {
             } else if (sel === 'video') {
                 forceVideo = true;
                 sel = 'off';
+            } else if (sel === 'mwsr-db' || sel === 'mwsr-dbq') {
+                mwsrDeblock = sel === 'mwsr-db' ? 'fixed' : 'qp';
+                sel = 'mwsr';
             }
             if (sel === 'auto') {
-                // A Snapdragon runs Qualcomm's own upscaler in both flavours;
-                // HDR otherwise keeps FSR1, the sharper one, on WebGPU.
-                if (hdr) sel = isSnapdragonGpu() ? 'sgsr' : 'fsr1';
-                else sel = 'gl-' + pickAutoEnhancer();
+                // MWSR in the flavour this device class runs best, none on an
+                // entry-level Mali (pickAutoEnhancer).
+                //
+                // A device of a gigabyte or less gets none: 'auto' is the
+                // platform's call, and on that GPU class the answer is no. A
+                // Mi TV's Mali-G31 (1.4 GB, 01/10/2026) lost its WebGL context
+                // to SGSR, and presents no more than ~27 plain 720p frames a
+                // second to begin with — a pass on top only costs frames.
+                if (IS_LOW_MEMORY) {
+                    console.log('[StreamView] Enhancer: none on a low-memory device');
+                    sel = 'off';
+                } else if (IS_TV && !hdr) {
+                    // Its <video> presents every frame, a canvas a third fewer
+                    // and a shader pass fewer still (see the TV sink below).
+                    console.log(
+                        '[StreamView] Enhancer: none on a TV — its <video> shows every frame',
+                    );
+                    sel = 'off';
+                } else {
+                    sel = pickAutoEnhancer({ hdr });
+                    if (sel === 'off') {
+                        console.log('[StreamView] Enhancer: none on an entry-level Mali');
+                    }
+                }
             }
             // HDR has no WebGL2 or Canvas2D presentation in Chrome (no HDR
             // surface for either), so with HDR on every upscaler runs in its
@@ -602,7 +813,12 @@ export class StreamView {
             // present the result. Smooth2D has no shader to move: it becomes
             // the plain WebGPU blit.
             if (hdr && NO_WEBGPU_ALGOS.includes(sel)) {
-                const toGpu = { 'gl-sgsr': 'sgsr', 'gl-nis': 'nis', 'gl-fsr1': 'fsr1' };
+                const toGpu = {
+                    'gl-sgsr': 'sgsr',
+                    'gl-nis': 'nis',
+                    'gl-fsr1': 'fsr1',
+                    'gl-mwsr': 'mwsr',
+                };
                 const moved = toGpu[sel] || 'off';
                 console.log('[StreamView] HDR: enhancer ' + sel + ' → ' + moved + ' on WebGPU');
                 sel = moved;
@@ -614,8 +830,23 @@ export class StreamView {
                 algo = sel;
             } else {
                 wantWebGpu = true;
-                algo = sel === 'nis' || sel === 'fsr1' ? sel : 'sgsr';
+                algo = sel === 'nis' || sel === 'fsr1' || sel === 'mwsr' ? sel : 'sgsr';
             }
+        }
+        // An entry-level Mali presents on WebGPU with no pass as well, the
+        // Enhancer on or off (plainPresenterIsWebGpu); not on a TV, whose
+        // <video> sink presents every frame, nor on a device of a gigabyte or
+        // less, where no bench has seen it.
+        if (
+            algo === 'off' &&
+            !wantWebGpu &&
+            !forceCanvas2d &&
+            !IS_TV &&
+            !IS_LOW_MEMORY &&
+            plainPresenterIsWebGpu()
+        ) {
+            console.log('[StreamView] Presenter: WebGPU on an entry-level Mali');
+            wantWebGpu = true;
         }
         // Whether the user enabled the Enhancer (used to flag it OFF in the overlay
         // when the stream lands on webrtc-media, where it can't be applied).
@@ -624,9 +855,15 @@ export class StreamView {
         if (forceCanvas2d) wantWebGpu = false;
         this._wantWebGpu = wantWebGpu;
         // Dev override (no UI): also force the Canvas2D path for comparison.
+        let devCanvas2d = false;
         try {
-            if (localStorage.getItem('mw_force_2d') === '1') this._wantWebGpu = false;
+            devCanvas2d = localStorage.getItem('mw_force_2d') === '1';
+            if (devCanvas2d) this._wantWebGpu = false;
         } catch (e) {}
+
+        // A TV presents through the <video> sink, fed on decode: see
+        // tvPresentsThroughSink. DataChannel/WSS only, as every sink (below).
+        const tvSink = tvPresentsThroughSink({ tv: IS_TV, hdr, algo, forceCanvas2d, devCanvas2d });
 
         // HDR routing (DataChannel/WSS only). Two things decide it: whether the
         // user asked for the Enhancer, and what this browser gives us to work
@@ -654,11 +891,13 @@ export class StreamView {
         //    importExternalTexture instead. Enhancer intact.
         //  - anything else → 'browser': plain blit, the browser's own tone-map
         //    on import. The least good picture, and the only one left.
+        // A browser seen handing its AV1 HDR frames opaque has no readback
+        // (hdrFramesOpaque, found on the first frame: _relaunchWithoutReadback).
         // Dev: mw_hdr_tonemap = '1' forces 'tonemap' on an HDR display (to
         // compare), '0' disables the readback altogether; mw_hdr_ext_tonemap
         // '1'/'0' forces or disables the external-texture tone-map.
         let hdrMode = 'none';
-        if (forceVideo && transport !== 'webrtc-media') {
+        if ((forceVideo || tvSink) && transport !== 'webrtc-media') {
             hdrMode = videoSinkCtor() ? 'sink' : 'none';
         } else if (forceCanvas2d) {
             hdrMode = hdr ? 'browser' : 'none';
@@ -670,12 +909,13 @@ export class StreamView {
                 if (dev === '1') forceTonemap = true;
                 else if (dev === '0') readback = false;
             } catch (e) {}
-            let extTonemap = !!navigator.gpu && IS_WEBKIT;
-            try {
-                const dev = localStorage.getItem('mw_hdr_ext_tonemap');
-                if (dev === '1') extTonemap = !!navigator.gpu;
-                else if (dev === '0') extTonemap = false;
-            } catch (e) {}
+            if (readback && hdrFramesOpaque()) {
+                readback = false;
+                console.log(
+                    '[StreamView] HDR: this browser hands its AV1 HDR frames opaque — no readback',
+                );
+            }
+            const extTonemap = hdrExtTonemapRoute();
             // A sink only earns its keep on an HDR display: on an SDR one it
             // presents the same tone-mapped picture with no enhancer left.
             const sinkHdr = displayHdr && !!videoSinkCtor();
@@ -693,13 +933,20 @@ export class StreamView {
         // no software decoder needed, so the enhancer survives on any codec.
         this._hdrExtTonemap = hdrMode === 'tonemap-ext';
         this._useVideoSink = hdrMode === 'sink';
+        // The TV's sink (above), fed on decode (startRenderLoop) and on the main
+        // thread: a <video> is a DOM element the video worker cannot reach.
+        this._tvSink = tvSink && this._useVideoSink;
+        if (this._tvSink && this._useWorker) {
+            console.log('[StreamView] TV: <video> sink on the main thread, not the video worker');
+            this._useWorker = false;
+        }
         // Either readback path: the decoder must be software (see configureDecoder).
         this._hdrYuv = this._hdrTonemap || this._hdrLinear;
         // The <video> sink has no shader stage: an enhancer asked for there is
         // dropped, and said so, rather than silently swapped for a tone-map that
         // would throw the HDR away.
         this._enhancerBlockedByHdr = false;
-        this._forceVideoSink = forceVideo;
+        this._forceVideoSink = forceVideo || this._tvSink;
         if (hdrMode === 'sink' && algo !== 'off') {
             console.log(
                 '[StreamView] HDR: ' +
@@ -726,6 +973,52 @@ export class StreamView {
             );
         }
         this._videoEnhancementAlgo = algo;
+        // What the WebGPU renderer is told for mwsr 2 / 3 (null: plain mwsr or none).
+        this._mwsrDeblock = algo === 'mwsr' ? mwsrDeblock : null;
+        // Firefox: the plain picture on WebGL2, its 2D canvas copies each
+        // frame on the main thread (geckoPresentsOnPlainWebGl). iOS: the same,
+        // its 2D canvas blurs under the pinch zoom (iosPresentsOnPlainWebGl).
+        const plainChoice = {
+            gecko: IS_GECKO,
+            ios: IS_IOS,
+            hdr: this._hdrMode !== 'none',
+            algo,
+            webgpu: this._wantWebGpu,
+            sink: this._useVideoSink || this._forceVideoSink,
+            forceCanvas2d,
+            devCanvas2d,
+        };
+        this._plainWebGl =
+            geckoPresentsOnPlainWebGl(plainChoice) || iosPresentsOnPlainWebGl(plainChoice);
+        // The plain picture on the main-thread canvas path: the one the
+        // renderer fallback may move between Canvas2D and WebGL2 when its draw
+        // stops fitting a frame (RendererFallback), and the one a previous
+        // session's verdict applies to.
+        this._plainPicture =
+            plainPicture({
+                hdr: this._hdrMode !== 'none',
+                algo,
+                webgpu: this._wantWebGpu,
+                sink: this._useVideoSink || this._forceVideoSink,
+                forceCanvas2d,
+                devCanvas2d,
+            }) &&
+            !this._ultraAsked &&
+            transport !== 'webrtc-media';
+        const plainKind = this._plainPicture ? rememberedPlainRenderer() : null;
+        if (plainKind && plainKind !== (this._plainWebGl ? 'webgl' : 'canvas2d')) {
+            console.log(
+                '[StreamView] Renderer: ' + plainKind + ', where this device settled last time',
+            );
+        }
+        if (plainKind) this._plainWebGl = plainKind === 'webgl';
+        /** @type {RendererFallback|null} made with the main-thread renderer */
+        this._rendererFallback = null;
+        this._swappingRenderer = false;
+        /** The renderer that gave up and was replaced (_checkRendererFailed). */
+        this._failedRenderer = null;
+        /** A renderer's fresh canvas, put in place at its first draw. */
+        this._nextCanvas = null;
         this._workerLastDecoded = 0;
 
         // Backend timestamp tracking for stale frame detection.
@@ -744,6 +1037,19 @@ export class StreamView {
          *  (ICE failure / closed before ever connecting). MoonlightApp relaunches
          *  with the next transport in the priority chain. Receives a reason string. */
         this.onConnectionFailed = null;
+        /** Callback invoked when the link goes AFTER it connected, in place of
+         *  ending the stream at once (_handOffLinkLoss). MoonlightApp asks the
+         *  host how the stream ended: it starts it again when the worker
+         *  crashed, and calls _linkLostDefault() for everything else. */
+        this.onLinkLost = null;
+        /** Callback invoked when nothing has come over the link for a moment
+         *  while it still counts as up (_checkLinkStall): MoonlightApp asks
+         *  the host whether the worker crashed, rather than wait for ICE. */
+        this.onLinkStall = null;
+        // When anything last came over the link, and when the host was last
+        // asked about a stall (_checkLinkStall).
+        this._lastRxAt = 0;
+        this._lastStallProbeAt = -Infinity;
         /** Callback invoked on SUSTAINED network congestion (IDR storms, backend
          *  SCTP backpressure drops, PLI storms). MoonlightApp reacts by
          *  relaunching the stream with a degraded session-only profile
@@ -797,6 +1103,27 @@ export class StreamView {
         // MoonlightApp can relaunch with the next transport (no in-session WS
         // reroute). WebRtcMedia ignores this flag (no in-session WS fallback).
         this.webrtc._chainFallback = true;
+        // A share-link guest was never paired with this host: no MW-BIND.
+        this.webrtc._unpairedGuest = this._playerMode;
+
+        // The viewer's microphone, when the host took it (/start's `mic`): it
+        // answers the stream's audio section, or rides the WSS socket. A
+        // standby leg holds it back until activate(), or the host would hear
+        // the voice twice.
+        /** @type {MicUplink|null} */
+        this._mic = null;
+        /** @type {HTMLButtonElement|null} */
+        this._micBtn = null;
+        if (opts.mic === true && micSupported()) {
+            this._mic = new MicUplink({
+                held: this._standby,
+                quality: opts.micQuality,
+                device: loadMicDevice(),
+            });
+            this._mic.onStateChange = (state) => this._onMicState(state);
+            this._mic.onDeviceMissing = () => Toast.warning(t('stream.micDeviceMissing'));
+            this.webrtc.mic = this._mic;
+        }
 
         // Ride out a gap rather than demand a keyframe — only when the HOST
         // confirmed its encoder is really intra-refreshing (opts.intraRefresh
@@ -806,26 +1133,130 @@ export class StreamView {
         if (opts.intraRefresh === true && 'rideOutLoss' in this.webrtc) {
             this.webrtc.rideOutLoss = true;
             console.log('[StreamView] Loss recovery: riding out the refresh wave');
+        } else if (opts.nativeHost === true && !decoderRidesOutGaps()) {
+            // Never asked for here (BackendClient): this platform's decoder
+            // fails on a delta whose reference is missing, so a stall on the
+            // link costs a keyframe instead.
+            console.log(
+                "[StreamView] Loss recovery: keyframes (this platform's decoder cannot ride out a gap)",
+            );
         }
         // Debug builds only: force the virtual pad the host presents instead of
         // letting it follow the controller we detect. 'auto' everywhere else —
         // see the gamepad profile note in SettingsView.
         this._gamepadProfile = opts.gamepadProfile || 'auto';
+        // Share-link guests: one controller only (the one picked on the join
+        // page), and a header button to check or remap it — only when the
+        // invitation lets them play with a gamepad at all.
+        this._gamepadAllowed = opts.gamepadAllowed === true;
+        // Whether this viewer's mouse reaches the host at all. A guest without
+        // keyboard and mouse keeps their own pointer over the picture, in
+        // desktop and gaming mode alike: hiding it leaves them nothing to see
+        // where their mouse is, and taking the lock gains them nothing. From
+        // the invitation at first, then from the host as the owner changes it
+        // (`inputcaps`).
+        this._mouseAllowed = !this._playerMode || opts.keyboardMouseAllowed === true;
+        this._padKey = opts.padKey || null;
         // Click-to-photon probe (debug builds, Windows host): the launch reply
         // says whether the host raises its flag on every click. Only then is
         // the measuring side installed — see stream/LatencyProbe.js.
         this._latencyFlag = opts.latencyFlag === true;
         this._latencyProbe = null;
+        // Content-age probe (bench, plan framerate-hote): reads the time the
+        // bench page codes into its band back off each drawn picture — see
+        // stream/ContentAgeProbe.js. Idle until `mwContentAge.start()`.
+        this._contentAge = new ContentAgeProbe({
+            renderer: () => this._renderer,
+            sendPing: (seq, ts) => {
+                if (this.webrtc) this.webrtc.send({ type: 'ping', seq, ts });
+            },
+            results: (window.mwContentAgeResults = window.mwContentAgeResults || []),
+        });
+        // Standby views measure nothing; the visible one owns the console handle.
+        if (!this._standby) window.mwContentAge = this._contentAge;
+        // Each drawn frame's age on the host's clock (stream/FrameLog.js):
+        // the measured end-to-end the latency breakdown shows beside its sum
+        // of legs, and the per-frame log a bench fetches (`mwFrameLog.csv()`).
+        this._frameLog = new FrameLog();
+        this._e2eMeasuredStats = new SlidingStats(2000);
+        // The last draw and that frame's age, and the last frame in: what the
+        // card's headline reads a freeze from (stream/LatencyHeadline.js).
+        this._lastDrawnAt = 0;
+        this._lastDrawnE2e = NaN;
+        this._lastFrameInAt = 0;
+        if (!this._standby) window.mwFrameLog = this._frameLog;
+        // This screen's refresh grid, for a native host that aims each frame at
+        // one refresh (cadence=deadline, plan framerate-hote §13) — see
+        // stream/VsyncGrid.js. Idle until a pong says the host wants it.
+        this._vsyncGrid = new VsyncGrid({
+            send: (msg) => {
+                if (this.webrtc) this.webrtc.send(msg);
+            },
+            sendPing: (seq, ts) => {
+                if (this.webrtc) this.webrtc.send({ type: 'ping', seq, ts });
+            },
+            tearing: () => this._tearing,
+            budgetFactor: vsyncGridBudget(),
+        });
+        if (!this._standby) window.mwVsyncGrid = this._vsyncGrid;
+        // How long an input takes to reach the host (stream/InputUplink.js,
+        // plan radios T7): splits each click of the probe, and benches the way
+        // up alone (`mwUplink.run()`). Idle until one of them asks.
+        this._inputUplink = new InputUplink({
+            send: (msg) => {
+                if (this.webrtc) this.webrtc.send(msg);
+            },
+            sendPing: (seq, ts) => {
+                if (this.webrtc) this.webrtc.send({ type: 'ping', seq, ts });
+            },
+            bufferedAmount: () => {
+                const dc =
+                    this.webrtc && this.webrtc.dataChannels && this.webrtc.dataChannels.input;
+                return dc ? dc.bufferedAmount : 0;
+            },
+            results: (window.mwUplinkResults = window.mwUplinkResults || []),
+        });
+        if (!this._standby) window.mwUplink = this._inputUplink;
+        // "Auto" with detection (stream/CadenceStepper.js): a native host's
+        // stream may run above this screen's rate while what it shows gets
+        // younger. Built by the first stats that carry the host's cadence, and
+        // only for a rate left to Auto — see _noteHostCadence. Off on a TV.
+        this._autostep = opts.fpsAuto === true && autostepEnabled(IS_TV);
+        this._stepper = null;
+        // Does this stream prove the rung of Auto's ceiling it runs at? The app
+        // hands the live view a meter (stream/AutoCeilingSession.js), fed here.
+        /** @type {import('../stream/AutoCeilingMeter.js').AutoCeilingMeter|null} */
+        this.autoCeilingMeter = null;
+        /** @type {(() => boolean)|null} a transition is under way */
+        this.autoCeilingIdle = null;
+        /** @type {(() => boolean)|null} this stream tries a rung not yet held */
+        this.autoCeilingOnTrial = null;
+        /** The most a step of the cadence may reach, pixels a second; 0: no bound. */
+        this.autoCeilingMaxPixelRate = 0;
+        /** @type {(() => {size: string, trial: boolean}|null)|null} the stats card's line */
+        this.autoCeilingLine = null;
+        this._hostPresentsFps = 0;
+        this._decodeRateCap = 0;
         // Native host: mouse motion goes out on `pointerrawupdate` — every
         // report the device makes, not the one-per-display-frame sum that
         // `mousemove` delivers. Decided in _bindPointerRaw; while it is on, the
         // mousemove handlers keep their cursor bookkeeping and stop sending.
         this._nativeHost = opts.nativeHost === true;
+        // The virtual display and the apps opened before the stream on two
+        // GPUs (util/vdGpuApartNotice.js): watched only when the host says so.
+        this._vdGpuApart = opts.vdGpuApart || null;
+        this._vdGpuApartWatch = this._vdGpuApart ? new VdGpuApartWatch() : null;
+        // This browser is streaming the very machine it runs on ("Stream
+        // anyway" past the self-stream warning). Every key the host injects
+        // then lands in this window again — see handleKeyDown/handleKeyUp.
+        this._selfStream = opts.selfStream === true;
         // The screen this view paints on, as the native host knows it: frames
         // wait for its vsync unless tearing is on, and /start carried its
         // measured refresh. A vsync client gets a stream cadence that divides
         // its refresh; when the window changes screen mid-stream the new rate
-        // goes out as `clientrefresh` — see _startRefreshWatch.
+        // goes out as `clientrefresh` — see _startRefreshWatch. /start could
+        // only say the setting: the renderer, once made, may wait for the
+        // vsync anyway, and the host is then told — see _notePresentation.
         this._clientVsync = !this._tearing;
         this._sentClientRefresh = opts.clientRefreshMilliHz || 0;
         this._offRefreshChange = null;
@@ -839,13 +1270,25 @@ export class StreamView {
         // The host heals a lost frame with a delta (NVENC reference
         // invalidation, /start says so): after a gap this view names the
         // frames it missed and keeps decoding, instead of discarding deltas
-        // until a keyframe — see handleVideoFrame.
-        this._refInvalidation = opts.refInvalidation === true;
+        // until a keyframe — see handleVideoFrame. Not on a device that takes
+        // no such repairs (an Apple one), whatever the host says.
+        this._refInvalidation = decodesThroughGaps(opts.refInvalidation);
+        // The size the native host streams, then each `displayformat`'s: a
+        // decoded AV1 frame padded past it is cut back to it at the decoder's
+        // output (stream/FrameCrop.js). Null for every other host.
+        this._frameSize =
+            opts.frameSize && opts.frameSize.width > 0 && opts.frameSize.height > 0
+                ? { width: opts.frameSize.width, height: opts.frameSize.height }
+                : null;
         // "NVENC" / "AMF" / "oneVPL" — which silicon block encodes this stream.
         // Empty for every other host. Shown in the latency detail, not in the
         // always-visible block: it is a "why is it this fast" answer, and the
         // compact card has no room to spare on a phone.
         this._nativeEncoderLabel = typeof opts.nativeEncoder === 'string' ? opts.nativeEncoder : '';
+        // The card this stream was launched from: a screen on the native host,
+        // an app ("Desktop", a game) on the others. Shown under the machine in
+        // the latency detail.
+        this._screenLabel = typeof opts.screenName === 'string' ? opts.screenName : '';
         if ('healsByInvalidation' in this.webrtc) {
             // Recovery is this view's gap handler from here on: the transport's
             // own keyframe requests (incomplete, stale, silence) stand down.
@@ -931,10 +1374,9 @@ export class StreamView {
         // the local arrow stays visible over the host cursor (double cursor).
         this._lastMouseClientX = undefined;
         this._lastMouseClientY = undefined;
-        // Per-session "closed" flags: the user can dismiss the stats and the
-        // gaming-mode exit overlay with their × button; they stay hidden after.
+        // Per-session "closed" flag: the user can dismiss the stats card with
+        // its × button; it stays hidden after.
         this._statsClosed = false;
-        this._gamingClosed = false;
 
         // Audio transport: on WebRTC transports (webrtc / webrtc-media) audio is a
         // native RTP Opus track decoded by the browser (jitter buffer + in-band
@@ -952,6 +1394,7 @@ export class StreamView {
         this.decoderConfigured = false;
         this.decoderConfiguring = false;
         this.nalParser = new NalParser();
+        this._sliceQp = null; // mwsr 3's QP reader (SliceQp.js), made on its first frame
         this.frameQueue = [];
         this.pendingFrames = []; // frames buffered before decoder config
         this.frameCount = 0;
@@ -1010,12 +1453,21 @@ export class StreamView {
         this._latencyDetail = false;
         // Mouse-gaming-mode exit reminder (discreet, draggable, top-center).
         this._gamingOverlay = null;
+        // Whether it floats over the picture (fullscreen) rather than sitting
+        // in the header, and the timer that fades it out when it does.
+        this._gamingFloating = null;
+        this._gamingFadeTimer = null;
         this._resolution = ''; // "1920x1080" — set once on first frame
         this._codec = this.videoCodec; // Same as videoCodec
         this._transport = transport; // "webrtc" or "wss"
         this._totalBytes = 0; // Cumulative video bytes for bitrate
-        this._startTime = performance.now(); // Stream start time for bitrate calc
+        this._startTime = performance.now(); // Stream start time
+        // The card's bitrate: the last 2 s, like the framerate next to it.
+        this._byteRate = new ByteRate(2000);
         this._fpsTimestamps = []; // performance.now() per decoded frame
+        // A decoder that takes chunks and gives no picture back, read off the
+        // two counters on the overlay's tick — see _checkSilentDecoder.
+        this._silentWatch = new SilentDecoderWatch();
 
         // ── Stats overlay ───────────────────────────────────────────────────
         // Latency is the sum of independently measured legs (moonlight-qt
@@ -1064,6 +1516,9 @@ export class StreamView {
         // reports its verdicts).
         this._governor = null;
         this._enhancerDegraded = false;
+        // …and whether the last frame was copied at 1:1, the pass idle
+        // (VideoRenderer.passthrough; the worker posts it with its counters).
+        this._enhancerPassthrough = false;
         // The setting is the ladder's ceiling; the pass a session starts with
         // may be lower, where the ladder settled last time on this device
         // (EnhancerGovernor's memory) — a phone that could not decode and
@@ -1099,11 +1554,12 @@ export class StreamView {
         this._dropsPerSec = 0;
         this._lastDiagLogMs = 0;
         // The raw observation line (and its 1/s console trace) is a debugging
-        // aid, not a user-facing readout: off unless mw_perf_diag = '1'. The
-        // counters themselves keep running — the enhancer ladder feeds on them.
-        this._perfDiag = false;
+        // aid, not a user-facing readout: off unless mw_perf_diag = '1' or the
+        // server runs with verbose logs. The counters themselves keep running
+        // — the enhancer ladder feeds on them.
+        this._perfDiag = serverDiag.verbose;
         try {
-            this._perfDiag = localStorage.getItem('mw_perf_diag') === '1';
+            if (localStorage.getItem('mw_perf_diag') === '1') this._perfDiag = true;
         } catch (e) {}
         // What the main thread does besides streaming — input sent, event-loop
         // lag, long tasks. Exists only under the same flag: it runs a timer.
@@ -1126,8 +1582,11 @@ export class StreamView {
         this._audioStatsTimer = null;
         this._audioJbMs = -1;
         this._audioJbAt = 0;
-        this._lastAudioJbDelay = 0;
-        this._lastAudioJbEmitted = 0;
+        // The rest of what NetEq does with the sound — its floor, the arrival
+        // jitter, the samples it made up — kept per second for the bench
+        // (`mwAudio.csv()`, stream/AudioStats.js) and shown under the buffer.
+        this._audioStats = new AudioStatsSampler();
+        if (!this._standby) window.mwAudio = this._audioStats;
         this._mediaFps = 0;
         this._mediaBitrateMbps = 0;
         // Per-tick latency samples, one window per stage (network RTT/2, jitter
@@ -1195,6 +1654,8 @@ export class StreamView {
 
         // Gamepad bridge (Xbox/PlayStation) — created lazily on first connect.
         this._gamepadManager = null;
+        this._gamepadDialog = null;
+        this._padBtn = null;
 
         // Forward stats/pong messages from backend to the stats overlay system.
         // Set before setupWebRtc() so it's active when connect() is called.
@@ -1208,6 +1669,13 @@ export class StreamView {
 
         // The owner stopped the session a player was invited to.
         this.webrtc.onSessionEnded = () => this._handleSessionEnded();
+
+        // The host ended the stream on purpose (the app was closed there).
+        this.webrtc.onHostEnded = () => this._handleHostEnded();
+
+        // The host side failed under the stream (Sunshine crashed, its encoder
+        // hung) — not this link.
+        this.webrtc.onHostLost = () => this._handleHostLost();
 
         // Physical keys currently held down (e.code → keyup payload). Used to
         // release everything when the window loses focus: the OS can steal focus
@@ -1276,6 +1744,12 @@ export class StreamView {
         // Bound handlers
         this._onKeyDown = (e) => this.handleKeyDown(e);
         this._onKeyUp = (e) => this.handleKeyUp(e);
+        this._onKeyPress = (e) => this.handleKeyPress(e);
+        // A dead key went out and its composition is still to come (true), and
+        // the keystroke after it, held back for the character the browser
+        // composes (see _deferComposedKey).
+        this._deadPending = false;
+        this._composedKey = null;
         this._onPaste = (e) => this.handlePaste(e);
         this._onPointerDownFlush = () => this._flushPendingClipboard();
         this._onWindowBlur = () => this._releaseAllPhysKeys();
@@ -1362,6 +1836,15 @@ export class StreamView {
         // Trackpad acceleration factor (CSS px → host deltas), user-configurable in Settings.
         this._touchSensitivity =
             typeof touchSensitivity === 'number' && touchSensitivity > 0 ? touchSensitivity : 2.0;
+        // Mouse sensitivity (Settings, 1 = the counts the mouse reported). The
+        // scaled motion keeps its fractions from one report to the next: at
+        // 0.5, two one-count moves are one count, not zero.
+        this._mouseSensitivity =
+            typeof opts.mouseSensitivity === 'number' && opts.mouseSensitivity > 0
+                ? opts.mouseSensitivity
+                : 1;
+        this._mouseCarryX = 0;
+        this._mouseCarryY = 0;
 
         // Virtual keyboard (touch devices): hidden capture element + toggle button.
         this._kbdBtn = null;
@@ -1369,9 +1852,18 @@ export class StreamView {
         this._kbdVisible = false;
         this._kbdBlurAt = 0; // timestamp of last capture blur
         this._onViewportResize = null; // VisualViewport handler (keyboard push-up)
+        // A Mac's invisible key field, where its dead keys compose (see
+        // _buildKeyField); null everywhere else.
+        this._keyField = null;
+        this._onKeyFieldPointerUp = null;
+
+        // The owner's Buy me a coffee button in the bar (_mountSupportButton).
+        this._supportBtn = null;
 
         // Mobile fullscreen button state
         this._mobileFsBtn = null;
+        // Stream volume control (desktop header, left of the Fullscreen button).
+        this._volumeCtl = null;
 
         // Mobile orientation tracking (see StreamViewFullscreen). _lastLandscape
         // is the orientation we last ACTED on: rotation signals arrive before
@@ -1391,7 +1883,14 @@ export class StreamView {
         // host as VK_ESCAPE) instead of exiting fullscreen. Fullscreen is then
         // left only via the keyboard combo. Synced on every fullscreenchange.
         this._keyboardLocked = false;
-        this._onFsChangeLock = () => this._syncKeyboardLock();
+        // The header's middle (Fullscreen button, volume) is laid out again on
+        // the way out, on every platform: a stream that started fullscreen
+        // ("Start streams in fullscreen") hid both, and on a desktop nothing
+        // else brought them back (issue #35).
+        this._onFsChangeLock = () => {
+            this._syncKeyboardLock();
+            this._updateMobileFsButtonVisibility();
+        };
         // Transient on-screen hint element (reused for the fullscreen-exit tip).
         this._transientHintEl = null;
         this._transientHintTimer = null;
@@ -1461,6 +1960,30 @@ export class StreamView {
         this._streamFps = opts.streamFps > 0 ? opts.streamFps : 0;
         this._peakArrivalFps = 0;
         this._rateGovernor = null;
+        // Tells a native host the moment a second frame waits at the decoder,
+        // and when it no longer does (DecodeQueueSignal): a host streaming at
+        // its own display's rate skips presents on it. Native host only.
+        this._queueSignal = new DecodeQueueSignal();
+        // Bench (plan framerate-hote): what the signal counts. decodeQueueSize
+        // sees only what waits IN FRONT of the decoder; a hardware decoder
+        // holds several more (8 frames measured behind a depth of 2 on
+        // DualRTX's iGPU). 'pending' counts every frame given to decode() and
+        // not yet out of it; 'delay' measures how long the oldest of them has
+        // waited beyond a usual decode (DecodeDelay).
+        this._queueSignalMode = '';
+        try {
+            this._queueSignalMode = localStorage.getItem('mw_decodequeue') || '';
+        } catch (e) {}
+        // 'delay30': the usual decode looked for over 30 s rather than 2 — a
+        // decoder that stays saturated makes a short window's minimum its
+        // queue, and the credit then stops holding it back.
+        this._decodeDelay = new DecodeDelay(this._queueSignalMode === 'delay30' ? 30000 : 2000);
+        // 'e2e': the same excess, counted from the frame's capture on the host
+        // (backendTs) rather than from decode(): it also sees a queue in the
+        // transport, or in front of the main thread — the N95's, which the
+        // decoder-side signals missed. The clocks' offset cancels in the
+        // excess over the minimum; 10 s of history.
+        this._e2eDelay = new DecodeDelay(10000);
         // Last config applied to the decoder, re-applied after a queue flush.
         this._activeDecoderCfg = null;
         // Last EncodedVideoChunk timestamp (µs) — enforces monotonicity.
@@ -1742,6 +2265,8 @@ export class StreamView {
             el.style.visibility = 'hidden';
         }
         const shell = shellIdentity();
+        // The eye test's split screen: a lab key, and its button only with it.
+        this._mwsrSplit = mwsrSplitWanted();
         el.innerHTML = `
             <div class="stream-header">
                 <div class="stream-brand" aria-hidden="true">
@@ -1784,7 +2309,7 @@ export class StreamView {
             </div>
             <div class="stream-canvas-area">
                 <canvas id="stream-canvas" class="stream-canvas"></canvas>
-                <video id="stream-video" class="stream-video" autoplay muted playsinline></video>
+                <video id="stream-video" class="stream-video" autoplay muted playsinline poster="${BLANK_POSTER}"></video>
                 <audio id="stream-audio" autoplay playsinline></audio>
                 <div id="stream-latency-mark" class="stream-latency-mark" hidden></div>
                 <div id="stream-input-layer" class="stream-input-layer"></div>
@@ -1797,6 +2322,12 @@ export class StreamView {
                     <button type="button" class="stream-input-gate-release"
                             id="stream-input-gate-release" hidden></button>
                 </div>
+                ${
+                    this._mwsrSplit
+                        ? `<button type="button" class="stream-mwsr-split" id="btn-mwsr-split"
+                                   title="Ctrl+Alt+Shift+G">${mwsrSplitLabel(this._mwsrSplit.view)}</button>`
+                        : ''
+                }
             </div>
         `;
         document.getElementById('app').appendChild(el);
@@ -1876,6 +2407,28 @@ export class StreamView {
         // over the video element.
         this.inputEl = /** @type {HTMLElement} */ (el.querySelector('#stream-input-layer'));
         this.inputEl.style.touchAction = 'none';
+        // The split screen's button, above the input layer: nothing of a press
+        // on it reaches the host, and it takes no focus (a Space for the host
+        // would press it again).
+        const splitBtn = el.querySelector('#btn-mwsr-split');
+        if (splitBtn) {
+            for (const type of [
+                'pointerdown',
+                'mousedown',
+                'mouseup',
+                'dblclick',
+                'contextmenu',
+                'wheel',
+            ])
+                splitBtn.addEventListener(type, (e) => {
+                    e.stopPropagation();
+                    if (type === 'mousedown' || type === 'contextmenu') e.preventDefault();
+                });
+            splitBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this._cycleMwsrSplit();
+            });
+        }
         // The pointer a touch screen draws for itself — see MOBILE_CURSOR_CLIENT_DRAWN.
         this._clientCursorEl = /** @type {HTMLImageElement} */ (
             el.querySelector('#stream-client-cursor')
@@ -1988,22 +2541,15 @@ export class StreamView {
         // ── Mouse-gaming-mode exit reminder (top-center, draggable) ────────
         // Discreet card that only appears once gaming mode has captured the
         // mouse. It reminds the single combo that frees the cursor, releases
-        // the full keyboard lock and leaves fullscreen. Touch devices never
-        // use gaming mode, so it is never built there.
-        if (!IS_TOUCH_DEVICE) {
+        // the full keyboard lock and leaves fullscreen. Devices without a
+        // mouse never use gaming mode, so it is never built there.
+        if (supportsGamingMode()) {
             this._gamingOverlay = document.createElement('div');
             this._gamingOverlay.id = 'stream-gaming-overlay';
             this._gamingOverlay.className = 'stream-gaming-overlay';
             this._buildGamingOverlayContent();
             this._rootEl.appendChild(this._gamingOverlay);
             this._makeStatsDraggable(this._gamingOverlay);
-            // × hides the reminder for the rest of the session.
-            this._gamingOverlay.addEventListener('click', (e) => {
-                if (!(/** @type {Element} */ (e.target).closest('.overlay-close-btn'))) return;
-                e.stopPropagation();
-                e.preventDefault();
-                this._closeOverlayEl(this._gamingOverlay);
-            });
         }
 
         // ── Cyberpunk "signal acquired" reveal ─────────────────────────────
@@ -2032,8 +2578,16 @@ export class StreamView {
         // covers the streamed image, leaving the header/letterbox untouched.
         this.canvasArea.appendChild(this._revealEl);
 
-        // Start overlay update timer (every 500ms)
-        this._overlayInterval = setInterval(() => this._updateOverlay(), 500);
+        // Start overlay update timer (every 500ms). The silent-decoder check,
+        // the renderer fallback and the pipeline governors ride on it: they
+        // read the same counters, whether the stats show or not.
+        this._overlayInterval = setInterval(() => {
+            this._checkSilentDecoder();
+            this._checkRendererFailed();
+            this._checkRendererCost();
+            this._runPipelineGovernors(performance.now());
+            this._updateOverlay();
+        }, 500);
 
         // ── Keyboard shortcuts slide ────────────────────────────────────────
         this._shortcutsSlide = document.createElement('div');
@@ -2109,6 +2663,7 @@ export class StreamView {
             // Insert before the quit button (first child)
             header.insertBefore(this._mobileFsBtn, header.firstChild);
         }
+        this._buildVolumeControl(header);
         // Initial state: desktop = visible, mobile = landscape only
         this._updateMobileFsButtonVisibility();
 
@@ -2142,6 +2697,9 @@ export class StreamView {
             this._kbdBtn.className = 'btn-stream-kbd stream-ctl-prestart';
             this._kbdBtn.innerHTML = Icons.keyboard;
             this._kbdBtn.title = t('stream.showKeyboard');
+            // A guest invited to watch has no keyboard to open: the keys would
+            // reach nothing. Shown again if the owner hands them input.
+            this._kbdBtn.hidden = !this._mouseAllowed;
             this._kbdBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this._toggleVirtualKeyboard();
@@ -2232,8 +2790,17 @@ export class StreamView {
                     algo: this._videoEnhancementAlgo,
                     ceiling: this._enhancerCeiling,
                     enhancerProfile: this._governorProfile(),
+                    // 4:4:4 negotiated: mwsr reconstructs the chroma too.
+                    yuv444: this._yuv444,
                     hdr: this._hdrEnabled,
                     pacing: this._pacingEnabled,
+                    frameSize: this._frameSize,
+                    // mwsr's gaze zone (a lab key, phones and tablets only).
+                    gazeZone: mwsrGazeWanted(),
+                    // mwsr's zones from the native host (a lab key, asked at /start).
+                    zoneMap: mwsrMapWanted(),
+                    // mwsr 2 / 3's deblocking (the debug menu's), null otherwise.
+                    deblock: this._mwsrDeblock,
                 },
                 [offscreen],
             );
@@ -2253,6 +2820,12 @@ export class StreamView {
                 webgpu: this._wantWebGpu,
                 algo: this._videoEnhancementAlgo,
                 ceiling: this._enhancerCeiling,
+                yuv444: this._yuv444,
+                gazeZone: mwsrGazeWanted(),
+                zoneMap: mwsrMapWanted(),
+                mwsrSplit: this._mwsrSplit,
+                deblock: this._mwsrDeblock,
+                plainWebGl: this._plainWebGl,
                 hdr: (this._useVideoSink && this._hdrEnabled) || this._hdrLinear,
                 hdrTonemap: this._hdrTonemap,
                 hdrLinear: this._hdrLinear,
@@ -2261,9 +2834,12 @@ export class StreamView {
                 videoEl: this._useVideoSink ? this.videoEl : null,
             }).then((r) => {
                 this._renderer = r;
+                this._contentAge.attach(r);
                 this._activeRendererKind = r.kind;
+                this._notePresentation(r.kind);
                 this._rendererHdrActive = !!r.hdrActive;
                 this._createEnhancerGovernor(r);
+                this._watchRendererCost(r);
                 this._applyRendererSink(r);
                 this._applyOutputSize();
                 this.setupDecoder();
@@ -2283,6 +2859,7 @@ export class StreamView {
             case 'rendererinfo':
                 // Worker reports which renderer it created (for the stats overlay).
                 this._activeRendererKind = m.kind;
+                this._notePresentation(m.kind);
                 this._rendererHdrActive = !!m.hdr;
                 break;
             case 'codecfallback':
@@ -2321,6 +2898,7 @@ export class StreamView {
                 this.stats.recoveries = m.recoveries || 0;
                 if (m.resolution && m.resolution !== this._resolution)
                     this._resolution = m.resolution;
+                this._enhancerPassthrough = !!m.passthrough;
                 // Client pipeline stages measured inside the worker (its own
                 // clock), already averaged over its 2s window.
                 if (m.clientDecodeMs > 0) this._clientDecodeStats.addSample(m.clientDecodeMs);
@@ -2343,6 +2921,7 @@ export class StreamView {
                 // The worker's governor stepped the enhancer up or down. The
                 // user's setting is untouched — only what runs right now, and
                 // what the overlay names.
+                this._noteEnhancerStep(m.algo);
                 this._videoEnhancementAlgo = m.algo;
                 this._enhancerDegraded = !!m.degraded;
                 this._rememberEnhancer(m.kind, ladderRung(m.algo), m.recoverAfterMs);
@@ -2390,6 +2969,13 @@ export class StreamView {
                             (frame.format || 'null'),
                     );
                 }
+                if (this._checkOpaqueHdrFrame(frame)) {
+                    frame.close();
+                    return;
+                }
+                // AV1 padded past the picture: cut to the host's size, before
+                // anything reads the frame (stream/FrameCrop.js).
+                if (this.videoCodec === CODEC_AV1) frame = cropToAnnounced(frame, this._frameSize);
                 this.onDecodedFrame(frame);
             },
             error: (err) => {
@@ -2570,7 +3156,10 @@ export class StreamView {
         this._lastIdrRequestMs = now;
         console.log('[StreamView] Requesting IDR (' + reason + ')');
         this._diag.noteRecovery('idr');
-        this.webrtc.send({ type: 'requestidr' });
+        // The reason goes along for the host's log: a guest that keeps asking
+        // is otherwise a list of requests with no why (12/10, an H.264 guest
+        // of the shared feed asking every second).
+        this.webrtc.send({ type: 'requestidr', reason });
         this._recordCongestionEvent('sv:' + reason);
     }
 
@@ -2598,6 +3187,7 @@ export class StreamView {
             this._congFiredAt = now;
             this._congEvents.length = 0;
             console.warn('[StreamView] Sustained congestion detected (last: ' + reason + ')');
+            if (this.autoCeilingMeter) this.autoCeilingMeter.noteCongestion();
             this.onCongestion();
         }
     }
@@ -2808,12 +3398,14 @@ export class StreamView {
                 });
         };
 
-        // Shared config fields
-        const shared = {
-            codedWidth: 1920,
-            codedHeight: 1080,
-            optimizeForLatency: true,
-        };
+        // The size the host really encodes, read from the SPS: Edge's hardware
+        // HEVC decoder crops every frame to the configured size (issue #23,
+        // see getPictureSize). 1080p only when the SPS cannot be read.
+        const pic = getPictureSize(this.nalParser);
+        const codedSize = pic
+            ? { codedWidth: pic.width, codedHeight: pic.height }
+            : { codedWidth: 1920, codedHeight: 1080 };
+        const shared = { ...codedSize, optimizeForLatency: true };
 
         // Decoder color space: HDR (BT.2020 + PQ) or SDR (BT.709).
         // HDR is detected from the codec string (HEVC Main10 / AV1 10-bit).
@@ -2855,6 +3447,15 @@ export class StreamView {
             fallbacks = fallbacks.filter((c) => isHevcHdrProfile(c));
             annexbStrings = annexbStrings.filter((c) => isHevcHdrProfile(c));
         }
+        // A 4:4:4 stream, the same way: a 4:2:0 profile configures fine and
+        // then fails every frame, three errors make a codec fallback, and the
+        // viewer ends in H.264 4:2:0 without a word (25/09/2026, an SDR HEVC
+        // RExt stream on Chrome with an AMD iGPU). Only the stream's own
+        // profile is tried; refused, the chain goes to the fallback at once.
+        if (isChroma444Profile(codec)) {
+            fallbacks = fallbacks.filter((c) => isChroma444Profile(c));
+            annexbStrings = annexbStrings.filter((c) => isChroma444Profile(c));
+        }
         // Chrome WebCodecs has historically rejected HEVC configs that include
         // an explicit colorSpace. We attempt it as the primary config for HEVC
         // too; if Chrome rejects it, the fallback chain skips to the next
@@ -2895,8 +3496,7 @@ export class StreamView {
             configsToTry.push({
                 codec: fbCodec,
                 description: desc.buffer,
-                codedWidth: 1920,
-                codedHeight: 1080,
+                ...codedSize,
                 optimizeForLatency: true,
                 ...vColor,
             });
@@ -2904,8 +3504,7 @@ export class StreamView {
             configsToTry.push({
                 codec: fbCodec,
                 description: desc.buffer,
-                codedWidth: 1920,
-                codedHeight: 1080,
+                ...codedSize,
                 optimizeForLatency: true,
             });
         }
@@ -2920,8 +3519,7 @@ export class StreamView {
             configsToTry.push({
                 codec: codec,
                 description: desc.buffer,
-                codedWidth: 1920,
-                codedHeight: 1080,
+                ...codedSize,
             });
             // Variant B: no optimizeForLatency, no codedWidth/codedHeight
             configsToTry.push({
@@ -2933,8 +3531,7 @@ export class StreamView {
             configsToTry.push({
                 codec: codec,
                 description: desc,
-                codedWidth: 1920,
-                codedHeight: 1080,
+                ...codedSize,
                 optimizeForLatency: true,
             });
             // Last resort: bare codec string, no description at all.
@@ -2949,6 +3546,15 @@ export class StreamView {
         }
 
         tryCodecs(configsToTry, 0, () => {
+            // A High 4:4:4 stream nothing here decodes: avc3 below is Baseline,
+            // 4:2:0 — the same trap as a Main string for HEVC RExt. The way out
+            // is H.264 without 4:4:4 (_computeCodecFallbackTarget).
+            if (isChroma444Profile(codec)) {
+                console.warn('[StreamView] No decoder for H.264 High 4:4:4 — H.264 4:2:0 fallback');
+                this.decoderConfiguring = false;
+                this._requestCodecFallback();
+                return;
+            }
             // All avc1 configs exhausted — try avc3 (in-band SPS/PPS).
             // Some browsers/devices prefer avc3 over avc1 for hardware decoding.
             console.warn('[GPU] All avc1 configs rejected, trying avc3 (in-band SPS/PPS)');
@@ -2984,7 +3590,12 @@ export class StreamView {
 
         cfgs.push({ codec, description: desc, ...shared });
         cfgs.push({ codec, description: desc.buffer, optimizeForLatency: true });
-        cfgs.push({ codec, description: desc.buffer, codedWidth: 1920, codedHeight: 1080 });
+        cfgs.push({
+            codec,
+            description: desc.buffer,
+            codedWidth: shared.codedWidth,
+            codedHeight: shared.codedHeight,
+        });
         cfgs.push({ codec, description: desc.buffer });
         cfgs.push({ codec, ...shared });
         cfgs.push({ codec, optimizeForLatency: true });
@@ -3080,6 +3691,12 @@ export class StreamView {
         const cur = (this.videoCodec === 'auto' ? 'hevc' : this.videoCodec).toLowerCase();
         this._codecFallback = target;
         this._codecFallbackRequested = true;
+        // An 8-bit 4:2:0 HEVC this browser could not decode: the browser keeps
+        // the verdict, and Auto asks it H.264 from the next launch on
+        // (CodecAuto.hevcFailedHere). Not an HDR or a 4:4:4 HEVC, which fail
+        // where plain HEVC may still decode.
+        if (cur === 'hevc' && !this._hdrEnabled && !this._yuv444 && target.codec === 'h264')
+            noteHevcFailed();
 
         console.warn(
             `[StreamView] Codec fallback: ${cur}${this._hdrEnabled ? ' HDR' : ''} → ` +
@@ -3106,6 +3723,138 @@ export class StreamView {
     }
 
     /**
+     * A guest on the native host's shared feed: the feed goes H.264 for
+     * everyone (another guest's browser decodes no HEVC) and the one this page
+     * watches ends in a moment. Back in, in H.264, exactly as this page's own
+     * codec fallback comes back — the app relaunches it on the quit.
+     */
+    _followFeedCodec(codec) {
+        if (codec !== 'h264' || !this._playerMode) return;
+        if (this._codecFallbackRequested || this._quitting || this._manualQuitting) return;
+        const cur = (this.videoCodec === 'auto' ? 'hevc' : this.videoCodec).toLowerCase();
+        if (cur === 'h264') return;
+        console.warn('[StreamView] The shared feed goes H.264 — rejoining in it');
+        this._codecFallback = { codec: 'h264', hdr: false };
+        this._codecFallbackRequested = true;
+        this.quit();
+    }
+
+    /**
+     * A decoder gone silent: chunks keep going in, no picture comes out, and
+     * WebCodecs says nothing (SilentDecoderWatch). Checked on the overlay's
+     * tick, for the main thread's decoder and the worker's alike.
+     *
+     * On a stream that rides losses out, that is this device's decoder failing
+     * under the refresh wave — the Freebox Player POP's does, for good, a few
+     * seconds in. On keyframes already, from a host that heals a loss by a
+     * reference repair, the repairs are what is left: the same box falls
+     * silent every 2.5 s under AMF's long-term references at 30 fps. Either
+     * way the device keeps the verdict and the session comes back, the same
+     * app in the same codec, relaunched the way a codec fallback is — at most
+     * twice, one verdict each. Not a guest: the feed is the owner's, and it
+     * would come back the same. Elsewhere, the ordinary recovery: a new
+     * decoder and a keyframe on the main thread; the worker's is asked for one.
+     */
+    _checkSilentDecoder(now = performance.now()) {
+        if (this._quitting || this._manualQuitting || this._codecFallbackRequested) return;
+        if (this._decoderRecovering || this._standby) return;
+        // A hidden page may be decoding nothing on purpose: count from its return.
+        if (typeof document !== 'undefined' && document.hidden) {
+            this._silentWatch.reset();
+            return;
+        }
+        const silence = this._silentWatch.observe(
+            this.stats.received,
+            this.stats.decoded,
+            now,
+            this.stats.recoveries || 0,
+        );
+        if (!silence) return;
+        // A decoder that failed in the stretch (an error, a recovery still
+        // under way) or never gave a picture is broken, not silent: the stream
+        // is not to blame, and no verdict is kept. A Mi TV whose decoder said
+        // "Decoding error" to everything until a reboot blamed the wave and
+        // the repairs that way (01/10/2026).
+        const broken =
+            this.stats.decoded === 0 || silence.faults > 0 || !!this._recoveryStartedPerf;
+        const ridingOut = !broken && !!(this.webrtc && this.webrtc.rideOutLoss);
+        const repaired = !broken && !ridingOut && this._refInvalidation === true;
+        console.warn(
+            '[StreamView] Decoder went silent: ' +
+                silence.chunks +
+                ' chunks in, no picture for ' +
+                Math.round(silence.ms) +
+                ' ms' +
+                (broken ? ' — a failing decoder, no verdict' : '') +
+                (ridingOut ? ' — under the refresh wave' : '') +
+                (repaired ? " — under the host's reference repairs" : ''),
+        );
+        if (this.autoCeilingMeter) this.autoCeilingMeter.noteSick('decoder_silent', true);
+        if (ridingOut) noteDecoderCannotRideOut();
+        if (repaired) noteDecoderRefusesReferenceRepairs();
+        if ((ridingOut || repaired) && !this._playerMode) {
+            this._relaunchOnKeyframes();
+        } else if (this._videoWorker) {
+            this._requestIdr('decoder silent');
+        } else {
+            this._handleDecoderError(new Error('Decoder went silent'));
+        }
+    }
+
+    /** The same app, in the same codec, launched again: see _checkSilentDecoder. */
+    _relaunchOnKeyframes() {
+        if (this._codecFallbackRequested || this._quitting || this._manualQuitting) return;
+        const codec = (this.videoCodec === 'auto' ? 'hevc' : this.videoCodec).toLowerCase();
+        this._codecFallback = { codec, hdr: !!this._hdrEnabled, reason: 'silent-decoder' };
+        this._codecFallbackRequested = true;
+        this.quit();
+    }
+
+    /**
+     * The first frame of an HDR readback route (_hdrYuv), looked at once: an
+     * opaque one (format null) is an HDR frame with nothing to read back, the
+     * decoder having run in hardware whatever it was asked. The 8-bit frame of
+     * a host that kept SDR goes through the import as any SDR frame does, and
+     * is left alone: its transfer is neither PQ nor HLG.
+     * @param {VideoFrame} frame
+     * @returns {boolean} true when the session is on its way back without it
+     */
+    _checkOpaqueHdrFrame(frame) {
+        if (!this._hdrYuv || this._opaqueHdrChecked) return false;
+        this._opaqueHdrChecked = true;
+        const transfer = frame.colorSpace && frame.colorSpace.transfer;
+        if (frame.format || (transfer !== 'pq' && transfer !== 'hlg')) return false;
+        return this._relaunchWithoutReadback();
+    }
+
+    /**
+     * No readback in this browser: the verdict kept (hdrFramesOpaque), and the
+     * session back on a route without one, relaunched as a codec fallback is.
+     * Where that route imports the frame for the tone-map (WebKit), in HEVC:
+     * WebKit breaks the chroma of the AV1 10-bit frame it imports and takes an
+     * HEVC one right (26/10/2026). Elsewhere in AV1 again, on the <video> sink
+     * of an HDR display (true HDR, no enhancer) or the browser's own tone-map.
+     * A guest keeps the verdict and stays: the feed is the owner's.
+     * @returns {boolean} whether the session is relaunched
+     */
+    _relaunchWithoutReadback() {
+        if (this._codecFallbackRequested || this._quitting || this._manualQuitting) return false;
+        noteHdrFramesOpaque();
+        if (this._playerMode) return false;
+        const codec = hdrExtTonemapRoute() ? 'hevc' : 'av1';
+        console.warn(
+            '[StreamView] HDR: the decoder hands opaque frames, nothing to read back — ' +
+                'relaunching in ' +
+                codec +
+                ' HDR without the readback',
+        );
+        this._codecFallback = { codec, hdr: true, reason: 'opaque-hdr-frames' };
+        this._codecFallbackRequested = true;
+        this.quit();
+        return true;
+    }
+
+    /**
      * Compute the next {codec, hdr} step in the fallback chain from the current
      * codec + HDR state, or null when nothing remains (already H.264 SDR).
      *
@@ -3123,6 +3872,8 @@ export class StreamView {
         if (cur === 'hevc' || cur === 'av1') {
             return { codec: 'h264', hdr: false };
         }
+        // H.264 High 4:4:4 → H.264 4:2:0: the relaunch drops 4:4:4 (launchApp).
+        if (cur === 'h264' && this._yuv444) return { codec: 'h264', hdr: false };
         return null;
     }
 
@@ -3142,15 +3893,21 @@ export class StreamView {
         }
         while (this.pendingFrames.length > 0) {
             const entry = this.pendingFrames.shift();
-            this.decodeFrame(entry.data, entry.isKeyframe, entry.backendTs, entry.arrivalAbs);
+            this.decodeFrame(
+                entry.data,
+                entry.isKeyframe,
+                entry.backendTs,
+                entry.arrivalAbs,
+                entry.zones,
+            );
         }
     }
 
-    decodeFrame(data, isKeyframe, backendTs, arrivalAbs = 0) {
+    decodeFrame(data, isKeyframe, backendTs, arrivalAbs = 0, zones = null) {
         if (!this.decoderConfigured) {
             // Buffer until decoder is ready (limit to avoid OOM)
             if (this.pendingFrames.length < 120) {
-                this.pendingFrames.push({ data, isKeyframe, backendTs, arrivalAbs });
+                this.pendingFrames.push({ data, isKeyframe, backendTs, arrivalAbs, zones });
             }
             return;
         }
@@ -3278,13 +4035,26 @@ export class StreamView {
                 duration: 16667,
                 data: avccData,
             });
-            this._trackChunkSubmit(timestamp, backendTs);
+            // The frame's size: the picture's motion, for the gaze zone of mwsr.
+            if (this._renderer) this._renderer.noteEncodedFrame(avccData.length, isKeyframe);
+            // mwsr 3: the frame's QP, from its first slice header (nothing read otherwise).
+            if (this._renderer && this._renderer.wantsFrameQp)
+                this._renderer.noteFrameQp(timestamp, this._frameQp(data));
+            // mwsr's zones from the native host, kept by the chunk's timestamp.
+            if (zones && this._renderer && this._renderer.wantsFrameZones)
+                this._renderer.noteFrameZones(timestamp, zones);
+            this._trackChunkSubmit(timestamp, backendTs, {
+                arrived: arrivalAbs > 0 ? arrivalAbs - performance.timeOrigin : 0,
+                bytes: avccData.length,
+                key: isKeyframe,
+            });
             if (arrivalAbs > 0) {
                 const arriveMs = performance.timeOrigin + performance.now() - arrivalAbs;
                 if (arriveMs >= 0 && arriveMs < 5000) this._clientArriveStats.addSample(arriveMs);
             }
             this.decoder.decode(chunk);
             this.stats.received++;
+            this._tellDecodeQueue();
             // Keyframe successfully submitted: reference is valid again.
             // Also restart the saturation clock — the stale value would count
             // the recovery wait as queue stall and trigger an instant reset.
@@ -3301,6 +4071,20 @@ export class StreamView {
     }
 
     /**
+     * The QP of a frame for mwsr 3 (SliceQp.js), from its Annex B access unit;
+     * the reader made on first use, per codec.
+     * @param {Uint8Array} annexB
+     * @returns {number|null}
+     */
+    _frameQp(annexB) {
+        const codec = this.nalParser.codec;
+        if (!this._sliceQp || this._sliceQp.codec !== codec) {
+            this._sliceQp = new SliceQpReader(codec);
+        }
+        return this._sliceQp.read(annexB);
+    }
+
+    /**
      * Record the decode() submit time of a chunk for the client pipeline
      * latency measurement, plus its capture stamp for the presentation pacer.
      * Entries are consumed in onDecodedFrame; frames the decoder never outputs
@@ -3311,11 +4095,13 @@ export class StreamView {
      * timestamp: the H.264/HEVC path derives that timestamp from backendTs but
      * nudges it to stay monotonic, and AV1 makes it up (frameCount * 16667).
      */
-    _trackChunkSubmit(timestamp, backendTs) {
+    /** @param {{arrived?: number, bytes?: number, key?: boolean}} [frame] for the frame log */
+    _trackChunkSubmit(timestamp, backendTs, frame = null) {
         if (this._chunkSubmitTimes.size > 240) this._chunkSubmitTimes.clear();
         this._chunkSubmitTimes.set(timestamp, {
             perf: performance.now(),
             backendTs: backendTs || 0,
+            frame,
         });
     }
 
@@ -3342,11 +4128,60 @@ export class StreamView {
         this._diag.noteRecovery('flush');
         this._lastQueueFlushMs = performance.now();
         console.warn('[StreamView] Decode queue flushed at the keyframe: ' + queued + ' stale');
+        this._tellDecodeQueue();
         return true;
+    }
+
+    /** Tell a native host where the decode queue stands (DecodeQueueSignal). */
+    _tellDecodeQueue() {
+        if (!this._nativeHost || !this.decoder) return;
+        const now = performance.now();
+        let depth = this.decoder.decodeQueueSize;
+        // The detection's net: a queue that holds above this screen's rate.
+        if (this._stepper) this._stepper.noteDecodeQueue(depth, now);
+        if (this._queueSignalMode === 'pending') {
+            depth = this._chunkSubmitTimes.size;
+        } else if (this._queueSignalMode === 'e2e') {
+            let oldestE2e = 0;
+            for (const [ts, e] of this._chunkSubmitTimes) {
+                if (now - e.perf >= 1000) {
+                    this._chunkSubmitTimes.delete(ts);
+                    continue;
+                }
+                if (e.backendTs > 0) oldestE2e = now - e.backendTs + E2E_SHIFT;
+                break;
+            }
+            depth = this._e2eDelay.depth(oldestE2e, this._diag.arrivalAvgMs);
+        } else if (
+            this._queueSignalMode === 'delay' ||
+            this._queueSignalMode === 'delay30' ||
+            this._queueSignalMode === 'mixed'
+        ) {
+            // The oldest frame still in the decoder: the map keeps decode()
+            // order and loses each entry at its output. One gone for longer
+            // than any decode takes was dropped by the decoder, not queued.
+            let oldestAge = 0;
+            for (const [ts, e] of this._chunkSubmitTimes) {
+                if (now - e.perf < 1000) {
+                    oldestAge = now - e.perf;
+                    break;
+                }
+                this._chunkSubmitTimes.delete(ts);
+            }
+            depth = this._decodeDelay.depth(oldestAge, this._diag.arrivalAvgMs);
+            // 'mixed': a delay, or three frames in the decoder — a count for a
+            // decoder that gives a picture back only when the next one comes,
+            // with one frame of room for one that keeps two in flight.
+            if (this._queueSignalMode === 'mixed')
+                depth = Math.max(depth, this._chunkSubmitTimes.size - 1);
+        }
+        const msg = this._queueSignal.observe(depth, now);
+        if (msg) this._sendToHost(msg);
     }
 
     onDecodedFrame(frame) {
         this.stats.decoded++;
+        this._tellDecodeQueue();
 
         // A successful decode means we've recovered — reset the counter
         this._recoveryAttempts = 0;
@@ -3389,9 +4224,26 @@ export class StreamView {
             this._chunkSubmitTimes.delete(frame.timestamp);
             const decodeMs = outPerf - submit.perf;
             if (decodeMs >= 0 && decodeMs < 5000) this._clientDecodeStats.addSample(decodeMs);
+            this._decodeDelay.noteLatency(decodeMs, outPerf);
+            if (submit.backendTs > 0)
+                this._e2eDelay.noteLatency(outPerf - submit.backendTs + E2E_SHIFT, outPerf);
             frame._mwDecodedPerf = outPerf;
+            frame._mwLog = submit.frame;
             backendTs = submit.backendTs;
         }
+        // The frame's host stamp for what measures its age: AV1 hands its
+        // pacer a zero (synthetic chunk timestamps, presented on decode), not
+        // its stamp, which rides with the frame's log entry. The detection,
+        // the content-age probe and the frame log read it there; the pacer
+        // and the vsync grid keep the zero.
+        const hostTs = backendTs || (submit && submit.frame && submit.frame.hostTs) || 0;
+        frame._mwHostTs = hostTs;
+        if (this._contentAge.running) this._contentAge.onDecoded(frame, hostTs);
+        // The vsync grid's ready time: decoded, on vsync — the render loop
+        // draws the freshest frame at the refresh. Drawn, when tearing (below).
+        frame._mwBackendTs = backendTs;
+        if (!this._immediateRender && this._vsyncGrid.running)
+            this._vsyncGrid.noteReady(backendTs, outPerf);
 
         // Presentation deadline (see FramePacer). Timed from the decoder output
         // rather than network arrival on purpose: decode time varies too, and it
@@ -3406,7 +4258,15 @@ export class StreamView {
         // Closing it mid-render zeroes its NV12 buffer → green screen on Chrome.
         // With a reserve, frames legitimately wait their turn, so the cap has to
         // clear the deepest reserve (25ms = 3 frames @120fps) plus arrival bunching.
-        if (this.frameQueue.length >= (this._framePacer ? 6 : 3)) {
+        const queueCap = this._framePacer ? 6 : 3;
+        // Tearing pumps on decode, nowhere else. Frames decoded before the
+        // renderer was there (an HDR one compiles its pipelines while dav1d
+        // already decodes) fill the queue with no pump to empty it, and every
+        // frame after them was dropped here, before the pump below: a black
+        // screen for good, one AV1 HDR launch in two (26/10/2026). The pump
+        // trims what waits — a queued frame is not being drawn — and draws.
+        if (this.frameQueue.length >= queueCap && this._immediateRender) this._pumpRender();
+        if (this.frameQueue.length >= queueCap) {
             frame.close();
             this.stats.dropped++;
             this._diag.noteDrop('queueFull');
@@ -3520,6 +4380,10 @@ export class StreamView {
         this._syncClipboardPreferences();
         // The console handle follows the visible view.
         if (this._latencyProbe) window.mwLatency = this._latencyProbe;
+        window.mwContentAge = this._contentAge;
+        window.mwFrameLog = this._frameLog;
+        window.mwAudio = this._audioStats;
+        window.mwVsyncGrid = this._vsyncGrid;
         if (this._rootEl) this._rootEl.style.visibility = '';
         // This leg is the live stream now, so it needs the full header — the
         // owner's Share menu above all: the retiring view takes its own away
@@ -3530,10 +4394,15 @@ export class StreamView {
         this._acquireWakeLock();
         this.bindEvents();
         if (this._gamepadManager) this._gamepadManager.start();
+        // The live leg's microphone goes with it; this one sends from now on.
+        if (this._mic) this._mic.release();
         // Unmuting an element the browser only let play BECAUSE it was muted
         // pauses it, unless the unmute happens on a user activation — and an
         // automatic quality degradation has none. Restart it, with the same
         // gesture retry as the ontrack path if that restart is refused too.
+        // The level may have been changed on the live view since this one was
+        // built in the background.
+        this._applyVolume();
         if (this.audioEl) {
             this.audioEl.muted = false;
             if (this.audioEl.paused) {
@@ -3589,7 +4458,214 @@ export class StreamView {
         const consoleBtn = this._rootEl.querySelector('#btn-stream-console');
         if (consoleBtn) consoleBtn.classList.remove('stream-ctl-prestart');
         if (this._kbdBtn) this._kbdBtn.classList.remove('stream-ctl-prestart');
+        this._mountGamepadButton();
+        this._mountMicButton();
         this._mountShareMenu();
+        this._mountGuestPresence();
+        this._mountSupportButton();
+    }
+
+    /**
+     * A guest's count of who is on this stream, the owner's Share button's
+     * counterpart: names on hover, a toast for each arrival and departure
+     * (issue #47). Guests only. Idempotent.
+     */
+    _mountGuestPresence() {
+        if (!this._playerMode || this._presence || !this._rootEl) return;
+        const header = /** @type {HTMLElement} */ (this._rootEl.querySelector('.stream-header'));
+        if (!header) return;
+        const quitBtn = /** @type {HTMLElement} */ (this._rootEl.querySelector('#btn-stream-quit'));
+        this._presence = new GuestPresence(header, quitBtn);
+        this._presence.mount();
+    }
+
+    /**
+     * The owner's "Buy me a coffee" button, first of the bar's right-hand
+     * controls — the same button as the header's, once this browser has
+     * streamed enough for it (util/supportNudge.js decides, and Settings can
+     * hide it for good). The official cup alone, white outline and yellow
+     * coffee, with no button around it: over a game, anything more draws the
+     * eye. CSS drops it from a phone held upright, where the bar has no room.
+     *
+     * A <button>, not a link: this overlay is a trackpad, and its touch layer
+     * lets only buttons through. It opens the page in a new tab, so the stream
+     * keeps running in this one. Never for a guest, never in booth mode.
+     * Idempotent.
+     */
+    _mountSupportButton() {
+        if (this._supportBtn || this._playerMode || BackendClient.adminLocked || !this._rootEl)
+            return;
+        const brand = this._rootEl.querySelector('.stream-header .stream-brand');
+        if (!brand || !showSupportButton()) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'stream-support-btn';
+        btn.innerHTML = BMC_LOGO;
+        btn.title = t('support.tooltip');
+        btn.setAttribute('aria-label', t('support.action'));
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            openSupportPage();
+        });
+        // Right after the mark: the controls that follow (Console, keyboard,
+        // Share…) all go in before Stop, so this one stays leftmost.
+        brand.after(btn);
+        this._supportBtn = btn;
+    }
+
+    /**
+     * A share guest's controller button: check the pad, remap it, or switch
+     * to another one. Guests only — the owner maps every pad from Settings —
+     * and only when the invitation allows a gamepad. Idempotent.
+     */
+    _mountGamepadButton() {
+        if (!this._playerMode || !this._gamepadAllowed || this._padBtn || !this._rootEl) return;
+        const header = this._rootEl.querySelector('.stream-header');
+        const quitBtn = this._rootEl.querySelector('#btn-stream-quit');
+        if (!header) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.id = 'btn-stream-pad';
+        btn.className = 'btn-stream-pad';
+        btn.innerHTML = Icons.gamepad;
+        btn.title = t('stream.gamepadButton');
+        btn.setAttribute('aria-label', t('stream.gamepadButton'));
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this._openGamepadDialog(this._gamepadManager?.forwardedKey() || this._padKey);
+        });
+        header.insertBefore(btn, quitBtn || null);
+        this._padBtn = btn;
+    }
+
+    /**
+     * The microphone's mute button, when the host took the viewer's
+     * microphone. Muting sends silence rather than dropping the track, so the
+     * host's virtual microphone stays where the apps found it.
+     *
+     * Right of the speaker, between it and the Fullscreen button, wherever
+     * that button is laid out (_positionGamingOverlay docks it there); where
+     * it is not — a phone held upright — it waits before Stop, so a viewer
+     * can always mute. Idempotent.
+     */
+    _mountMicButton() {
+        if (!this._mic || this._micBtn || !this._rootEl) return;
+        const header = this._rootEl.querySelector('.stream-header');
+        const quitBtn = this._rootEl.querySelector('#btn-stream-quit');
+        if (!header) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.id = 'btn-stream-mic';
+        btn.className = 'btn-stream-pad btn-stream-mic';
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this._toggleMicSaid();
+            this._syncMicButton();
+            // Space in the game would toggle it again.
+            btn.blur();
+        });
+        // After the volume in the tab order, as on screen.
+        const after = this._volumeCtl || this._mobileFsBtn;
+        if (after && after.parentElement === header) after.after(btn);
+        else header.insertBefore(btn, quitBtn || null);
+        this._micBtn = btn;
+        this._syncMicButton();
+        this._positionGamingOverlay();
+        this._showMicHintOnce();
+    }
+
+    /**
+     * It starts cut, which a viewer who left the default has no reason to guess:
+     * said once on this browser, at the first stream that offers it.
+     */
+    _showMicHintOnce() {
+        if (this._standby) return;
+        try {
+            if (localStorage.getItem(MIC_HINT_KEY)) return;
+            localStorage.setItem(MIC_HINT_KEY, '1');
+        } catch (_e) {
+            /* a blocked storage would say it at every stream: not said at all */
+            return;
+        }
+        const combo = /Mac/.test(navigator.platform) ? 'Cmd+Option+Ctrl+P' : 'Ctrl+Alt+Shift+P';
+        Toast.info(t('stream.micStartsOff', { combo }));
+    }
+
+    /**
+     * Opens or cuts the microphone, from the button or the shortcut. Said on
+     * screen once it really changed: in fullscreen the button is out of sight,
+     * and a refusal has its own message.
+     */
+    _toggleMicSaid() {
+        const mic = this._mic;
+        if (!mic) return;
+        const before = mic.state === 'live';
+        mic.toggleMuted().then(() => {
+            const now = mic.state === 'live';
+            if (now !== before) {
+                Toast.info(t(now ? 'stream.micOn' : 'stream.micOff'), { durationMs: 1500 });
+            }
+        });
+    }
+
+    /**
+     * The button as the microphone stands. Lit only once it really sends: not
+     * while the permission prompt is up. Still clickable after a refusal, as
+     * the viewer may have allowed it in the browser since.
+     */
+    _syncMicButton() {
+        const btn = this._micBtn;
+        if (!btn || !this._mic) return;
+        const state = this._mic.state;
+        const off = state !== 'live';
+        btn.innerHTML = off ? Icons.micOff : Icons.mic;
+        btn.classList.toggle('is-off', off);
+        const label =
+            state === 'denied'
+                ? t('stream.micDenied')
+                : state === 'error'
+                  ? t('stream.micError')
+                  : off
+                    ? t('stream.micUnmute')
+                    : t('stream.micMute');
+        btn.title = label;
+        btn.setAttribute('aria-label', label);
+        btn.setAttribute('aria-pressed', off ? 'true' : 'false');
+    }
+
+    /** @param {string} state - MicUplink.state */
+    _onMicState(state) {
+        this._syncMicButton();
+        // A standby leg's own refusal would only repeat the live one's.
+        if ((state === 'denied' || state === 'error') && !this._standby) {
+            Toast.warning(t(state === 'denied' ? 'stream.micDenied' : 'stream.micError'));
+        }
+    }
+
+    /**
+     * The controller dialog over the stream. The pad stops reaching the host
+     * while it is open (mapping "A" must not press A in the game), and a guest
+     * who picks another pad in it switches the one forwarded.
+     */
+    _openGamepadDialog(key) {
+        if (this._gamepadDialog && this._gamepadDialog.isOpen) return;
+        const gm = this._gamepadManager;
+        this._gamepadDialog = new GamepadRemapDialog({
+            container: this._rootEl || document.body,
+            padKey: key || null,
+            mode: 'auto',
+            onOpen: () => this._holdPads('remap'),
+            onClose: () => {
+                this._releasePads('remap');
+                if (this._padBtn) this._padBtn.classList.remove('is-attention');
+            },
+            onPadChange: (k) => {
+                if (!this._playerMode) return;
+                this._padKey = k;
+                if (gm) gm.setPreferredPad(k);
+            },
+        });
+        this._gamepadDialog.open();
     }
 
     /**
@@ -3610,6 +4686,9 @@ export class StreamView {
         // model is settled. Gate on the declared capability, not the product
         // name: the day this comes back, it comes back for every co-op backend.
         if (this.host?.supportsLobbies === true) return;
+        // Booth mode (--noadmin) lets no guest in, unless the owner set
+        // share_in_booth_mode (issue #40).
+        if (BackendClient.adminLocked && !BackendClient.boothShare) return;
         const menu = new ShareMenu(header, quitBtn, this.host);
         this._shareMenu = menu;
         menu.mount().then((mounted) => {
@@ -3642,7 +4721,6 @@ export class StreamView {
             panY: this._panY,
             kbdVisible: this._kbdVisible === true,
             statsClosed: this._statsClosed === true,
-            gamingClosed: this._gamingClosed === true,
         };
     }
 
@@ -3667,15 +4745,11 @@ export class StreamView {
         this._applyViewState(state);
     }
 
-    /** Carry the × dismissals of the stats / gaming-mode cards to this view. */
+    /** Carry the × dismissal of the stats card to this view. */
     _adoptOverlayDismissals(s) {
         if (s.statsClosed) {
             this._statsClosed = true;
             if (this._overlayEl) this._overlayEl.style.display = 'none';
-        }
-        if (s.gamingClosed) {
-            this._gamingClosed = true;
-            this._updateGamingOverlay();
         }
     }
 
@@ -3780,6 +4854,203 @@ export class StreamView {
                 this.videoEl.style.display = 'none';
             if (this.canvas) this.canvas.style.display = '';
         }
+    }
+
+    /** The plain picture's main-thread renderer: watch what its draw costs. */
+    _watchRendererCost(r) {
+        this._rendererFallback =
+            this._plainPicture && !this._useWorker && (r.kind === 'canvas2d' || r.kind === 'webgl')
+                ? new RendererFallback(r.kind)
+                : null;
+    }
+
+    /**
+     * Feed RendererFallback on the 500 ms tick, whether the stats card shows
+     * or not, and carry out its verdict.
+     */
+    _checkRendererCost() {
+        const f = this._rendererFallback;
+        if (!f || !this._renderer || this._quitting || this._swappingRenderer) return;
+        if (!this._firstFrameRendered || this._standby) return;
+        const d = this._diag.snapshot();
+        const step = f.update({
+            submitMs: d.renderSubmitMs,
+            arrivalMs: d.arrivalAvgMs,
+            now: performance.now(),
+        });
+        if (!step) return;
+        const ms = (v) => v.toFixed(1) + ' ms';
+        const from = this._renderer.kind;
+        if (step.action === 'keep') {
+            console.log(
+                '[StreamView] Renderer: ' +
+                    step.kind +
+                    ' draws in ' +
+                    ms(step.toMs) +
+                    ', ' +
+                    ms(step.fromMs) +
+                    ' before — kept, and remembered on this device',
+            );
+            rememberPlainRenderer(step.kind);
+            return;
+        }
+        console.log(
+            '[StreamView] Renderer: ' +
+                from +
+                ' draws cost ' +
+                ms(step.action === 'switch' ? step.fromMs : step.toMs) +
+                ' a frame, frames arrive every ' +
+                ms(step.budgetMs) +
+                (step.action === 'switch'
+                    ? ' — trying ' + step.kind
+                    : ', no better than ' + ms(step.fromMs) + ' — back to ' + step.kind),
+        );
+        this._swapPlainRenderer(step.kind);
+    }
+
+    /**
+     * Put the plain picture on the other renderer. A canvas keeps the first
+     * context it was given, so the new renderer gets a fresh copy of the
+     * element, which takes the old one's place at its first draw
+     * (_showNextCanvas). Until then the old renderer keeps drawing.
+     * @param {'canvas2d'|'webgl'} kind
+     */
+    async _swapPlainRenderer(kind) {
+        this._swappingRenderer = true;
+        const el = /** @type {HTMLCanvasElement} */ (this.canvas.cloneNode(false));
+        let r = null;
+        try {
+            r = await createVideoRenderer(el, {
+                desynchronized: this._tearing,
+                videoCodec: this.videoCodec,
+                isChromeWindowsHevc: this._isChromeWindowsHevc,
+                webgpu: false,
+                algo: 'off',
+                ceiling: 'off',
+                gazeZone: mwsrGazeWanted(),
+                plainWebGl: kind === 'webgl',
+            });
+        } catch (e) {
+            console.warn('[StreamView] Renderer: ' + kind + ' did not start: ' + e.message);
+        }
+        this._swappingRenderer = false;
+        // WebGL2 refused: createVideoRenderer answered with Canvas2D instead.
+        if (r && r.kind !== kind) {
+            r.dispose();
+            r = null;
+        }
+        if (!r || this._quitting || !this.renderRunning) {
+            if (r) r.dispose();
+            if (!r && this._rendererFallback) {
+                this._rendererFallback.abandon();
+                console.log('[StreamView] Renderer: no ' + kind + ' here, staying put');
+            }
+            return;
+        }
+        this._takeOverRenderer(r, el);
+    }
+
+    /**
+     * A renderer that gave up (VideoRenderer.failed: a WebGPU renderer no
+     * frame could reach, or whose device did not come back) hands the picture
+     * over, on the 500 ms tick and once. The main-thread path only: the
+     * worker's canvas stays the worker's, its renderer gives up all the same
+     * and says so in the console.
+     */
+    _checkRendererFailed() {
+        const r = this._renderer;
+        if (!r || !r.failed || r === this._failedRenderer) return;
+        if (this._quitting || this._swappingRenderer) return;
+        this._failedRenderer = r;
+        if (this.autoCeilingMeter) this.autoCeilingMeter.noteSick('renderer_failed', true);
+        this._replaceFailedRenderer();
+    }
+
+    /**
+     * Move the picture off the renderer that gave up (rendererAfterFailure):
+     * the pass it ran onto its WebGL2 twin, the plain copy where the setting
+     * has no pass, Canvas2D where WebGL2 refuses, rather than black. The new
+     * renderer gets a fresh copy of the canvas, as in _swapPlainRenderer, and
+     * the ladder starts again from the rung the old one stood on.
+     */
+    async _replaceFailedRenderer() {
+        const from = this._renderer.kind;
+        const next = rendererAfterFailure({
+            ceiling: ladderRung(this._enhancerCeiling),
+            pass: ladderRung(this._videoEnhancementAlgo),
+            plainWebGl: this._plainWebGl,
+        });
+        this._swappingRenderer = true;
+        const el = /** @type {HTMLCanvasElement} */ (this.canvas.cloneNode(false));
+        let r = null;
+        try {
+            r = await createVideoRenderer(el, {
+                desynchronized: this._tearing,
+                videoCodec: this.videoCodec,
+                isChromeWindowsHevc: this._isChromeWindowsHevc,
+                webgpu: false,
+                yuv444: this._yuv444,
+                gazeZone: mwsrGazeWanted(),
+                ...next,
+            });
+        } catch (e) {
+            console.warn(
+                '[StreamView] Renderer: nothing took over from ' + from + ': ' + e.message,
+            );
+        }
+        this._swappingRenderer = false;
+        if (!r || this._quitting || !this.renderRunning) {
+            if (r) r.dispose();
+            return;
+        }
+        console.warn(
+            '[StreamView] Renderer: ' +
+                from +
+                ' gave up, the picture goes on ' +
+                r.kind +
+                (r.kind === 'webgl' && next.algo !== 'off' ? ' (' + next.algo + ')' : ''),
+        );
+        const gov = this._governor;
+        this._enhancerStart =
+            gov && gov.degraded ? { rung: gov.level, recoverAfterMs: gov.recoverAfterMs } : null;
+        if (next.ceiling !== 'off') this._enhancerCeiling = next.ceiling;
+        this._videoEnhancementAlgo = r.kind === 'webgl' ? next.algo : 'off';
+        this._wantWebGpu = false;
+        this._takeOverRenderer(r, el);
+        this._enhancerDegraded = !!(this._governor && this._governor.degraded);
+    }
+
+    /**
+     * A renderer made on a fresh copy of the canvas (`el`) takes the old one's
+     * place: it draws from the next frame on, and its canvas goes on the page
+     * at its first picture (_showNextCanvas). Until then the old renderer's
+     * canvas stays.
+     */
+    _takeOverRenderer(r, el) {
+        const old = this._renderer;
+        this._renderer = r;
+        this._nextCanvas = el;
+        this._activeRendererKind = r.kind;
+        this._notePresentation(r.kind);
+        this._rendererHdrActive = !!r.hdrActive;
+        this._governor = null;
+        this._createEnhancerGovernor(r);
+        this._contentAge.attach(r);
+        this._applyOutputSize();
+        // A draw of the old renderer may still be finishing.
+        setTimeout(() => old.dispose(), 1000);
+    }
+
+    /** The swapped renderer's canvas, in place of the old one (see _pumpRender). */
+    _showNextCanvas() {
+        const el = this._nextCanvas;
+        this._nextCanvas = null;
+        if (!this.canvas || !el) return;
+        // The touch zoom may have moved the old one since it was copied.
+        el.style.cssText = this.canvas.style.cssText;
+        this.canvas.replaceWith(el);
+        this.canvas = el;
+        this._invalidateMediaRect();
     }
 
     /**
@@ -3888,7 +5159,11 @@ export class StreamView {
         // → _pumpRender) for lower latency. The rAF loop then only handles context-loss
         // detection. Tearing off (default): the rAF loop paces rendering to the
         // display refresh (VSync).
-        this._immediateRender = this._tearing;
+        //
+        // A TV's <video> sink is fed on decode too: the compositor paces the
+        // element on its own vsync, so nothing tears, and the page's rAF —
+        // ~35 a second on a Freebox under a 50 fps stream — no longer caps it.
+        this._immediateRender = this._tearing || this._tvSink === true;
 
         const loop = (now) => {
             if (!this.renderRunning) return;
@@ -4001,8 +5276,14 @@ export class StreamView {
         // trimmed to its memory bound — a queued frame is early, not stale — and
         // the head is held until it comes due. That subsumes the fixed reserve
         // below, including the framerate-near-refresh case it costs latency in.
+        //
+        // A host that aims its frames at this screen's refreshes (VsyncGrid)
+        // never lands one on the boundary the reserve is there to absorb: no
+        // reserve then, on any path. One that sends them as they come — the
+        // link too uneven to aim through — leaves it in place.
         const paced = !!this._framePacer;
-        const useReserve = !paced && SUPPORTS_CANVAS_TEARING && !this._immediateRender;
+        const useReserve =
+            !paced && SUPPORTS_CANVAS_TEARING && !this._immediateRender && !this._vsyncGrid.aimed;
         const maxQueued = paced ? 6 : useReserve ? 2 : 1;
 
         // Queue depth BEFORE any trim: a depth above the reserve means the draw
@@ -4040,6 +5321,12 @@ export class StreamView {
         // draws and closes it; stats stay here. Read the decode time before the
         // draw — the renderer closes the VideoFrame.
         const decodedPerf = frame._mwDecodedPerf;
+        const frameBackendTs = frame._mwBackendTs;
+        const frameHostTs = frame._mwHostTs;
+        const frameLog = frame._mwLog;
+        // A swapped renderer's canvas goes on the page in the same task as its
+        // first picture, so the page never composites it empty.
+        if (this._nextCanvas) this._showNextCanvas();
         const drawStart = performance.now();
         // Queue stage: how long the decoded frame waited for its turn to draw
         // (vsync pacing in rAF mode, renderer busy in immediate mode).
@@ -4047,16 +5334,39 @@ export class StreamView {
             const queueMs = drawStart - decodedPerf;
             if (queueMs >= 0 && queueMs < 5000) this._clientQueueStats.addSample(queueMs);
         }
-        this._renderer
-            .draw(frame)
+        // A PyroWave frame the player presented itself (B2.1): already on its
+        // way to the screen, only the bookkeeping is left.
+        const presented = frame.presented === true;
+        const drawn = presented ? Promise.resolve() : this._renderer.draw(frame);
+        drawn
             .then(() => {
                 this.stats.rendered++;
                 // Render stage: the GPU/canvas draw itself, same clock.
                 const renderMs = performance.now() - drawStart;
+                // A canvas that tears shows the frame as it is drawn: that is
+                // when it is ready, for the vsync grid.
+                if (this._immediateRender && this._vsyncGrid.running)
+                    this._vsyncGrid.noteReady(frameBackendTs, drawStart + renderMs);
+                // …and what the detection measures: capture → painted.
+                if (this._stepper) this._stepper.notePainted(frameHostTs, drawStart + renderMs);
+                // …and the frame's whole way, on the host's clock.
+                const e2e = this._frameLog.noteDrawn({
+                    backendTs: frameHostTs,
+                    drawnMs: drawStart + renderMs,
+                    arrivedMs: frameLog ? frameLog.arrived : 0,
+                    decodedMs: decodedPerf,
+                    drawStartMs: drawStart,
+                    bytes: frameLog ? frameLog.bytes : 0,
+                    key: frameLog ? frameLog.key : false,
+                });
+                if (e2e === e2e) this._e2eMeasuredStats.addSample(e2e);
+                this._lastDrawnAt = drawStart + renderMs;
+                this._lastDrawnE2e = e2e;
                 if (renderMs >= 0 && renderMs < 5000) this._clientRenderStats.addSample(renderMs);
                 // …and how that time splits between our work and waiting on the
                 // GPU/compositor, which is what tells back-pressure from cost.
-                this._diag.noteDraw(this._renderer && this._renderer.lastDraw, inFlight);
+                if (!presented)
+                    this._diag.noteDraw(this._renderer && this._renderer.lastDraw, inFlight);
                 // Click-to-photon probe: a presented frame is a chance to spot
                 // the host's flag. One null check when no measurement is on.
                 if (this._latencyProbe) this._latencyProbe.onFramePresented();
@@ -4192,6 +5502,55 @@ export class StreamView {
         return true;
     }
 
+    /**
+     * The link went after it had connected: hand the ending to MoonlightApp
+     * (onLinkLost), which asks the host how the stream ended before anything
+     * shows. Once: a transport error comes with its close. Returns false when
+     * there is nobody to hand it to, and the stream ends at once as it did.
+     */
+    _handOffLinkLoss(err) {
+        if (!this._linkLossHandedOff) {
+            if (!this._everConnected || this._takenOver) return false;
+            if (typeof this.onLinkLost !== 'function') return false;
+            this._linkLossHandedOff = true;
+            this.connected = false;
+            const cb = this.onLinkLost;
+            // Deferred, as _reportConnectionFailed: the transport is still in
+            // its _onError, whose onClose and close() come next.
+            setTimeout(() => cb(), 0);
+        }
+        // Its banner waits with the rest of the ending (_linkLostDefault).
+        if (err) this._linkLostError = true;
+        return true;
+    }
+
+    /**
+     * Nothing has come over the link for LINK_STALL_MS (frames, the host's
+     * stats every second, pongs) while it still counts as up: ask MoonlightApp
+     * to check with the host (onLinkStall), at most every LINK_STALL_PROBE_MS.
+     * A worker that crashed takes the link down with it, and ICE needs some
+     * 8 s to say so; the host knows within a tenth of a second.
+     */
+    _checkLinkStall(now = performance.now()) {
+        if (!this._firstFrameRendered || this._standby || this._quitting) return;
+        if (this._manualQuitting || this._takenOver || this._linkLossHandedOff) return;
+        if (typeof this.onLinkStall !== 'function' || !(this._lastRxAt > 0)) return;
+        if (now - this._lastRxAt < LINK_STALL_MS) return;
+        if (now - this._lastStallProbeAt < LINK_STALL_PROBE_MS) return;
+        this._lastStallProbeAt = now;
+        this.onLinkStall();
+    }
+
+    /** How a lost link has always ended: the banners, then quit() in 3 s. */
+    _linkLostDefault() {
+        if (this._quitting || this._manualQuitting || this._takenOver) return;
+        if (this._linkLostError) Toast.error(t('stream.webrtcError'));
+        this.connected = false;
+        this.setStatus('disconnected', 'Disconnected');
+        Toast.error(t('stream.streamDisconnected'));
+        setTimeout(() => this.quit(), 3000);
+    }
+
     // =========================================================================
     // WebRTC DataChannel (replaces legacy WebSocket binary transport)
     // =========================================================================
@@ -4233,6 +5592,8 @@ export class StreamView {
                 const seq = this._pingSeq++;
                 this.webrtc.send({ type: 'ping', seq, ts: performance.now() });
             }, 2000);
+            if (this._stallWatch) clearInterval(this._stallWatch);
+            this._stallWatch = setInterval(() => this._checkLinkStall(), 250);
 
             // Held-input heartbeat (see _sendInputState). The first beat is
             // forced — even with nothing held — because it doubles as the
@@ -4276,25 +5637,59 @@ export class StreamView {
                     },
                     {
                         profile: this._gamepadProfile,
-                        // A pad with no standard mapping is not forwarded; say
-                        // so, or the player pushes buttons at a game that never
-                        // hears them. Longer than the default fade: this is
-                        // advice to act on, not an acknowledgement. The id
-                        // carries vendor/product ids the player cannot use
-                        // (Chrome appends them in parentheses, Firefox prefixes
-                        // them as hex); only the name is shown.
+                        // A guest forwards the one pad they picked, as
+                        // controller 0 (see GamepadManager's single mode).
+                        single: this._playerMode,
+                        preferredKey: this._padKey,
+                        // mw_perf_diag only: the pad's reads and states in
+                        // the [perf] line.
+                        probe: this._mainThreadProbe,
+                        // A TV remote seen as a pad (the Freebox's): its
+                        // arrows are arrow keys for the host, as a remote of
+                        // the keyboard kind sends them.
+                        onRemoteKey: (dir, down, repeat) => this._remoteArrow(dir, down, repeat),
+                        // On a TV a pad has no Stop button either: its
+                        // Select + Start + LB + RB opens the remote's menu.
+                        onMenuChord: RemoteNav.isActive() ? () => this._openRemoteMenu() : null,
+                        // A pad nothing maps is not forwarded; say so, or the
+                        // player pushes buttons at a game that never hears
+                        // them — and offer the wizard that fixes it. Longer
+                        // than the default fade: this is advice to act on.
                         onIgnored: (gp) => {
-                            const name =
-                                (gp.id || '')
-                                    .replace(/\s*\(.*\)\s*$/, '')
-                                    .replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '')
-                                    .trim() || '?';
-                            Toast.warning(t('stream.gamepadIgnored', { name }), {
+                            if (this._padBtn) this._padBtn.classList.add('is-attention');
+                            Toast.warning(t('stream.gamepadIgnored', { name: padName(gp) }), {
                                 durationMs: 10000,
+                                action: {
+                                    label: t('stream.gamepadConfigure'),
+                                    onClick: () => this._openGamepadDialog(padKey(gp)),
+                                },
+                            });
+                        },
+                        // A layout guessed (Chrome Android, SDL database): it
+                        // is right most of the time, and one tap away from
+                        // fixed when it is not.
+                        onMapped: (gp) => {
+                            Toast.info(t('stream.gamepadAutoMapped', { name: padName(gp) }), {
+                                durationMs: 6000,
+                                action: {
+                                    label: t('stream.gamepadRemap'),
+                                    onClick: () => this._openGamepadDialog(padKey(gp)),
+                                },
                             });
                         },
                     },
                 );
+            }
+            // A wheel switched on to go as itself waits for the host's word
+            // instead of showing up first as a mapped Xbox pad; a device
+            // already sent (the host answered first) stays off it too.
+            const hidPassthrough = this._ensureHidPassthrough();
+            if (this._gamepadManager && hidPassthrough)
+                this._gamepadManager.setExcluded(hidPassthrough.excludedKeys());
+            // A hold asked before the pads were up (the remote's menu opened
+            // while connecting) still holds.
+            if (this._gamepadManager && this._padHolds.size > 0) {
+                this._gamepadManager.setPaused(true);
             }
             // Standby: created but not polling — started in activate().
             if (this._gamepadManager && !this._standby) this._gamepadManager.start();
@@ -4314,6 +5709,8 @@ export class StreamView {
                 // Media track mode: video arrives natively via <video> element.
                 // No WebCodecs decoder needed. The first video frame triggers
                 // the 'live' status via the video element's playing event.
+                // That element waits for the vsync, tearing or not.
+                this._notePresentation(null);
                 if (this.videoEl) {
                     const onMediaLive = () => {
                         if (this._firstFrameRendered) return;
@@ -4355,6 +5752,17 @@ export class StreamView {
                         webgpu: this._wantWebGpu,
                         algo: this._videoEnhancementAlgo,
                         ceiling: this._enhancerCeiling,
+                        // 4:4:4 negotiated: mwsr reconstructs the chroma too.
+                        yuv444: this._yuv444,
+                        // mwsr's gaze zone (a lab key, phones and tablets only).
+                        gazeZone: mwsrGazeWanted(),
+                        // mwsr's zones from the native host (a lab key, asked at /start).
+                        zoneMap: mwsrMapWanted(),
+                        // The eye test's split screen (a lab key, main thread only).
+                        mwsrSplit: this._mwsrSplit,
+                        // mwsr 2 / 3's deblocking (the debug menu's), null otherwise.
+                        deblock: this._mwsrDeblock,
+                        plainWebGl: this._plainWebGl,
                         hdr: (this._useVideoSink && this._hdrEnabled) || this._hdrLinear,
                         hdrTonemap: this._hdrTonemap,
                         hdrLinear: this._hdrLinear,
@@ -4364,8 +5772,10 @@ export class StreamView {
                     }).then((r) => {
                         this._renderer = r;
                         this._activeRendererKind = r.kind;
+                        this._notePresentation(r.kind);
                         this._rendererHdrActive = !!r.hdrActive;
                         this._createEnhancerGovernor(r);
+                        this._watchRendererCost(r);
                         console.log(
                             '[StreamView] renderer=' +
                                 r.kind +
@@ -4382,6 +5792,11 @@ export class StreamView {
                         );
                         this._applyRendererSink(r);
                         this._applyOutputSize();
+                        // Frames decoded while it was being made wait in the
+                        // queue. Tearing pumps on decode only, and a still
+                        // host screen may send no next frame for a while: the
+                        // first picture goes up now.
+                        if (this._immediateRender) this._pumpRender();
                     });
                     this.setupDecoder();
                 }
@@ -4401,6 +5816,7 @@ export class StreamView {
 
             // Mobile fullscreen/button init (all transport modes)
             this._initMobileFullscreen();
+            this._applyFullscreenOnStart();
         };
         this.webrtc.onClose = () => {
             // _manualQuitting: Stop pressed, exit animation running — quit() is
@@ -4421,10 +5837,10 @@ export class StreamView {
             // transport instead of showing a disconnect error.
             if (!this._everConnected && this._reportConnectionFailed('closed before connect'))
                 return;
-            this.connected = false;
-            this.setStatus('disconnected', 'Disconnected');
-            Toast.error(t('stream.streamDisconnected'));
-            setTimeout(() => this.quit(), 3000);
+            // Why it went is the host's to say: its worker may have crashed
+            // under a healthy stream, and then the stream starts again.
+            if (this._handOffLinkLoss()) return;
+            this._linkLostDefault();
         };
         this.webrtc.onError = (err) => {
             if (this._quitting || this._manualQuitting) return;
@@ -4437,12 +5853,18 @@ export class StreamView {
             }
             // Never connected → connection failure, defer to the transport chain.
             if (!this._everConnected && this._reportConnectionFailed(err.message)) return;
+            if (this._handOffLinkLoss(err)) return;
             Toast.error(t('stream.webrtcError'));
         };
         // Video frames: DataChannel mode uses WebCodecs callbacks
         if (this._transport !== 'webrtc-media') {
-            this.webrtc.onVideo = (frame, isKeyframe, backendTs, frameId) =>
-                this.handleVideoFrame(frame, isKeyframe, backendTs, frameId);
+            this.webrtc.onVideo = (frame, isKeyframe, backendTs, frameId, zones) =>
+                this.handleVideoFrame(frame, isKeyframe, backendTs, frameId, zones);
+            // POC Ultra, decode by slices: the front of a frame still coming.
+            this.webrtc.onVideoPart = (frameId, offset, bytes) => {
+                if (!this._quitting && this._ultraPlayer && this._ultraMode())
+                    this._ultraPlayer.pushPart(frameId, offset, bytes);
+            };
             // Frame loss from reassembly: invalidate reference until next keyframe.
             // IDR is already requested by WebRtcDataChannel (throttled) — don't double it.
             this.webrtc.onFrameLoss = (frameId, wasKeyframe) => {
@@ -4708,6 +6130,7 @@ export class StreamView {
             recentSince: performance.now(),
             gaps: 0,
             frames: 0,
+            sentAt: 0,
         };
         this._linkTimer = setInterval(() => {
             if (this._quitting || !this._link) return;
@@ -4718,7 +6141,14 @@ export class StreamView {
                 owdRiseMs = Math.max(0, Math.round(l.windowMinOffset - l.sessionMinOffset));
             }
             const fps = Math.round(l.frames * 2);
-            const report = { type: 'linkstats', owdRiseMs, gaps: l.gaps, fps };
+            // How much later than its 500 ms this report leaves after the
+            // last one: a main thread held up here makes the same gap in the
+            // reports as a link frozen upstream, and the host counts a freeze
+            // on that gap. It writes this figure next to it (plan « Gels du
+            // lien », D).
+            const late = l.sentAt > 0 ? Math.max(0, Math.round(now - l.sentAt - 500)) : 0;
+            l.sentAt = now;
+            const report = { type: 'linkstats', owdRiseMs, gaps: l.gaps, fps, late };
             // The first report after the tab came back (see _resyncAfterHidden)
             // says so: the frames it names as missing were evicted by the host's
             // own sender while nobody here was draining them, and the host cut
@@ -4795,14 +6225,19 @@ export class StreamView {
             this.webrtc.noteResumed();
         }
         if (this._gamepadManager) this._gamepadManager.resendAll();
+        // What the detection measured before is of another page: start over.
+        if (this._stepper) this._stepper.linkChanged('back from the background', performance.now());
     }
 
     // ── This screen's refresh, for the native host's cadence ─────────────
     //
     // /start carried what the monitor had measured by then (possibly nothing,
     // on a page that launched within its first second). From here on the view
-    // measures once more now and listens for a change — the window moving to
-    // another monitor — and tells the host only when the number really moved.
+    // listens for a change — the window moving to another monitor — and tells
+    // the host only when the number really moved. It measures now only when
+    // nothing was measured yet: a stream that is starting is the page at its
+    // busiest, and a phone read its 120 Hz as 112 then (RefreshRate.js, "Under
+    // load").
     // The host re-chooses its cadence between two frames; nothing relaunches.
     // Native host only: no other host can be told how to pace its capture.
     _startRefreshWatch() {
@@ -4817,9 +6252,12 @@ export class StreamView {
                 `[StreamView] Screen refresh ${(mhz / 1000).toFixed(1)} Hz ` +
                     `(${this._clientVsync ? 'vsync' : 'tearing'}) told to the host`,
             );
+            if (this._stepper) this._stepper.linkChanged('the screen changed', performance.now());
         };
         this._offRefreshChange = onRefreshRateChange(tell);
-        measureRefreshRate().then(tell, () => {});
+        const known = currentRefreshMilliHz();
+        if (known) tell(known);
+        else measureRefreshRate().then(tell, () => {});
     }
 
     _stopRefreshWatch() {
@@ -4827,6 +6265,30 @@ export class StreamView {
             this._offRefreshChange();
             this._offRefreshChange = null;
         }
+    }
+
+    /**
+     * The renderer this view paints with, once made (`kind` null: none, the
+     * media transport's own <video>). /start told the native host what "Allow
+     * tearing" asks for; on WebGPU — every HDR stream — or on a <video>
+     * element the frames wait for the vsync all the same (presentsOnVsync).
+     * The host is told the truth, with the refresh it already has: it then
+     * runs the stream at a divisor of this screen's refresh and keeps its
+     * window after a press for a client that tears. A measurement still on
+     * its way (_startRefreshWatch) carries the same word.
+     * @param {?string} kind
+     */
+    _notePresentation(kind) {
+        const vsync = presentsOnVsync({ tearing: this._tearing, transport: this._transport, kind });
+        if (vsync === this._clientVsync) return;
+        this._clientVsync = vsync;
+        if (!this._nativeHost || !this.webrtc) return;
+        this._sendToHost({ type: 'clientrefresh', mhz: this._sentClientRefresh, vsync });
+        console.log(
+            `[StreamView] ${kind || 'The <video> element'} paints ` +
+                `${vsync ? 'on the vsync' : 'as frames arrive'}, told to the host`,
+        );
+        if (this._stepper) this._stepper.linkChanged('the renderer changed', performance.now());
     }
 
     // ── This screen's size, for a resolution choice that follows it ──────
@@ -4924,19 +6386,16 @@ export class StreamView {
             if (!peer || typeof peer.getStats !== 'function') return;
             try {
                 const report = await peer.getStats();
-                let inbound = null;
-                report.forEach((s) => {
-                    if (s.type === 'inbound-rtp' && s.kind === 'audio') inbound = s;
-                });
+                // The stream's sound only, never an audio-road track (POC Ultra).
+                const inbound = findStreamAudioInbound(report, peer);
                 if (!inbound) return;
-                const delay = inbound.jitterBufferDelay || 0;
-                const emitted = inbound.jitterBufferEmittedCount || 0;
-                const dDelay = delay - this._lastAudioJbDelay;
-                const dEmitted = emitted - this._lastAudioJbEmitted;
-                this._lastAudioJbDelay = delay;
-                this._lastAudioJbEmitted = emitted;
-                if (dEmitted > 0 && dDelay >= 0) {
-                    this._audioJbMs = (dDelay / dEmitted) * 1000;
+                const row = this._audioStats.sample(
+                    inbound,
+                    performance.now(),
+                    findAudioPlayout(report, inbound),
+                );
+                if (row && row.bufferMs >= 0) {
+                    this._audioJbMs = row.bufferMs;
                     this._audioJbAt = performance.now();
                 }
             } catch (e) {
@@ -5038,10 +6497,17 @@ export class StreamView {
             } catch (_) {}
             window.removeEventListener('pointermove', onMove);
             window.removeEventListener('pointerup', onUp);
+            window.removeEventListener('pointercancel', onUp);
             e.preventDefault();
         };
         el.addEventListener('pointerdown', (e) => {
             if (e.button !== 0 && e.pointerType === 'mouse') return;
+            // A TV browser has no finger: its only touches are the swipes TV
+            // Bro fakes to scroll when its cursor is held against an edge. Over
+            // the card they dragged it, and as each swipe ends cancelled (no
+            // pointerup), the drag never ended — the card slid away for as long
+            // as the arrow was held (Mi TV, 04/10/2026).
+            if (this._tvCursor && e.pointerType === 'touch') return;
             // The close (×) button handles its own pointer events — never drag.
             if (e.target.closest && e.target.closest('.overlay-close-btn')) return;
             const rect = el.getBoundingClientRect();
@@ -5059,6 +6525,7 @@ export class StreamView {
             if (e.pointerType === 'touch') e.stopPropagation();
             window.addEventListener('pointermove', onMove);
             window.addEventListener('pointerup', onUp);
+            window.addEventListener('pointercancel', onUp);
             e.preventDefault();
         });
     }
@@ -5081,15 +6548,102 @@ export class StreamView {
         return btn;
     }
 
-    /** Dismiss a draggable overlay (× button). */
+    /** Dismiss the stats card (× button). */
     _closeOverlayEl(el) {
         if (el === this._overlayEl) {
             this._statsClosed = true;
             if (this._overlayEl) this._overlayEl.style.display = 'none';
-        } else if (el === this._gamingOverlay) {
-            this._gamingClosed = true;
-            this._updateGamingOverlay();
         }
+    }
+
+    // ── Stream volume (header, beside the Fullscreen button) ─────────────
+
+    /**
+     * The stream's own volume (issue #29): a speaker that mutes and unmutes,
+     * and a slider that opens from it on hover. It sits left of the Fullscreen
+     * button, so it is there whenever the header is, for the owner and for an
+     * invited player alike.
+     *
+     * Desktop only: a phone or a tablet has volume keys on its side, and iOS
+     * does not let a page set an element's volume at all. The level goes to the
+     * browser's own <audio> element on the RTP paths (never a Web Audio stage
+     * there — see iosAudioUnlock), and to the pipeline's gain on WSS.
+     * @param {HTMLElement|null} header
+     */
+    _buildVolumeControl(header) {
+        if (!header || IS_MOBILE_OR_TABLET) return;
+        const label = t('stream.volume');
+        const ctl = document.createElement('div');
+        ctl.className = 'stream-volume';
+        ctl.setAttribute('role', 'group');
+        ctl.setAttribute('aria-label', label);
+        ctl.innerHTML =
+            '<input type="range" class="stream-volume-slider" min="0" max="100" step="1">' +
+            '<button type="button" class="stream-volume-btn"></button>';
+        const slider = /** @type {HTMLInputElement} */ (ctl.querySelector('.stream-volume-slider'));
+        const btn = /** @type {HTMLButtonElement} */ (ctl.querySelector('.stream-volume-btn'));
+        slider.setAttribute('aria-label', label);
+        slider.addEventListener('input', () => {
+            const level = Number(slider.value) / 100;
+            streamVolume.setLevel(level);
+            // Turning a muted stream up is also how it comes back.
+            if (level > 0) streamVolume.setMuted(false);
+            this._applyVolume();
+        });
+        // Give the keyboard back to the game once the level is set: a focused
+        // range is a local keyboard target, and the next keys would move it
+        // instead of reaching the host.
+        slider.addEventListener('change', () => slider.blur());
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleMute();
+            // Same reason: Space in the game would toggle it again.
+            btn.blur();
+        });
+        // Before the Fullscreen button, for the tab order; where it shows is
+        // _positionGamingOverlay's business.
+        header.insertBefore(ctl, this._mobileFsBtn || header.firstChild);
+        this._volumeCtl = ctl;
+        this._applyVolume();
+    }
+
+    /**
+     * Sound off, or back on: the volume button, and Ctrl+Alt+Shift+S
+     * (Cmd+Option+Ctrl+S on a Mac) — issue #29. @returns {boolean} muted now.
+     */
+    toggleMute() {
+        if (streamVolume.outputLevel() > 0) {
+            streamVolume.setMuted(true);
+        } else {
+            streamVolume.setMuted(false);
+            // Unmuting a level dragged down to nothing would change nothing.
+            if (streamVolume.getLevel() === 0) streamVolume.setLevel(0.5);
+        }
+        this._applyVolume();
+        return streamVolume.outputLevel() === 0;
+    }
+
+    /** Send the stream volume to whatever plays this view's audio, and redraw the control. */
+    _applyVolume() {
+        const out = streamVolume.outputLevel();
+        if (this.audioEl) this.audioEl.volume = out;
+        if (this.audioPipeline) this.audioPipeline.setVolume(out);
+        // A phone or a tablet has no control to redraw, but the shortcut
+        // still mutes it (a keyboard paired to a tablet).
+        const ctl = this._volumeCtl;
+        if (!ctl) return;
+
+        const slider = /** @type {HTMLInputElement} */ (ctl.querySelector('.stream-volume-slider'));
+        const btn = /** @type {HTMLButtonElement} */ (ctl.querySelector('.stream-volume-btn'));
+        const pct = Math.round(out * 100);
+        slider.value = String(pct);
+        slider.style.setProperty('--level', pct + '%');
+        btn.innerHTML =
+            out === 0 ? Icons.volumeMuted : out < 0.5 ? Icons.volumeLow : Icons.volumeHigh;
+        const action = out === 0 ? t('stream.unmute') : t('stream.mute');
+        btn.title = action;
+        btn.setAttribute('aria-label', action);
+        ctl.classList.toggle('is-muted', out === 0);
     }
 
     // ── Mouse-gaming-mode exit reminder ──────────────────────────────────
@@ -5118,6 +6672,8 @@ export class StreamView {
      * Build the gaming-mode overlay content: the platform-correct exit combo
      * plus a one-line reminder of what it does (free the mouse + leave
      * fullscreen). Built once — the combo never changes during a session.
+     * No × any more (issue #28): in the header it covers nothing, and over the
+     * picture it leaves by itself.
      */
     _buildGamingOverlayContent() {
         if (!this._gamingOverlay) return;
@@ -5135,32 +6691,50 @@ export class StreamView {
         html += '</span>';
         html += '<span class="gm-text">' + t('stream.gamingExitTitle') + '</span>';
         this._gamingOverlay.innerHTML = html;
-        this._gamingOverlay.appendChild(this._makeOverlayCloseBtn());
         this._gamingOverlay.title = t('stream.gamingExitTitle');
     }
 
     /**
-     * Show the gaming-mode overlay only while gaming mode actually holds the
-     * mouse (pointer locked). Hidden otherwise so it never clutters the view.
+     * Show the gaming-mode reminder while gaming mode is on, and decide how
+     * long it stays.
+     *
+     * Docked in the header beside the Fullscreen button, it covers nothing and
+     * stays. Over the picture — fullscreen, or dragged there — it shows for a
+     * few seconds each time it lands there, then fades (issue #28: it sat on
+     * top of a fullscreen game until clicked away, and a captured mouse cannot
+     * click anything).
      */
     _updateGamingOverlay() {
-        if (!this._gamingOverlay) return;
+        const el = this._gamingOverlay;
         // Visible whenever gaming mode is on (after the first frame), NOT only
         // while the mouse is captured: a captured (pointer-locked) cursor cannot
         // be moved onto the card to drag it, so it must be reachable pre-capture.
-        const show = this._gamingMode && this._firstFrameRendered && !this._gamingClosed;
-        this._gamingOverlay.classList.toggle('visible', show);
-        if (show) this._positionGamingOverlay();
+        const show = !!el && this._gamingMode && this._firstFrameRendered;
+        if (el) el.classList.toggle('visible', show);
+        const docked = this._positionGamingOverlay();
+        this._setGamingOverlayFloating(show && !docked);
     }
 
     /**
-     * Place the gaming-mode reminder.
-     *  - Non-fullscreen (Fullscreen button visible): dock it in the header just
-     *    right of the centered Fullscreen button — outside the streamed image,
-     *    so it never covers the game (and the fade effect stays off there).
-     *  - Fullscreen (button hidden): back to the CSS default (top-center).
-     * No-op once the user has dragged the card (manual position wins).
+     * Start the reminder's time over the picture, or end it. Restarted on each
+     * arrival there (fullscreen entered, gaming mode switched on), so the combo
+     * is on screen exactly when it has just become the way out.
+     * @param {boolean} floating
      */
+    _setGamingOverlayFloating(floating) {
+        const el = this._gamingOverlay;
+        if (!el || floating === this._gamingFloating) return;
+        this._gamingFloating = floating;
+        if (this._gamingFadeTimer) clearTimeout(this._gamingFadeTimer);
+        this._gamingFadeTimer = null;
+        el.classList.remove('faded');
+        if (!floating) return;
+        this._gamingFadeTimer = setTimeout(() => {
+            this._gamingFadeTimer = null;
+            el.classList.add('faded');
+        }, GAMING_HINT_SHOW_MS);
+    }
+
     /**
      * Place the stats card just under the header, not over it: on a phone the
      * header holds the keyboard button, and a card parked on top of it had to
@@ -5178,38 +6752,89 @@ export class StreamView {
         el.style.top = r && r.height > 0 ? Math.round(r.bottom + 10) + 'px' : '';
     }
 
+    /**
+     * Lay out the middle of the header, and place the gaming-mode reminder.
+     *  - Out of fullscreen (Fullscreen button laid out): the volume control on
+     *    the button's left, then the microphone's button between the two when
+     *    the host took it, the reminder on its right — outside the streamed
+     *    image, so it never covers the game — and the group centred as one.
+     *  - Fullscreen (button hidden): the reminder goes back to the CSS default
+     *    (top-center, over the picture).
+     * A reminder the user has dragged keeps its place.
+     * @returns {boolean} whether the reminder is docked in the header
+     */
     _positionGamingOverlay() {
         const el = this._gamingOverlay;
-        if (!el) return;
+        const vol = this._volumeCtl;
+        const mic = this._micBtn;
         const fsBtn = this._mobileFsBtn;
         // Default: button back to its CSS-centered position (cleared each pass so
-        // the pair-centering offset below is never left stale).
+        // the group-centering offset below is never left stale).
         if (fsBtn) fsBtn.style.transform = '';
-        if (el.classList.contains('user-moved')) return;
         // Require a REAL on-screen rect: in native fullscreen the header (and its
         // button) is hidden via CSS, so style.display stays '' while the rect
         // collapses to 0. Docking off a 0-rect would slam the card to top-left
         // over the stats card. Only dock when the button is actually laid out.
         const r = fsBtn && fsBtn.isConnected ? fsBtn.getBoundingClientRect() : null;
-        const fsVisible = r && r.width > 0 && r.height > 0 && fsBtn.style.display !== 'none';
-        if (fsVisible && el.classList.contains('visible')) {
-            // Center the PAIR (Fullscreen button + reminder) as a group: shift the
-            // button left by half the reminder's footprint, then dock the reminder
-            // to its right. The midpoint of the pair lands on the viewport center.
+        const fsVisible = !!r && r.width > 0 && r.height > 0 && fsBtn.style.display !== 'none';
+        const dock =
+            fsVisible &&
+            !!el &&
+            el.classList.contains('visible') &&
+            !el.classList.contains('user-moved');
+        if (vol) vol.hidden = !fsVisible;
+        // Docked beside the Fullscreen button with it, or back in the bar's
+        // flow before Stop when that button is not laid out.
+        if (mic) {
+            mic.classList.toggle('is-docked', fsVisible);
+            if (!fsVisible) mic.style.left = '';
+        }
+
+        if (fsVisible) {
             const gap = 12;
-            const overlayW = el.getBoundingClientRect().width;
-            const shift = (overlayW + gap) / 2;
-            fsBtn.style.transform = `translate(calc(-50% - ${shift}px), -50%)`;
+            // The microphone sits right of the speaker, closer to it than the
+            // group is to the Fullscreen button: one sound group, two buttons.
+            const micGap = 6;
+            const micW = mic ? mic.getBoundingClientRect().width : 0;
+            // The volume counts at its resting width: the slider it opens on
+            // hover grows leftwards and must not push the Fullscreen button
+            // about under the cursor.
+            let volW = 0;
+            if (vol) {
+                const speaker = vol.querySelector('.stream-volume-btn');
+                volW =
+                    (speaker ? speaker.getBoundingClientRect().width : 0) +
+                    (vol.offsetWidth - vol.clientWidth); // its border
+            }
+            const micSpan = mic ? micW + (vol ? micGap : 0) : 0;
+            const left = vol || mic ? volW + micSpan + gap : 0;
+            const right = dock ? el.getBoundingClientRect().width + gap : 0;
+            const shift = (right - left) / 2;
+            if (shift) fsBtn.style.transform = `translate(calc(-50% - ${shift}px), -50%)`;
             const rb = fsBtn.getBoundingClientRect();
-            el.style.left = Math.round(rb.right + gap) + 'px';
-            el.style.top = Math.round(rb.top + rb.height / 2) + 'px';
-            el.style.transform = 'translateY(-50%)';
-        } else {
+            // Both anchored by their right edge (translateX(-100%) in the CSS).
+            if (mic && mic.parentElement) {
+                const hr = mic.parentElement.getBoundingClientRect();
+                mic.style.left = Math.round(rb.left - gap - hr.left) + 'px';
+            }
+            if (vol && vol.parentElement) {
+                const hr = vol.parentElement.getBoundingClientRect();
+                vol.style.left = Math.round(rb.left - gap - micSpan - hr.left) + 'px';
+            }
+            if (dock) {
+                el.style.left = Math.round(rb.right + gap) + 'px';
+                el.style.top = Math.round(rb.top + rb.height / 2) + 'px';
+                el.style.transform = 'translateY(-50%)';
+                return true;
+            }
+        }
+        if (el && !el.classList.contains('user-moved')) {
             // Restore the CSS default (left:50% + translateX(-50%), safe-area top).
             el.style.left = '';
             el.style.top = '';
             el.style.transform = '';
         }
+        return false;
     }
 
     // ── Stats overlay (refreshed every 500ms) ────────────────────────────
@@ -5218,6 +6843,10 @@ export class StreamView {
         // Refresh the gaming-mode exit reminder on the same 500ms tick so it
         // appears once streaming starts, independent of the perf-stats setting.
         this._updateGamingOverlay();
+
+        // Sampled even while the card is hidden: reopened, it shows the last
+        // 2 s at once instead of a rate across the time it was closed.
+        this._byteRate.sample(performance.now(), this._totalBytes);
 
         if (!this._overlayEl) return;
 
@@ -5241,7 +6870,6 @@ export class StreamView {
         }
 
         const now = performance.now();
-        const elapsed = (now - this._startTime) / 1000;
         let fps = 0;
         let bitrateMbps = 0;
         const isMedia = this._transport === 'webrtc-media';
@@ -5251,15 +6879,11 @@ export class StreamView {
             fps = this._mediaFps;
             bitrateMbps = this._mediaBitrateMbps;
         } else {
-            // FPS: decoded frames in the last 2 seconds
-            const cutoff = now - 2000;
-            this._fpsTimestamps = this._fpsTimestamps.filter((t) => t > cutoff);
-            fps = Math.round(this._fpsTimestamps.length / 2);
+            fps = this._decodedFps(now);
 
-            // Bitrate: total bytes / elapsed seconds
-            if (elapsed > 0.5) {
-                bitrateMbps = (this._totalBytes * 8) / elapsed / 1e6;
-            }
+            // Bitrate: the last 2 s, not the session's average — after a
+            // step down the ladder, the card follows within the window.
+            bitrateMbps = this._byteRate.mbps();
 
             // Presented-frame and drop rates for the diagnostics line below.
             this._sampleDiagRates(now);
@@ -5280,6 +6904,7 @@ export class StreamView {
             (this._resolution || '?') +
             '</span>' +
             '</div>';
+        html += this._autoCeilingRow();
 
         // Framerate
         html +=
@@ -5307,12 +6932,12 @@ export class StreamView {
         // when a 10-bit profile was requested). A '*' marks that the canvas
         // actually presents in HDR (rgba16float accepted); no '*' means the
         // decode is HDR but the canvas fell back to SDR.
-        let codecLabel = codec.toUpperCase() + (this._yuv444 ? ' 4:4:4' : '');
+        let codecLabel = this._statsCodecName(codec) + (this._yuv444 ? ' 4:4:4' : '');
         // Same voice as the enhancer's '(auto)' and 'OFF (WebGL unavailable)':
         // when a setting did not take, the overlay says so where the setting
         // would have shown.
         if (!this._yuv444 && this._yuv444Declined)
-            codecLabel += ' 4:2:0 (4:4:4: ' + this._yuv444Declined + ')';
+            codecLabel += ' 4:2:0 (' + this._yuv444Declined + ')';
         if (this._hdrEnabled) {
             // HDR→SDR when the stream is tone-mapped for an SDR output (ACES, or
             // the browser's own on import); HDR* when the canvas or the <video>
@@ -5323,6 +6948,7 @@ export class StreamView {
             else if (this._hdrLinear) codecLabel += this._rendererHdrActive ? ' HDR*' : ' HDR→SDR';
             else codecLabel += this._rendererHdrActive ? ' HDR*' : ' HDR';
         }
+        if (this._codecAuto) codecLabel += ' (Auto)';
         html +=
             '<div class="stats-row">' +
             '<span class="stats-label">' +
@@ -5335,27 +6961,51 @@ export class StreamView {
 
         // Enhancer: show the active algo when the WebGPU renderer is up. On
         // webrtc-media (<video>, no canvas) the Enhancer can't be applied — if the
-        // user enabled it, flag it OFF so they know it isn't active.
+        // user enabled it, flag it OFF so they know it isn't active. At 1:1 the
+        // shader renderers copy the frame and the pass sits idle
+        // (upscaler-mwsr.md §5): say that, not the name of a pass that is not
+        // running.
+        const passIdle = this._enhancerPassthrough && this._videoEnhancementAlgo !== 'off';
         let enhancerName = null;
         if (this._activeRendererKind === 'webgpu') {
-            enhancerName =
-                this._videoEnhancementAlgo === 'off'
-                    ? t('stream.enhancerOff')
-                    : { fsr1: 'FSR1', nis: 'NIS', sgsr: 'SGSR' }[this._videoEnhancementAlgo] ||
-                      'SGSR';
+            enhancerName = passIdle
+                ? t('stream.enhancerPassthrough')
+                : this._videoEnhancementAlgo === 'off'
+                  ? t('stream.enhancerOff')
+                  : { fsr1: 'FSR1', nis: 'NIS', sgsr: 'SGSR', mwsr: 'MWSR' }[
+                        this._videoEnhancementAlgo
+                    ] || 'SGSR';
+            if (this._videoEnhancementAlgo === 'mwsr' && this._mwsrDeblock && !passIdle) {
+                enhancerName = this._mwsrDeblock === 'qp' ? 'MWSR 3' : 'MWSR 2';
+                // mwsr 3: the last frame's QP and the threshold it gave (the
+                // main-thread renderer; the worker's stays out of reach).
+                const last = this._renderer && this._renderer.deblockLast;
+                if (this._mwsrDeblock === 'qp' && last) {
+                    enhancerName +=
+                        ' (QP ' +
+                        (last.qp === null ? '?' : last.qp) +
+                        ', ' +
+                        (last.thr ? 't' + last.thr.toFixed(1) : 'off') +
+                        ')';
+                }
+            }
             // Stepped down by the governor: say so, otherwise the card reads as
             // if the user's setting silently changed.
-            if (this._enhancerDegraded) enhancerName += ' (auto)';
+            if (this._enhancerDegraded && !passIdle) enhancerName += ' (auto)';
         } else if (this._activeRendererKind === 'webgl') {
             // Enhancers without WebGPU: name what actually runs, which the
             // ladder may have stepped below the setting like on WebGPU.
-            enhancerName =
-                this._videoEnhancementAlgo === 'off'
-                    ? t('stream.enhancerOff')
-                    : { 'gl-fsr1': 'WebGL FSR1', 'gl-sgsr': 'WebGL SGSR', 'gl-nis': 'WebGL NIS' }[
-                          this._videoEnhancementAlgo
-                      ] || 'WebGL';
-            if (this._enhancerDegraded) enhancerName += ' (auto)';
+            enhancerName = passIdle
+                ? t('stream.enhancerPassthrough')
+                : this._videoEnhancementAlgo === 'off'
+                  ? t('stream.enhancerOff')
+                  : {
+                        'gl-fsr1': 'WebGL FSR1',
+                        'gl-sgsr': 'WebGL SGSR',
+                        'gl-nis': 'WebGL NIS',
+                        'gl-mwsr': 'WebGL MWSR',
+                    }[this._videoEnhancementAlgo] || 'WebGL';
+            if (this._enhancerDegraded && !passIdle) enhancerName += ' (auto)';
         } else if (NO_WEBGPU_ALGOS.includes(this._enhancerCeiling)) {
             // The renderer may have fallen back (no WebGL2 → Canvas2D), so the
             // kind decides, not the setting.
@@ -5435,7 +7085,13 @@ export class StreamView {
             const legs = hostStages
                 ? [{ key: 'statStageTotal', stats: this._hostTotalStats }]
                 : [
-                      { key: 'statLegHost', stats: this._hostProcStats },
+                      // The native host without its stages (on wss, where no
+                      // sender closes them) still measures present → encoded
+                      // itself: its own time, not Sunshine's.
+                      {
+                          key: this._nativeHost ? 'statLegHostNative' : 'statLegHost',
+                          stats: this._hostProcStats,
+                      },
                       { key: 'statLegHostNet', stats: this._hostRttStats },
                   ];
             if (isMedia) {
@@ -5510,20 +7166,11 @@ export class StreamView {
                 value +
                 '</span>' +
                 '</div>';
-            if (!isMedia) rows.push(legRow('', escapeHtml(t('stream.statLegHeader'))));
-            for (const leg of legs) {
-                const label = escapeHtml(t('stream.' + leg.key));
-                let value = '–';
-                if (leg.stats.count > 0) {
-                    const ms = leg.stats.avg * (leg.scale || 1);
-                    latency += ms;
-                    const p99 = this._legP99(leg);
-                    latencyP99 += (p99 >= 0 ? p99 : leg.stats.avg) * (leg.scale || 1);
-                    if (leg.counts) haveLatency = true;
-                    value = ms.toFixed(1) + this._legTailSuffix(leg) + 'ms';
-                }
-                rows.push(legRow(label, value));
-            }
+            // The rows follow the picture's own path, top to bottom: which
+            // machine and encoder, then the host's stages in the order a frame
+            // goes through them, the network, and the browser's stages down to
+            // the draw. Read in order, the breakdown IS the pipeline.
+            //
             // WHICH machine produced everything under this heading. First,
             // above the encoder, because it is the outermost fact: every number
             // below belongs to one PC, and a report that names the milliseconds
@@ -5535,6 +7182,13 @@ export class StreamView {
                 if (machine) {
                     rows.push(legRow(escapeHtml(t('stream.statMachine')), escapeHtml(machine)));
                 }
+            }
+            // Which screen of that machine, right under it: the card the stream
+            // was launched from. Absent for a guest, who chose none.
+            if (this._screenLabel) {
+                rows.push(
+                    legRow(escapeHtml(t('stream.statScreen')), escapeHtml(this._screenLabel)),
+                );
             }
             // Which encoder produced these stages. Named here rather than in
             // the compact block above because it explains the numbers under it
@@ -5553,8 +7207,10 @@ export class StreamView {
                     escapeHtml(this._nativeEncoderLabel || t('stream.statEncoderUnknown')),
                 ),
             );
-            // The host's stages, shown but not added: the total leg above
-            // already holds their sum. These say WHICH stage moved.
+            if (!isMedia) rows.push(legRow('', escapeHtml(t('stream.statLegHeader'))));
+            // The host's stages, shown but not added: the total leg right after
+            // them holds their sum. These say WHICH stage moved, and they come
+            // first because a frame is acquired before it goes anywhere.
             if (hostStages) {
                 const named = {
                     acquire: 'statStageAcquire',
@@ -5575,9 +7231,10 @@ export class StreamView {
                 }
             }
             // Reserve currently held by the pacer. Not added to the total — the
-            // hold already lands in the render-queue leg above (decoder output →
-            // draw start), so counting it here would double it. It is shown so
-            // the adaptation is visible: 0 on a clean link, growing under jitter.
+            // hold already lands in the render-queue leg (decoder output → draw
+            // start), so counting it would double it; it is shown right under
+            // that leg so the adaptation is visible where it is spent: 0 on a
+            // clean link, growing under jitter.
             // Worker mode: the WORKER's pacer does the pacing and posts its
             // stats with the counters; the main-thread _framePacer exists only
             // as the fallback for a failed worker init and would read 0 forever
@@ -5587,16 +7244,58 @@ export class StreamView {
                 : this._framePacer
                   ? this._framePacer.stats
                   : this._pacerStats;
-            if (pacer) {
+            const reserveRow = pacer
+                ? legRow(escapeHtml(t('stream.statLegReserve')), pacer.targetMs.toFixed(1) + 'ms')
+                : null;
+            let reserveShown = false;
+            for (const leg of legs) {
+                const label = escapeHtml(t('stream.' + leg.key));
+                let value = '–';
+                if (leg.stats.count > 0) {
+                    const ms = leg.stats.avg * (leg.scale || 1);
+                    latency += ms;
+                    const p99 = this._legP99(leg);
+                    latencyP99 += (p99 >= 0 ? p99 : leg.stats.avg) * (leg.scale || 1);
+                    if (leg.counts) haveLatency = true;
+                    value = ms.toFixed(1) + this._legTailSuffix(leg) + 'ms';
+                }
+                rows.push(legRow(label, value));
+                if (leg.key === 'statLegQueue' && reserveRow) {
+                    rows.push(reserveRow);
+                    reserveShown = true;
+                }
+            }
+            if (reserveRow && !reserveShown) rows.push(reserveRow);
+            // Where the sum stops: at the draw. The compositor and the screen's
+            // scan-out still come after it, and no page can time them (the
+            // click bench reads them at ~½ to 1 refresh). A row says so rather
+            // than leaving the total to read as glass to glass.
+            rows.push(
+                legRow(
+                    escapeHtml(t('stream.statLegScreen')),
+                    escapeHtml(t('stream.statLegScreenValue')),
+                ),
+            );
+            // The same way measured whole, frame by frame (stream/FrameLog.js):
+            // shown, not added — it is what the sum above should read, and the
+            // gap between the two is a leg nobody times. Main-thread path only.
+            // The headline takes it when it has one (stream/LatencyHeadline.js),
+            // so the sum gets its own row, just above.
+            if (!isMedia && !this._useWorker) {
+                const m = this._e2eMeasuredStats;
                 rows.push(
-                    '<div class="stats-leg-row">' +
-                        '<span class="stats-label">' +
-                        escapeHtml(t('stream.statLegReserve')) +
-                        '</span>' +
-                        '<span class="stats-value">' +
-                        pacer.targetMs.toFixed(1) +
-                        'ms</span>' +
-                        '</div>',
+                    legRow(
+                        escapeHtml(t('stream.statLegSum')),
+                        haveLatency ? latency.toFixed(1) + 'ms' : '–',
+                    ),
+                );
+                rows.push(
+                    legRow(
+                        escapeHtml(t('stream.statLegMeasured')),
+                        m.count > 0
+                            ? m.avg.toFixed(1) + ' / ' + m.percentile(0.99).toFixed(1) + 'ms'
+                            : '–',
+                    ),
                 );
             }
             // The audio playout buffer: how far the sound sits behind the
@@ -5606,12 +7305,50 @@ export class StreamView {
                 rows.push(
                     legRow(escapeHtml(t('stream.statLegAudio')), this._audioJbMs.toFixed(0) + 'ms'),
                 );
+                // Its floor (target / minimum NetEq held), the arrival jitter
+                // and the share of sound made up — the crackle — last second.
+                const a = this._audioStats.last;
+                if (a) {
+                    const ms = (v) => (v >= 0 ? v.toFixed(0) : '–');
+                    rows.push(
+                        legRow(
+                            escapeHtml(t('stream.statLegAudioDetail')),
+                            ms(a.targetMs) +
+                                ' / ' +
+                                ms(a.minimumMs) +
+                                ' · ' +
+                                (a.jitterMs >= 0 ? a.jitterMs.toFixed(1) : '–') +
+                                'ms · ' +
+                                AudioStatsSampler.concealedPercent(a).toFixed(2) +
+                                '%',
+                        ),
+                    );
+                }
             }
-            if (haveLatency) {
-                avgLatency = latency.toFixed(1) + 'ms';
-                latencyDetail = rows.join('');
-                latencyTotalMs = latency;
-                latencyP99Ms = latencyP99;
+            if (haveLatency) latencyDetail = rows.join('');
+            // The headline: the frame log's measure where there is one, the
+            // picture's age while it is frozen, the sum otherwise (25/10/2026:
+            // the sum said 78 ms while the frames came 4 s late).
+            const measuredHere = !isMedia && !this._useWorker;
+            const ages = this._e2eMeasuredStats;
+            const head = latencyHeadline({
+                sumMs: haveLatency ? latency : NaN,
+                sumP99Ms: haveLatency ? latencyP99 : NaN,
+                measured:
+                    measuredHere && ages.count > 0
+                        ? { count: ages.count, avg: ages.avg, p99: ages.percentile(0.99) }
+                        : null,
+                lastE2eMs: measuredHere ? this._lastDrawnE2e : NaN,
+                sinceDrawMs: now - this._lastDrawnAt,
+                sinceRxMs: now - this._lastRxAt,
+                silentAfterMs: LINK_STALL_MS,
+                framesSinceDraw: this._lastFrameInAt > this._lastDrawnAt,
+                hidden: typeof document !== 'undefined' && document.hidden === true,
+            });
+            if (head.source !== 'none') {
+                avgLatency = head.ms.toFixed(1) + 'ms';
+                latencyTotalMs = head.ms;
+                latencyP99Ms = head.p99Ms;
             }
         }
         const showDetail = this._latencyDetail && latencyDetail !== '';
@@ -5712,11 +7449,6 @@ export class StreamView {
         // be reported without watching the overlay.
         // Not applicable to webrtc-media: no WebCodecs pipeline to observe.
         if (!isMedia) {
-            // Main-thread path only: the worker applies its own ladder before
-            // posting, so re-deciding here would fight it with stale numbers.
-            // Runs whether or not the diagnostics are displayed.
-            if (!this._useWorker) this._applyEnhancerGovernor(diagSnap, now);
-            this._applyDecodeRateGovernor(diagSnap, fps, now);
             if (this._perfDiag) {
                 let diagLine = formatDiag(diagSnap, {
                     decodedFps: fps,
@@ -5727,8 +7459,22 @@ export class StreamView {
                 // that was felt — the averages above cannot.
                 const tails = this._formatStageTails(now);
                 if (tails) diagLine += ' · ' + tails;
+                // What the enhancer ladder read from the GPU fences this window.
+                if (this._gpuBehind !== null && this._gpuBehind !== undefined) {
+                    diagLine += ' · gpu behind ' + Math.round(this._gpuBehind * 100) + '%';
+                }
                 if (this._mainThreadProbe) {
                     diagLine += ' · ' + formatMainThread(this._mainThreadProbe.snapshot());
+                }
+                // The way measured whole, host's stamp → end of the draw.
+                if (this._e2eMeasuredStats.count > 0) {
+                    const m = this._e2eMeasuredStats;
+                    diagLine +=
+                        ' · e2e measured ' +
+                        m.avg.toFixed(1) +
+                        '/' +
+                        m.percentile(0.99).toFixed(1) +
+                        'ms';
                 }
                 if (showDetail) {
                     html += '<div class="stats-diag">' + escapeHtml(diagLine) + '</div>';
@@ -5930,6 +7676,95 @@ export class StreamView {
      * queue covers the case the draw wait cannot see: a GPU pass that only
      * queues its work reports no cost at all while it starves the decoder.
      */
+    /** Decoded frames per second, over the last 2 s. */
+    _decodedFps(now) {
+        const cutoff = now - 2000;
+        this._fpsTimestamps = this._fpsTimestamps.filter((t) => t > cutoff);
+        return Math.round(this._fpsTimestamps.length / 2);
+    }
+
+    /**
+     * Feed the enhancer and decode-rate governors on the 500 ms tick, whether
+     * the stats card shows or not: they used to run inside _updateOverlay,
+     * whose early returns stopped both ladders once the card was hidden or
+     * closed, and whose repaints (a hover on the card) fed them extra windows.
+     * The decoded-frame window is pruned here too, so a hidden card does not
+     * let it grow for the whole session.
+     */
+    _runPipelineGovernors(now) {
+        const fps = this._decodedFps(now);
+        if (this._transport === 'webrtc-media' || !this._firstFrameRendered) return;
+        const diag = this._workerDiag || this._diag.snapshot();
+        // Main-thread path only: the worker applies its own ladder before
+        // posting, so re-deciding here would fight it with stale numbers.
+        if (!this._useWorker) {
+            this._enhancerPassthrough = !!(this._renderer && this._renderer.passthrough);
+            this._applyEnhancerGovernor(diag, now);
+        }
+        this._applyDecodeRateGovernor(diag, fps, now);
+        this._tickAutoCeiling(diag, now);
+    }
+
+    /**
+     * Feed the meter of Auto's ceiling (stream/AutoCeilingMeter.js). What a
+     * share, a transition, a hidden page or a step of the cadence does to the
+     * numbers says nothing of this machine: those windows count for nothing.
+     */
+    _tickAutoCeiling(diag, now) {
+        const meter = this.autoCeilingMeter;
+        if (!meter || this._quitting) return;
+        const stepped = !!(this._stepper && this._stepper.stepFps > 0);
+        const idle = !!(this.autoCeilingIdle && this.autoCeilingIdle());
+        meter.tick(now, {
+            neutral:
+                (typeof document !== 'undefined' && document.hidden) ||
+                this.hasActiveShare() ||
+                idle ||
+                stepped,
+            arrivalFps: diag && diag.arrivalAvgMs > 0 ? 1000 / diag.arrivalAvgMs : 0,
+            sizeMatches: frameMatchesAsked(this._resolution, meter.asked),
+            frames: this.stats.received,
+            drops: diag ? (diag.dropQueueFull || 0) + (diag.dropBackpressure || 0) : 0,
+            rebuilds: diag ? diag.recoverReset || 0 : 0,
+            fpsCap: this._decodeRateCap,
+            presentsFps: this._hostPresentsFps,
+        });
+    }
+
+    /** The stats card's line on what Auto learned from this host; '' when it
+     *  has nothing to say. */
+    _autoCeilingRow() {
+        const line = this.autoCeilingLine ? this.autoCeilingLine() : null;
+        if (!line) return '';
+        return (
+            '<div class="stats-row">' +
+            '<span class="stats-label">' +
+            t('stream.statAuto') +
+            '</span>' +
+            '<span class="stats-value">' +
+            t(line.trial ? 'stream.statAutoTrial' : 'stream.statAutoLearned', { size: line.size }) +
+            '</span>' +
+            '</div>'
+        );
+    }
+
+    /** The fastest step of the cadence Auto's ceiling allows at this frame; 0: no bound. */
+    _autoCeilingMaxFps() {
+        const m = /^(\d+)[×x](\d+)/.exec(this._resolution || '');
+        if (!(this.autoCeilingMaxPixelRate > 0) || !m) return 0;
+        return Math.floor(this.autoCeilingMaxPixelRate / (Number(m[1]) * Number(m[2])));
+    }
+
+    /** The enhancer is about to run @p algo: a step down is a signal for the
+     *  meter of Auto's ceiling. Starting low on its memory is none: only a step
+     *  taken in this stream comes through here. */
+    _noteEnhancerStep(algo) {
+        if (!this.autoCeilingMeter) return;
+        const from = ENHANCER_LADDER.indexOf(ladderRung(this._videoEnhancementAlgo));
+        const to = ENHANCER_LADDER.indexOf(ladderRung(algo));
+        if (from >= 0 && to > from) this.autoCeilingMeter.noteSick('enhancer');
+    }
+
     /**
      * Feed the decode-rate governor and tell the host what it decides.
      *
@@ -5957,6 +7792,7 @@ export class StreamView {
             now,
         });
         if (cap === null) return;
+        this._decodeRateCap = cap > 0 ? cap : 0;
         console.log(
             '[StreamView] Decode rate: ' +
                 (cap > 0
@@ -5964,19 +7800,44 @@ export class StreamView {
                     : 'the queue stayed empty — back to the rate that was set'),
         );
         this._sendToHost({ type: 'clientfpscap', fps: cap });
+        // A decoder that asks for fewer frames is never stepped above them.
+        if (this._stepper) this._stepper.setDecoderCapped(cap > 0, now);
     }
 
     _applyEnhancerGovernor(diag, now) {
         if (!this._governor || !this._renderer) return;
+        // The GPU fences of the window (WebGlRenderer.takeGpuBehind): the one
+        // signal of a pass the GPU keeps up with, frames late. Other renderers
+        // cannot tell, and null says so.
+        this._gpuBehind =
+            typeof this._renderer.takeGpuBehind === 'function'
+                ? this._renderer.takeGpuBehind()
+                : null;
+        const fencesIgnored = this._governor.fencesIgnored;
+        const presentationBound = this._governor.presentationBound;
         const algo = this._governor.update({
             serviceMs: diag.renderServiceMs,
             arrivalMs: diag.arrivalAvgMs,
             decodeQueue: diag.decodeQueueAvg,
+            gpuBehind: this._gpuBehind,
+            // A frame copied at 1:1 ran no pass: the window is not a measurement.
+            passthrough: this._renderer.passthrough === true,
             now,
         });
+        if (!fencesIgnored && this._governor.fencesIgnored) {
+            console.log(
+                '[StreamView] Enhancer: the GPU fences read the plain copy late — ignored for this session',
+            );
+        }
+        if (!presentationBound && this._governor.presentationBound) {
+            console.log(
+                '[StreamView] Enhancer: the plain copy waits on presentation — the draw time cuts only past a whole frame, for this session',
+            );
+        }
         if (!algo) return;
         const pass = rendererAlgo(algo, this._renderer.kind);
         if (!this._renderer.setAlgo(pass)) return;
+        this._noteEnhancerStep(pass);
         this._videoEnhancementAlgo = pass;
         this._enhancerDegraded = this._governor.degraded;
         this._rememberEnhancer(this._renderer.kind, algo, this._governor.recoverAfterMs);
@@ -6003,6 +7864,9 @@ export class StreamView {
      *  a guest's ladder follows its own fixed rule). */
     _rememberEnhancer(kind, rung, recoverAfterMs) {
         if (this._playerMode) return;
+        // A verdict from a rung on trial would follow the viewer back down to a
+        // size where it means nothing: the memory holds no size.
+        if (this.autoCeilingOnTrial && this.autoCeilingOnTrial()) return;
         rememberRung(kind, ladderRung(this._enhancerCeiling), rung, recoverAfterMs);
     }
 
@@ -6029,9 +7893,75 @@ export class StreamView {
         this._lastDropCount = this.stats.dropped;
     }
 
+    // ── HID passthrough (hid/HidPassthrough.js) ─────────────────────────────
+
+    /**
+     * The devices the viewer switched on in Settings go to the host as
+     * themselves — the real wheel, not an Xbox pad — when it says it can
+     * (`hidcaps`). Made at the first message about it, so a `hidcaps` sent at
+     * channel open is never missed. Null without WebHID or on a transport
+     * without the 'hid' channel (the WebSocket fallback).
+     */
+    _ensureHidPassthrough() {
+        if (this._hidPassthrough) return this._hidPassthrough;
+        if (!navigator.hid || !this.webrtc || typeof this.webrtc.sendHid !== 'function')
+            return null;
+        this._hidPassthrough = new HidPassthrough({
+            send: (msg) => {
+                if (!this._quitting) this.webrtc.send(msg);
+            },
+            sendFrame: (frame) => this.webrtc.sendHid(frame),
+            // A device sent as itself is never forwarded as a mapped pad too.
+            onChange: () =>
+                this._gamepadManager?.setExcluded(this._hidPassthrough?.excludedKeys() || []),
+            onResult: (device, ok, why) => {
+                const name = device.productName || '';
+                if (ok) Toast.info(t('stream.hidForwarded', { name }), { durationMs: 5000 });
+                else Toast.warning(t('stream.hidRefused', { name, why }), { durationMs: 8000 });
+            },
+        });
+        // Chrome shows a pad once a button is pressed: offer it then too.
+        this._onHidPadConnected = () => this._offerHid();
+        window.addEventListener('gamepadconnected', this._onHidPadConnected);
+        return this._hidPassthrough;
+    }
+
+    /**
+     * A wheel, radio or stick plugged in but never linked: offer, once a
+     * stream, to send it as itself. The toast's button is the click Chrome's
+     * chooser needs (narrowed to that model). It stays until clicked — the
+     * stream's first seconds bring many toasts — and goes with the stream.
+     */
+    async _offerHid() {
+        const hp = this._hidPassthrough;
+        if (!hp || this._quitting || !navigator.getGamepads) return;
+        const pads = Array.from(navigator.getGamepads()).filter(Boolean);
+        for (const m of await hp.offers(pads)) {
+            if (hp !== this._hidPassthrough) return; // the stream ended meanwhile
+            const toast = Toast.info(t('stream.hidOffer', { name: m.name }), {
+                sticky: true,
+                action: {
+                    label: t('stream.hidOfferAction'),
+                    onClick: () => hp.link(m.vendorId, m.productId),
+                },
+            });
+            (this._hidOfferToasts ||= []).push(toast);
+        }
+    }
+
     // ── Stats message handler (ping/pong + periodic backend stats) ─────────
 
     _handleStatsMessage(msg) {
+        this._lastRxAt = performance.now();
+        if (typeof msg.type === 'string' && msg.type.startsWith('hid')) {
+            this._ensureHidPassthrough()?.handleMessage(msg);
+            if (msg.type === 'hidcaps') this._offerHid();
+            return;
+        }
+        if (msg.type === 'inputcaps') {
+            this._setMouseAllowed(msg.keyboardMouse === true);
+            return;
+        }
         if (msg.type === 'rumble') {
             if (this._gamepadManager) this._gamepadManager.rumble(msg.index, msg.low, msg.high);
             return;
@@ -6057,7 +7987,19 @@ export class StreamView {
                     msg.frameHeight +
                     (msg.hdr ? ' HDR' : ' SDR'),
             );
+            if (this._frameSize && msg.frameWidth > 0 && msg.frameHeight > 0) {
+                this._frameSize = { width: msg.frameWidth, height: msg.frameHeight };
+                if (this._videoWorker)
+                    this._videoWorker.postMessage({
+                        type: 'framesize',
+                        frameSize: this._frameSize,
+                    });
+            }
             if (this.onHostDisplayFormat) this.onHostDisplayFormat(msg);
+            return;
+        }
+        if (msg.type === 'feedcodec') {
+            this._followFeedCodec(msg.codec);
             return;
         }
         if (msg.type === 'cursor') {
@@ -6123,7 +8065,31 @@ export class StreamView {
             if (typeof msg.text === 'string') this._applyHostClipboard(msg.text);
             return;
         }
+        if (msg.type === 'textviaime') {
+            // Touch-keyboard characters the host could only take as text.
+            if (typeof msg.text === 'string') this._noteTextViaIme(msg.text);
+            return;
+        }
+        if (msg.type === 'inputstamp') {
+            // The host's answer to a stamped input (stream/InputUplink.js).
+            this._inputUplink.noteReply(msg, performance.now());
+            return;
+        }
+        if (msg.type === 'fpsstep') {
+            // The native host's answer to a step of the detection.
+            if (this._stepper) this._stepper.noteReply(msg, performance.now());
+            return;
+        }
         if (msg.type === 'pong') {
+            this._contentAge.notePong(msg, performance.now());
+            this._frameLog.notePong(msg, performance.now());
+            this._vsyncGrid.notePong(msg, performance.now());
+            this._inputUplink.notePong(msg, performance.now());
+            if (this._stepper) this._stepper.notePong(msg, performance.now());
+            // The host would aim its frames at this screen's refreshes: tell it
+            // when they are (native host, cadence=deadline).
+            if (msg.grid === true && this._nativeHost && !this._vsyncGrid.running)
+                this._vsyncGrid.start();
             const browserRtt = performance.now() - msg.ts;
             if (browserRtt > 0 && browserRtt < 10000) {
                 this._browserRttStats.addSample(browserRtt);
@@ -6146,6 +8112,13 @@ export class StreamView {
             if (msg.stages && typeof msg.stages === 'object') {
                 this._hostStages = msg.stages;
                 this._hostStagesAt = performance.now();
+                if (this._vdGpuApartWatch?.note(msg.stages)) {
+                    const notice = takeVdGpuApartNotice(
+                        { vd_gpu_apart: this._vdGpuApart },
+                        this.host?.uuid || '',
+                    );
+                    if (notice) Toast.info(t('launch.vdGpuApart', notice), { durationMs: 12000 });
+                }
                 const total = msg.stages.total;
                 if (total && total.n > 0 && total.avg > 0) {
                     this._hostTotalStats.addSample(total.avg / 1000);
@@ -6176,14 +8149,55 @@ export class StreamView {
             if (typeof msg.linkQueueMs === 'number') {
                 this._hostLinkQueueMs = msg.linkQueueMs;
             }
+            // The native host's cadence, for "Auto" with detection. Absent
+            // from every other host, and from a guest on the shared feed.
+            if (msg.cadence && typeof msg.cadence === 'object') this._noteHostCadence(msg.cadence);
         }
     }
 
-    handleVideoFrame(data, isKeyframe, backendTs, frameId = 0) {
+    /**
+     * The host's cadence, once a second: the first one builds the detection
+     * (stream/CadenceStepper.js) where it can measure — a rate left to Auto
+     * (the switch `mw_autostep`), every frame drawn the moment it is decoded
+     * (a canvas that tears), on this thread, as it comes (no pacer). A client
+     * on vsync shows one frame per refresh and keeps its rate.
+     */
+    _noteHostCadence(cadence) {
+        const now = performance.now();
+        this._hostPresentsFps = cadence.presents > 0 ? cadence.presents : 0;
+        if (!this._stepper) {
+            if (!this._autostep || this._standby || this._quitting || !this._nativeHost) return;
+            if (!this._immediateRender || this._useWorker || this._framePacer) return;
+            this._stepper = new CadenceStepper({
+                baseFps: this._streamFps,
+                send: (msg) => {
+                    if (this.webrtc) this._sendToHost(msg);
+                },
+                sendPing: (seq, ts) => {
+                    if (this.webrtc) this.webrtc.send({ type: 'ping', seq, ts });
+                },
+                // The steps this device failed at, for this host at this size.
+                memory: stepMemory((this.host.uuid || '') + '|' + (this._resolution || '')),
+                maxFps: this._autoCeilingMaxFps(),
+            });
+            window.mwCadenceStepper = this._stepper;
+            this._stepper.start();
+            console.log(
+                '[StreamView] Auto with detection on: steps above ' +
+                    (this._streamFps || '?') +
+                    ' fps are tried while the content is faster',
+            );
+        }
+        this._stepper.noteStats(cadence, now);
+    }
+
+    handleVideoFrame(data, isKeyframe, backendTs, frameId = 0, zones = null) {
         // The frame is whole: this is where the network's time ends and the
         // browser's begins. Stamped on the absolute clock so the decode worker,
         // which has its own time origin, can measure the hop to decode().
         const arrivalAbs = performance.timeOrigin + performance.now();
+        this._lastRxAt = arrivalAbs - performance.timeOrigin;
+        this._lastFrameInAt = this._lastRxAt;
         // Stop processing frames once quit() has started.  The DC may still
         // deliver queued messages during the async HTTP /quit call.
         if (this._quitting) return;
@@ -6193,6 +8207,16 @@ export class StreamView {
 
         if (data.length < 4) {
             console.warn('[StreamView] Video frame too small:', data.length);
+            return;
+        }
+        // Received, against painted: the detection's share of frames shown.
+        if (this._stepper) this._stepper.noteReceived(performance.now());
+
+        // POC Ultra (U4): the host codes PyroWave (enc12=pyrowave), the page
+        // decodes it on WebGPU. Every frame stands alone: no stale-frame or
+        // gap logic, no keyframe to wait for.
+        if (this._ultraMode()) {
+            this._handleUltraFrame(data, backendTs, arrivalAbs, frameId);
             return;
         }
 
@@ -6313,7 +8337,7 @@ export class StreamView {
         if (stall) this._notePeriodicStall(stall);
 
         // Direct frame processing — no reordering.
-        this._processVideoFrame(data, isKeyframe, backendTs, arrivalAbs);
+        this._processVideoFrame(data, isKeyframe, backendTs, arrivalAbs, zones);
     }
 
     /**
@@ -6339,7 +8363,9 @@ export class StreamView {
      * the whole injection is refused while that window holds the foreground,
      * the pointer included: there is no "somewhere else" to click, because the
      * pointer will not go there. That is a dead end, so the strip carries the
-     * way out of it — see _releaseInputBlock.
+     * way out of it — see _releaseInputBlock. It carries it under our own
+     * policy too: a game run as administrator that fills the host's screen
+     * leaves an invited player nothing else to click either.
      *
      * Kept up for a few seconds at least, even if the host says "open" right
      * after: a dropped click on a window off to the side closes and reopens
@@ -6358,11 +8384,16 @@ export class StreamView {
             if (btn) {
                 btn.textContent = t('stream.inputGateRelease');
                 btn.disabled = false;
-                // Offered only where the pointer itself is stuck. Under our own
-                // policy the viewer keeps their pointer and can click their way
-                // out, so minimising the host's windows for them would be an
-                // act nobody asked for.
-                btn.hidden = !stuck;
+                // Offered in both cases (decision of 22/10/2026). Where the
+                // pointer itself is stuck it is the only way out. Under our own
+                // policy (an invited player, an administrator window) the
+                // pointer still works, but a game run as administrator that
+                // fills the host's screen leaves nothing else to click, and
+                // Win+D is held back with the rest — so the guest may minimise
+                // the host's windows, the owner's game included. The stylesheet
+                // had shown it there since 0.3.1 anyway (its display outranks
+                // the attribute); this says so.
+                btn.hidden = false;
             }
             el.hidden = false;
             this._inputGateShownAt = performance.now();
@@ -6387,7 +8418,8 @@ export class StreamView {
 
     /**
      * Ask the host to minimise its desktop, the one way out of a gate closed
-     * by Windows itself.
+     * by Windows itself — and of an administrator window that fills the
+     * screen in front of an invited player.
      *
      * The button exists because the alternative is a session the viewer can
      * only end: while an elevated window holds the foreground, injection is
@@ -6546,9 +8578,10 @@ export class StreamView {
 
     /**
      * Process a single video frame (deliver to NAL parser / decoder).
-     * Called in monotonically-increasing frameId order.
+     * Called in monotonically-increasing frameId order. `zones`: MWSR's zones
+     * from the native host's side block (stream/MwsrZoneBlock.js), or null.
      */
-    _processVideoFrame(data, isKeyframe, backendTs, arrivalAbs = 0) {
+    _processVideoFrame(data, isKeyframe, backendTs, arrivalAbs = 0, zones = null) {
         if (!this._firstFrameProcessed) {
             this._firstFrameProcessed = true;
             console.log(
@@ -6573,7 +8606,7 @@ export class StreamView {
                     buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
                 }
                 this._videoWorker.postMessage(
-                    { type: 'frame', data: buf, isKeyframe, backendTs, arrivalAbs },
+                    { type: 'frame', data: buf, isKeyframe, backendTs, arrivalAbs, zones },
                     [buf],
                 );
             }
@@ -6589,7 +8622,7 @@ export class StreamView {
         // AV1 pipeline: no NAL units, no SPS/PPS, no Annex B start codes.
         // OBUs are passed directly to the decoder.
         if (this.videoCodec === CODEC_AV1) {
-            this.handleAv1Frame(data, isKeyframe);
+            this.handleAv1Frame(data, isKeyframe, backendTs, arrivalAbs, zones);
             return;
         }
 
@@ -6665,12 +8698,12 @@ export class StreamView {
         }
 
         // Submit frame to decoder
-        this.decodeFrame(data, isKeyframe, backendTs, arrivalAbs);
+        this.decodeFrame(data, isKeyframe, backendTs, arrivalAbs, zones);
     }
 
     // --- AV1 pipeline ---
 
-    handleAv1Frame(data, isKeyframe) {
+    handleAv1Frame(data, isKeyframe, backendTs = 0, arrivalAbs = 0, zones = null) {
         // On first keyframe, extract the Sequence Header OBU for decoder config
         // and immediately configure the decoder.
         if (!this.decoderConfigured && !this.decoderConfiguring) {
@@ -6695,7 +8728,7 @@ export class StreamView {
             } else {
                 // Wait for a keyframe before configuring — buffer until then
                 if (this.pendingFrames.length < 120) {
-                    this.pendingFrames.push({ data, isKeyframe });
+                    this.pendingFrames.push({ data, isKeyframe, zones });
                 }
 
                 // Request an IDR if we've buffered too many delta frames
@@ -6715,7 +8748,7 @@ export class StreamView {
         }
 
         // Submit frame to AV1 decoder (no AVCC conversion needed)
-        this.decodeAv1Frame(data, isKeyframe);
+        this.decodeAv1Frame(data, isKeyframe, backendTs, arrivalAbs, zones);
     }
 
     configureAv1Decoder(seqHeaderObu) {
@@ -6770,7 +8803,13 @@ export class StreamView {
                             }
                             while (this.pendingFrames.length > 0) {
                                 const entry = this.pendingFrames.shift();
-                                this.decodeAv1Frame(entry.data, entry.isKeyframe);
+                                this.decodeAv1Frame(
+                                    entry.data,
+                                    entry.isKeyframe,
+                                    0,
+                                    0,
+                                    entry.zones,
+                                );
                             }
                         } catch (e) {
                             console.warn(
@@ -6795,11 +8834,11 @@ export class StreamView {
         tryCodecs(0);
     }
 
-    decodeAv1Frame(data, isKeyframe) {
+    decodeAv1Frame(data, isKeyframe, backendTs = 0, arrivalAbs = 0, zones = null) {
         if (!this.decoderConfigured) {
             // Buffer until decoder is ready (limit to avoid OOM)
             if (this.pendingFrames.length < 120) {
-                this.pendingFrames.push({ data, isKeyframe });
+                this.pendingFrames.push({ data, isKeyframe, zones });
             }
             return;
         }
@@ -6827,10 +8866,22 @@ export class StreamView {
                 data: obuData,
             });
             // AV1 has no backendTs here (synthetic chunk timestamps), so the
-            // pacer sees 0 and this path keeps presenting on decode.
-            this._trackChunkSubmit(timestamp, 0);
+            // pacer sees 0 and this path keeps presenting on decode. The
+            // frame's stamp (hostTs) still reaches what measures its age: the
+            // detection, the content-age probe, the frame log.
+            if (this._renderer) this._renderer.noteEncodedFrame(obuData.length, isKeyframe);
+            // mwsr's zones from the native host, kept by the chunk's timestamp.
+            if (zones && this._renderer && this._renderer.wantsFrameZones)
+                this._renderer.noteFrameZones(timestamp, zones);
+            this._trackChunkSubmit(timestamp, 0, {
+                arrived: arrivalAbs > 0 ? arrivalAbs - performance.timeOrigin : 0,
+                bytes: obuData.length,
+                key: isKeyframe,
+                hostTs: backendTs > 0 ? backendTs : 0,
+            });
             this.decoder.decode(chunk);
             this.stats.received++;
+            this._tellDecodeQueue();
         } catch (err) {
             console.error('[StreamView] decodeAv1Frame() error:', err.message, err);
             this.stats.dropped++;
@@ -6846,7 +8897,9 @@ export class StreamView {
         // carries no initial lock state, so the host can't know the client
         // started with e.g. NumLock on. Re-sync once per session on the first
         // real keyboard event (getModifierState requires a KeyboardEvent).
-        this._locksSynced = false;
+        // Not from a TV remote: it has no lock keys, reads them all off, and
+        // its first press would turn the host's NumLock off.
+        this._locksSynced = RemoteNav.isActive();
         // Load the physical-key → printed-label map so control combos match the
         // user's layout (AZERTY: KeyA → 'q') instead of the QWERTY position.
         // Chromium-only; Safari/Firefox fall back to e.key/e.code detection.
@@ -6854,9 +8907,11 @@ export class StreamView {
         // Common events (both modes)
         document.addEventListener('keydown', this._onKeyDown);
         document.addEventListener('keyup', this._onKeyUp);
+        document.addEventListener('keypress', this._onKeyPress);
         // Native paste event: the only permission-free way to read the local
         // clipboard (Ctrl/Cmd+V IS the user's consent). See handlePaste().
         document.addEventListener('paste', this._onPaste);
+        this._buildKeyField();
         // Any pointer gesture is an opportunity to flush a host-clipboard
         // write that was denied for lack of transient activation.
         document.addEventListener('pointerdown', this._onPointerDownFlush, true);
@@ -7030,7 +9085,8 @@ export class StreamView {
                 // Raw mode: every report already went out from _onPointerRaw;
                 // this is the same motion summed up, a frame late.
                 if (this._rawPointerLive()) return;
-                this._sendToHost({ type: 'mousemove', dx: e.movementX, dy: e.movementY });
+                this._sendRelativeMouse(e.movementX, e.movementY);
+                this._noteMouseSent(e);
             } else {
                 this._lastMouseClientX = e.clientX;
                 this._lastMouseClientY = e.clientY;
@@ -7057,6 +9113,7 @@ export class StreamView {
                     referenceWidth: refW,
                     referenceHeight: refH,
                 });
+                this._noteMouseSent(e);
             }
         };
         this.inputEl.addEventListener('mousemove', this._onGamingMouseMove);
@@ -7179,6 +9236,9 @@ export class StreamView {
      * double cursor from coming back.
      */
     _pictureCursor() {
+        // A mouse that reaches nothing: the viewer's own arrow is the only
+        // pointer that is theirs.
+        if (!this._mouseAllowed) return 'default';
         // The host is drawing it into the frame — showing ours too would be a
         // double cursor.
         if (!this._hostDrawsCursor) return this._hiddenCursor();
@@ -7849,7 +9909,10 @@ export class StreamView {
             // Send absolute position. LiSendMousePositionEvent() on the backend
             // will scale (x, y) from the reference plane to host screen coords.
             const msg = this._absoluteMouseMessage(e.clientX, e.clientY);
-            if (msg) this._sendToHost(msg);
+            if (msg) {
+                this._sendToHost(msg);
+                this._noteMouseSent(e);
+            }
         };
 
         this._onNormalMouseDown = (e) => {
@@ -7860,6 +9923,9 @@ export class StreamView {
             // last was, with nothing on the client to show the gap. Over the
             // bars there is nothing to aim at: no press either, the release
             // below still goes out so a button is never left held.
+            // The mouse events a browser makes up after a tap: the touch path
+            // has already clicked there, a second press would double it.
+            if (firedByTouch(e)) return;
             const msg = this._absoluteMouseMessage(e.clientX, e.clientY);
             if (!msg) return;
             this._sendToHost(msg);
@@ -7867,6 +9933,7 @@ export class StreamView {
         };
 
         this._onNormalMouseUp = (e) => {
+            if (firedByTouch(e)) return;
             this.handleMouseUp(e);
         };
 
@@ -7896,8 +9963,18 @@ export class StreamView {
 
     unbindEvents() {
         if (this._gamepadManager) this._gamepadManager.stop();
+        if (this._hidPassthrough) {
+            this._hidPassthrough.stop();
+            this._hidPassthrough = null;
+            window.removeEventListener('gamepadconnected', this._onHidPadConnected);
+        }
+        for (const toast of this._hidOfferToasts || []) toast.dismiss();
+        this._hidOfferToasts = [];
         document.removeEventListener('keydown', this._onKeyDown);
         document.removeEventListener('keyup', this._onKeyUp);
+        document.removeEventListener('keypress', this._onKeyPress);
+        this._dropComposedKey();
+        this._removeKeyField();
         document.removeEventListener('paste', this._onPaste);
         document.removeEventListener('pointerdown', this._onPointerDownFlush, true);
         if (this._pendingPasteKey) {
@@ -7973,6 +10050,23 @@ export class StreamView {
     }
 
     /**
+     * The owner gave this guest's mouse to the host, or took it back, while
+     * they watch. Taken back: the lock goes with it, and the viewer's arrow
+     * comes back over the picture. Given: the next move styles the pointer as
+     * for anyone, and gaming mode takes the mouse at the next click.
+     */
+    _setMouseAllowed(allowed) {
+        if (this._mouseAllowed === allowed) return;
+        this._mouseAllowed = allowed;
+        console.log(`[StreamView] Mouse ${allowed ? 'given to' : 'taken from'} this viewer`);
+        if (this._kbdBtn) this._kbdBtn.hidden = !allowed;
+        if (allowed) return;
+        this._hideVirtualKeyboard();
+        if (document.pointerLockElement === this.inputEl) document.exitPointerLock();
+        if (this.inputEl) this.inputEl.style.cursor = 'default';
+    }
+
+    /**
      * Take the mouse without waiting for a click.
      *
      * Gaming mode is chosen before the stream exists, and it means "the mouse
@@ -7989,7 +10083,7 @@ export class StreamView {
      * for the retiring view to let go (see activate()).
      */
     _autoCapturePointer() {
-        if (!this._gamingMode || !this.inputEl || this.pointerLocked) return;
+        if (!this._gamingMode || !this.inputEl || this.pointerLocked || !this._mouseAllowed) return;
         if (document.pointerLockElement && document.pointerLockElement !== this.inputEl) return;
         try {
             const p = this._lockPointer();
@@ -8050,7 +10144,7 @@ export class StreamView {
      */
     _lockPointer() {
         const el = this.inputEl;
-        if (!el) return null;
+        if (!el || !this._mouseAllowed) return null;
         let p = null;
         try {
             p = el.requestPointerLock({ unadjustedMovement: true });
@@ -8095,7 +10189,7 @@ export class StreamView {
         if (!el || typeof el.closest !== 'function') return false;
         return !!el.closest(
             'input, textarea, select, [contenteditable="true"], ' +
-                '.share-popin-overlay, .share-board-overlay, .session-input-panel',
+                '.share-popin-overlay, .share-board-overlay, .gamepad-remap-overlay, .session-input-panel',
         );
     }
 
@@ -8224,7 +10318,10 @@ export class StreamView {
         MetaLeft: 0x5b,
         ControlRight: 0x11,
         ShiftRight: 0x10,
-        AltRight: 0x12,
+        // VK_RMENU, not VK_MENU: on a European layout the right Alt is
+        // AltGr. As 0x12 it reached Wolf and Sunshine as the LEFT Alt, and
+        // AltGr+E on a French host typed no € (issue #44, 29/10/2026).
+        AltRight: 0xa5,
         MetaRight: 0x5c,
         // Context menu
         ContextMenu: 0x5d,
@@ -8369,6 +10466,62 @@ export class StreamView {
         return { char: key, nonUs: key !== us[e.shiftKey ? 1 : 0] };
     }
 
+    /**
+     * Whether the Ctrl and Alt of a keystroke chose its character rather than
+     * made a shortcut: AltGr (Chrome on Windows reports it as Ctrl+Alt with
+     * AltGraph, on Linux as AltGraph alone), a left Ctrl+Alt that typed what
+     * AltGr types there (Windows takes the one for the other: € on AZERTY's E),
+     * or a Mac's Option, which composes characters as AltGr does ({ [ | ~ € on
+     * the Mac's AZERTY). Said so, the host lets them go when its own layout
+     * does not need them: "@" from a French AltGr is Shift+2 on a US host, "{"
+     * from Option is Shift+[. Ctrl+Alt+T, which types its plain t, stays a
+     * shortcut.
+     *
+     * @param {KeyboardEvent} e
+     * @param {boolean} apple the client's keyboard is a Mac's
+     * @param {Map<string, string>|null} map navigator.keyboard's layout map
+     * @returns {boolean}
+     */
+    static altGraphLevel(e, apple, map) {
+        let altGraph = false;
+        try {
+            altGraph = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
+        } catch {
+            altGraph = false;
+        }
+        if (altGraph) return true;
+        if (apple) return !!(e.altKey && !e.ctrlKey && !e.metaKey);
+        if (e.ctrlKey && e.altKey && !e.shiftKey && !e.metaKey && map) {
+            const plain = map.get(e.code);
+            return typeof plain === 'string' && e.key !== plain && e.key !== plain.toUpperCase();
+        }
+        return false;
+    }
+
+    /**
+     * The character a keystroke carries to the host, or null where its
+     * position is what counts.
+     *
+     * A shortcut names a key, not a character: Ctrl, Cmd (the host's Windows
+     * key) or an Alt that is not AltGr. A letter keeps its character — Ctrl+A
+     * on an AZERTY is the host's A, not the Q of its position — and anything
+     * else goes by its position, as a keyboard plugged into the host would
+     * send it: Ctrl+1 on an AZERTY is Ctrl+1, where its "&" was Ctrl+Shift+7
+     * on a US host. Decided at the press, which its release and the heartbeat
+     * replay.
+     *
+     * @param {KeyboardEvent} e
+     * @param {{char: string, nonUs: boolean}|null} cc clientChar(e)
+     * @param {boolean} altGraph altGraphLevel(e, …)
+     * @returns {{char: string, nonUs: boolean}|null}
+     */
+    static keyChar(e, cc, altGraph) {
+        if (!cc) return null;
+        const shortcut = (e.ctrlKey || e.metaKey || e.altKey) && !altGraph;
+        if (shortcut && !/^[A-Za-z]$/.test(cc.char)) return null;
+        return cc;
+    }
+
     // Cache navigator.keyboard.getLayoutMap() to resolve a physical key code
     // (e.code) to its printed label for the active layout. Used by combo
     // detection so Cmd+Option+Ctrl+{Q,X,Z,M} matches the labelled key on
@@ -8394,6 +10547,31 @@ export class StreamView {
         }
     }
 
+    /**
+     * An AltGr keystroke the layout has no character for: a dead key, or
+     * nothing at all. Chrome on Windows names neither 'Dead' — e.key reads the
+     * key's plain character, as if AltGr were not held: 'é' for AltGr+2 on
+     * AZERTY, whose tilde then comes composed with the next key ("~" with the
+     * Space). Sent as that 'é', it typed "é~" on the native host for one tilde
+     * (12/10/2026). The layout map holds each key's plain character, which a
+     * real AltGr character ('#' for AltGr+3) is not. A left Ctrl+Alt chord
+     * reports Control and Alt, not AltGraph, and stays a chord.
+     *
+     * @param {KeyboardEvent} e
+     * @param {Map<string, string>|null} map navigator.keyboard's layout map
+     * @returns {boolean}
+     */
+    static isAltGrWithoutChar(e, map) {
+        if (!map || typeof e.key !== 'string' || [...e.key].length !== 1) return false;
+        let altGraph = false;
+        try {
+            altGraph = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
+        } catch {
+            altGraph = false;
+        }
+        return altGraph && map.get(e.code) === e.key;
+    }
+
     // Align the host's toggle-lock state with the client's. The Moonlight
     // protocol has no lock-state field, so we send the client's lock states
     // to the backend, which reads the host's REAL state (when the streamed
@@ -8412,7 +10590,12 @@ export class StreamView {
             e.code === name ? !e.getModifierState(name) : e.getModifierState(name);
         this.webrtc.send({
             type: 'locksync',
-            numLock: state('NumLock'),
+            // An Apple keyboard has no NumLock to read, and its keypad always
+            // types digits: NumLock on, at the PC. Read as off, the PC's keypad
+            // would type arrows from the first key on (26/10/2026). Its Clear
+            // key carries the NumLock code: pressed first, the PC toggles after
+            // the sync, so the sync says off and the PC ends on.
+            numLock: this._appleKeyboard ? e.code !== 'NumLock' : state('NumLock'),
             capsLock: state('CapsLock'),
             scrollLock: state('ScrollLock'),
         });
@@ -8427,10 +10610,47 @@ export class StreamView {
         // Soft-keyboard events on the capture element are handled by its own
         // listeners (beforeinput/keydown) — don't double-process here.
         if (e.target === this._kbdCapture) return;
+        // A keystroke still waiting for its composed character goes out first:
+        // the host must see the two presses in the order they were made.
+        if (this._composedKey) this._flushComposedKey();
+        // The OK that opened the remote's menu, still held: its repeats land
+        // on the menu's first button the moment it takes the focus, and press
+        // it — the menu closed again under the finger (measured on a Freebox).
+        if (this._okHold && this._okHold.fired && e.key === 'Enter' && !e.code) {
+            e.preventDefault();
+            return;
+        }
+        // A remote's colour key is "back" (RemoteNav): over the bare stream it
+        // opens the stream's menu — RemoteNav closes it again. Never the
+        // host's: its code reads MediaStop, Eject or BrowserSearch.
+        if (RemoteNav.isRemoteBackKey(e)) {
+            e.preventDefault();
+            if (RemoteNav.isActive() && RemoteNav.backKeyFresh(e)) this._openRemoteMenu();
+            return;
+        }
         // A dialog over the stream owns the keyboard. Forwarding its keystrokes
         // to the host — and preventDefault-ing them — made Ctrl+C on the share
         // popin's PIN do nothing locally while sending a copy chord to the game.
-        if (StreamView.isLocalKeyboardTarget(e.target)) return;
+        // The Mac's key field is a text field, and the stream's own.
+        if (e.target !== this._keyField && StreamView.isLocalKeyboardTarget(e.target)) return;
+        // A keystroke that missed the Mac's key field (a toolbar button kept
+        // the focus): the next ones go through it.
+        if (this._keyField && e.target !== this._keyField) this._focusKeyField();
+        // The remote's menu is up: nothing reaches the host. Its buttons have
+        // the keys through the focus (RemoteNav moves it there).
+        if (this._remoteMenu && this._remoteMenu.isOpen) {
+            e.preventDefault();
+            return;
+        }
+        // A key the host has no code for — a remote's colour or app keys
+        // (no code, keyCode 0), an IME's 229 — has nothing to press there.
+        if (!e.code && (!e.keyCode || e.keyCode === 229)) {
+            e.preventDefault();
+            return;
+        }
+        if (RemoteNav.isActive() && this._remoteOkDown(e)) return;
+        if (this._remotePointerOn && this._remotePointerActive() && this._remotePointerKeyDown(e))
+            return;
 
         // Before anything else reads this event: a modifier the local OS ate
         // the key-up of is still down on the host, and this event says so.
@@ -8438,6 +10658,7 @@ export class StreamView {
         // clears the drift on its own, without the player doing anything.
         this._keyMapper?.observeModifiers(e, true);
         this._reconcileModifiers(e);
+        this._markAltGrCtrl(e);
 
         // OS auto-repeat (e.repeat) is forwarded, because nothing on the host
         // would produce it otherwise: typematic is generated by the keyboard
@@ -8450,21 +10671,26 @@ export class StreamView {
         // deliberately swallow theirs (a control combo is a one-shot action, and
         // re-arming the clipboard bridge on every repeat would paste in a loop),
         // and _heldPhysKeys is exactly the set that went out.
+        //
+        // Except when this browser streams its own machine. The host injects
+        // into the foreground window, which is this one: its press of a key
+        // already down comes straight back here as a repeat, went out again,
+        // was injected again — forty-odd presses a second of every held key,
+        // for as long as the stream lasted. There the keyboard is local, and
+        // its own typematic already repeats on the host; nothing to forward.
         if (e.repeat) {
             e.preventDefault();
+            if (this._selfStream) return;
             const held = this._heldPhysKeys.get(e.code);
             if (!held) return;
+            // The repeat replays the press the host actually received — its
+            // character, its mouse mode and its AltGr included, or the host
+            // would resolve the repeats, then the release, through another
+            // path than the press: a key held in gaming mode turned into a
+            // character after the first repeat.
             this._sendKeyEvent({
+                ...held,
                 type: 'keydown',
-                keyCode: held.keyCode,
-                code: held.code,
-                key: held.key,
-                // The repeat replays the press the host actually received —
-                // character included, or the host would resolve the repeats
-                // through a different path than the original press.
-                char: held.char,
-                nonUs: held.nonUs,
-                hold: held.hold,
                 ctrlKey: e.ctrlKey,
                 shiftKey: e.shiftKey,
                 altKey: e.altKey,
@@ -8631,6 +10857,36 @@ export class StreamView {
                 return;
             }
 
+            // Sound off / on: Ctrl+Alt+Shift+S (Win) / Cmd+Option+Ctrl+S (Mac),
+            // issue #29. Said on screen: in fullscreen the volume control,
+            // and with it any sign of the change, is out of sight.
+            if (chk('s', 'KeyS')) {
+                e.preventDefault();
+                if (!e.repeat) {
+                    const muted = this.toggleMute();
+                    Toast.info(t(muted ? 'stream.soundOff' : 'stream.soundOn'), {
+                        durationMs: 1500,
+                    });
+                }
+                return;
+            }
+
+            // Microphone open / cut: Ctrl+Alt+Shift+P (Win) / Cmd+Option+Ctrl+P
+            // (Mac).
+            if (chk('p', 'KeyP')) {
+                e.preventDefault();
+                if (!e.repeat) this._toggleMicSaid();
+                return;
+            }
+
+            // Stats overlay open / closed: Ctrl+Alt+Shift+I (Win) /
+            // Cmd+Option+Ctrl+I (Mac) — the same toggle as the menu's entry.
+            if (chk('i', 'KeyI')) {
+                e.preventDefault();
+                if (!e.repeat) this._toggleStatsFromMenu();
+                return;
+            }
+
             // Switch host desktop: Ctrl+Alt+Shift+Left/Right (Win, Linux) /
             // Ctrl+Option+Cmd+Left/Right (Mac). Tested on e.code, not through
             // chk(): the arrows carry no layout label, and chk() only ever
@@ -8643,6 +10899,14 @@ export class StreamView {
                 return;
             }
 
+            // The eye test's split screen, next view: Ctrl+Alt+Shift+G
+            // (Win) / Cmd+Option+Ctrl+G (Mac), with its lab key only.
+            if (this._mwsrSplit && chk('g', 'KeyG')) {
+                e.preventDefault();
+                if (!e.repeat) this._cycleMwsrSplit();
+                return;
+            }
+
             // Block ANY other triple-modifier combo from reaching the host.
             // Ctrl+Alt+Shift (Win) / Cmd+Option+Ctrl (Mac) combos that are NOT
             // mapped above are still streaming-control territory — they must not
@@ -8651,19 +10915,50 @@ export class StreamView {
             return;
         }
 
-        e.preventDefault();
         // Use physical-position-based VK code (like moonlight-qt's SDL scancode→VK).
         // e.code is always layout-independent ("KeyQ" = top-left letter row).
         // e.keyCode may be layout-dependent on some browsers (VK_A for 'a' on
         // AZERTY instead of VK_Q), which breaks Sunshine's layout correction.
         // Fall back to e.keyCode only for unmapped codes.
         const vkCode = StreamView.codeToWindowsVk(e.code) || e.keyCode;
+        // A dead key (AltGr+2's tilde on AZERTY): its character comes composed
+        // with the next key. Said so, for the native host to leave it out.
+        const dead = e.key === 'Dead' || StreamView.isAltGrWithoutChar(e, this._layoutMap);
         // …and, for a printable key, which character the client's layout put
         // there — plus whether the US layout disagrees. What each host does with
-        // that is InputMsg::resolveKey's business, not ours.
-        const cc = StreamView.clientChar(e);
+        // that is InputMsg::resolveKey's business, not ours. A dead key has none
+        // yet, whatever e.key reads.
+        const typed = dead ? null : StreamView.clientChar(e);
+        // AltGr, or a Mac's Option, chose the character: the host lets their
+        // Ctrl and Alt go for the key when its own layout does not need them
+        // (Alt+Shift+[ was a shortcut on a US host, not "{"). With a key that
+        // types nothing (Tab, F4, an arrow) they stay modifiers.
+        const altGraph =
+            !!typed && StreamView.altGraphLevel(e, this._appleKeyboard, this._layoutMap);
+        const cc = StreamView.keyChar(e, typed, altGraph);
         const char = cc ? cc.char : null;
         const nonUs = cc ? cc.nonUs : false;
+
+        // The printable key after a dead key: what it types is the browser's
+        // composition, and Chrome on Windows does not put that in this event —
+        // e.key still reads ' ' for the Space of "~", 'n' for the n of "ñ". It
+        // comes in the keypress, which only fires if this keydown is left alone.
+        // Never in gaming mode: a game's key does not wait, and there the dead
+        // key itself goes by its position and the host composes.
+        if (this._deadPending && !dead && cc && !e.ctrlKey && !e.metaKey && !this._gamingMode) {
+            this._deadPending = false;
+            this._deferComposedKey(e, vkCode, cc);
+            // A Mac typing into its key field: the browser composed it already,
+            // "~" on the Space itself, and fires no keypress (the keyCode of an
+            // IME's keystroke says so). Nothing to wait for, and the keydown,
+            // the IME's, is left alone all the same.
+            if (e.keyCode === 229) this._flushComposedKey();
+            return;
+        }
+        if (dead) this._deadPending = true;
+        else if (!StreamView.MODIFIER_CODES.has(e.code)) this._deadPending = false;
+
+        e.preventDefault();
 
         // ── Cmd+key on an Apple keyboard: send a tap, not a hold ──────────
         // macOS never delivers the keyup of a key pressed while Cmd is down.
@@ -8682,6 +10977,9 @@ export class StreamView {
                 key: e.key,
                 char,
                 nonUs,
+                dead,
+                gaming: !!this._gamingMode,
+                altGraph,
                 ctrlKey: e.ctrlKey,
                 shiftKey: e.shiftKey,
                 altKey: e.altKey,
@@ -8704,7 +11002,12 @@ export class StreamView {
             key: e.key,
             char,
             nonUs,
+            dead,
             hold: this._holdsThroughStall(e.code),
+            // The client's mouse mode at the press: under "auto" the host
+            // plays gaming mode by key positions (InputMsg::resolveKey).
+            gaming: !!this._gamingMode,
+            altGraph,
             ctrlKey: e.ctrlKey,
             shiftKey: e.shiftKey,
             altKey: e.altKey,
@@ -8712,11 +11015,183 @@ export class StreamView {
         });
     }
 
+    /**
+     * Hold back the printable keystroke that follows a dead key, until the
+     * browser has said what the two compose to. Its keydown is left without
+     * preventDefault() so that the keypress carrying the composition fires;
+     * handleKeyPress() collects it and cancels that one instead. The press goes
+     * out at the first of: its own release, the next keydown, or 50 ms — with
+     * the composed character when one came, with the key's own otherwise.
+     *
+     * The position is unchanged, so a Sunshine host, which gets the dead key as
+     * a position too and composes on its side, sees the same two presses as
+     * before. Only the native host, which types the character, gets the "~".
+     */
+    _deferComposedKey(e, vkCode, cc) {
+        this._dropComposedKey();
+        this._composedKey = {
+            code: e.code,
+            msg: {
+                type: 'keydown',
+                keyCode: vkCode,
+                code: e.code,
+                key: e.key,
+                char: cc.char,
+                nonUs: cc.nonUs,
+                dead: false,
+                hold: this._holdsThroughStall(e.code),
+                gaming: !!this._gamingMode,
+                altGraph: StreamView.altGraphLevel(e, this._appleKeyboard, this._layoutMap),
+                ctrlKey: e.ctrlKey,
+                shiftKey: e.shiftKey,
+                altKey: e.altKey,
+                metaKey: e.metaKey,
+            },
+            chars: [],
+            timer: setTimeout(() => this._flushComposedKey(), 50),
+        };
+    }
+
+    /** The keypress of a keystroke held back by _deferComposedKey(). */
+    handleKeyPress(e) {
+        if (!this._composedKey || e.target === this._kbdCapture) return;
+        e.preventDefault();
+        if (typeof e.key === 'string' && [...e.key].length === 1)
+            this._composedKey.chars.push(e.key);
+    }
+
+    _flushComposedKey() {
+        const pending = this._composedKey;
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this._composedKey = null;
+        // One keypress: the composition ("~" from the tilde and Space). Two:
+        // the pair did not compose ("~" then "z"), and the key types its own,
+        // the last one — the accent is lost there, as on a single key press
+        // there is room for one character only.
+        const composed = pending.chars.length
+            ? pending.chars[pending.chars.length - 1]
+            : pending.msg.char;
+        const msg = { ...pending.msg, char: composed };
+        if (composed !== pending.msg.char) msg.nonUs = true;
+        this._sendKeyEvent(msg);
+    }
+
+    _dropComposedKey() {
+        if (!this._composedKey) return;
+        clearTimeout(this._composedKey.timer);
+        this._composedKey = null;
+    }
+
+    /**
+     * A Mac composes a dead key for a text field only. On the page itself,
+     * Chrome and Safari both report Option+n as 'Dead' and the Space after it
+     * as ' ', in every event, cancelled or not: the "~" is nowhere, and the
+     * native host typed a space for every tilde (Chrome 126 and Safari 27, a
+     * French Mac, 24/10/2026). In a field the next keystroke reads the
+     * composition itself, "~" on the Space and "ñ" on the n, even with the
+     * dead key's keydown cancelled. So a Mac's keys go through this invisible
+     * field, emptied as the compositions land in it.
+     *
+     * Not on a touch device, where a field brings up the on-screen keyboard,
+     * and not in gaming mode (see _focusKeyField).
+     */
+    _buildKeyField() {
+        if (this._keyField || !IS_APPLE || IS_IOS || IS_TOUCH_DEVICE) return;
+        this._keyField = StreamView.createKeyField();
+        (this._rootEl || document.body).appendChild(this._keyField);
+        // A click on the picture leaves the focus nowhere: give it back.
+        this._onKeyFieldPointerUp = (e) => {
+            if (!StreamView.isLocalKeyboardTarget(e.target)) this._focusKeyField();
+        };
+        document.addEventListener('pointerup', this._onKeyFieldPointerUp, true);
+        this._focusKeyField();
+    }
+
+    /** The key field itself: invisible, and empty once a composition is in. */
+    static createKeyField() {
+        const field = document.createElement('textarea');
+        field.className = 'stream-kbd-capture';
+        field.setAttribute('autocomplete', 'off');
+        field.setAttribute('autocorrect', 'off');
+        field.setAttribute('autocapitalize', 'off');
+        field.setAttribute('spellcheck', 'false');
+        field.setAttribute('aria-hidden', 'true');
+        field.setAttribute('tabindex', '-1');
+        const empty = () => {
+            field.value = '';
+        };
+        // Never from inside a composition: emptied under it, the field ends it.
+        field.addEventListener('input', (e) => {
+            const ev = /** @type {InputEvent} */ (e);
+            if (!ev.isComposing && !/Composition/.test(ev.inputType || '')) empty();
+        });
+        field.addEventListener('compositionend', () => setTimeout(empty, 0));
+        return field;
+    }
+
+    /**
+     * The keyboard back on the Mac's key field, unless a text field or a
+     * dialog of the page has it. Never in gaming mode: there a dead key goes
+     * by its position, and a field's press-and-hold (the accents of a held
+     * letter) would stop the repeats of a held key.
+     */
+    _focusKeyField() {
+        const field = this._keyField;
+        if (!field || this._gamingMode || this._quitting) return;
+        const active = document.activeElement;
+        if (active === field || (active && StreamView.isLocalKeyboardTarget(active))) return;
+        try {
+            field.focus({ preventScroll: true });
+        } catch {
+            field.focus();
+        }
+    }
+
+    _removeKeyField() {
+        if (!this._keyField) return;
+        document.removeEventListener('pointerup', this._onKeyFieldPointerUp, true);
+        this._keyField.blur();
+        this._keyField.remove();
+        this._keyField = null;
+    }
+
     handleKeyUp(e) {
         if (e.target === this._kbdCapture) return;
+        // Its press, held back for a composition, goes out before its release.
+        if (this._composedKey && this._composedKey.code === e.code) this._flushComposedKey();
+        // Ahead of the dialog exclusion: the OK that opened the remote's menu
+        // comes back up on the menu's button, and its hold must end there.
+        if (this._okHold && this._remoteOkUp(e)) return;
+        // A colour key's release: its press never went to the host.
+        if (RemoteNav.isRemoteBackKey(e)) {
+            e.preventDefault();
+            return;
+        }
+        // An arrow that was steering the pointer: its press never went to the
+        // host, neither does its release — even if the mode went off meanwhile.
+        if ((this._remotePointer || this._remotePointerOn) && this._remotePointerKeyUp(e)) return;
         // Same exclusion as handleKeyDown: a release whose press was never sent
         // would land on the host as an unmatched key-up.
-        if (StreamView.isLocalKeyboardTarget(e.target)) return;
+        if (e.target !== this._keyField && StreamView.isLocalKeyboardTarget(e.target)) return;
+        if (!e.code && (!e.keyCode || e.keyCode === 229)) {
+            e.preventDefault();
+            return;
+        }
+        // The menu takes its keys down and up; and the release of the OK that
+        // picked one of its buttons comes after the menu is gone — its press
+        // never went to the host, so neither does it. Same once Stop was
+        // chosen (from the menu's "leave or stop" question, say): a release of
+        // a key the host does not hold has nothing to release.
+        const held = this._heldPhysKeys.has(e.code) || this._heldPhysKeys.has(e.keyCode);
+        if (
+            (this._remoteMenu && this._remoteMenu.isOpen) ||
+            (!held && performance.now() - this._remoteMenuClosedAt < 1000) ||
+            (!held && this._manualQuitting)
+        ) {
+            e.preventDefault();
+            return;
+        }
         // Above every branch below, all of which return early.
         this._keyMapper?.observeModifiers(e, false);
         this._reconcileModifiers(e);
@@ -8764,6 +11239,11 @@ export class StreamView {
             }
         }
         e.preventDefault();
+        // Streaming its own machine, the host's injected release lands here
+        // too, for a key this view already let go of: sent back, it is
+        // injected again and comes back again, forever. A release of a key
+        // not held is only ever that echo there.
+        if (this._selfStream && !this._heldPhysKeys.has(e.code)) return;
         const vkCode = StreamView.codeToWindowsVk(e.code) || e.keyCode;
         this._sendKeyEvent({
             type: 'keyup',
@@ -8778,6 +11258,9 @@ export class StreamView {
             // the first one never comes back up.
             char: this._heldPhysKeys.get(e.code)?.char ?? null,
             nonUs: this._heldPhysKeys.get(e.code)?.nonUs ?? false,
+            dead: this._heldPhysKeys.get(e.code)?.dead ?? false,
+            gaming: this._heldPhysKeys.get(e.code)?.gaming ?? false,
+            altGraph: this._heldPhysKeys.get(e.code)?.altGraph ?? false,
             ctrlKey: e.ctrlKey,
             shiftKey: e.shiftKey,
             altKey: e.altKey,
@@ -8795,6 +11278,13 @@ export class StreamView {
         if (this._pendingPasteKey) clearTimeout(this._pendingPasteKey.timer);
         this._pendingPasteKey = null;
         this._clipboardReadRequest = null;
+        // A press still held back would go out after the releases below, with
+        // no keyup ever coming for it: it is dropped instead.
+        if (this._composedKey) {
+            clearTimeout(this._composedKey.timer);
+            this._composedKey = null;
+        }
+        this._deadPending = false;
         // Nothing stays held, so no late keyup is worth swallowing any more.
         if (this._metaTapCodes) this._metaTapCodes.clear();
         if (this._swallowKeyUpCodes) this._swallowKeyUpCodes.clear();
@@ -8908,13 +11398,11 @@ export class StreamView {
         // Snapshot: _sendKeyEvent deletes from the map we are iterating.
         for (const [id, payload] of [...this._heldPhysKeys]) {
             if (typeof id !== 'string' || StreamView.MODIFIER_CODES.has(id)) continue;
+            // The press's own template, mouse mode included: a release
+            // resolved otherwise lets go of another key.
             this._sendKeyEvent({
+                ...payload,
                 type: 'keyup',
-                keyCode: payload.keyCode,
-                code: payload.code,
-                key: payload.key,
-                char: payload.char ?? null,
-                nonUs: !!payload.nonUs,
                 ctrlKey: false,
                 shiftKey: false,
                 altKey: false,
@@ -8965,6 +11453,7 @@ export class StreamView {
                 key: payload.key,
                 char: payload.char ?? null,
                 nonUs: !!payload.nonUs,
+                dead: !!payload.dead,
                 ctrlKey: false,
                 shiftKey: false,
                 altKey: false,
@@ -8974,16 +11463,71 @@ export class StreamView {
     }
 
     /**
+     * The left Ctrl Windows puts under an AltGr, told apart from the viewer's.
+     *
+     * Windows sends it with the right Alt, at the same instant, and the right
+     * Alt's event says AltGraph. Held, it stopped AltGr+E from typing € on a
+     * Linux host, where Ctrl with the right Alt is no AltGr (issue #44,
+     * 29/10/2026). Its release goes out marked, for a positional host only:
+     * Windows reads Ctrl and Alt as AltGr, and the native host keeps it. The
+     * key stays held here, marked, for the heartbeat.
+     *
+     * @param {KeyboardEvent} e
+     */
+    _markAltGrCtrl(e) {
+        if (e.repeat) return;
+        // A remapped Ctrl or right Alt no longer forms the host's AltGr pair.
+        const mappings = this._inputPreferences?.mappings;
+        if (mappings && ('ControlLeft' in mappings || 'AltRight' in mappings)) return;
+        if (e.code === 'ControlLeft') {
+            this._ctrlLeftAt = e.timeStamp;
+            return;
+        }
+        if (e.code !== 'AltRight') return;
+        let altGraph = false;
+        try {
+            altGraph = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
+        } catch {
+            altGraph = false;
+        }
+        const ctrl = this._heldPhysKeys && this._heldPhysKeys.get('ControlLeft');
+        if (!altGraph || !ctrl || ctrl.altGrCtrl) return;
+        // Pressed by a hand, the Ctrl comes well before; Windows sends both
+        // from one key, in the same millisecond.
+        if (!(Math.abs(e.timeStamp - (this._ctrlLeftAt ?? -Infinity)) <= 20)) return;
+        ctrl.altGrCtrl = true;
+        this.webrtc.send({
+            type: 'keyup',
+            keyCode: ctrl.keyCode,
+            code: 'ControlLeft',
+            key: ctrl.key,
+            altGrCtrl: true,
+            ctrlKey: false,
+            shiftKey: !!e.shiftKey,
+            altKey: false,
+            metaKey: false,
+        });
+    }
+
+    /**
      * Whether @p e says the modifier behind @p flag is down.
      *
      * getModifierState is the normative answer and the one that knows about
      * a key held since before this event; the boolean is the fallback for a
      * synthesised event that has no such method (the test harness, and the
      * soft keyboard's own events).
+     *
+     * Under AltGr, Chrome on Windows says Control and Alt are up while its
+     * Ctrl and Alt keys are down: AltGraph stands for both. Read as up, they
+     * were let go of on the host as the AltGr went down, its Alt with nothing
+     * between, and Notepad turned its KeyTips on at each @ (29/10/2026).
      */
     static modifierHeld(e, flag) {
         const name = StreamView.MODIFIER_STATE_BY_FLAG[flag];
-        if (name && typeof e.getModifierState === 'function') return !!e.getModifierState(name);
+        if (name && typeof e.getModifierState === 'function') {
+            if (e.getModifierState(name)) return true;
+            return (flag === 'ctrlKey' || flag === 'altKey') && !!e.getModifierState('AltGraph');
+        }
         return !!e[flag];
     }
 
@@ -9137,7 +11681,15 @@ export class StreamView {
                 key: msg.key,
                 char: msg.char ?? null,
                 nonUs: !!msg.nonUs,
+                dead: !!msg.dead,
                 hold: !!msg.hold,
+                // A toolbar chord releases the key its press resolved to.
+                chord: !!msg.chord,
+                // So does a key pressed in one mouse mode and let go in the
+                // other: under "auto" the host resolved it by its position in
+                // gaming mode, by its character at the desktop.
+                gaming: !!msg.gaming,
+                altGraph: !!msg.altGraph,
             });
         } else {
             this._heldPhysKeys.delete(id);
@@ -9158,7 +11710,10 @@ export class StreamView {
      * a physical release, the key stops being held, whatever we send.
      */
     _forgetHeldKey(code) {
-        if (code) this._heldPhysKeys.delete(code);
+        if (code) {
+            this._heldPhysKeys.delete(code);
+            this._keyMapper?.pressed.delete(code);
+        }
     }
 
     /**
@@ -9177,10 +11732,13 @@ export class StreamView {
             // canvas everywhere else.
             source: () =>
                 this.videoEl && this.videoEl.style.display === 'block' ? this.videoEl : this.canvas,
-            sendClick: () => {
-                this._sendMouseButton(1, true);
+            // The press carries the probe's stamp, for the host to date its
+            // arrival (stream/InputUplink.js).
+            sendClick: (stamp) => {
+                this._sendMouseButton(1, true, stamp);
                 this._sendMouseButton(1, false);
             },
+            uplink: this._inputUplink,
             // The grey circle: at the pointer when we know where it is, at the
             // centre otherwise, up for exactly one frame (hidden again from the
             // rAF after the one that paints it).
@@ -9212,6 +11770,7 @@ export class StreamView {
             // Renderers whose canvas cannot be read once presented (WebGL2,
             // desynchronized) hand the probe their own pixel read instead.
             samplePixels: () => (this._renderer ? this._renderer.probePixels : undefined),
+            pixelsDrawnAt: () => (this._renderer ? this._renderer.probeDrawnAt : null),
             setProbing: (on) => {
                 if (this._renderer) this._renderer.probeActive = on;
             },
@@ -9236,7 +11795,7 @@ export class StreamView {
 
     /** Send a mouse button event and keep _heldMouseButtons in sync (same
      *  reason as _sendKeyEvent). `button` is 1-based, as the host expects. */
-    _sendMouseButton(button, down) {
+    _sendMouseButton(button, down, stamp = null) {
         // Latch the pointer as the drag opens, read while it lasts — see
         // _pictureCursor. Taken BEFORE the set changes, so it is the shape the
         // viewer was actually looking at when they pressed.
@@ -9246,12 +11805,16 @@ export class StreamView {
         else this._heldMouseButtons.delete(button);
 
         if (this._heldMouseButtons.size === 0) this._dragCursor = null;
-        this.webrtc.send({
+        const msg = {
             type: down ? 'mousedown' : 'mouseup',
             button,
             // Aim/fire in gaming mode is a genuine hold, not a drag.
             hold: down && !!this._gamingMode,
-        });
+        };
+        // A measured click (the latency probe): the host answers with when it
+        // arrived. Nothing else sets it.
+        if (stamp !== null) msg.stamp = stamp;
+        this.webrtc.send(msg);
     }
 
     /**
@@ -9306,7 +11869,12 @@ export class StreamView {
                 // differently from the original press would strand a key.
                 char: payload.char ?? null,
                 nonUs: !!payload.nonUs,
+                dead: !!payload.dead,
                 hold: !!payload.hold,
+                chord: !!payload.chord,
+                gaming: !!payload.gaming,
+                // An AltGr's Ctrl, which a positional host does not hold.
+                altGrCtrl: !!payload.altGrCtrl,
                 ...mods,
             });
         }
@@ -9335,7 +11903,7 @@ export class StreamView {
     }
 
     /**
-     * Mouse motion at the device's own report rate (native host only).
+     * Mouse motion at the device's own report rate, towards every host.
      *
      * `mousemove` is dispatched once per display frame with the motion since
      * the previous one summed up: a 1000 Hz mouse on a 60 Hz screen reaches
@@ -9343,8 +11911,11 @@ export class StreamView {
      * `pointerrawupdate` (Chromium) fires for every report instead, off the
      * frame clock. The native host injects each event on the thread that
      * receives it (no per-frame batching anywhere downstream), so there the
-     * extra messages buy the delay back; a GameStream host keeps the coalesced
-     * cadence its own protocol was built around — hence the gate.
+     * extra messages buy the delay back. Sunshine, Wolf, Apollo and MultiSeat
+     * get it too since 13/10/2026: moonlight-common-c sums the motions and
+     * sends them at most every millisecond, so the host is not flooded, and
+     * an A/B in game showed no difference either way — the rate meant to be
+     * fastest won.
      *
      * The mousemove handlers stay bound for what only they know how to do
      * (cursor styling, the pre-focus click-to-capture position) and skip the
@@ -9352,17 +11923,18 @@ export class StreamView {
      */
     _bindPointerRaw() {
         this._rawPointer = false;
-        if (!this._nativeHost || !this.inputEl) return;
+        if (!this.inputEl) return;
         if (!('onpointerrawupdate' in window)) return;
-        // Diagnostics: mw_raw_pointer = '0' keeps the coalesced mousemove
-        // cadence against a native host too — the A/B for "is it the report
-        // rate?". Not a setting, same family as mw_pacing.
+        // Diagnostics, read once here: mw_raw_pointer = '0' goes back to the
+        // coalesced mousemove cadence. Not a setting, same family as mw_pacing.
+        let key = null;
         try {
-            if (localStorage.getItem('mw_raw_pointer') === '0') {
-                console.log('[StreamView] Mouse: raw report rate held off (mw_raw_pointer=0)');
-                return;
-            }
+            key = localStorage.getItem('mw_raw_pointer');
         } catch (e) {}
+        if (key === '0') {
+            console.log('[StreamView] Mouse: raw report rate held off (mw_raw_pointer=0)');
+            return;
+        }
         this._onPointerRaw = (e) => {
             if (e.pointerType !== 'mouse') return;
             this._lastRawPointerMs = performance.now();
@@ -9371,17 +11943,35 @@ export class StreamView {
                 // host cursor and handles the capture click.
                 if (!this._mouseFocused) return;
                 if (e.movementX || e.movementY) {
-                    this._sendToHost({ type: 'mousemove', dx: e.movementX, dy: e.movementY });
+                    this._sendRelativeMouse(e.movementX, e.movementY);
+                    this._noteMouseSent(e);
                 }
                 return;
             }
             this._lastClientMoveMs = performance.now();
             const msg = this._absoluteMouseMessage(e.clientX, e.clientY);
-            if (msg) this._sendToHost(msg);
+            if (msg) {
+                this._sendToHost(msg);
+                this._noteMouseSent(e);
+            }
         };
         this.inputEl.addEventListener('pointerrawupdate', this._onPointerRaw);
         this._rawPointer = true;
-        console.log('[StreamView] Mouse: raw report rate (pointerrawupdate, native host)');
+        console.log(
+            this._nativeHost
+                ? '[StreamView] Mouse: raw report rate (pointerrawupdate, native host)'
+                : '[StreamView] Mouse: raw report rate (pointerrawupdate, GameStream host)',
+        );
+    }
+
+    /**
+     * Diagnostics (mw_perf_diag): a mouse motion went out for @p e — how old
+     * its report was, for the [perf] line's mouse part. A null check otherwise.
+     */
+    _noteMouseSent(e) {
+        if (this._mainThreadProbe) {
+            this._mainThreadProbe.noteMouseSend(performance.now() - e.timeStamp);
+        }
     }
 
     /**
@@ -9648,10 +12238,30 @@ export class StreamView {
         return true;
     }
 
+    /**
+     * One relative mouse move, scaled by the Settings sensitivity. Whole counts
+     * go out, the remainder waits for the next move — so a slow hand at 0.5 is
+     * half as fast, not stopped.
+     */
+    _sendRelativeMouse(dx, dy) {
+        const s = this._mouseSensitivity;
+        if (s === 1) {
+            this._sendToHost({ type: 'mousemove', dx, dy });
+            return;
+        }
+        const x = dx * s + this._mouseCarryX;
+        const y = dy * s + this._mouseCarryY;
+        const outX = Math.trunc(x);
+        const outY = Math.trunc(y);
+        this._mouseCarryX = x - outX;
+        this._mouseCarryY = y - outY;
+        if (outX || outY) this._sendToHost({ type: 'mousemove', dx: outX, dy: outY });
+    }
+
     handleMouseMove(e) {
         if (!this.pointerLocked) return;
         if (this._rawPointer) return; // already sent per report by _onPointerRaw
-        this._sendToHost({ type: 'mousemove', dx: e.movementX, dy: e.movementY });
+        this._sendRelativeMouse(e.movementX, e.movementY);
     }
 
     handleMouseDown(e) {
@@ -9737,8 +12347,11 @@ export class StreamView {
         // keystroke to ask for it has nothing left to do.
         if (this.pointerLocked) this._disarmPointerCapture();
         this._mouseFocused = this.pointerLocked;
+        // The hint asks for a click only gaming mode answers. Leaving gaming
+        // mode lets the lock go afterwards, asynchronously: shown again there,
+        // the hint stayed over the desktop-mode picture for good (12/10/2026).
         if (this.hintEl) {
-            this.hintEl.style.display = this.pointerLocked ? 'none' : 'flex';
+            this.hintEl.style.display = this._gamingMode && !this.pointerLocked ? 'flex' : 'none';
         }
         // Capturing/releasing the mouse drives both the full keyboard lock and
         // the gaming-mode exit-reminder overlay.
@@ -9767,6 +12380,21 @@ export class StreamView {
         } else {
             this._requestFullscreen();
         }
+    }
+
+    /**
+     * The eye test's split screen, its next view (BrowserDetect.MWSR_SPLIT_VIEWS),
+     * kept for the next streams: the button's press and Ctrl+Alt+Shift+G. The
+     * grid's side stays the one the lab key set. The main thread's renderer
+     * only — the worker's never takes the split.
+     */
+    _cycleMwsrSplit() {
+        if (!this._mwsrSplit) return;
+        this._mwsrSplit = { ...this._mwsrSplit, view: nextMwsrSplitView(this._mwsrSplit.view) };
+        if (this._renderer && typeof this._renderer.setMwsrSplit === 'function')
+            this._renderer.setMwsrSplit(this._mwsrSplit);
+        const btn = this.streamEl && this.streamEl.querySelector('#btn-mwsr-split');
+        if (btn) btn.textContent = mwsrSplitLabel(this._mwsrSplit.view);
     }
 
     /**
@@ -9826,6 +12454,9 @@ export class StreamView {
             // Hide hint — no pointer lock in desktop mode
             if (this.hintEl) this.hintEl.style.display = 'none';
         }
+        // The Mac's key field is the desktop's only (see _focusKeyField).
+        if (this._gamingMode) this._keyField?.blur();
+        else this._focusKeyField();
 
         // Leaving gaming mode hides the exit reminder and drops the full
         // keyboard lock; entering it keeps the overlay hidden until capture.
@@ -9877,6 +12508,7 @@ export class StreamView {
             touch,
             touchScreen: this._touchScreen,
             isMac: /Mac/.test(navigator.platform),
+            remote: RemoteNav.isActive(),
         };
         this._shortcutsSlide.innerHTML =
             '<div class="shortcuts-slide-title">' +
@@ -9895,18 +12527,23 @@ export class StreamView {
         // with _firstFrameRendered reset, which would otherwise re-pop the
         // slide on every degrade step — app.js sets this flag to suppress it.
         if (!this._shortcutsSlide || this._suppressShortcutsSlide) return;
+        // A guest invited to watch: the gestures move a cursor and open a
+        // keyboard that reach nothing. (A computer's key combos stay: quitting,
+        // fullscreen and stats are this page's own.)
+        if (IS_TOUCH_DEVICE && !this._mouseAllowed && !RemoteNav.isActive()) return;
         this._shortcutsSlide.classList.remove('fading-out');
         this._shortcutsSlide.style.display = '';
 
         if (this._shortcutsTimeout) {
             clearTimeout(this._shortcutsTimeout);
         }
-        // Touch help has more rows to read than the keyboard combos.
+        // Touch help has more rows to read than the keyboard combos, and a TV
+        // is read from the sofa.
         this._shortcutsTimeout = setTimeout(
             () => {
                 this._hideShortcutsSlide();
             },
-            IS_TOUCH_DEVICE ? 7000 : 4000,
+            IS_TOUCH_DEVICE || RemoteNav.isActive() ? 7000 : 4000,
         );
     }
 
@@ -10099,6 +12736,75 @@ export class StreamView {
     }
 
     /**
+     * The host side stopped streaming without meaning to: Sunshine crashed or
+     * its encoder hung the GPU (29/09/2026, Vulkan Video on RADV), or the
+     * native engine died. The browser link is healthy, so "DataChannel closed"
+     * would send the viewer looking in the wrong place; this names the host.
+     * An error, so the alarm transition; the relay closes right after.
+     */
+    _handleHostLost() {
+        if (this._quitting || this._takenOver || this._manualQuitting) return;
+        // A hidden standby leg keeps its own failure path (retire, no toast).
+        if (this._standby) return;
+        this.webrtc.markStopping();
+        this._handleForcedExit(t('stream.hostLostTitle'), t('stream.hostLostBody'));
+    }
+
+    /**
+     * The host ended the stream on purpose: the app was closed there (Quit to
+     * Desktop in the game, or quit from another client). Not an error, so the
+     * clean-exit transition rather than the alarm one, and no disconnect
+     * toasts. The host session is already gone: exit locally, no /quit — the
+     * backend cleans up the slot on its own when the worker ends.
+     */
+    _handleHostEnded() {
+        if (this._quitting || this._takenOver || this._manualQuitting) return;
+        // A hidden standby leg keeps its own failure path (retire, no toast).
+        if (this._standby) return;
+        // A guest sees the owner's session end, whoever closed the app.
+        if (this._playerMode) {
+            this.webrtc.markStopping();
+            this._handleSessionEnded();
+            return;
+        }
+        this._manualQuitting = true;
+        this.connected = false;
+        // The relay closes its channels right after the notice: keep that
+        // close from reading as an unexpected disconnect.
+        this.webrtc.markStopping();
+        if (this.onQuitStart) {
+            try {
+                this.onQuitStart();
+            } catch (e) {}
+        }
+        const el = document.createElement('div');
+        el.className = 'stream-takeover-overlay is-quit';
+        const title = t('stream.hostEndedTitle');
+        el.innerHTML =
+            '<div class="takeover-scanlines"></div>' +
+            '<div class="takeover-box">' +
+            '<div class="takeover-title" data-text="' +
+            title +
+            '">' +
+            title +
+            '</div>' +
+            '<div class="takeover-sub">' +
+            t('stream.hostEndedBody') +
+            '</div>' +
+            '<div class="takeover-bar"><span></span></div>' +
+            '</div>';
+        const root = this._rootEl || document.body;
+        root.appendChild(el);
+        requestAnimationFrame(() => el.classList.add('is-active'));
+        setTimeout(() => {
+            try {
+                el.classList.add('is-closing');
+            } catch (e) {}
+            this._playPowerOff(() => this.quit({ takenOver: true }));
+        }, 1200);
+    }
+
+    /**
      * Backend-initiated exit (take-over / revocation): show the 2s cyberpunk
      * "connection terminated" transition, then quit locally (no backend /quit).
      */
@@ -10142,8 +12848,10 @@ export class StreamView {
      * (clean-exit variant — signature yellow/cyan, no alarm magenta), then
      * quit normally (backend /quit). Guarded so a double-tap is a no-op.
      *
-     * @param {{keepHostSession?: boolean}} [opts] keepHostSession leaves the
-     *        game — and every guest on it — running; see _askShareExit().
+     * @param {{keepHostSession?: boolean, quitApp?: boolean}} [opts]
+     *        keepHostSession leaves the game — and every guest on it — running;
+     *        see _askShareExit(). quitApp closes the app on the host as well
+     *        (implied by the "Quit the app when the stream stops" setting).
      */
     _handleManualQuit(opts = {}) {
         if (this._quitting || this._takenOver || this._manualQuitting) return;
@@ -10185,14 +12893,317 @@ export class StreamView {
         root.appendChild(el);
         requestAnimationFrame(() => el.classList.add('is-active'));
 
+        // Whatever stalls past this — the backend /quit has its own 5-10 s
+        // bounds — the exit screen does not outlive it: the page goes back to
+        // the host list.
+        this._quitWatchdog = setTimeout(() => {
+            if (this._quitFinished) return;
+            console.warn('[StreamView] Quit still pending: forcing the way out');
+            this._quitting = true;
+            this._quitDone();
+        }, StreamView.QUIT_WATCHDOG_MS);
+
         // Shorter than take-over (1.2s deplete) — voluntary, friendly exit.
         // Then power off the "screen" like an old CRT terminal before quitting.
         setTimeout(() => {
             try {
                 el.classList.add('is-closing');
             } catch (e) {}
-            this._playPowerOff(() => this.quit({ keepHostSession: opts.keepHostSession === true }));
+            this._playPowerOff(() =>
+                this.quit({
+                    keepHostSession: opts.keepHostSession === true,
+                    quitApp:
+                        opts.keepHostSession !== true &&
+                        (opts.quitApp === true || this._quitAppOnStop),
+                }),
+            );
         }, 1200);
+    }
+
+    /** How long the exit screen may stay up before the way out is forced. */
+    static get QUIT_WATCHDOG_MS() {
+        return 15000;
+    }
+
+    // ── A TV remote: OK held opens the stream's own menu ───────────────────
+
+    /** How long OK must be held to open the menu instead of pressing Enter. */
+    static get REMOTE_MENU_HOLD_MS() {
+        return 800;
+    }
+
+    /**
+     * How long after the OK that opened the menu comes up the menu still
+     * ignores clicks: the TV browser's own click for that key may land just
+     * after its release.
+     */
+    static get REMOTE_OK_SETTLE_MS() {
+        return 300;
+    }
+
+    /**
+     * Whether the remote's menu may act on a click now. Not while the OK that
+     * opened it is held: TV Bro clicks the focused button on every repeat of a
+     * held OK, preventDefault or not, so the menu closed and opened again
+     * under the finger (Freebox, 03/10/2026).
+     */
+    _remoteMenuAcceptsClick() {
+        if (this._okHold && this._okHold.fired) return false;
+        const ended = this._okHoldEndedAt || 0;
+        return !ended || performance.now() - ended >= StreamView.REMOTE_OK_SETTLE_MS;
+    }
+
+    /**
+     * A remote's OK going down — Enter with no code; a keyboard's Enter has
+     * one. Nothing goes to the host yet: released before REMOTE_MENU_HOLD_MS
+     * it becomes an Enter press and release (_remoteOkUp), held past it the
+     * menu opens and the host never hears of it. The price is that Enter
+     * cannot be held down on the host from a remote, which nothing asks of it.
+     * @returns {boolean} whether the event was taken
+     */
+    _remoteOkDown(e) {
+        if (!RemoteNav.isActive() || e.key !== 'Enter' || e.code) return false;
+        e.preventDefault();
+        if (e.repeat || this._okHold) return true;
+        const hold = { fired: false, timer: 0 };
+        hold.timer = setTimeout(() => {
+            if (this._okHold !== hold) return;
+            hold.fired = true;
+            this._openRemoteMenu();
+        }, StreamView.REMOTE_MENU_HOLD_MS);
+        this._okHold = hold;
+        return true;
+    }
+
+    /** The same OK coming back up: an Enter tap, or nothing if it opened the menu. */
+    _remoteOkUp(e) {
+        if (!this._okHold || e.key !== 'Enter' || e.code) return false;
+        e.preventDefault();
+        const { fired, timer } = this._okHold;
+        clearTimeout(timer);
+        this._okHold = null;
+        if (fired) this._okHoldEndedAt = performance.now();
+        if (!fired) {
+            if (this._remotePointerOn && this._remotePointerActive()) {
+                // Mouse mode: OK is the left button, where the pointer is.
+                this._sendMouseButton(1, true);
+                this._sendMouseButton(1, false);
+            } else {
+                const tap = {
+                    keyCode: 0x0d,
+                    code: 'Enter',
+                    key: 'Enter',
+                    char: null,
+                    nonUs: false,
+                };
+                this._sendKeyEvent({ type: 'keydown', ...tap });
+                this._sendKeyEvent({ type: 'keyup', ...tap });
+            }
+        }
+        return true;
+    }
+
+    // ── A TV remote as a mouse (the menu's "Mouse") ────────────────────────
+
+    /** The device's choice, off unless it was turned on here before. */
+    static readRemotePointerPref() {
+        try {
+            return localStorage.getItem('mw_remote_pointer') === '1';
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /** Mouse mode is on, on a TV, and no menu is over the stream. */
+    _remotePointerActive() {
+        return (
+            this._remotePointerOn &&
+            RemoteNav.isActive() &&
+            !(this._remoteMenu && this._remoteMenu.isOpen)
+        );
+    }
+
+    /** The menu's "Mouse": on, or back to the arrows going to the host. */
+    _toggleRemotePointer() {
+        this._remotePointerOn = !this._remotePointerOn;
+        try {
+            localStorage.setItem('mw_remote_pointer', this._remotePointerOn ? '1' : '0');
+        } catch (e) {
+            /* private mode: for this stream only */
+        }
+        if (!this._remotePointerOn && this._remotePointer) this._remotePointer.releaseAll();
+    }
+
+    _pointerOfRemote() {
+        if (!this._remotePointer) {
+            this._remotePointer = new RemotePointer({
+                move: (dx, dy) => this._remotePointerMove(dx, dy),
+            });
+        }
+        return this._remotePointer;
+    }
+
+    /**
+     * The remote moved the pointer by (dx, dy) host desktop pixels. Where the
+     * page draws the pointer itself, it is moved there and the host's put at
+     * the same point (absolute, as the finger does — see _clientCursorSteer);
+     * elsewhere the host moves its own by the delta.
+     */
+    _remotePointerMove(dx, dy) {
+        if (this._quitting) return;
+        if (this._clientCursorSteers()) {
+            this._clientCursorMoved(dx, dy);
+            const p = this._clientCursorPos;
+            const fw = this._pictureWidth(),
+                fh = this._pictureHeight();
+            if (p && fw > 0 && fh > 0) {
+                this._sendToHost({
+                    type: 'mousemove',
+                    x: Math.round(p.x),
+                    y: Math.round(p.y),
+                    referenceWidth: Math.round(fw),
+                    referenceHeight: Math.round(fh),
+                });
+                return;
+            }
+        }
+        this._sendToHost({ type: 'mousemove', dx, dy });
+    }
+
+    /**
+     * A key of a remote in mouse mode: an arrow steers, Ch+ / Ch− scroll.
+     * @returns {boolean} whether the event was taken
+     */
+    _remotePointerKeyDown(e) {
+        const dir = REMOTE_POINTER_DIRS[e.key];
+        if (dir) {
+            e.preventDefault();
+            if (!e.repeat) this._pointerOfRemote().press(dir);
+            return true;
+        }
+        if (e.key === 'ChannelUp' || e.key === 'ChannelDown') {
+            e.preventDefault();
+            this._sendWheel('mousewheel', e.key === 'ChannelUp' ? 1 : -1);
+            return true;
+        }
+        return false;
+    }
+
+    /** @returns {boolean} whether the release was a steering arrow's */
+    _remotePointerKeyUp(e) {
+        const dir = REMOTE_POINTER_DIRS[e.key];
+        if (!dir || !this._remotePointer || !this._remotePointer.isHeld(dir)) {
+            // Ch± in mouse mode scrolled: no key went down on the host.
+            if (this._remotePointerActive() && (e.key === 'ChannelUp' || e.key === 'ChannelDown')) {
+                e.preventDefault();
+                return true;
+            }
+            return false;
+        }
+        e.preventDefault();
+        this._remotePointer.release(dir);
+        return true;
+    }
+
+    /**
+     * An arrow of a TV remote that reaches the page as a pad (GamepadManager's
+     * onRemoteKey): pressed, repeated while held, released — as a keyboard's
+     * arrow would be, so a remote of either kind does the same on the host.
+     */
+    _remoteArrow(dir, down, repeat) {
+        const keys = {
+            up: ['ArrowUp', 0x26],
+            down: ['ArrowDown', 0x28],
+            left: ['ArrowLeft', 0x25],
+            right: ['ArrowRight', 0x27],
+        };
+        const k = keys[dir];
+        if (!k || this._quitting) return;
+        // Mouse mode: the pad's arrows steer the pointer, as the keys' do.
+        if (this._remotePointer && this._remotePointer.isHeld(dir) && !down) {
+            this._remotePointer.release(dir);
+            return;
+        }
+        if (this._remotePointerOn && this._remotePointerActive()) {
+            if (down && !repeat) this._pointerOfRemote().press(dir);
+            return;
+        }
+        if (!down && !this._heldPhysKeys.has(k[0])) return;
+        if (down && repeat && !this._heldPhysKeys.has(k[0])) return;
+        this._sendKeyEvent({
+            type: down ? 'keydown' : 'keyup',
+            keyCode: k[1],
+            code: k[0],
+            key: k[0],
+            char: null,
+            nonUs: false,
+        });
+    }
+
+    /** Keep the pads from reaching the host for as long as `who` asks. */
+    _holdPads(who) {
+        this._padHolds.add(who);
+        if (this._gamepadManager) this._gamepadManager.setPaused(true);
+    }
+
+    _releasePads(who) {
+        this._padHolds.delete(who);
+        if (this._gamepadManager && this._padHolds.size === 0) {
+            this._gamepadManager.setPaused(false);
+        }
+    }
+
+    /**
+     * Open the remote's menu: Resume, Statistics, Stop. Whatever was held is
+     * let go on the host first, and the pads stop reaching it, so a menu over
+     * a game does not leave a key or a trigger down underneath.
+     */
+    _openRemoteMenu() {
+        if (this._quitting || this._manualQuitting) return;
+        if (!this._remoteMenu) {
+            this._remoteMenu = new StreamRemoteMenu({
+                container: this._rootEl || document.body,
+                statsOn: () => !!(this._showPerfStats && !this._statsClosed),
+                onResume: () => this._closeRemoteMenu(),
+                onStats: () => this._toggleStatsFromMenu(),
+                pointerOn: () => this._remotePointerOn,
+                onPointer: () => this._toggleRemotePointer(),
+                onStop: () => {
+                    this._closeRemoteMenu();
+                    this._handleManualQuit();
+                },
+                acceptsClick: () => this._remoteMenuAcceptsClick(),
+            });
+        }
+        if (this._remoteMenu.isOpen) return;
+        this._releaseAllPhysKeys();
+        if (this._remotePointer) this._remotePointer.releaseAll();
+        this._holdPads('remote-menu');
+        this._remoteMenu.open();
+    }
+
+    _closeRemoteMenu() {
+        if (!this._remoteMenu || !this._remoteMenu.isOpen) return;
+        this._remoteMenu.close();
+        this._remoteMenuClosedAt = performance.now();
+        this._releasePads('remote-menu');
+    }
+
+    /** The menu's Statistics: the stats card on, or off as its × would. */
+    _toggleStatsFromMenu() {
+        if (this._showPerfStats && !this._statsClosed) {
+            this._closeOverlayEl(this._overlayEl);
+        } else {
+            this._showPerfStats = true;
+            this._statsClosed = false;
+            // The refresh never unhides the card (only the first frame does):
+            // shown again here, or a second press would leave it hidden.
+            if (this._overlayEl && this._firstFrameRendered) {
+                this._overlayEl.style.display = '';
+                this._positionStatsOverlay();
+            }
+            this._updateOverlay();
+        }
     }
 
     /**
@@ -10250,7 +13261,7 @@ export class StreamView {
         });
         overlay.querySelector('.share-exit-stop').addEventListener('click', () => {
             close();
-            this._handleManualQuit({ keepHostSession: false });
+            this._handleManualQuit({ keepHostSession: false, quitApp: true });
         });
     }
 
@@ -10308,10 +13319,39 @@ export class StreamView {
         // every guest on it carry on. Implied by retire, which is the same
         // promise made by the seamless switcher.
         const keepHostSession = retire || opts.keepHostSession === true;
+        // quitApp: close the app on the host too. Only an explicit choice asks
+        // for it — "Stop everything", or the "Quit the app when the stream
+        // stops" setting. Without it, a host whose app outlives the stream
+        // keeps it running for a later resume (the backend decides by host).
+        const quitApp = !keepHostSession && opts.quitApp === true;
+        // dualFailed: this was a seamless standby that the host said it was
+        // streaming and never sent a picture for — the backend remembers the
+        // host as unable to run two sessions (issue #36).
+        const dualFailed = opts.dualFailed === true;
         // Guard: prevent re-entrant calls (e.g. from WS onClose -> setTimeout)
         if (this._quitting) return;
         this._quitting = true;
+        try {
+            await this._quitTeardown({
+                silent,
+                takenOver,
+                retire,
+                keepHostSession,
+                quitApp,
+                dualFailed,
+            });
+        } catch (err) {
+            // A throw half-way used to skip destroy(): the exit screen stayed
+            // up over a page whose keys were already unbound, and every later
+            // quit() returned at the guard above.
+            console.error('[StreamView] Quit teardown failed:', err);
+        } finally {
+            this._quitDone();
+        }
+    }
 
+    /** quit()'s body: everything between the guard and the hand-back. */
+    async _quitTeardown({ silent, takenOver, retire, keepHostSession, quitApp, dualFailed }) {
         // Exit fullscreen if active (before unbinding events).
         // Covers both standard Fullscreen API and iOS webkitExitFullscreen.
         // Also exit CSS fallback fullscreen if active.
@@ -10387,6 +13427,10 @@ export class StreamView {
             clearInterval(this._pingInterval);
             this._pingInterval = null;
         }
+        if (this._stallWatch) {
+            clearInterval(this._stallWatch);
+            this._stallWatch = null;
+        }
         if (this._inputStateInterval) {
             clearInterval(this._inputStateInterval);
             this._inputStateInterval = null;
@@ -10410,6 +13454,20 @@ export class StreamView {
                 this.videoEl.removeEventListener('webkitendfullscreen', this._onFullscreenChange);
             }
             this._onFullscreenChange = null;
+        }
+
+        // The reminder's fade and the volume control go with the header.
+        if (this._gamingFadeTimer) {
+            clearTimeout(this._gamingFadeTimer);
+            this._gamingFadeTimer = null;
+        }
+        if (this._volumeCtl) {
+            this._volumeCtl.remove();
+            this._volumeCtl = null;
+        }
+        if (this._micBtn) {
+            this._micBtn.remove();
+            this._micBtn = null;
         }
 
         // Remove mobile fullscreen button
@@ -10442,6 +13500,14 @@ export class StreamView {
         if (this._kbdBtn) {
             this._kbdBtn.remove();
             this._kbdBtn = null;
+        }
+        if (this._padBtn) {
+            this._padBtn.remove();
+            this._padBtn = null;
+        }
+        if (this._gamepadDialog) {
+            this._gamepadDialog.close();
+            this._gamepadDialog = null;
         }
         if (this._kbToolbar) {
             this._kbToolbar.remove();
@@ -10493,6 +13559,9 @@ export class StreamView {
         this.pendingFrames = [];
         this._clearPacingTimer();
 
+        // The microphone's indicator goes out with the stream.
+        if (this._mic) this._mic.close();
+
         // Mark WebRTC as stopping before calling /quit so that DataChannel
         // "onclose" events from the backend closing its side are not treated
         // as unexpected errors.  Then send the HTTP request while the relay
@@ -10505,11 +13574,16 @@ export class StreamView {
         } else if (this._playerMode) {
             // A guest leaving frees their slot and nothing else: the owner's
             // game keeps running and their invitation stays valid until the
-            // owner revokes it or the eight hours run out.
-            try {
-                await BackendClient.playerLeave();
-            } catch (err) {
-                console.warn('[StreamView] Leave failed:', err);
+            // owner revokes it or the eight hours run out. A retire is the
+            // guest's transport chain moving on: the next join replaces this
+            // worker itself, and leaving first would free the slot while the
+            // old worker still holds its ports.
+            if (!retire) {
+                try {
+                    await BackendClient.playerLeave();
+                } catch (err) {
+                    console.warn('[StreamView] Leave failed:', err);
+                }
             }
             this.webrtc.close();
         } else {
@@ -10521,19 +13595,52 @@ export class StreamView {
                 const quitExtras = { session_slot: this._sessionSlot };
                 if (this._slotUniqueId) quitExtras.client_uniqueid = this._slotUniqueId;
                 if (keepHostSession) quitExtras.keep_host_session = true;
+                if (quitApp) quitExtras.quit_app = true;
+                if (dualFailed) quitExtras.dual_failed = true;
                 await BackendClient.quitApp(this.host.uuid, quitExtras);
                 this.webrtc.close();
                 if (!silent) {
                     await Toast.dismissAll();
-                    Toast.success(t('stream.streamEnd'));
+                    // Say where the app went: still running, and where to get
+                    // back to it — the viewer used to it closing would look for it.
+                    Toast.success(
+                        this.host && this.host.resumableApps && !quitApp
+                            ? t('stream.streamEndAppRunning')
+                            : t('stream.streamEnd'),
+                    );
                 }
             } catch (err) {
                 console.warn('[StreamView] Quit failed:', err);
                 this.webrtc.close();
             }
         }
+    }
 
-        this.destroy();
+    /**
+     * The end of every quit, whatever happened before it: the stream's DOM
+     * goes and the page gets its view back. Runs once — from quit()'s finally,
+     * or from the exit screen's watchdog (_handleManualQuit) when quit() is
+     * still stuck somewhere.
+     */
+    _quitDone() {
+        if (this._quitFinished) return;
+        this._quitFinished = true;
+        clearTimeout(this._quitWatchdog);
+        try {
+            this.destroy();
+        } catch (err) {
+            console.error('[StreamView] destroy failed:', err);
+            // At least the screen: without it the exit overlay stays forever.
+            try {
+                if (this._rootEl) this._rootEl.remove();
+            } catch (e) {}
+            if (!document.querySelector('.stream-overlay')) {
+                document.body.classList.remove('streaming-active');
+            }
+        }
+        // In debug mode, what the stream printed goes to the client log now,
+        // not at the next tick: the page may be closed next.
+        void flushClientLog();
 
         // Notify MoonlightApp that streaming ended (restores apps/hosts view).
         if (this.onQuit) {
@@ -10543,16 +13650,152 @@ export class StreamView {
         }
     }
 
+    /**
+     * POC Ultra (U4): whether this page decodes the host's frames as PyroWave:
+     * the host said so (/start's ultra_codec, the codec chosen in Settings), or the bench
+     * key localStorage mw_ultra=pyrowave, with the host's
+     * pipeline=d3d12,enc12=pyrowave. Read once per session.
+     */
+    _ultraMode() {
+        if (this._ultraOn === undefined) {
+            let on = this._ultraAsked === true;
+            try {
+                on = on || globalThis.localStorage?.getItem('mw_ultra') === 'pyrowave';
+            } catch {
+                /* the host's word stands */
+            }
+            // The player draws through onDecodedFrame on this thread: a
+            // decode worker that owns the canvas has no room for it.
+            this._ultraOn = on && ultraPlayerSupported() && !this._useWorker;
+            if (on && !this._ultraOn)
+                console.warn(
+                    '[MW-ULTRA] mw_ultra=pyrowave asked, but ' +
+                        (this._useWorker
+                            ? 'the decode worker is on'
+                            : 'this browser has neither WebGPU nor WebGL2'),
+                );
+        }
+        return this._ultraOn;
+    }
+
+    /**
+     * The stats card's codec: PyroWave once a PyroWave frame was drawn — the
+     * launch's video_codec is the HEVC it falls back to, and the card read
+     * "HEVC" over a PyroWave picture (13/10/2026). The others as they were.
+     */
+    _statsCodecName(codec) {
+        return this._ultraFrames > 0 ? 'PyroWave' : codec.toUpperCase();
+    }
+
+    /**
+     * One PyroWave frame (its packets back to back, the start-of-frame
+     * header first). The player is made from the first header's size; the
+     * frame it gives back takes the ordinary road from onDecodedFrame on.
+     */
+    _handleUltraFrame(data, backendTs, arrivalAbs, frameId) {
+        this.stats.received++;
+        // Its bytes in the stats' bitrate, as handleVideoFrame counts every
+        // other frame's: it hands PyroWave over before that line, and the
+        // card read 0.0 Mbps while the picture came (13/10/2026).
+        this._totalBytes += data.length;
+        if (!this._ultraPlayer) {
+            if (this._ultraStarting || data.length < 8) return;
+            const dv = new DataView(data.buffer, data.byteOffset, 8);
+            const w0 = dv.getUint32(0, true);
+            if (!(w0 >>> 31)) return; // not a start of frame: wait for one
+            const width = (w0 & 0x3fff) + 1;
+            const height = ((w0 >>> 14) & 0x3fff) + 1;
+            this._ultraStarting = true;
+            // POC Ultra U3.7 B2.1 (bench key mw_ultra_present): a canvas of the
+            // same box for the player to present on itself; it takes the
+            // place of this one once the player has it configured.
+            const present = presentMode() && this.canvas ? this.canvas.cloneNode(false) : null;
+            const player = new UltraPlayer(
+                width,
+                height,
+                (frame, meta) => {
+                    this._ultraFrames = (this._ultraFrames || 0) + 1;
+                    if (!this._firstDecoderOutputLogged) {
+                        this._firstDecoderOutputLogged = true;
+                        console.log(
+                            '[MW-ULTRA] first PyroWave frame drawn, ' + width + 'x' + height,
+                        );
+                    }
+                    this.onDecodedFrame(frame);
+                },
+                { log: (m) => console.log(m), present },
+            );
+            player.init().then(
+                (ok) => {
+                    this._ultraStarting = false;
+                    if (ok && player.presenting) this._showUltraCanvas(present);
+                    if (ok) this._ultraPlayer = player;
+                    else
+                        console.warn(
+                            '[MW-ULTRA] no GPU decoder (WebGPU or WebGL2): nothing will be drawn',
+                        );
+                },
+                (e) => {
+                    this._ultraStarting = false;
+                    console.warn('[MW-ULTRA] the decoder did not start: ' + e.message);
+                },
+            );
+            return;
+        }
+        // A chunk timestamp of its own, increasing: onDecodedFrame pairs the
+        // decoded frame with this submit by it.
+        const ts = (this._ultraTs = (this._ultraTs || 0) + 1);
+        this._trackChunkSubmit(ts, backendTs, {
+            arrived: arrivalAbs > 0 ? arrivalAbs - performance.timeOrigin : 0,
+            bytes: data.length,
+            key: true,
+            hostTs: backendTs,
+        });
+        // The frame id pairs it with the pieces that came before it (by slices).
+        this._ultraPlayer.push(data, ts, backendTs, frameId || undefined);
+    }
+
+    /**
+     * B2.1: the player's canvas in the place of this one, whose renderer
+     * stays (nothing is drawn on it any more). What maps the input and sizes
+     * the picture reads this.canvas, so it follows. The click probe reads the
+     * renderer's pixels: it sees no flag on this road.
+     */
+    _showUltraCanvas(el) {
+        if (!this.canvas || !el) return;
+        this.canvas.replaceWith(el);
+        this.canvas = el;
+        this._invalidateMediaRect();
+        console.log('[MW-ULTRA] the player presents on the page (' + presentMode() + ')');
+    }
+
     destroy() {
+        if (this._ultraPlayer) {
+            this._ultraPlayer.destroy();
+            this._ultraPlayer = null;
+        }
+        if (this._remotePointer) this._remotePointer.releaseAll();
         this._exitCssFallbackFullscreen();
         this._releaseWakeLock();
         this.stopRenderLoop();
         this.unbindEvents();
+        if (this._mic) this._mic.close();
         this.webrtc.close();
         if (this._latencyProbe) {
             this._latencyProbe.stop();
             if (window.mwLatency === this._latencyProbe) window.mwLatency = null;
             this._latencyProbe = null;
+        }
+        if (this._contentAge.running) this._contentAge.stop();
+        if (window.mwContentAge === this._contentAge) window.mwContentAge = null;
+        if (window.mwFrameLog === this._frameLog) window.mwFrameLog = null;
+        if (window.mwAudio === this._audioStats) window.mwAudio = null;
+        this._vsyncGrid.stop();
+        if (window.mwVsyncGrid === this._vsyncGrid) window.mwVsyncGrid = null;
+        if (this._stepper) {
+            this._stepper.stop();
+            if (window.mwCadenceStepper === this._stepper) window.mwCadenceStepper = null;
+            this._stepper = null;
         }
         if (this._mainThreadProbe) {
             this._mainThreadProbe.stop();
@@ -10563,9 +13806,21 @@ export class StreamView {
             this._shareMenu.destroy();
             this._shareMenu = null;
         }
+        if (this._presence) {
+            this._presence.destroy();
+            this._presence = null;
+        }
         if (this._shareExitOverlay) {
             this._shareExitOverlay.remove();
             this._shareExitOverlay = null;
+        }
+        if (this._okHold) {
+            clearTimeout(this._okHold.timer);
+            this._okHold = null;
+        }
+        if (this._remoteMenu) {
+            this._remoteMenu.close();
+            this._remoteMenu = null;
         }
         if (this._stallPopinOverlay) {
             this._stallPopinOverlay.remove();
@@ -10575,6 +13830,10 @@ export class StreamView {
         if (this._pingInterval) {
             clearInterval(this._pingInterval);
             this._pingInterval = null;
+        }
+        if (this._stallWatch) {
+            clearInterval(this._stallWatch);
+            this._stallWatch = null;
         }
         if (this._inputStateInterval) {
             clearInterval(this._inputStateInterval);
@@ -10598,6 +13857,20 @@ export class StreamView {
                 this.videoEl.removeEventListener('webkitendfullscreen', this._onFullscreenChange);
             }
             this._onFullscreenChange = null;
+        }
+
+        // The reminder's fade and the volume control go with the header.
+        if (this._gamingFadeTimer) {
+            clearTimeout(this._gamingFadeTimer);
+            this._gamingFadeTimer = null;
+        }
+        if (this._volumeCtl) {
+            this._volumeCtl.remove();
+            this._volumeCtl = null;
+        }
+        if (this._micBtn) {
+            this._micBtn.remove();
+            this._micBtn = null;
         }
 
         // Remove mobile fullscreen button
@@ -10630,6 +13903,14 @@ export class StreamView {
         if (this._kbdBtn) {
             this._kbdBtn.remove();
             this._kbdBtn = null;
+        }
+        if (this._padBtn) {
+            this._padBtn.remove();
+            this._padBtn = null;
+        }
+        if (this._gamepadDialog) {
+            this._gamepadDialog.close();
+            this._gamepadDialog = null;
         }
         if (this._kbToolbar) {
             this._kbToolbar.remove();

@@ -16,6 +16,7 @@
  */
 
 #include "MoonlightShim.h"
+#include "AnnexBFiller.h"
 #include "InputWatchdog.h"
 
 #include "common/MacActivity.h"
@@ -529,6 +530,30 @@ int MoonlightShim::drSubmitDecodeUnit(PDECODE_UNIT decodeUnit)
         fflush(stderr);
     }
 
+    // Filler NALs out before anything else sees the frame: a CBR encoder's
+    // padding is bandwidth on the link and, placed ahead of the slice, a
+    // keyframe some decoders refuse (AnnexBFiller.h). AV1 has no start codes.
+    const int videoFormat = instance->m_NegotiatedVideoFormat.load(std::memory_order_acquire);
+    if (videoFormat & (VIDEO_FORMAT_MASK_H264 | VIDEO_FORMAT_MASK_H265)) {
+        const size_t kept = AnnexBFiller::strip(reinterpret_cast<uint8_t*>(frameData.data()),
+                                                static_cast<size_t>(frameData.size()),
+                                                (videoFormat & VIDEO_FORMAT_MASK_H265) != 0);
+        if (kept != static_cast<size_t>(frameData.size())) {
+            const int64_t strippedBytes = frameData.size() - static_cast<int64_t>(kept);
+            frameData.truncate(static_cast<int>(kept));
+            const int64_t frames =
+                instance->m_FillerFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+            const int64_t total =
+                instance->m_FillerBytes.fetch_add(strippedBytes, std::memory_order_relaxed) +
+                strippedBytes;
+            if (frames == 1 || frames % 1800 == 0) {
+                qInfo() << "[MoonlightShim] Host pads its frames with filler data — not sent:"
+                        << strippedBytes << "bytes off frame" << decodeUnit->frameNumber << "("
+                        << kept << "kept);" << frames << "frames," << (total / 1024) << "KB so far";
+            }
+        }
+    }
+
     // Measure the time spent in buffer concatenation — contributes to decode latency.
     auto concatEnd = std::chrono::steady_clock::now();
     instance->m_LastDecodeLatencyUs.store(
@@ -664,7 +689,16 @@ void MoonlightShim::sendKeyEvent(short keyCode, bool down, char modifiers, char 
     k.modifiers = modifiers;
     k.flags = flags;
     k.hold = hold;
-    m_Watchdog->noteKey(k, down);
+    // A press of a key already down is the client's auto-repeat, and a
+    // GameStream host makes its own: Sunshine drops it on arrival ("already
+    // pressed", input.cpp) and repeats from its key_repeat_delay; Wolf hands
+    // every one to inputtino, whose keyboard appends it to the list its repeat
+    // thread walks, unlocked, every 50 ms. Thirty presses a second grew that
+    // list for as long as a key was held, and a release landing mid-walk was
+    // pressed again by the thread from the list's stale tail: the key stuck
+    // down on the host (Discord, 24/10/2026). moonlight-qt drops them too.
+    // The release always goes, whatever the watchdog thinks is held.
+    if (m_Watchdog->noteKey(k, down)) return;
     LiSendKeyboardEvent2(keyCode | 0x8000, down ? KEY_ACTION_DOWN : KEY_ACTION_UP, modifiers,
                          flags);
 }
@@ -754,10 +788,12 @@ void MoonlightShim::sendSecureAttention()
     sendKeyEvent(kCtrl, false, 0, 0);
 }
 
-void MoonlightShim::sendKeyChar(const QString& ch, bool down, char /*modifiers*/)
+void MoonlightShim::sendKeyChar(const QString& ch, bool down, char /*modifiers*/,
+                                const CharKeyHints& /*hints*/)
 {
     // The modifier mask is dropped on purpose: on GameStream the modifier
-    // state belongs to the host, and a text event carries none anyway.
+    // state belongs to the host, and a text event carries none anyway. So are
+    // the hints: no plan sends a chord here as text (InputMsg::resolveKey).
     // Only the press: the text event types the character outright, so acting on
     // the release too would double every keystroke.
     if (down) sendUtf8Text(ch);

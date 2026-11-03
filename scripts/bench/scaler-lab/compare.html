@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="dark" />
+    <title>Comparateur d'agrandisseurs</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        overscroll-behavior: none;
+        background: #101014;
+        color: #ddd;
+        font:
+          13px/1.35 system-ui,
+          -apple-system,
+          "Segoe UI",
+          Roboto,
+          sans-serif;
+        -webkit-text-size-adjust: 100%;
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-tap-highlight-color: transparent;
+      }
+      #view {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        touch-action: none;
+        cursor: grab;
+      }
+      #view.dragging {
+        cursor: grabbing;
+      }
+      #bands {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+      }
+      .band {
+        position: absolute;
+        box-sizing: border-box;
+        border: 0 solid rgba(255, 255, 255, 0.45);
+      }
+      .chip {
+        position: absolute;
+        left: 6px;
+        top: 6px;
+        max-width: calc(100% - 12px);
+        padding: 4px 7px;
+        border-radius: 6px;
+        background: rgba(0, 0, 0, 0.62);
+        color: #fff;
+        font-size: 12px;
+        line-height: 1.3;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .chip b {
+        font-weight: 650;
+      }
+      .err {
+        color: #ff9d94;
+      }
+      #gear {
+        position: fixed;
+        top: calc(8px + env(safe-area-inset-top));
+        right: calc(8px + env(safe-area-inset-right));
+        width: 44px;
+        height: 44px;
+        border-radius: 22px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(28, 28, 34, 0.9);
+        color: #fff;
+        padding: 0;
+        cursor: pointer;
+        z-index: 11;
+        display: grid;
+        place-items: center;
+      }
+      #gear svg {
+        width: 24px;
+        height: 24px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      #zoom {
+        position: fixed;
+        left: calc(8px + env(safe-area-inset-left));
+        bottom: calc(8px + env(safe-area-inset-bottom));
+        padding: 3px 7px;
+        border-radius: 5px;
+        background: rgba(0, 0, 0, 0.6);
+        color: #fff;
+        font-size: 12px;
+        pointer-events: none;
+        z-index: 5;
+      }
+      #status {
+        position: fixed;
+        left: 50%;
+        top: 42%;
+        transform: translate(-50%, -50%);
+        max-width: 80vw;
+        padding: 10px 14px;
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.75);
+        color: #fff;
+        font-size: 14px;
+        text-align: center;
+        display: none;
+        z-index: 6;
+      }
+      #panel {
+        position: fixed;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        width: min(400px, 100vw);
+        box-sizing: border-box;
+        padding: calc(10px + env(safe-area-inset-top)) 14px
+          calc(16px + env(safe-area-inset-bottom));
+        overflow: auto;
+        overscroll-behavior: contain;
+        background: rgba(18, 18, 22, 0.97);
+        border-left: 1px solid #333;
+        display: none;
+        z-index: 10;
+        -webkit-user-select: text;
+        user-select: text;
+      }
+      #panel.open {
+        display: block;
+      }
+      #panel h2 {
+        margin: 6px 56px 8px 0;
+        font-size: 16px;
+        font-weight: 650;
+      }
+      #panel h3 {
+        margin: 16px 0 4px;
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: #9aa3b5;
+      }
+      #close {
+        position: absolute;
+        top: calc(8px + env(safe-area-inset-top));
+        right: 10px;
+        width: 40px;
+        height: 40px;
+        border: 0;
+        border-radius: 20px;
+        background: transparent;
+        color: #ccc;
+        font-size: 22px;
+        cursor: pointer;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 34px;
+      }
+      .row.algo {
+        min-height: 38px;
+      }
+      .grow {
+        flex: 1;
+        min-width: 0;
+      }
+      label.row,
+      label.grow {
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      input[type="radio"],
+      input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        margin: 0;
+        accent-color: #6aa0ff;
+        flex: none;
+      }
+      small {
+        color: #9aa3b5;
+      }
+      button,
+      select {
+        font: inherit;
+        color: #fff;
+        background: #2a2d36;
+        border: 1px solid #454a58;
+        border-radius: 6px;
+        padding: 6px 10px;
+        min-height: 32px;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.35;
+        cursor: default;
+      }
+      .algo button {
+        width: 36px;
+        padding: 6px 0;
+      }
+      #link {
+        flex: 1;
+        min-width: 0;
+        font:
+          11px/1.3 ui-monospace,
+          monospace;
+        color: #bbb;
+        background: #15161b;
+        border: 1px solid #333;
+        border-radius: 6px;
+        padding: 6px 8px;
+      }
+      .note {
+        margin: 4px 0 0;
+        color: #9aa3b5;
+        font-size: 12px;
+      }
+      #info div {
+        word-break: break-word;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-variant-numeric: tabular-nums;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 4px 6px 4px 0;
+        border-bottom: 1px solid #2a2d36;
+        white-space: nowrap;
+      }
+      th {
+        font-weight: 500;
+        color: #9aa3b5;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="bands"></div>
+    <div id="zoom"></div>
+    <div id="status"></div>
+    <button
+      id="gear"
+      type="button"
+      title="Réglages"
+      aria-label="Réglages"
+      aria-expanded="false"
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="3.2" />
+        <path
+          d="M19.4 13.5a7.6 7.6 0 0 0 0-3l2-1.5-2-3.5-2.4 1a7.7 7.7 0 0 0-2.6-1.5L14 2.5h-4l-.4 2.5A7.7 7.7 0 0 0 7 6.5l-2.4-1-2 3.5 2 1.5a7.6 7.6 0 0 0 0 3l-2 1.5 2 3.5 2.4-1a7.7 7.7 0 0 0 2.6 1.5l.4 2.5h4l.4-2.5a7.7 7.7 0 0 0 2.6-1.5l2.4 1 2-3.5z"
+        />
+      </svg>
+    </button>
+    <aside id="panel" aria-label="Réglages">
+      <button id="close" type="button" aria-label="Fermer">×</button>
+      <h2>Comparateur d'agrandisseurs</h2>
+      <div id="body"></div>
+    </aside>
+    <input id="file" type="file" accept="image/*" hidden />
+    <script type="module">
+      // The side-by-side viewer of the upscalers (compare.js): the product's
+      // own renderers on one picture, their outputs in bands under one zoom.
+      // Served from the repository root by scaler_lab.py --serve, which
+      // prints its link (/compare); the picture comes from /test/.
+      import("./compare.js").catch((e) => {
+        const s = document.getElementById("status");
+        s.textContent =
+          "Erreur de chargement : " + (e && e.message ? e.message : e);
+        s.style.display = "block";
+      });
+    </script>
+  </body>
+</html>

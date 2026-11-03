@@ -4,7 +4,10 @@
 FROM caddy:2-builder AS builder
 # -v makes `go build` print each package as it compiles; the installer counts
 # those lines to render a live progress bar (Go has no native progress output).
-RUN XCADDY_GO_BUILD_FLAGS="-v" xcaddy build --with github.com/mholt/caddy-ratelimit
+# The plugin at a commit, not its branch: a build takes what was reviewed, and
+# a new commit upstream reaches production only by changing this line
+# (master on 26/10/2026, unchanged upstream since 12/06/2026).
+RUN XCADDY_GO_BUILD_FLAGS="-v" xcaddy build --with github.com/mholt/caddy-ratelimit@5625512f24f6f59d6f64fb3aafe5eecff0b286db
 
 FROM caddy:2
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy

@@ -65,6 +65,11 @@ main() {
         exit 0
     fi
 
+    # Cold backup first (backup-prod.sh: dated ZIP, three kept), the current
+    # tree included. No backup, no install.
+    echo "--- backing up"
+    bash "$(dirname "$0")/backup-prod.sh"
+
     echo "--- installing to $DEST"
     mkdir -p "$DEST"
     # --delete: an old release's files must not linger once superseded — the

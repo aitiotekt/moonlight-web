@@ -15,6 +15,7 @@
 
 #include "../src/backend/streambackend/NativeCapabilitiesJson.h"
 
+#include <QJsonArray>
 #include <QJsonDocument>
 
 using namespace mw::native;
@@ -34,6 +35,8 @@ Capabilities sample()
     nvidia.name = "NVIDIA GeForce RTX 5060 Ti";
     nvidia.vendorId = 0x10DE;
     nvidia.deviceId = 0x2D04;
+    // Above 2^53 too, as every driver version is.
+    nvidia.driverVersion = driverVersionOf(32, 0, 15, 7652);
     nvidia.nativeHandle = 0xFFFFFFFF0000ABCDull; // above 2^53: a double would lose it
     nvidia.encoders = {EncoderApi::Nvenc};
     nvidia.codecs = {Codec::Av1, Codec::Hevc, Codec::H264};
@@ -97,6 +100,22 @@ void run_native_capabilities_json_tests()
         CHECK(out.gpus[0].vendorId == 0x10DE);
         CHECK(out.gpus[0].deviceId == 0x2D04);
         CHECK(out.gpus[0].nativeHandle == 0xFFFFFFFF0000ABCDull);
+        CHECK(out.gpus[0].driverVersion == driverVersionOf(32, 0, 15, 7652));
+        CHECK(driverVersionText(out.gpus[0].driverVersion) == "32.0.15.7652");
+        // A GPU whose driver nobody gave keeps none, and an older probe's
+        // answer, which never carried one, reads the same.
+        CHECK(out.gpus[1].driverVersion == 0);
+        {
+            QJsonObject older = NativeCapabilitiesJson::toJson(in);
+            QJsonArray gpus = older["gpus"].toArray();
+            QJsonObject first = gpus[0].toObject();
+            first.remove("driverVersion");
+            gpus[0] = first;
+            older["gpus"] = gpus;
+            Capabilities fromOlder;
+            CHECK(NativeCapabilitiesJson::fromJson(older, fromOlder));
+            CHECK(fromOlder.gpus[0].driverVersion == 0);
+        }
         CHECK(out.gpus[0].encoders.size() == 1 && out.gpus[0].encoders[0] == EncoderApi::Nvenc);
         CHECK(out.gpus[0].codecs.size() == 3 && out.gpus[0].codecs[0] == Codec::Av1);
         CHECK(out.gpus[0].supports444(Codec::Hevc));
@@ -138,6 +157,36 @@ void run_native_capabilities_json_tests()
         // And the serialization is stable: the service compares two snapshots
         // by their JSON to decide whether the host card has to move.
         CHECK(NativeCapabilitiesJson::toJson(in) == NativeCapabilitiesJson::toJson(out));
+    }
+
+    SECTION("NativeCapabilitiesJson — the GPU a display card names, numbered among namesakes");
+    {
+        Capabilities caps = sample();
+        // Two GPUs of different names: each display names its own, no number.
+        QJsonObject gpu = NativeCapabilitiesJson::displayGpu(caps, 0);
+        CHECK(gpu.value("gpu").toString() == QStringLiteral("NVIDIA GeForce RTX 5060 Ti"));
+        CHECK(!gpu.contains("gpuNumber"));
+        CHECK(NativeCapabilitiesJson::displayGpu(caps, 1).value("gpu").toString() ==
+              QStringLiteral("Microsoft Basic Render Driver"));
+        // A GPU nobody has: nothing said.
+        CHECK(NativeCapabilitiesJson::displayGpu(caps, 7).isEmpty());
+        CHECK(NativeCapabilitiesJson::displayGpu(caps, -1).isEmpty());
+
+        // DualRTX: two RTX of one name around another GPU. Counted in the OS's
+        // order among the namesakes only.
+        GpuInfo twin = caps.gpus[0];
+        twin.id = 2;
+        caps.gpus.push_back(twin);
+        gpu = NativeCapabilitiesJson::displayGpu(caps, 0);
+        CHECK(gpu.value("gpuNumber").toInt() == 1);
+        gpu = NativeCapabilitiesJson::displayGpu(caps, 2);
+        CHECK(gpu.value("gpu").toString() == QStringLiteral("NVIDIA GeForce RTX 5060 Ti"));
+        CHECK(gpu.value("gpuNumber").toInt() == 2);
+        CHECK(!NativeCapabilitiesJson::displayGpu(caps, 1).contains("gpuNumber"));
+
+        // One GPU: the line would say nothing, so there is none.
+        caps.gpus.resize(1);
+        CHECK(NativeCapabilitiesJson::displayGpu(caps, 0).isEmpty());
     }
 
     SECTION("NativeCapabilitiesJson — an unavailable machine keeps its reason");

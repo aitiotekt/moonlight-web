@@ -42,6 +42,18 @@ struct AudioPacket
 
     /// Steady-clock microseconds at which the underlying PCM was captured.
     int64_t capturedUs = 0;
+
+    // What the bench's audio log reads (`audiolog=1`; plan « le son et la
+    // priorité des paquets », A0). Free to fill: the frame is in hand anyway.
+
+    /// Frames left in the pacer's queue once this one was taken: how much
+    /// captured sound waited behind it. -1 when the capture does not say.
+    int queuedFrames = -1;
+    /// The frame's peak, 0 to 1 (absolute sample value): where a test tone
+    /// starts in the capture. -1 when the capture does not say.
+    float peak = -1.0f;
+    /// The pacer had nothing and sent silence in its place (an underrun).
+    bool silence = false;
 };
 
 } // namespace mw::native

@@ -47,6 +47,11 @@ import {
     noteBoxArtSeen,
 } from '../util/appCache.js';
 import { noteHostUse, forgetHostUse, hostUsageRanker } from '../util/hostUsage.js';
+import { loadCachedHosts, saveCachedHosts } from '../util/hostListCache.js';
+import { bootMark } from '../util/bootTiming.js';
+import * as RemoteNav from './RemoteNav.js';
+import { confirmAction } from './ConfirmDialog.js';
+import { hostUpdate, canSelfUpdate } from './HostUpdate.js';
 
 /**
  * Where the empty host list sends someone who has nothing to stream from yet.
@@ -59,30 +64,21 @@ import { noteHostUse, forgetHostUse, hostUsageRanker } from '../util/hostUsage.j
 const SUNSHINE_DOWNLOAD_URL = 'https://github.com/LizardByte/Sunshine/releases/latest';
 
 /**
- * Update progress is driven by a local animation, not by the poll samples.
+ * The order a host card shows its apps in: "MoonlightWeb Virtual Display"
+ * always first, then alphabetical.
  *
- * The host reports a figure every ~900 ms at best, and stops reporting at all
- * the moment the installer kills it — a bar painted straight from those samples
- * reads as "jump, jump, freeze". Instead each phase owns a slice of the bar and
- * eases towards its ceiling without ever reaching it, so the bar is always
- * moving; a figure coming from the host only ever pushes it forward.
- *
- * `tau` is the exponential time constant in seconds: ~63 % of the remaining
- * distance to the ceiling is covered in that time.
+ * Not the host's order: that one moves under the user — the native host lists
+ * the primary display first, and the display just streamed becomes primary —
+ * so the card they clicked would jump to the front. A fixed order keeps every
+ * app where the hand expects it.
  */
-const UPDATE_PHASES = {
-    // Seconds on any usable link — a small slice, quickly filled.
-    downloading: { ceiling: 30, tau: 4 },
-    // The host flips to `restarting` as soon as it has spawned the installer,
-    // but it is the install that is actually running (and it still answers us),
-    // so both share one slow budget.
-    installing: { ceiling: 90, tau: 18 },
-    restarting: { ceiling: 90, tau: 18 },
-    // Host gone: nothing left to poll but /api/health. Slightly brisker — this
-    // is the tail, and the bar should read as nearly there when the new build
-    // answers and the page reloads.
-    finalizing: { ceiling: 99, tau: 16 },
-};
+function sortApps(apps) {
+    return apps.sort(
+        (a, b) =>
+            (b.isVirtualDisplay ? 1 : 0) - (a.isVirtualDisplay ? 1 : 0) ||
+            a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }),
+    );
+}
 
 export class HostListView {
     // First backoff before re-attempting an app-list fetch that failed
@@ -112,11 +108,30 @@ export class HostListView {
     // floors the extra checks fired
     // by visibilitychange (a phone can wake this page many times a minute).
     static UPDATE_CHECK_MS = 30 * 60 * 1000;
+    // How often the host list asks a per-device host (MultiSeat) what this
+    // device's seat runs: each answer costs a request to the seat's Apollo.
+    static DEVICE_RUNNING_MS = 15 * 1000;
     static UPDATE_CHECK_MIN_MS = 5 * 60 * 1000;
 
     constructor(container) {
         this.container = container;
         this.hosts = [];
+        // Which machine this page belongs to (instances.js id), set by the app
+        // before start(): the host list it last answered with is drawn at once
+        // under that name (hostListCache.js). Unset, nothing is remembered.
+        this.memoryKey = '';
+        // Whether this browser holds the server's admin rights (the app's
+        // /api/auth/status reading): the virtual display's GPU is chosen on its
+        // card by the administrator only.
+        this.canAdminister = false;
+        // The cards on screen came from that memory and the machine has not
+        // answered yet: its first answer replaces them, and drops any host it
+        // no longer has.
+        this._hostsFromMemory = false;
+        // What THIS device's seat runs, per host where each device has its own
+        // (host.runningAppPerDevice): uuid -> app id, and when it was asked.
+        this._deviceRunning = new Map();
+        this._deviceRunningAt = new Map();
         this.pollTimer = null;
         this.eventsBound = false;
         this.onLaunchApp = null; // called with (host, app) when an app card is clicked
@@ -149,9 +164,11 @@ export class HostListView {
         // Bounded fast retries while the host's first GitHub fetch is in flight.
         this._updateWarmupTries = 0;
         this._updateInfo = null;
-        this._updateBusy = false;
         this._hostsLoaded = false;
         this.renderShell();
+        // An update under way (started here or from Settings) owns the banner.
+        // After the shell: the banner it paints into is part of it.
+        this._unsubUpdate = hostUpdate.subscribe((view) => this._paintUpdateRun(view));
 
         // Auto-scan when page gains focus. Also re-ask about updates: a phone
         // keeps this page alive for days behind a locked screen, and coming back
@@ -176,7 +193,7 @@ export class HostListView {
 
             // ── Update banner: apply on the host ───────────────────────────
             if (e.target.closest('.update-banner-apply')) {
-                this._startUpdate();
+                hostUpdate.start(this._updateInfo);
                 return;
             }
 
@@ -190,9 +207,9 @@ export class HostListView {
                 if (banner) {
                     banner.hidden = true;
                     banner.innerHTML = '';
-                    this._stopProgressAnimation();
                     this._progressFill = null;
                 }
+                hostUpdate.clearFailure();
                 // Only for this page load — a reload offers the update again.
                 this._updateInfo = null;
                 return;
@@ -210,9 +227,15 @@ export class HostListView {
                 if (banner) {
                     banner.hidden = true;
                     banner.innerHTML = '';
-                    this._stopProgressAnimation();
                     this._progressFill = null;
                 }
+                return;
+            }
+
+            // ── Kebab menu: its own Close (a TV remote has no Escape) ─────
+            if (e.target.closest('.btn-menu-close')) {
+                e.stopPropagation();
+                this._closeMenuBackToButton();
                 return;
             }
 
@@ -248,6 +271,22 @@ export class HostListView {
                 return;
             }
 
+            const permBtn = e.target.closest('.btn-mac-perm');
+            if (permBtn) {
+                // Opens the pane on the Mac itself: only the Mac's own browser
+                // may ask (the backend answers anyone else with a refusal), so
+                // a remote viewer is told where to go instead.
+                const open =
+                    permBtn.dataset.pane === 'accessibility'
+                        ? BackendClient.openAccessibilitySettings()
+                        : BackendClient.openScreenRecordingSettings();
+                open.then(
+                    () => Toast.show(t('hosts.nativePermOpened'), 'success'),
+                    () => Toast.show(t('hosts.nativePermOnTheMac'), 'info'),
+                );
+                return;
+            }
+
             const wolBtn = e.target.closest('.btn-wol');
             if (wolBtn) {
                 const uuid = wolBtn.dataset.uuid;
@@ -275,15 +314,17 @@ export class HostListView {
                 const uuid = stopSessionBtn.dataset.uuid;
                 // This closes the game for everyone, including any invited
                 // player — worth one confirmation.
-                if (!window.confirm(t('hosts.stopSessionConfirm'))) return;
-                stopSessionBtn.disabled = true;
-                stopSessionBtn.textContent = t('hosts.stopSessionWorking');
-                BackendClient.stopHostSession(uuid)
-                    .catch((err) => console.error('[MW] Stop session failed:', err))
-                    .finally(() => {
-                        this._closeAllMenus();
-                        this.refresh();
-                    });
+                confirmAction(t('hosts.stopSessionConfirm'), { danger: true }).then((yes) => {
+                    if (!yes) return;
+                    stopSessionBtn.disabled = true;
+                    stopSessionBtn.textContent = t('hosts.stopSessionWorking');
+                    BackendClient.stopHostSession(uuid)
+                        .catch((err) => console.error('[MW] Stop session failed:', err))
+                        .finally(() => {
+                            this._closeAllMenus();
+                            this.refresh();
+                        });
+                });
                 return;
             }
 
@@ -319,26 +360,28 @@ export class HostListView {
                 const host = this.hosts.find((h) => h.uuid === uuid);
                 // The service going down takes every stream on that host with
                 // it, this browser's included — same weight as "Stop session".
-                if (!window.confirm(t('hosts.restartConfirm'))) return;
-                restartBtn.disabled = true;
-                restartBtn.textContent = t('hosts.restartWorking');
-                BackendClient.restartHost(uuid)
-                    .then(() => {
-                        Toast.show(
-                            t('hosts.restartSent', { name: host ? host.displayName : uuid }),
-                            'success',
-                        );
-                    })
-                    .catch((err) => {
-                        console.error('[MW] Restart host failed:', err);
-                        Toast.show(err.message, 'error');
-                    })
-                    .finally(() => {
-                        this._closeAllMenus();
-                        // The host is mid-restart: let the poll repaint it as it
-                        // drops offline and comes back.
-                        this.refresh();
-                    });
+                confirmAction(t('hosts.restartConfirm'), { danger: true }).then((yes) => {
+                    if (!yes) return;
+                    restartBtn.disabled = true;
+                    restartBtn.textContent = t('hosts.restartWorking');
+                    BackendClient.restartHost(uuid)
+                        .then(() => {
+                            Toast.show(
+                                t('hosts.restartSent', { name: host ? host.displayName : uuid }),
+                                'success',
+                            );
+                        })
+                        .catch((err) => {
+                            console.error('[MW] Restart host failed:', err);
+                            Toast.show(err.message, 'error');
+                        })
+                        .finally(() => {
+                            this._closeAllMenus();
+                            // The host is mid-restart: let the poll repaint it as it
+                            // drops offline and comes back.
+                            this.refresh();
+                        });
+                });
                 return;
             }
 
@@ -361,6 +404,44 @@ export class HostListView {
                     });
                 return;
             }
+
+            // ── Quit the app a stopped stream left running (issue #24) ─────
+            const quitAppBtn = e.target.closest('.app-card-quit');
+            if (quitAppBtn) {
+                const hostCard = quitAppBtn.closest('.host-card');
+                const uuid = hostCard && hostCard.dataset.uuid;
+                const host = this.hosts.find((h) => h.uuid === uuid);
+                const entry = this.appsByHost[uuid];
+                const appId = parseInt(quitAppBtn.dataset.appId, 10);
+                const app = entry && entry.apps && entry.apps.find((a) => a.id === appId);
+                const name = app ? app.displayName : '';
+                // Closes the game on the host, for everyone on it: one
+                // confirmation, as Moonlight asks.
+                confirmAction(t('apps.quitConfirm', { name }), { danger: true }).then((yes) => {
+                    if (!yes) return;
+                    quitAppBtn.disabled = true;
+                    quitAppBtn.textContent = t('apps.quitting');
+                    BackendClient.stopHostSession(uuid)
+                        .then((res) => {
+                            const id = Number(res && res.currentGameId) || 0;
+                            if (host) host.currentGameId = id;
+                            if (host && host.runningAppPerDevice)
+                                this.forgetDeviceRunning(uuid, id);
+                        })
+                        .catch((err) => {
+                            console.error('[MW] Quit app failed:', err);
+                            Toast.error(t('apps.quitFailed', { name }));
+                        })
+                        .finally(() => {
+                            this.renderList();
+                            this.refresh();
+                        });
+                });
+                return;
+            }
+
+            // The GPU list on the virtual display's card is its own control.
+            if (e.target.closest('.app-card-gpu--choice')) return;
 
             // ── App card launch ───────────────────────────────────────────
             const appCard = e.target.closest('.app-card');
@@ -392,23 +473,83 @@ export class HostListView {
         // App-card keyboard activation (Enter/Space) — cards are role="button".
         this._keydownHandler = (e) => {
             if (this._destroyed) return;
+            // Escape (a pad's B, through RemoteNav) closes an open kebab menu,
+            // and the focus goes back to the button that opened it.
+            if (e.key === 'Escape' && this._closeMenuBackToButton()) {
+                e.preventDefault();
+                return;
+            }
             if (e.key !== 'Enter' && e.key !== ' ') return;
+            // The Quit button of a running app is a real <button>: let it act.
+            if (e.target.closest && e.target.closest('.app-card-quit')) return;
+            // So is the GPU list: Enter and Space open it, never the stream.
+            if (e.target.closest && e.target.closest('.app-card-gpu--choice')) return;
             const appCard = e.target.closest && e.target.closest('.app-card');
             if (!appCard) return;
             e.preventDefault();
             appCard.click();
         };
         this.container.addEventListener('keydown', this._keydownHandler);
+
+        // The GPU the virtual display is drawn by, picked on its card: saved
+        // for its next start, and the grid asks the host again, which repaints
+        // the card with what it now says. Refused, the list goes back to what
+        // it showed.
+        this._changeHandler = (e) => {
+            if (this._destroyed) return;
+            const select = e.target.closest && e.target.closest('.app-card-gpu-select');
+            if (!select) return;
+            const hostCard = select.closest('.host-card');
+            const uuid = hostCard && hostCard.dataset.uuid;
+            if (!uuid) return;
+            const before = select.dataset.selected || '';
+            select.disabled = true;
+            BackendClient.setVirtualDisplayGpu(uuid, select.value)
+                .then(() => this._refreshApps(uuid))
+                .catch((err) => {
+                    console.error('[MW] Virtual display GPU not saved:', err);
+                    select.value = before;
+                    Toast.error(t('apps.gpuSaveFailed'));
+                })
+                .finally(() => {
+                    if (select.isConnected) select.disabled = false;
+                });
+        };
+        this.container.addEventListener('change', this._changeHandler);
     }
 
     // --- Public API ---
 
     start() {
         this._active = true;
+        // Back on the list, maybe from a stream just stopped: ask again at once.
+        this._deviceRunningAt.clear();
+        this._drawRememberedHosts();
         this._autoScan();
         this.scheduleNextPoll(0); // immediate first refresh
         this._checkForUpdate(); // discreet "new version available" banner
         this._scheduleUpdateCheck();
+    }
+
+    /**
+     * Draw the host list this machine sent last time, before it answers now
+     * (hostListCache.js). Only on the page's first sight of the list: once the
+     * machine has answered, what is on screen is already newer than any memory.
+     */
+    _drawRememberedHosts() {
+        if (this._hostsLoaded || this.hosts.length > 0) return;
+        const remembered = loadCachedHosts(this.memoryKey);
+        if (!remembered) return;
+        this.hosts = remembered.map((h) => {
+            const host = new Host(h);
+            // What ran last time is no news about now: no card offers to resume
+            // a game on the strength of a memory.
+            host.currentGameId = 0;
+            return host;
+        });
+        this._hostsFromMemory = true;
+        bootMark('hosts-remembered', `${this.hosts.length} hosts`);
+        this.renderList();
     }
 
     // --- Update banner ---
@@ -433,7 +574,7 @@ export class HostListView {
     async _checkForUpdate() {
         // Nothing to learn while the banner shows an update in flight, and don't
         // re-ask more often than the backend could plausibly change its answer.
-        if (this._updateBusy) return;
+        if (hostUpdate.busy) return;
         const now = Date.now();
         if (now - this._updateCheckedAt < HostListView.UPDATE_CHECK_MIN_MS) return;
         this._updateCheckedAt = now;
@@ -458,29 +599,16 @@ export class HostListView {
         this._renderUpdateBanner();
     }
 
-    /**
-     * Whether this browser can have the update applied for it.
-     *
-     * The installer runs on the HOST, never here — offering a download link to a
-     * phone streaming from the other side of the house would be a dead end. So
-     * the banner only ever offers an action when the host can carry it out
-     * itself, which needs two things:
-     *   - the machine running MoonlightWeb is paired with its local Sunshine.
-     *     That is the "already set up" marker: the installer has nothing left to
-     *     ask (no credentials, no pairing), so it can run unattended.
-     *   - the platform has an unattended elevation path at all (self_update.
-     *     supported — see SelfUpdater).
-     * Anything else degrades to "go update the host PC".
-     */
+    /** Whether this browser can have the update applied for it (HostUpdate.js). */
     _canSelfUpdate() {
-        const cap = this._updateInfo && this._updateInfo.self_update;
-        if (!cap || !cap.supported) return false;
-        return this.hosts.some((h) => h.isLocalHost && h.isPaired);
+        return canSelfUpdate(this._updateInfo, this.hosts);
     }
 
     _renderUpdateBanner() {
         // An update in flight owns the banner (progress bar); never repaint over it.
-        if (this._updateBusy) return;
+        if (hostUpdate.busy) return;
+        // A booth's visitors can do nothing about an update: the banner stays hidden.
+        if (BackendClient.adminLocked) return;
         // Wait for the host list: painting "update the host PC by hand" and then
         // flipping it to a one-click button a second later reads as a glitch.
         if (!this._hostsLoaded) return;
@@ -492,7 +620,6 @@ export class HostListView {
         const notes = info.release_url || '';
         const canUpdate = this._canSelfUpdate();
         // Whatever this replaces, the progress row's nodes are gone with it.
-        this._stopProgressAnimation();
         this._progressFill = null;
         banner.innerHTML = `
             <span class="update-banner-icon" aria-hidden="true">${Icons.power}</span>
@@ -520,15 +647,21 @@ export class HostListView {
         banner.hidden = false;
     }
 
-    // --- Applying the update (host-side, watched from here) ---
+    // --- Applying the update (host-side, watched from HostUpdate.js) ---
+
+    /** Paint what the update run shows (HostUpdate.js subscribe). */
+    _paintUpdateRun(view) {
+        if (this._destroyed || !view) return;
+        if (view.state === 'failed') this._renderUpdateFailed(view.message);
+        else this._renderUpdateProgress(view.label, view.percent);
+    }
 
     // Repaint the banner as a progress row. No dismiss button: the host is being
     // replaced under us, hiding the bar would only lose the user.
     //
     // The row is built once and then updated in place — re-rendering the markup
-    // on every poll would hand the animation a brand new element each time, with
-    // no width to continue from.
-    _renderUpdateProgress(status) {
+    // on every frame would restart the sheen and churn the DOM for nothing.
+    _renderUpdateProgress(label, percent) {
         const banner = this.container.querySelector('#update-banner');
         if (!banner) return;
 
@@ -544,71 +677,15 @@ export class HostListView {
             this._progressTrack = banner.querySelector('.update-banner-progress');
             this._progressFill = banner.querySelector('.update-banner-progress-fill');
             this._progressLabel = banner.querySelector('.update-banner-text');
-            this._progressShown = 0;
-            this._progressFloor = 0;
         }
         banner.hidden = false;
-
-        let label;
-        if (status.requires_host_confirmation && status.state !== 'downloading')
-            label = t('update.confirmOnHost');
-        else if (status.state === 'downloading') label = t('update.downloading');
-        else if (status.state === 'installing') label = t('update.installing');
-        else label = t('update.restarting');
         if (this._progressLabel.textContent !== label) this._progressLabel.textContent = label;
-
-        this._progressPhase = UPDATE_PHASES[status.state] ? status.state : 'installing';
-        // The host's own figure is a floor, never a setpoint: it may be stale by
-        // up to a poll, and it must not drag the bar backwards.
-        const pct = Math.max(0, Math.min(100, status.percent || 0));
-        if (pct > this._progressFloor) this._progressFloor = pct;
-        this._startProgressAnimation();
-    }
-
-    // Ease the bar towards the ceiling of its phase, one frame at a time.
-    _startProgressAnimation() {
-        if (this._progressRaf) return;
-        this._progressAt = performance.now();
-        const step = () => {
-            this._progressRaf = null;
-            if (this._destroyed || !this._progressFill) return;
-            const now = performance.now();
-            // Clamp: a backgrounded tab stops firing frames, and the catch-up
-            // step on return should not slam the bar into its ceiling.
-            const dt = Math.min((now - this._progressAt) / 1000, 1);
-            this._progressAt = now;
-
-            const phase = UPDATE_PHASES[this._progressPhase] || UPDATE_PHASES.installing;
-            let value = this._progressShown;
-            // Catching up to a figure the host reported is still a slide, not a
-            // snap — the download typically lands whole in the very first poll.
-            if (value < this._progressFloor)
-                value += (this._progressFloor - value) * (1 - Math.exp(-dt / 0.6));
-            if (value < phase.ceiling)
-                value += (phase.ceiling - value) * (1 - Math.exp(-dt / phase.tau));
-            this._progressShown = Math.min(value, phase.ceiling);
-
-            this._paintProgress(this._progressShown);
-            this._progressRaf = requestAnimationFrame(step);
-        };
-        this._progressRaf = requestAnimationFrame(step);
-    }
-
-    _stopProgressAnimation() {
-        if (this._progressRaf) cancelAnimationFrame(this._progressRaf);
-        this._progressRaf = null;
-    }
-
-    _paintProgress(value) {
-        const pct = Math.max(0, Math.min(100, value));
+        const pct = Math.max(0, Math.min(100, percent));
         this._progressFill.style.width = `${pct.toFixed(1)}%`;
-        if (this._progressTrack)
-            this._progressTrack.setAttribute('aria-valuenow', String(Math.round(pct)));
+        this._progressTrack.setAttribute('aria-valuenow', String(Math.round(pct)));
     }
 
     _renderUpdateFailed(message) {
-        this._updateBusy = false;
-        this._stopProgressAnimation();
         this._progressFill = null;
         const banner = this.container.querySelector('#update-banner');
         if (!banner) return;
@@ -623,96 +700,9 @@ export class HostListView {
         banner.hidden = false;
     }
 
-    async _startUpdate() {
-        if (this._updateBusy) return;
-        this._updateBusy = true;
-        // Fresh bar even if a previous attempt failed halfway up.
-        this._stopProgressAnimation();
-        this._progressFill = null;
-        this._renderUpdateProgress({ state: 'downloading', percent: 0 });
-        try {
-            await BackendClient.startUpdate();
-        } catch (err) {
-            this._renderUpdateFailed(err.message);
-            return;
-        }
-        this._watchUpdate();
-    }
-
-    /**
-     * Follow the update to its end, across the moment the server disappears.
-     *
-     * Phase 1 polls /api/update/status for real progress. The installer then
-     * replaces (and on Windows kills) that very server, so the polling failing is
-     * the expected transition, not an error. Phase 2 waits for the new build to
-     * answer /api/health and reloads the app on it.
-     */
-    async _watchUpdate() {
-        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-        const info = this._updateInfo || {};
-
-        // Phase 1 — the host is still answering. Bounded: on the platforms whose
-        // installer needs a prompt on the host desktop, nothing kills this server
-        // and an unanswered dialog would keep us polling forever.
-        let alive = true;
-        for (let i = 0; i < 600 && !this._destroyed && alive; i++) {
-            await sleep(900);
-            let status;
-            try {
-                status = await BackendClient.getUpdateStatus();
-            } catch (_) {
-                alive = false; // server gone: the installer took it down
-                break;
-            }
-            if (status.state === 'failed') {
-                this._renderUpdateFailed(status.error);
-                return;
-            }
-            // `idle` from a server that we told to update means we are already
-            // talking to its freshly started replacement — phase 2's version
-            // check is what settles that.
-            if (status.state === 'idle') {
-                alive = false;
-                break;
-            }
-            this._renderUpdateProgress(status);
-        }
-        if (this._destroyed) return;
-        if (alive) {
-            // Still up after the whole budget — the install never went through.
-            this._renderUpdateFailed(t('update.timeout'));
-            return;
-        }
-
-        // Phase 2 — wait for the new build. Generous budget: a Windows install
-        // plus the server rebinding its ports can take a couple of minutes, and
-        // an elevation prompt on the host desktop may be waiting for someone.
-        // Nothing reports progress any more, so the bar rides on its own easing
-        // from wherever phase 1 left it — no jump to a fixed 98 % that would
-        // then sit still for the whole restart.
-        this._renderUpdateProgress({ state: 'finalizing', percent: 0 });
-        for (let i = 0; i < 200 && !this._destroyed; i++) {
-            await sleep(3000);
-            const health = await BackendClient.probeHealth();
-            // Wait for a version that is no longer the one we started from. The
-            // old server can keep answering for a few seconds (or phase 1 may
-            // have broken on a transient error), and reloading onto it would
-            // silently look like the update did nothing.
-            if (health && health.version && health.version !== info.current) {
-                localStorage.removeItem('mw_update_dismissed');
-                // Close the bar before the reload wipes it — the last thing seen
-                // should be a full bar, not one frozen at 96 %.
-                this._stopProgressAnimation();
-                if (this._progressFill) this._paintProgress(100);
-                location.reload();
-                return;
-            }
-        }
-        if (!this._destroyed) this._renderUpdateFailed(t('update.timeout'));
-    }
-
     async _autoScan() {
-        if (!this._active) return;
+        // A booth offers the hosts it was given; discovery would add others.
+        if (!this._active || BackendClient.adminLocked) return;
         try {
             await BackendClient.scanHosts();
         } catch (err) {
@@ -742,7 +732,8 @@ export class HostListView {
         this._active = false;
         this._destroyed = true;
         this.stop();
-        this._stopProgressAnimation();
+        if (this._unsubUpdate) this._unsubUpdate();
+        this._unsubUpdate = null;
         this._progressFill = null;
         this._launchFailTimers.forEach((id) => clearTimeout(id));
         this._launchFailTimers.clear();
@@ -753,6 +744,10 @@ export class HostListView {
         if (this._keydownHandler) {
             this.container.removeEventListener('keydown', this._keydownHandler);
             this._keydownHandler = null;
+        }
+        if (this._changeHandler) {
+            this.container.removeEventListener('change', this._changeHandler);
+            this._changeHandler = null;
         }
         if (this._docClickHandler) {
             document.removeEventListener('click', this._docClickHandler);
@@ -777,20 +772,38 @@ export class HostListView {
     async refresh() {
         if (!this._active) return;
         try {
+            const asked = performance.now();
             const data = await BackendClient.getHosts();
             // Re-check after await: stop()/destroy() may have run while the
             // request was in flight (e.g. a stream was launched) — a late
             // render here would overwrite the current view.
             if (!this._active || this._destroyed) return;
             const serverHosts = data.hosts || [];
+            bootMark(
+                'hosts-answered',
+                `${serverHosts.length} hosts, asked ${Math.round(performance.now() - asked)} ms before`,
+            );
             const before = this._fingerprint();
+            // The cards drawn from memory give way to the machine's own list,
+            // and a host it no longer has goes with them — the merge below
+            // never removes anything.
+            if (this._hostsFromMemory) {
+                this._hostsFromMemory = false;
+                const kept = new Set(serverHosts.map((h) => h.uuid));
+                this.hosts = this.hosts.filter((h) => kept.has(h.uuid));
+            }
+            this._rememberHosts(serverHosts);
             // Merge — add/update, never remove
             for (const h of serverHosts) {
                 const host = new Host(h);
+                // This device's running app, as last asked (see Host).
+                if (host.runningAppPerDevice)
+                    host.currentGameId = this._deviceRunning.get(host.uuid) || 0;
                 const idx = this.hosts.findIndex((ex) => ex.uuid === host.uuid);
                 if (idx >= 0) this.hosts[idx] = host;
                 else this.hosts.push(host);
             }
+            this._refreshDeviceRunning();
             const firstLoad = !this._hostsLoaded;
             this._hostsLoaded = true;
             const after = this._fingerprint();
@@ -811,6 +824,55 @@ export class HostListView {
         }
     }
 
+    /**
+     * Keep the list the machine just sent, for the next opening to draw at once.
+     * Written only when it changed: the list is asked every few seconds.
+     */
+    _rememberHosts(serverHosts) {
+        if (!this.memoryKey) return;
+        const json = JSON.stringify(serverHosts);
+        if (json === this._rememberedJson) return;
+        this._rememberedJson = json;
+        saveCachedHosts(this.memoryKey, serverHosts);
+    }
+
+    /**
+     * What this device's own seat runs, on every host where each device has
+     * one: the host list carries the machine's currentGameId, which is no one
+     * device's. Asked at most every DEVICE_RUNNING_MS per host, and at once
+     * after start() or forgetDeviceRunning().
+     */
+    _refreshDeviceRunning() {
+        const now = Date.now();
+        for (const host of this.hosts) {
+            if (!host.runningAppPerDevice || host.state !== 'online') continue;
+            const at = this._deviceRunningAt.get(host.uuid);
+            if (at !== undefined && now - at < HostListView.DEVICE_RUNNING_MS) continue;
+            this._deviceRunningAt.set(host.uuid, now);
+            BackendClient.getRunningApp(host.uuid)
+                .then((answer) => {
+                    if (!this._active || this._destroyed) return;
+                    const id = Number(answer && answer.currentGameId) || 0;
+                    if ((this._deviceRunning.get(host.uuid) || 0) === id) return;
+                    this._deviceRunning.set(host.uuid, id);
+                    const current = this.hosts.find((h) => h.uuid === host.uuid);
+                    if (current) current.currentGameId = id;
+                    this.renderList();
+                })
+                .catch(() => {
+                    /* unknown: keep the last answer, ask again next time */
+                });
+        }
+    }
+
+    /** Ask this host's seat again on the next refresh, and show nothing meanwhile. */
+    forgetDeviceRunning(uuid, id = 0) {
+        this._deviceRunning.set(uuid, id);
+        this._deviceRunningAt.delete(uuid);
+        const host = this.hosts.find((h) => h.uuid === uuid);
+        if (host && host.runningAppPerDevice) host.currentGameId = id;
+    }
+
     // Stable fingerprint of host list — skips re-render when nothing changed
     _fingerprint() {
         return JSON.stringify(
@@ -823,11 +885,16 @@ export class HostListView {
                 h.customName,
                 h.port,
                 h.gpuModel,
-                // A running session drives the kebab's "Stop session" entry;
-                // without it here the card never re-renders when a Leave leaves
-                // the Sunshine app paused-but-alive.
-                h.currentGameId > 0,
+                // A running session drives the kebab's "Stop session" entry and
+                // the running app's card; without it here the card never
+                // re-renders when a Stop leaves the Sunshine app running.
+                h.currentGameId,
+                h.resumableApps,
                 h.restartSupported,
+                // The native host's display state: without it here a virtual
+                // display going off never reaches the card, nor the app list
+                // the card then asks for again.
+                h.nativeDisplay,
             ]),
         );
     }
@@ -844,7 +911,8 @@ export class HostListView {
             host.gpuModel,
             host.wakeSupported,
             host.restartSupported,
-            host.currentGameId > 0,
+            host.currentGameId,
+            host.resumableApps,
             // The native host's display state: a screen appearing or leaving
             // must repaint the card from empty state to grid and back.
             JSON.stringify(host.nativeDisplay),
@@ -861,7 +929,11 @@ export class HostListView {
                 <div class="hosts-header">
                     <h2>${t('hosts.title')}</h2>
                     <div class="hosts-actions">
-                        <button class="btn btn-neutral" id="btn-manual">${t('hosts.addManually')}</button>
+                        ${
+                            BackendClient.adminLocked
+                                ? ''
+                                : `<button class="btn btn-neutral" id="btn-manual">${t('hosts.addManually')}</button>`
+                        }
                     </div>
                 </div>
                 <div class="hosts-list" id="hosts-list"></div>
@@ -919,11 +991,23 @@ export class HostListView {
         // discovery order is the network's opinion, and it puts the machine
         // played on every evening under three boxes seen once. The score only
         // moves on a launch, so the list does not reshuffle under the cursor;
-        // hosts never launched all score 0 and the stable sort leaves them in
-        // discovery order behind the rest.
+        // hosts never launched all score 0 and fall back to the default order:
+        // the native host (always there, the one a fresh install streams
+        // from), then the available hosts on this same PC, then the rest by
+        // name rather than in whatever order they answered.
         const usage = hostUsageRanker();
+        const isNative = (h) => (h.backendType === 'native' ? 1 : 0);
+        const isHere = (h) => (h.isLocalHost && h.isAvailable ? 1 : 0);
         this.hosts.sort(
-            (a, b) => Number(b.isPaired) - Number(a.isPaired) || usage(b.uuid) - usage(a.uuid),
+            (a, b) =>
+                Number(b.isPaired) - Number(a.isPaired) ||
+                usage(b.uuid) - usage(a.uuid) ||
+                isNative(b) - isNative(a) ||
+                isHere(b) - isHere(a) ||
+                a.displayName.localeCompare(b.displayName, undefined, {
+                    sensitivity: 'base',
+                    numeric: true,
+                }),
         );
 
         const currentUuids = new Set(this.hosts.map((h) => h.uuid));
@@ -946,6 +1030,7 @@ export class HostListView {
                 tmp.innerHTML = this.renderCard(host);
                 card = tmp.firstElementChild;
                 card.dataset.fingerprint = fp;
+                card.dataset.nativeDisplay = JSON.stringify(host.nativeDisplay);
             } else if (card.dataset.fingerprint !== fp) {
                 // Data changed — replace just this card, unless its kebab is
                 // open.
@@ -962,10 +1047,23 @@ export class HostListView {
                 if (card.querySelector('.host-menu:not([hidden])')) {
                     this._staleCards = true;
                 } else {
+                    // The native host's displays moved (the virtual display
+                    // went on or off, and with "other screens off" the
+                    // physical ones with it): the list this page holds may
+                    // have been asked for in between, so it is confirmed
+                    // again like a remembered one.
+                    const entry = this.appsByHost[host.uuid];
+                    if (
+                        entry &&
+                        entry.apps &&
+                        card.dataset.nativeDisplay !== JSON.stringify(host.nativeDisplay)
+                    )
+                        entry.fromCache = true;
                     const tmp = document.createElement('div');
                     tmp.innerHTML = this.renderCard(host);
                     const newCard = /** @type {HTMLElement} */ (tmp.firstElementChild);
                     newCard.dataset.fingerprint = fp;
+                    newCard.dataset.nativeDisplay = JSON.stringify(host.nativeDisplay);
                     card.replaceWith(newCard);
                     card = newCard;
                 }
@@ -978,12 +1076,16 @@ export class HostListView {
 
         // Fill in app grids for available hosts (cache hit = instant).
         for (const host of this.hosts) {
-            if (host.isAvailable && !host.needsVirtualDisplay) this._ensureAppsLoaded(host);
+            if (host.isAvailable && !host.needsVirtualDisplay && !host.needsCapturePermission)
+                this._ensureAppsLoaded(host);
         }
     }
 
     renderCard(host) {
         const cls = host.statusClass;
+        // Booth mode leaves the menu one entry, Stop session, and hides it
+        // while there is no app to stop.
+        const booth = BackendClient.adminLocked;
         return `
             <div class="host-card ${cls}" data-uuid="${host.uuid}">
                 <div class="host-card-head">
@@ -999,12 +1101,18 @@ export class HostListView {
                         }
                     </div>
                     <span class="status-badge ${cls}">${host.statusLabel}</span>
-                    <div class="host-card-menu">
+                    <div class="host-card-menu"${
+                        booth && !(host.currentGameId > 0) ? ' style="display: none"' : ''
+                    }>
                         <button class="btn-icon btn-host-menu" data-uuid="${host.uuid}"
                                 aria-haspopup="true" aria-expanded="false"
                                 aria-label="${this.esc(t('hosts.menuAria'))}">${Icons.menu}</button>
                         <div class="host-menu" hidden>
-                            <button class="host-menu-item btn-rename" data-uuid="${host.uuid}">${t('hosts.rename')}</button>
+                            ${
+                                booth
+                                    ? ''
+                                    : `<button class="host-menu-item btn-rename" data-uuid="${host.uuid}">${t('hosts.rename')}</button>`
+                            }
                             ${
                                 // Sharing without a stream: the board opens
                                 // cold, the owner picks the app, and the first
@@ -1012,7 +1120,7 @@ export class HostListView {
                                 // Gated on the declared lobby capability, not
                                 // the product name — a co-op host manages its
                                 // own players in its own streamed UI.
-                                host.isAvailable && host.supportsLobbies !== true
+                                !booth && host.isAvailable && host.supportsLobbies !== true
                                     ? `<button class="host-menu-item btn-share" data-uuid="${host.uuid}">${t('sharing.share')}</button>`
                                     : ''
                             }
@@ -1022,7 +1130,7 @@ export class HostListView {
                                 // API that can bounce the service. It never asks
                                 // the user for a host password, so on a plain
                                 // remote host there is simply nothing to show.
-                                host.restartSupported
+                                !booth && host.restartSupported
                                     ? `<button class="host-menu-item btn-restart" data-uuid="${host.uuid}">${t('hosts.restartService')}</button>`
                                     : ''
                             }
@@ -1051,7 +1159,10 @@ export class HostListView {
                                 // such a host can ever be set up — and because
                                 // the test is a Sunshine one, a Sunshine card
                                 // still shows nothing at all.
-                                host.backendType || host.multiSeatDetected || host.mayHaveControlApi
+                                !booth &&
+                                (host.backendType ||
+                                    host.multiSeatDetected ||
+                                    host.mayHaveControlApi)
                                     ? `<button class="host-menu-item btn-backend" data-uuid="${host.uuid}">${
                                           host.backendType
                                               ? t('hosts.backendManage', { type: host.backendType })
@@ -1059,7 +1170,18 @@ export class HostListView {
                                       }</button>`
                                     : ''
                             }
-                            <button class="host-menu-item btn-remove" data-uuid="${host.uuid}">${t('common.remove')}</button>
+                            ${
+                                booth
+                                    ? ''
+                                    : `<button class="host-menu-item btn-remove" data-uuid="${host.uuid}">${t('common.remove')}</button>`
+                            }
+                            ${
+                                // A TV remote's Back never reaches the page: the
+                                // menu carries its own way out there.
+                                RemoteNav.isActive()
+                                    ? `<button class="host-menu-item btn-menu-close">${t('common.close')}</button>`
+                                    : ''
+                            }
                         </div>
                     </div>
                 </div>
@@ -1080,10 +1202,34 @@ export class HostListView {
                         <p class="host-empty-display-text">${t('vdisplay.emptyBody')}</p>
                     </div>`;
         }
-        if (host.isAvailable) {
-            // App grid filled asynchronously by _ensureAppsLoaded().
-            return `<div class="host-apps" data-uuid="${host.uuid}"></div>`;
+        if (host.needsCapturePermission) {
+            // The Mac's Screen Recording grant went away after the install (an
+            // update, a reset). The card stays and says which switch to flip:
+            // one that vanished would say nothing at all.
+            return `<div class="host-body-center host-empty-display">
+                        <p class="host-empty-display-text">${t('hosts.nativeCapturePermission')}</p>
+                        ${
+                            BackendClient.adminLocked
+                                ? ''
+                                : `<button class="btn btn-secondary btn-mac-perm" data-pane="screen">${t('setup.openScreenRecording')}</button>`
+                        }
+                    </div>`;
         }
+        if (host.isAvailable) {
+            // App grid filled asynchronously by _ensureAppsLoaded(). A Mac that
+            // lost Accessibility still streams, but takes no input: said above
+            // the grid, since macOS says nothing.
+            const inputWarn = host.lacksInputPermission
+                ? `<div class="host-perm-warn"><p>${t('hosts.nativeInputPermission')}</p>${
+                      BackendClient.adminLocked
+                          ? ''
+                          : `<button class="btn btn-secondary btn-mac-perm" data-pane="accessibility">${t('setup.openAccessibility')}</button>`
+                  }</div>`
+                : '';
+            return inputWarn + `<div class="host-apps" data-uuid="${host.uuid}"></div>`;
+        }
+        // A booth pairs nothing: an unpaired host just shows its badge.
+        if (host.isLocked && BackendClient.adminLocked) return '';
         if (host.isLocked) {
             return `<div class="host-body-center">
                         <button class="btn btn-secondary btn-pair" data-uuid="${host.uuid}">${t('common.pair')}</button>
@@ -1145,7 +1291,10 @@ export class HostListView {
         if (!entry) {
             const remembered = loadCachedApps(uuid);
             if (remembered) {
-                entry = { apps: remembered.map((a) => new App(a, uuid)), fromCache: true };
+                entry = {
+                    apps: sortApps(remembered.map((a) => new App(a, uuid))),
+                    fromCache: true,
+                };
                 this.appsByHost[uuid] = entry;
             }
         }
@@ -1190,15 +1339,22 @@ export class HostListView {
         const entry = prev && prev.apps ? prev : {};
         this.appsByHost[uuid] = entry;
 
+        const asked = performance.now();
         const pending = BackendClient.getAppList(uuid)
             .then((data) => {
+                bootMark(
+                    'apps-answered',
+                    `asked ${Math.round(performance.now() - asked)} ms before`,
+                );
                 if (data && data.status === 'ok') {
                     const raw = data.apps || [];
                     saveCachedApps(uuid, raw);
                     // The host answered: the next failure starts the ladder over.
                     delete this._appRetryDelay[uuid];
                     delete this._appRetryAt[uuid];
-                    return /** @type {AppsEntry} */ ({ apps: raw.map((a) => new App(a, uuid)) });
+                    return /** @type {AppsEntry} */ ({
+                        apps: sortApps(raw.map((a) => new App(a, uuid))),
+                    });
                 }
                 // The backend answered with a definitive rejection (host not
                 // paired / not found) — retrying won't change the outcome.
@@ -1343,8 +1499,11 @@ export class HostListView {
             cont.innerHTML = `<div class="host-apps-msg">${t('apps.empty')}</div>`;
             return;
         }
+        bootMark('apps-painted', entry.fromCache ? 'remembered' : 'from the host');
         const devices = apps.map((a) => a.device).filter(Boolean);
-        cont.innerHTML = `<div class="apps-grid">${apps.map((a) => this.renderApp(a, devices)).join('')}</div>`;
+        const host = this.hosts.find((h) => h.uuid === uuid);
+        const runningId = host && host.resumableApps ? host.currentGameId : 0;
+        cont.innerHTML = `<div class="apps-grid">${apps.map((a) => this.renderApp(a, devices, runningId)).join('')}</div>`;
         this._wireBoxArt(cont, uuid);
     }
 
@@ -1429,30 +1588,89 @@ export class HostListView {
         });
     }
 
-    renderApp(app, devices = []) {
+    renderApp(app, devices = [], runningId = 0) {
         // The whole card is the launch action. role/tabindex keep it
         // keyboard-accessible (Enter/Space handled by the keydown delegate).
         //
-        // A native host's app is a display, and the host says what it is: the
-        // card draws that machine, on no frame. Every other host keeps its
-        // cover art, and its own stand-in when there is none.
-        const image = app.device
+        // A native host's display card draws the machine the host says it
+        // is, on no frame. Its apps show the image the owner gave them, else
+        // the stand-in every other host's app gets when it has no cover art.
+        const cover = `<img src="${this.esc(app.boxArtUrl ?? '')}"
+                               alt="${this.esc(app.displayName)}"
+                               loading="lazy">`;
+        const drawsMachine = app.device && !app.isHostApp;
+        const image = drawsMachine
             ? hostArtHtml(app.device, devices)
             : app.boxArtUrl
-              ? `<img src="${this.esc(app.boxArtUrl)}"
-                               alt="${this.esc(app.displayName)}"
-                               loading="lazy">`
+              ? cover
               : appPlaceholderHtml(app.id, t);
+        // The app a stopped stream left running (issue #24): the card resumes
+        // it, and says so; a small Quit closes it on the host.
+        const running = runningId > 0 && app.id === runningId;
+        const aria = running
+            ? t('apps.resumeAria', { name: app.displayName })
+            : t('apps.launchAria', { name: app.displayName });
         return `
-            <div class="app-card" data-app-id="${app.id}"
+            <div class="app-card${running ? ' app-card--running' : ''}" data-app-id="${app.id}"
                  role="button" tabindex="0"
-                 aria-label="${this.esc(t('apps.launchAria', { name: app.displayName }))}">
-                <div class="app-card-image${app.device ? ' app-card-image--host' : ''}">
+                 aria-label="${this.esc(aria)}">
+                <div class="app-card-image${drawsMachine ? ' app-card-image--host' : ''}">
                     ${image}
+                    ${running ? `<span class="app-card-badge">${this.esc(t('apps.running'))}</span>` : ''}
                 </div>
                 <div class="app-card-name">${this.esc(app.displayName)}</div>
+                ${drawsMachine ? this._gpuLine(app) : ''}
+                ${
+                    running
+                        ? `<button type="button" class="app-card-quit" data-app-id="${app.id}"
+                                aria-label="${this.esc(t('apps.quitAria', { name: app.displayName }))}">${this.esc(t('apps.quit'))}</button>`
+                        : ''
+                }
             </div>
         `;
+    }
+
+    /**
+     * The line under a native display's card that names the GPU drawing it,
+     * on a PC with several (01/11/2026: DualRTX, and nothing said which screen
+     * was on which card). Two GPUs of one name carry their number.
+     *
+     * On the virtual display's card, where the driver's settings are
+     * MoonlightWeb's own, the line is where its administrator picks that GPU:
+     * a list, "Auto" — the driver's own choice — first, then the GPUs by name,
+     * the only thing the driver tells them apart by. Anyone else, and a booth,
+     * sees the line only.
+     */
+    _gpuLine(app) {
+        const d = app.device;
+        const name = typeof d.gpu === 'string' ? d.gpu : '';
+        const label =
+            name && d.gpuNumber > 0 ? t('apps.gpuNumbered', { name, n: d.gpuNumber }) : name;
+        const choice = d.gpuChoice;
+        if (
+            choice &&
+            Array.isArray(choice.options) &&
+            this.canAdminister &&
+            !BackendClient.adminLocked
+        ) {
+            const selected = typeof choice.selected === 'string' ? choice.selected : '';
+            const names = choice.options.filter((n) => typeof n === 'string' && n);
+            if (selected && !names.includes(selected)) names.push(selected);
+            // While the display is on, the GPU really drawing it is said too.
+            const auto = label && !selected ? `${t('apps.gpuAuto')} · ${label}` : t('apps.gpuAuto');
+            const option = (value, text) =>
+                `<option value="${this.esc(value)}"${value === selected ? ' selected' : ''}>${this.esc(text)}</option>`;
+            const options = [
+                option('', auto),
+                ...names.map((n) => option(n, n === selected && n === name ? label : n)),
+            ];
+            return `
+                <label class="app-card-gpu app-card-gpu--choice" title="${this.esc(t('apps.gpuChoiceHint'))}">
+                    <select class="app-card-gpu-select" data-selected="${this.esc(selected)}"
+                            aria-label="${this.esc(t('apps.gpuChoiceAria', { name: app.displayName }))}">${options.join('')}</select>
+                </label>`;
+        }
+        return label ? `<div class="app-card-gpu">${this.esc(label)}</div>` : '';
     }
 
     // Switch a card into the "launching" state: a discreet Cyberpunk scan/glow
@@ -1496,8 +1714,10 @@ export class HostListView {
                 nameEl.textContent = nameEl.dataset.label;
                 delete nameEl.dataset.label;
             }
+            // Not with a remote: there the focus IS the pointer, and a card that
+            // drops it leaves the next arrow press starting from nowhere.
             const focused = /** @type {HTMLElement | null} */ (document.activeElement);
-            if (focused && card.contains(focused)) focused.blur();
+            if (focused && card.contains(focused) && !RemoteNav.isActive()) focused.blur();
             if (failed) this._flashLaunchFailed(card);
         });
     }
@@ -1516,6 +1736,18 @@ export class HostListView {
                 this._launchFailTimers.delete(card);
             }, HostListView.LAUNCH_FAIL_FADE_MS),
         );
+    }
+
+    /**
+     * Close the open kebab menu, focusing the button that opened it.
+     * @returns {boolean} whether a menu was open
+     */
+    _closeMenuBackToButton() {
+        const open = this.container.querySelector('.btn-host-menu[aria-expanded="true"]');
+        if (!this.container.querySelector('.host-menu:not([hidden])')) return false;
+        this._closeAllMenus();
+        if (open instanceof HTMLElement) open.focus();
+        return true;
     }
 
     _closeAllMenus() {

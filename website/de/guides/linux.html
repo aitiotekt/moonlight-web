@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<!-- Generated from /guides/linux.html and _i18n/de/guides/linux.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoonlightWeb unter Linux installieren — dein PC in jedem Browser</title>
+<meta name="description" content="Schritt für Schritt: Installiere den MoonlightWeb-Server auf deinem Linux-Gaming-PC (.deb, .rpm oder AppImage) und streame deine Spiele auf jedes Gerät mit Browser.">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#05080d">
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="MoonlightWeb unter Linux installieren — dein PC in jedem Browser">
+<meta property="og:description" content="Schritt für Schritt: Installiere den MoonlightWeb-Server auf deinem Linux-Gaming-PC (.deb, .rpm oder AppImage) und streame deine Spiele auf jedes Gerät mit Browser.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://moonlightweb.top/de/guides/linux.html">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="MoonlightWeb unter Linux installieren — dein PC in jedem Browser">
+<meta name="twitter:description" content="Schritt für Schritt: Installiere den MoonlightWeb-Server auf deinem Linux-Gaming-PC (.deb, .rpm oder AppImage) und streame deine Spiele auf jedes Gerät mit Browser.">
+<meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/de/guides/linux.html">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/linux.html">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/linux.html">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/linux.html">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/linux.html">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/linux.html">
+<!-- /i18n:alternates -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<link rel="stylesheet" href="/assets/pages.css?v={{(fileStat `/assets/pages.css`).ModTime.Unix}}">
+<!-- Shared header/footer styling -->
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://moonlightweb.top/de/"},
+        {"@type": "ListItem", "position": 2, "name": "Guides", "item": "https://moonlightweb.top/de/guides/"},
+        {"@type": "ListItem", "position": 3, "name": "Install on Linux", "item": "https://moonlightweb.top/de/guides/linux.html"}
+      ]
+    },
+    {
+      "@type": "HowTo",
+      "name": "Install MoonlightWeb on Linux and stream your PC to any browser",
+      "description": "Install the MoonlightWeb server on a Linux gaming PC — it captures and encodes that machine itself — and play from any device with a browser.",
+      "totalTime": "PT5M",
+      "estimatedCost": {"@type": "MonetaryAmount", "currency": "USD", "value": "0"},
+      "supply": [{"@type": "HowToSupply", "name": "Linux gaming PC (x64) with a GPU capable of hardware encoding"}],
+      "tool": [{"@type": "HowToTool", "name": "A modern browser on any client device (Chrome, Edge, Safari, Firefox)"}],
+      "step": [
+        {"@type": "HowToStep", "name": "Download a package", "text": "Download the .deb (Debian, Ubuntu, Mint, Pop!_OS), the .rpm (Fedora, RHEL, Rocky, Alma, openSUSE) or the portable AppImage (SteamOS and the rest; Arch uses the AUR package) from the MoonlightWeb releases page.", "url": "https://moonlightweb.top/de/guides/linux.html#step-download"},
+        {"@type": "HowToStep", "name": "Install and launch the server", "text": "Install the package with your package manager, or make the AppImage executable and run it, on the gaming PC.", "url": "https://moonlightweb.top/de/guides/linux.html#step-install"},
+        {"@type": "HowToStep", "name": "Answer the setup wizard", "text": "On first launch the setup wizard at https://localhost/setup asks about the optional Internet link. Nothing else is installed: the app captures and encodes this desktop itself.", "url": "https://moonlightweb.top/de/guides/linux.html#step-setup"},
+        {"@type": "HowToStep", "name": "Open a browser on any device", "text": "Go to https://localhost on the PC itself, or your LAN IP from another device on your network.", "url": "https://moonlightweb.top/de/guides/linux.html#step-open"},
+        {"@type": "HowToStep", "name": "Your PC is already there", "text": "The gaming PC is listed straight away, with one card per screen — no pairing, no PIN. Other hosts on the network (Sunshine, Wolf, MultiSeat) are discovered too and pair with a PIN.", "url": "https://moonlightweb.top/de/guides/linux.html#step-pair"},
+        {"@type": "HowToStep", "name": "Press play", "text": "Pick a game or the full desktop and play from any browser in the house — or anywhere.", "url": "https://moonlightweb.top/de/guides/linux.html#step-play"}
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/de/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/de/" data-nav="home">Start</a><a href="/de/guides/" data-nav="guides" aria-current="page">Anleitungen</a><a href="/de/faq.html" data-nav="faq">FAQ</a><a href="/de/contact.html" data-nav="contact">Kontakt</a><a href="/de/server-access/" data-nav="connect">Verbinden</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/guides/linux.html">English</option><option value="fr" data-href="/fr/guides/linux.html">Français</option><option value="de" data-href="/de/guides/linux.html" selected>Deutsch</option><option value="zh" data-href="/zh/guides/linux.html" lang="zh">中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<main>
+<div class="wrap">
+  <nav class="crumbs" aria-label="Breadcrumb" data-i18n-html="crumbs"><a href="/de/">Startseite</a> / <a href="/de/guides/">Anleitungen</a> / Linux</nav>
+  <span class="kicker" data-i18n="kicker">Installationsanleitung · Linux</span>
+  <h1 data-i18n="h1">Streame deinen Linux-Gaming-PC in jeden Browser</h1>
+  <p class="lead" data-i18n-html="lead">MoonlightWeb ist ein kostenloser Open-Source-Server (GPL-3.0), der deinen Gaming-Rechner auf jedes Gerät mit Browser streamt. <strong>Ein Paket auf dem Gaming-PC. Alle anderen Geräte öffnen einfach eine URL.</strong></p>
+
+  <h2 data-i18n="need.h">Was du brauchst</h2>
+  <ul>
+    <li data-i18n="need.1">Einen Linux-Gaming-PC (x64) mit einer GPU, die Hardware-Encoding beherrscht — den Rechner, auf dem deine Spiele laufen.</li>
+    <li data-i18n-html="need.2"><strong>Sonst nichts zu installieren</strong> — MoonlightWeb erfasst den Desktop selbst (KMS oder unter Wayland die Bildschirmaufnahme des Compositors) und encodiert ihn über VA-API oder Vulkan Video. Für den Ton braucht es <strong>PipeWire</strong>: Auf einem Rechner, der noch reines PulseAudio nutzt, bleibt der Stream stumm, und das Log sagt es dir. Du hast schon irgendwo Sunshine, Wolf oder MultiSeat laufen? Diese Rechner koppelst du auf derselben Seite.</li>
+    <li data-i18n="need.3">Als Client jedes Gerät mit einem modernen Browser: Chrome, Edge, Safari oder Firefox. Keine App, kein Konto.</li>
+    <li data-i18n-html="need.4">Eine Distribution, die nicht älter ist als <strong>Ubuntu 22.04</strong>, <strong>Debian 12</strong> oder <strong>Fedora 36</strong> (glibc 2.34+). Qt und OpenSSL sind mitgeliefert, die C-Laufzeitbibliothek des Systems kann es aber nie sein — auf einer älteren Distro lässt sich das Paket installieren, die App startet dann aber nicht.</li>
+  </ul>
+
+  <h2 id="one-line-install" data-i18n="repo.h">Der schnelle Weg: ein Befehl, Updates inklusive</h2>
+  <p data-i18n-html="repo.p">MoonlightWeb stellt signierte <strong>APT</strong>- und <strong>DNF</strong>-Repositorys bereit. Installierst du aus einem davon, hält die Update-Verwaltung deines Systems MoonlightWeb von selbst aktuell, und die App erscheint in <strong>GNOME Software</strong>, <strong>KDE Discover</strong> und Ubuntus <strong>App Center</strong> wie jede andere Anwendung. Dieser eine Befehl erkennt deine Distribution und macht das Richtige:</p>
+  <pre><code>curl -fsSL https://moonlightweb.top/install.sh | bash</code></pre>
+  <p data-i18n="repo.manual">Lieber von Hand? Das sind genau diese Schritte:</p>
+  <pre><code># Debian / Ubuntu / Mint / Pop!_OS
+sudo install -d /etc/apt/keyrings
+sudo curl -fsSL -o /etc/apt/keyrings/moonlightweb.gpg https://packages.moonlightweb.top/moonlightweb.gpg
+sudo curl -fsSL -o /etc/apt/sources.list.d/moonlightweb.sources https://packages.moonlightweb.top/moonlightweb.sources
+sudo apt update &amp;&amp; sudo apt install moonlightweb
+
+# Fedora / RHEL / Rocky / Alma / Nobara
+sudo curl -fsSL -o /etc/yum.repos.d/moonlightweb.repo https://packages.moonlightweb.top/moonlightweb.repo
+sudo dnf install moonlightweb
+
+# openSUSE
+sudo curl -fsSL -o /etc/zypp/repos.d/moonlightweb.repo https://packages.moonlightweb.top/moonlightweb.repo
+sudo zypper install moonlightweb
+
+# Arch / Manjaro / EndeavourOS
+paru -S moonlightweb-bin</code></pre>
+  <p data-i18n-html="repo.rest">SteamOS, Bazzite und andere unveränderliche (immutable) Systeme haben keinen Paketmanager, dem man ein Repository hinzufügen könnte — sie bleiben beim portablen AppImage, das derselbe Befehl für dich herunterlädt. Der manuelle Weg unten funktioniert weiterhin überall.</p>
+
+  <h2 id="docker" data-i18n="docker.h">Lieber Docker? Headless-Server, NAS und Mini-PCs</h2>
+  <p data-i18n-html="docker.p">Offizielle Multi-Arch-Images (<code>amd64</code> + <code>arm64</code>) werden in der GitHub Container Registry veröffentlicht. Ein Befehl auf jedem Linux-Host mit Docker — <code>--network host</code> setzt den Container direkt in dein LAN, damit er die Hosts darin findet. Ein Container hat keinen Desktop zum Erfassen, daher streamt er die Rechner, mit denen du koppelst, nicht sich selbst:</p>
+  <pre><code>docker run -d --name moonlightweb --network host \
+  -v mw-data:/data --restart unless-stopped \
+  ghcr.io/linckosz/moonlight-web:latest</code></pre>
+  <p data-i18n-html="docker.p2">Ein Container hat keinen vertrauenswürdigen lokalen Browser, also leg einmalig eine Zugangs-PIN fest, öffne dann <code>https://&lt;server-ip&gt;</code> und gib sie ein:</p>
+  <pre><code>docker exec moonlightweb moonlightweb --new-pin</code></pre>
+  <p data-i18n-html="docker.rest">Aktualisiere mit <code>docker pull</code> und erstelle den Container neu — das Volume behält deine Kopplungen und dein Zertifikat. Compose-Datei, Port-Tabelle, macvlan und Internetzugriff per Klick stehen alle in der <a href="https://github.com/linckosz/moonlight-web/blob/main/docker/README.md" target="_blank" rel="noopener">Docker-Anleitung</a>.</p>
+
+  <h2 data-i18n="steps.h">Installation Schritt für Schritt</h2>
+  <div class="gsteps">
+    <div class="gstep cyb" id="step-download">
+      <h3 data-i18n="step1.h">Lade ein Paket herunter</h3>
+      <p data-i18n-html="step1.p">Wähle auf der <a href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener">Releases-Seite</a> das Paket für deine Distro-Familie: <code>.deb</code> für <strong>Debian, Ubuntu, Mint, Pop!_OS, elementary, Zorin</strong>; <code>.rpm</code> für <strong>Fedora, RHEL, CentOS Stream, Rocky, Alma, Nobara, openSUSE</strong>; ein portables <code>.AppImage</code> für <strong>SteamOS, Bazzite</strong> und alles andere (unter <strong>Arch und Manjaro</strong> das AUR-Paket <code>moonlightweb-bin</code>). Jedes Paket ist eigenständig (Qt und OpenSSL mitgeliefert — keine Abhängigkeiten zu installieren).</p>
+    </div>
+    <div class="gstep cyb" id="step-install">
+      <h3 data-i18n="step2.h">Installieren und starten — auf dem Gaming-PC</h3>
+      <pre><code># Debian / Ubuntu / Mint / Pop!_OS — double-clicking the .deb works too
+sudo apt install ./moonlightweb-*-linux-x64.deb
+
+# Fedora / RHEL / Rocky / Alma / Nobara
+sudo dnf install ./moonlightweb-*-linux-x64.rpm
+
+# openSUSE
+sudo zypper install --allow-unsigned-rpm ./moonlightweb-*-linux-x64.rpm
+
+# Arch / SteamOS / other — portable AppImage (needs FUSE 2, see below)
+chmod +x moonlightweb-*.AppImage
+./moonlightweb-*.AppImage</code></pre>
+      <p data-i18n-html="step2.p">Das Paket installiert sich nach <code>/opt/moonlightweb</code>, legt einen Menüeintrag und einen <code>moonlightweb</code>-Befehl an, öffnet die nötigen Ports in der Firewall und startet den Server sofort.</p>
+      <p data-i18n-html="step2.p3"><strong>Um diesen Rechner zu hosten, nimm das .deb, das .rpm oder das AUR-Paket.</strong> Die Bildschirmaufnahme braucht eine File Capability, die in einem AppImage nicht erhalten bleiben kann — ein portables AppImage streamt weiterhin die Sunshine-, Wolf- und MultiSeat-Hosts in deinem Netzwerk, aber nie den eigenen Bildschirm.</p>
+    </div>
+    <div class="gstep cyb" id="step-setup">
+      <h3 data-i18n="stepS.h">Beantworte die Frage des Einrichtungsassistenten</h3>
+      <p data-i18n-html="stepS.p">Beim ersten Start öffnet MoonlightWeb <code>https://localhost/setup</code> und stellt dort die einzige verbleibende Frage: ob die Internet-Verbindung erlaubt werden soll (Remote-Streaming-Sessions, standardmäßig aus). Sonst wird nichts installiert — diesen Desktop erfasst die App selbst. In einer Wayland-Session außer GNOME kann der erste Stream einmal den Bildschirmfreigabe-Dialog des Compositors öffnen; die Freigabe bleibt danach gespeichert.</p>
+    </div>
+    <div class="gstep cyb" id="step-open">
+      <h3 data-i18n="step3.h">Öffne einen Browser auf einem beliebigen Gerät</h3>
+      <p data-i18n-html="step3.p">Auf dem PC selbst: <code>https://localhost</code>. Von einem anderen Gerät in deinem Netzwerk: deine LAN-IP. Spielen von außerhalb deines Netzwerks: Schalte den Internetzugriff ein, und die App gibt dir einen Remote-Link, der direkt zu diesem Rechner führt. Du kannst auch deine eigene Domain und dein eigenes Zertifikat verwenden.</p>
+    </div>
+    <div class="gstep cyb" id="step-pair">
+      <h3 data-i18n="step4.h">Dein PC ist schon da</h3>
+      <p data-i18n="step4.p">Dieser Rechner steht sofort in der Liste, mit einer Karte pro Bildschirm — nichts zu koppeln, keine PIN. Andere Hosts in deinem Netzwerk (Sunshine, Wolf, MultiSeat) werden daneben per mDNS gefunden: Die koppelst du einmal — bei Sunshine, indem du die PIN, die MoonlightWeb anzeigt, auf der Weboberfläche von Sunshine eingibst — und die Kopplung bleibt für immer gespeichert.</p>
+    </div>
+    <div class="gstep cyb" id="step-play">
+      <h3 data-i18n="step5.h">Drück auf Play</h3>
+      <p data-i18n="step5.p">Wähle einen Bildschirm, ein Spiel oder den ganzen Desktop. Vollbild, Gamepad in der Hand — bis zu 4K mit 240 fps, bei unter 20 ms Latenz über WLAN. (HDR von einem Linux-Host ist noch nicht implementiert.)</p>
+    </div>
+  </div>
+
+  <p style="text-align:center"><a class="btn btn-primary" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-loc="guide-linux" data-i18n="dl.btn">⬇ Für Linux herunterladen</a></p>
+
+  <h2 data-i18n="tr.h">Fehlerbehebung</h2>
+  <h3 data-i18n="trOld.h">Die Installation klappt, aber ein Klick auf die App bewirkt rein gar nichts</h3>
+  <p data-i18n-html="trOld.p">Fast immer eine Distribution, die älter ist als die Voraussetzung oben. Der Menüeintrag startet ohne Terminal, also kann der Fehler des Loaders nirgends angezeigt werden, und der Klick wirkt, als hätte er nichts getan. Starte <code>/opt/moonlightweb/bin/MoonlightWeb</code> aus einem Terminal: Eine Zeile mit <code>GLIBC_</code> oder <code>GLIBCXX_</code> <em>not found</em> bestätigt es. Die einzige Lösung ist ein Upgrade der Distribution — ein Programm kann seine eigene C-Laufzeitbibliothek nicht mitbringen.</p>
+  <h3 data-i18n="tr0.h">Ein Doppelklick auf das AppImage öffnet nur ein Fenster „nach Software suchen“</h3>
+  <p data-i18n-html="tr0.p">Ein AppImage ist eine ganz normale Datei: Dein Desktop weigert sich, sie auszuführen, bis sie als ausführbar markiert ist (<code>chmod +x moonlightweb-*.AppImage</code> oder <em>Eigenschaften → Zugriffsrechte → Datei als Programm ausführen</em>). Außerdem braucht es <strong>FUSE 2</strong>, das Ubuntu ab 22.04 nicht mehr mitliefert — installiere es mit <code>sudo apt install libfuse2t64</code> (<code>libfuse2</code> vor Ubuntu 24.04) oder starte die Datei einmalig mit <code>./moonlightweb-*.AppImage --appimage-extract-and-run</code>. <strong>Unter Debian, Ubuntu und Derivaten nimm einfach stattdessen das <code>.deb</code></strong> — es installiert sich per Doppelklick, hat keinen dieser Haken und legt einen richtigen Menüeintrag an.</p>
+  <h3 data-i18n="tr1.h">Der Host erscheint nicht im Browser</h3>
+  <p data-i18n="tr1.p">Stell sicher, dass das Client-Gerät im selben Netzwerk ist wie der Gaming-PC und dass deine Firewall die Ports von MoonlightWeb zulässt. Du kannst einen Host auch manuell per IP hinzufügen.</p>
+  <h3 data-i18n="tr2.h">HEVC oder AV1 ist ausgegraut</h3>
+  <p data-i18n="tr2.p">Codecs, die dein Browser nicht per Hardware decodieren kann, werden automatisch deaktiviert — das ist so gewollt. H264 läuft überall; ob HEVC und AV1 verfügbar sind, hängt von Browser und GPU des Client-Geräts ab.</p>
+  <h3 data-i18n="tr3.h">Der Stream ruckelt bei schwacher Verbindung</h3>
+  <p data-i18n-html="tr3.p">Senk die Stream-Auflösung und aktiviere <strong>Video Enhancement</strong>: Der Stream wird auf der GPU des Clients hochskaliert und nachgeschärft (WebGL2 oder WebGPU mit MoonlightWebs eigenem Upscaler), sodass ein 720p-Stream fast wie 1440p aussieht.</p>
+
+  <div class="note" data-i18n-html="note"><strong>Restriktives Netzwerk?</strong> Blockiert ein Netzwerk UDP, weicht MoonlightWeb von selbst auf TCP aus, weiterhin direkt — außer die Firewall des PCs ist aktiv (firewalld, oder ufw, falls eingeschaltet): Das Paket öffnet für den Stream vorerst nur UDP.</div>
+
+  <h2 data-i18n="read.h">Weiterlesen</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/de/faq.html"><strong data-i18n="x.faq.t">FAQ</strong><span data-i18n="x.faq.d">Latenz, Codecs, Sicherheit, Spielen übers Internet — alle häufigen Fragen.</span></a>
+    <a class="cyb" href="/de/guides/windows.html"><strong data-i18n="x.win.t">Unter Windows installieren</strong><span data-i18n="x.win.d">Geführter Installer — ein Assistent, sonst nichts einzurichten.</span></a>
+    <a class="cyb" href="/de/guides/macos.html"><strong data-i18n="x.mac.t">Unter macOS installieren</strong><span data-i18n="x.mac.d">Anleitung für Apple Silicon mit dem .pkg-Installer.</span></a>
+  </div>
+</div>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/de/">Start</a> · <a href="/de/guides/">Anleitungen</a> · <a href="/de/faq.html">FAQ</a> · <a href="/de/contact.html">Kontakt</a> · <a href="/de/server-access/">Verbinden</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>Kaffee</span></a></span><span class="foot-play">Spielen auf: <a href="/de/play/chromebook.html">Chromebook</a> · <a href="/de/play/iphone-ipad.html">iPhone und iPad</a> · <a href="/de/play/tv.html">TV</a> · <a href="/de/sunshine-web-client.html">Web-Client für Sunshine</a> · <a href="/de/browser-game-streaming.html">Warum ein Browser-Client</a></span></div></footer>
+
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+</body>
+</html>

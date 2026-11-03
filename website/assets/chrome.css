@@ -18,6 +18,18 @@
   clip-path:polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
 }
 .btn-primary{background:linear-gradient(100deg,var(--cyan),#0fa8d6); color:#031017}
+
+/* The Buy Me a Coffee cup (chrome.js fills every [data-bmc-logo] slot): sized
+   on the text it sits beside, its outline in that text's colour. */
+[data-bmc-logo]{display:inline-flex}
+.bmc-logo{height:1.3em; width:auto; flex-shrink:0}
+.bmc-link{display:inline-flex; align-items:center; gap:.3em; vertical-align:bottom}
+.bmc-link .bmc-logo{height:1.15em}
+/* The cup and wordmark on a button: the logo is the label, and the words sit
+   beside it for screen readers only (.sr-only), in the page's language. */
+[data-bmc-full-logo]{display:inline-flex}
+.bmc-full-logo{height:1.9em; width:auto; flex-shrink:0}
+.sr-only{position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0}
 @media(hover:hover){
   .btn-primary:hover{filter:brightness(1.12); text-decoration:none; transform:translateY(-1px)}
 }
@@ -145,3 +157,4 @@ header nav a[aria-current="page"]{color:var(--cyan)}
 /* ───── Footer ───── */
 footer{border-top:1px solid var(--line); padding:36px 0; color:var(--muted); font-size:.9rem}
 footer .wrap{display:flex; gap:16px; flex-wrap:wrap; align-items:center; justify-content:space-between; max-width:1160px}
+footer .foot-play{flex-basis:100%; order:2; font-size:.82rem}

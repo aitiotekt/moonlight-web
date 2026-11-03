@@ -245,23 +245,50 @@ function Get-NativeDisplay($Screen) {
     } | Select-Object -First 1
 }
 
-if (-not $Device) {
-    $virtual = @($screens | Where-Object {
-        $_.Name -match 'VDD|Virtual|Dummy|IddSample|Parsec|Meta|Indirect' -and (Get-NativeDisplay $_)
-    })
-    if ($virtual.Count -eq 0) {
-        throw ("no virtual display to change modes on. This script switches the captured screen's " +
-               "mode and HDR; it will not guess a physical monitor for that. Pass -Device \\.\DISPLAYn " +
-               "to name one on purpose (it will flicker).")
+# Without -Device the captured screen is the product's own "MoonlightWeb
+# Virtual Display". It does not exist between streams: a stream on its tile
+# turns it on, and it goes off 4 s after the last one ends. So it is found the
+# way cadence.py finds it - launch its tile, and take the screen that was not
+# there before - and it is kept alive from then on (see Reset-Page).
+$script:vdMode = -not $Device
+$script:vdName = ''
+$script:before = @()
+$cap = $null
+if ($script:vdMode) {
+    $vd = $null
+    try { $vd = Invoke-RestMethod -Uri "$ApiUrl/api/native/virtual-display" -Method Get -TimeoutSec 10 } catch { }
+    if (-not $vd -or -not (Get-Prop $vd 'installed' $false)) {
+        throw ("no MoonlightWeb Virtual Display on this host to change modes on. This script switches the " +
+               "captured screen's mode and HDR; it will not guess a physical monitor for that. Pass " +
+               "-Device \\.\DISPLAYn to name one on purpose (it will flicker).")
     }
-    $Device = $virtual[0].Gdi
+    if (-not $Tile) { $Tile = Get-Prop $vd 'name' 'MoonlightWeb Virtual Display' }
+    $script:before = @($screens | ForEach-Object { $_.Gdi })
+} else {
+    $cap = Get-Screen $Device
+    if (-not $cap) { throw "no active display named $Device" }
+    $native = Get-NativeDisplay $cap
+    if (-not $Tile) {
+        $Tile = Get-Prop $native 'label' ''
+        if (-not $Tile) { throw "cannot find the native tile for $Device ($($cap.Name)) - pass -Tile" }
+    }
 }
-$cap = Get-Screen $Device
-if (-not $cap) { throw "no active display named $Device" }
-$native = Get-NativeDisplay $cap
-if (-not $Tile) {
-    $Tile = Get-Prop $native 'label' ''
-    if (-not $Tile) { throw "cannot find the native tile for $Device ($($cap.Name)) - pass -Tile" }
+
+# The virtual display, once a stream has it up: the screen that appeared,
+# then the same monitor by name (a display turned off and on again may come
+# back under another GDI name). Updates $Device and $cap.
+function Update-VirtualScreen {
+    if (-not $script:vdMode) { return $true }
+    $now = @([BenchScreens]::List())
+    # By name, but never a screen that was there before the launch: the desk's
+    # own "VDD by MTT" (DualRTX, 25/09/2026) carries the very same name.
+    $found = @(if ($script:vdName) { $now | Where-Object { $_.Name -eq $script:vdName -and $script:before -notcontains $_.Gdi } }
+               else { $now | Where-Object { $script:before -notcontains $_.Gdi } })
+    if ($found.Count -ne 1) { return $false }
+    $script:vdName = $found[0].Name
+    $script:Device = $found[0].Gdi
+    $script:cap = $found[0]
+    return $true
 }
 
 $clientCandidates = @($screens | Where-Object { $_.Gdi -ne $Device } | Sort-Object { $_.W * $_.H } -Descending)
@@ -269,25 +296,53 @@ if ($clientCandidates.Count -eq 0) {
     throw "the captured screen is the only one: the client kiosk would film itself"
 }
 $client = $clientCandidates[0]
+# The client decodes on -ClientAdapterLuid: its window goes on a screen that
+# adapter drives, or Chrome draws on one GPU and scans out on another.
+if ($ClientAdapterLuid -match '^(-?\d+),(\d+)$') {
+    $luid = "$($Matches[1]),$($Matches[2])"
+    # The GPU that renders each screen (render=), not the adapter of its path:
+    # a virtual display's path names the virtual adapter, never the GPU behind it.
+    $render = @{}
+    & powershell -NoProfile -File (Join-Path (Split-Path $PSScriptRoot -Parent) 'Set-DisplayHdr.ps1') -List |
+        ForEach-Object { if ($_ -match '^(\S+)\s.*render=(-?\d+,\d+)') { $render[$Matches[1]] = $Matches[2] } }
+    $onAdapter = @($clientCandidates | Where-Object { $render[$_.Gdi] -eq $luid })
+    if ($onAdapter.Count -gt 0) { $client = $onAdapter[0] }
+    else { Write-Warning "no screen on adapter ${ClientAdapterLuid}: the client kiosk goes on $($client.Gdi)" }
+}
 
 # The alternative shape: the mode furthest from the base ratio that is still a
-# real desktop, preferring 4:3 - the shape a game actually switches to.
-$baseRatio = $cap.W / $cap.H
-$alt = @([BenchScreens]::Modes($Device) | Where-Object { $_[0] -ge 800 -and $_[1] -ge 600 } |
-    Where-Object { [Math]::Abs(($_[0] / $_[1]) - $baseRatio) -gt 0.05 } |
-    Sort-Object { [Math]::Abs(($_[0] / $_[1]) - 4 / 3) }, { - $_[0] * $_[1] }) | Select-Object -First 1
-if (-not $alt) { throw "$Device offers no mode of another shape than $($cap.W)x$($cap.H)" }
-
-Write-Host "captured     : $Device ($($cap.Name)) $($cap.W)x$($cap.H)@$($cap.Hz) HDR=$($cap.HdrOn) -> tile '$Tile'"
-Write-Host "other shape  : $($alt[0])x$($alt[1])"
+# real desktop, preferring 4:3 - the shape a game actually switches to - and,
+# among equals, the size nearest the base one. The virtual display lists 16:9
+# sizes only, besides the size it was made at: it is launched at a 4:3 custom
+# size (below), and its other shape is then a 16:9 one.
+function Get-AltMode {
+    $baseRatio = $cap.W / $cap.H
+    $target = if ([Math]::Abs($baseRatio - 4 / 3) -lt 0.05) { 16 / 9 } else { 4 / 3 }
+    @([BenchScreens]::Modes($Device) | Where-Object { $_[0] -ge 800 -and $_[1] -ge 600 } |
+        Where-Object { [Math]::Abs(($_[0] / $_[1]) - $baseRatio) -gt 0.05 } |
+        Sort-Object { [Math]::Abs(($_[0] / $_[1]) - $target) }, { [Math]::Abs($_[0] * $_[1] - $cap.W * $cap.H) }) |
+        Select-Object -First 1
+}
+if (-not $script:vdMode) {
+    $alt = Get-AltMode
+    if (-not $alt) { throw "$Device offers no mode of another shape than $($cap.W)x$($cap.H)" }
+    Write-Host "captured     : $Device ($($cap.Name)) $($cap.W)x$($cap.H)@$($cap.Hz) HDR=$($cap.HdrOn) -> tile '$Tile'"
+    Write-Host "other shape  : $($alt[0])x$($alt[1])"
+} else {
+    Write-Host "captured     : the virtual display, made by a stream on tile '$Tile'"
+}
 Write-Host "client screen: $($client.Gdi) ($($client.Name)) $($client.W)x$($client.H)@$($client.Hz) HDR=$($client.HdrOn)"
 
 if (-not $LogDir) {
-    # A dev instance writes to its own profile; read the one whose log moved last.
+    # A dev instance writes to its own profile; read the one whose WORKER log
+    # moved last. Any log would do not: the virtual display's elevated helper
+    # writes moonlightweb-vdisplay.log into the production profile whatever
+    # instance asked it, and on 25/09/2026 that sent the script to a folder
+    # with none of the stream's lines in it — every change read "0x0".
     $roots = @('MoonlightWeb-dev', 'MoonlightWebDev', 'MoonlightWeb') |
         ForEach-Object { Join-Path $env:APPDATA "MoonlightWeb\$_\logs" } | Where-Object { Test-Path $_ }
     $LogDir = $roots | Sort-Object {
-        $newest = Get-ChildItem $_ -Filter 'moonlightweb*.log' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $newest = Get-ChildItem $_ -Filter 'moonlightweb-worker-*.log' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         if ($newest) { $newest.LastWriteTime } else { [datetime]::MinValue }
     } -Descending | Select-Object -First 1
 }
@@ -296,10 +351,37 @@ Write-Host "worker logs  : $LogDir"
 # -- Both ends of the stream, read back ---------------------------------------
 # The HOST: every worker log that grew since the mark. A seamless relaunch is a
 # second worker with its own file, so one file is never enough.
-function Get-LogMark {
-    $m = @{}
+#
+# Sizes are read through a handle, never from the directory listing: NTFS
+# updates a listing's size lazily while the writer keeps the file open, and a
+# worker keeps its log open for its whole life. Read from the listing, a
+# worker's log never seemed to grow and every change read "host encodes 0x0".
+function Get-LiveLength([string] $Path) {
+    try {
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try { return $fs.Length } finally { $fs.Dispose() }
+    } catch { return 0 }
+}
+#
+# Only the logs this run can have written to: a profile keeps every worker log
+# it ever had (1,830 on DualRTX, 25/09/2026), and opening them all on every
+# poll made one poll outlast the change it was waiting for. Written to during
+# the run, or belonging to a worker alive right now — the second because the
+# listing's dates are as lazy as its sizes while a worker holds its log open,
+# and because a pid comes back: worker 50044 appended to a log of 02/09.
+$script:logSince = (Get-Date).AddMinutes(-2)
+function Get-WorkerLogs {
+    $live = @(Get-CimInstance Win32_Process -Filter "Name='MoonlightWeb.exe' OR Name='MoonlightWebDev.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*--stream-worker*' } |
+        ForEach-Object { "moonlightweb-worker-$($_.ProcessId).log" })
     Get-ChildItem (Join-Path $LogDir 'moonlightweb-worker-*.log') -ErrorAction SilentlyContinue |
-        ForEach-Object { $m[$_.FullName] = $_.Length }
+        Where-Object { $_.LastWriteTime -gt $script:logSince -or $live -contains $_.Name }
+}
+# The mark also carries its time: a log that comes back under a reused pid
+# holds another day's sessions before the offset of a file first seen now.
+function Get-LogMark {
+    $m = @{ '__since' = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff') }
+    Get-WorkerLogs | ForEach-Object { $m[$_.FullName] = Get-LiveLength $_.FullName }
     return $m
 }
 # With -Share the guest's worker writes a log of its own: kept out of the
@@ -307,17 +389,21 @@ function Get-LogMark {
 $script:GuestLog = ''
 function Get-HostLines($Mark, [string] $Only = '') {
     $lines = @()
-    foreach ($f in Get-ChildItem (Join-Path $LogDir 'moonlightweb-worker-*.log') -ErrorAction SilentlyContinue) {
+    foreach ($f in Get-WorkerLogs) {
         if ($Only) { if ($f.FullName -ne $Only) { continue } }
         elseif ($script:GuestLog -and $f.FullName -eq $script:GuestLog) { continue }
         $from = if ($Mark.ContainsKey($f.FullName)) { $Mark[$f.FullName] } else { 0 }
-        if ($f.Length -le $from) { continue }
         $fs = [System.IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite')
+        if ($fs.Length -le $from) { $fs.Dispose(); continue }
         try {
             $fs.Seek($from, 'Begin') | Out-Null
             $text = (New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)).ReadToEnd()
         } finally { $fs.Dispose() }
-        $lines += @($text -split "`r?`n" | Where-Object { $_ -match '\[native\] (session:|display format:|session ended|AcquireNextFrame failed)' })
+        $since = if ($Mark.ContainsKey('__since')) { $Mark['__since'] } else { '' }
+        $lines += @($text -split "`r?`n" | Where-Object {
+            $_ -match '\[native\] (session:|display format:|session ended|AcquireNextFrame failed)' -and
+            (-not $since -or ($_.Length -gt 24 -and $_.Substring(1, 23) -ge $since))
+        })
     }
     # Two workers overlap during a transition: order by their own timestamps.
     return @($lines | Sort-Object)
@@ -395,10 +481,15 @@ function Test-Ratio([int] $W, [int] $H, [int] $RefW, [int] $RefH) {
 # a seamless transition, in fullscreen, the button is not on the page, the
 # stream silently carried on, and the next "launch" measured a relaunch the
 # old stream had made on its own. The next launch takes the host over anyway.
+#
+# The virtual display goes off 4 s after the last stream on it ends, and the
+# next one comes up in SDR whatever it was (the product forces it at every
+# activation). So in that mode the reload does not idle: the next launch has
+# to land inside those 4 s, and the caller launches straight after.
 function Reset-Page {
     Cdp exitfs | Out-Null
     Cdp call Page.reload | Out-Null
-    Start-Sleep -Seconds 2
+    if (-not $script:vdMode) { Start-Sleep -Seconds 2 }
     $ready = Wait-For { (Cdp eval 'document.body ? document.body.innerText : 0') -match [regex]::Escape($Tile) } 60
     if ($ready -lt 0) { throw "after a reload the tile '$Tile' never came back at $AppUrl" }
     Cdp evalfile $hookJs | Out-Null
@@ -421,6 +512,8 @@ function Start-Stream {
     # window nothing of which is visible.
     if (-not $Share) { Cdp fullscreen | Out-Null }
     Start-Sleep -Seconds 3
+    # Relaunched after a stream died, the virtual display may be a new one.
+    if ($script:vdMode -and $script:vdName) { Update-VirtualScreen | Out-Null }
 }
 
 $rows = @()
@@ -440,8 +533,7 @@ function Add-Row($Row) {
 # when the guest joined: found once, then kept out of the owner's lines.
 function Get-GuestState($Mark) {
     if (-not $script:GuestLog) {
-        $new = @(Get-ChildItem (Join-Path $LogDir 'moonlightweb-worker-*.log') -ErrorAction SilentlyContinue |
-            Where-Object { -not $Mark.ContainsKey($_.FullName) } |
+        $new = @(Get-WorkerLogs | Where-Object { -not $Mark.ContainsKey($_.FullName) } |
             Where-Object { Select-String -Path $_.FullName -Pattern '\[native\] session:' -Quiet })
         if ($new.Count -ne 1) { return Get-HostState @() }
         $script:GuestLog = $new[0].FullName
@@ -492,7 +584,10 @@ function Join-Guest {
 function Invoke-Change {
     param([string] $Id, [string] $What, [string] $Expected, [scriptblock] $Act,
           [scriptblock] $Holds, [int] $MaxDecoders = 1, [int] $Relaunches = -1, [switch] $Launch,
-          [scriptblock] $GuestHolds = $null)
+          [scriptblock] $GuestHolds = $null,
+          # Asked right after $Act: a reason when the change could not be made
+          # as described, and the row then says so instead of judging it.
+          [scriptblock] $Void = $null)
     Write-Host ""
     Write-Host "=== $Id - $What ==="
     # Each change is measured on a live stream: one that died on the previous
@@ -506,6 +601,12 @@ function Invoke-Change {
     $hostMark = Get-LogMark
     $since = Get-PageNow
     & $Act
+    $voidWhy = if ($Void) { & $Void } else { '' }
+    if ($voidWhy) {
+        Add-Row ([ordered]@{ id = $Id; what = $What; expected = $Expected; observed = 'not judged'; ok = $null
+                             reason = $voidWhy; adaptMs = -1; decoders = 0; relaunches = 0; evidence = @() })
+        return
+    }
     $script:hostState = $null
     $ms = Wait-For {
         $script:hostState = Get-HostState (Get-HostLines $hostMark)
@@ -564,18 +665,27 @@ function Skip-Change([string] $Id, [string] $What, [string] $Why) {
 }
 
 # -- Run ------------------------------------------------------------------------
-$orig = [pscustomobject]@{ capW = $cap.W; capH = $cap.H; capHz = $cap.Hz; capHdr = $cap.HdrOn
-                           cliW = $client.W; cliH = $client.H; cliHz = $client.Hz; cliHdr = $client.HdrOn }
+# What the screens were, to put them back. The virtual display's is taken once
+# a stream has made it.
+function New-Orig {
+    [pscustomobject]@{ capW = $cap.W; capH = $cap.H; capHz = $cap.Hz; capHdr = $cap.HdrOn
+                       cliW = $client.W; cliH = $client.H; cliHz = $client.Hz; cliHdr = $client.HdrOn }
+}
+$orig = if ($cap) { New-Orig } else { $null }
+if ($script:vdMode) { $alt = $null }
 $kiosksUp = $false
 $script:shareUp = $false
 $script:guestState = $null
 $script:guestView = $null
 try {
-    if ($cap.HdrOn) { Set-ScreenHdr $Device $false }
+    if ($cap -and $cap.HdrOn) { Set-ScreenHdr $Device $false }
 
     # The kiosks: moving content on the captured screen, the app on the client's.
+    # The virtual display gets its content once a stream has brought it up.
     $content = 'file:///' + ((Join-Path $PSScriptRoot 'content\scroll.html') -replace '\\', '/')
-    & powershell -NoProfile -File "$PSScriptRoot\kiosk.ps1" -Url $content -X $cap.X -Y $cap.Y -W $cap.W -H $cap.H | Out-Host
+    if (-not $script:vdMode) {
+        & powershell -NoProfile -File "$PSScriptRoot\kiosk.ps1" -Url $content -X $cap.X -Y $cap.Y -W $cap.W -H $cap.H | Out-Host
+    }
     # Shared, the client's screen is split: the owner on the left half, the
     # guest (Join-Guest) on the right.
     $ownerW = if ($Share) { [int][Math]::Floor($client.W / 2) } else { $client.W }
@@ -591,8 +701,14 @@ try {
     # Aspect Auto is what hands the shape to the host. HDR is asked OFF on
     # purpose: a native host ignores the box, and a stream that still comes
     # out HDR below is the proof.
+    #
+    # The virtual display is made at the size the launch names, and its other
+    # modes are all 16:9: a 4:3 custom size makes it 4:3, and gives the shape
+    # change a real other shape to go to (a game's 4:3 the other way round).
     $settingsPath = Join-Path $ResultsDir 'settings-display-follow.json'
-    '{"video_codec":"hevc","stream_height":1080,"stream_fps":60,"stream_aspect":"auto","hdr_enabled":false,"mute_host_audio":true}' |
+    $size = if ($script:vdMode) { '"stream_resolution":"custom","stream_custom_width":1440,"stream_custom_height":1080' }
+            else { '"stream_height":1080,"stream_aspect":"auto"' }
+    ('{"video_codec":"hevc",' + $size + ',"stream_fps":60,"hdr_enabled":false,"mute_host_audio":true}') |
         Set-Content -Path $settingsPath -Encoding ASCII
     $ready = Wait-For { (Cdp eval 'document.body ? document.body.innerText : 0') -match [regex]::Escape($Tile) } 80
     if ($ready -lt 0) { throw "the app at $AppUrl never showed a tile named '$Tile' - is the host paired in this instance?" }
@@ -607,13 +723,23 @@ try {
     # Whether this client can show HDR at all is the page's own verdict, which
     # it logs at launch: the screen, WebGPU and a 10-bit decoder.
     $launchSince = Get-PageNow
-    Invoke-Change 'launch-sdr' "launch on a $($cap.W)x$($cap.H) SDR display" `
+    $launchWhat = if ($cap) { "launch on a $($cap.W)x$($cap.H) SDR display" } else { 'launch on the virtual display, made SDR' }
+    Invoke-Change 'launch-sdr' $launchWhat `
         "the display's shape, SDR" `
         { Start-Stream } `
-        { $script:hostState.w -gt 0 -and $null -ne $script:hostState.hdr -and
+        { (Update-VirtualScreen) -and $script:hostState.w -gt 0 -and $null -ne $script:hostState.hdr -and
           (Test-Ratio $script:hostState.w $script:hostState.h $cap.W $cap.H) -and
           -not $script:hostState.hdr -and $script:view.w -eq $script:hostState.w -and $script:view.h -eq $script:hostState.h } `
         -MaxDecoders 0 -Relaunches 0 -Launch
+    if ($script:vdMode) {
+        if (-not (Update-VirtualScreen)) { throw "the stream on '$Tile' brought no new screen up" }
+        $alt = Get-AltMode
+        if (-not $alt) { throw "$Device offers no mode of another shape than $($cap.W)x$($cap.H)" }
+        $orig = New-Orig
+        Write-Host "captured     : $Device ($($cap.Name)) $($cap.W)x$($cap.H)@$($cap.Hz) HDR=$($cap.HdrOn)"
+        Write-Host "other shape  : $($alt[0])x$($alt[1])"
+        & powershell -NoProfile -File "$PSScriptRoot\kiosk.ps1" -Url $content -X $cap.X -Y $cap.Y -W $cap.W -H $cap.H | Out-Host
+    }
     $askLine = @(Get-PageLines $launchSince | Where-Object { $_ -match 'Native host: HDR' }) | Select-Object -Last 1
     $clientHdr = [bool]($askLine -match 'display=true webgpu=true decode=true')
     Write-Host "client HDR   : $clientHdr ($askLine)"
@@ -729,14 +855,37 @@ try {
             { $script:hostState.displayHdr -eq $false -and $script:hostState.hdr -eq $false } `
             -MaxDecoders 1 -Relaunches $(if ($want) { 1 } else { 0 })
 
-        Reset-Page
-        Set-ScreenHdr $Device $true
-        Start-Sleep -Seconds 4
+        if ($script:vdMode) {
+            # The virtual display exists only while a stream holds it, and is
+            # made SDR whenever it comes up: it goes to HDR under the running
+            # stream, and the next launch lands inside the 4 s it outlives it.
+            Set-ScreenHdr $Device $true
+            Start-Sleep -Seconds 4
+            $relaunch = {
+                $r = Cdp relaunch $Tile $hookJs
+                Write-Host "  relaunched: $($r.Trim())"
+                $ms = Wait-For { (Get-View).w -gt 0 } 40
+                if ($ms -lt 0) { throw "the stream on '$Tile' never showed a picture after the relaunch" }
+                Cdp fullscreen | Out-Null
+                Start-Sleep -Seconds 3
+                Update-VirtualScreen | Out-Null
+            }
+            $void = { $s = Get-Screen $Device
+                      if (-not $s -or -not $s.HdrOn) {
+                        'the virtual display went off between the two streams (the 4 s it outlives the last one ' +
+                        'were missed) and came back SDR, as every activation makes it' } }
+        } else {
+            Reset-Page
+            Set-ScreenHdr $Device $true
+            Start-Sleep -Seconds 4
+            $relaunch = { Start-Stream }
+            $void = $null
+        }
         Invoke-Change 'launch-hdr' 'launch on a display already in HDR, the box unticked' `
             $(if ($want) { 'HDR from the first frame' } else { 'SDR: this client cannot show HDR' }) `
-            { Start-Stream } `
+            $relaunch `
             { $script:hostState.sessions -gt 0 -and $script:hostState.hdr -eq $want } `
-            -MaxDecoders 0 -Relaunches 0 -Launch
+            -MaxDecoders 0 -Relaunches 0 -Launch -Void $void
     }
     Reset-Page
 }
@@ -746,8 +895,10 @@ finally {
         try { Invoke-ShareApi '/api/share/slots/2/deactivate' | Out-Null; Write-Host 'share closed' }
         catch { Write-Warning "could not close the share: $_" }
     }
-    try {
-        $now = Get-Screen $Device
+    # A virtual display that never came up left nothing to put back. One that
+    # did is put back too: it outlives the last stream by 4 s.
+    if ($orig) { try {
+        $now = if ($Device) { Get-Screen $Device } else { $null }
         if ($now -and ($now.W -ne $orig.capW -or $now.H -ne $orig.capH)) { Set-ScreenMode $Device $orig.capW $orig.capH $orig.capHz }
         if ($now -and $now.HdrOn -ne $orig.capHdr) { Set-ScreenHdr $Device $orig.capHdr }
         $now = Get-Screen $client.Gdi
@@ -760,7 +911,7 @@ finally {
         Write-Host "screens restored: $Device $($orig.capW)x$($orig.capH) HDR=$($orig.capHdr), $($client.Gdi) HDR=$($orig.cliHdr) @$($orig.cliHz) Hz"
     } catch {
         Write-Warning "could not put the screens back: $_"
-    }
+    } }
     if ($kiosksUp -and -not $KeepKiosks) {
         & powershell -NoProfile -File "$PSScriptRoot\kiosk-close.ps1" | Out-Host
     }

@@ -33,6 +33,7 @@
 #include "../backend/streambackend/HostOsProbe.h"
 
 #include <memory>
+#include <optional>
 
 class NvHTTP;
 class NvComputer;
@@ -41,6 +42,7 @@ class MediaTrackRelay;
 class SignalingServer;
 class StreamRelay;
 class IMediaEngine;
+class MicUplink;
 
 class StreamSession : public QObject
 {
@@ -70,9 +72,20 @@ public:
     /// Enable/disable ICE-TCP candidates for WebRTC transport.
     /// Set before start() to control whether TCP fallback candidates are generated.
     void setEnableIceTcp(bool enable) { m_EnableIceTcp = enable; }
+    /// With ICE-TCP, also listen for a browser that dials (AppSettings::iceTcpPassive).
+    void setIceTcpPassive(bool enable) { m_IceTcpPassive = enable; }
+    /// Bench only: no UDP candidate crosses (AppSettings::debugIceDropUdp).
+    void setDebugIceDropUdp(bool enable) { m_DebugIceDropUdp = enable; }
 
     /// Request lower-bandwidth audio (10ms Opus frames) for mobile clients.
     void setLowAudio(bool enable) { m_LowAudio = enable; }
+
+    /// The browser asks to send its microphone (/start's mic_enabled). Granted
+    /// only where it can land on the right machine — see the gate in
+    /// onLaunchResult — and the /start reply says which (`mic`, `mic_why`).
+    void setMicRequested(bool on) { m_MicRequested = on; }
+    /// settings.json `mic_device`: which device it plays into (MicOutput.h).
+    void setMicDevice(const QString& device) { m_MicDevice = device; }
 
     /// Mute the host PC speakers while streaming (GameStream localAudioPlayMode).
     /// true (default) → host muted; false → audio also plays on the host.
@@ -101,6 +114,10 @@ public:
     /// Drives both the ICE-server choice and whether the private LAN candidate
     /// may be advertised. See SignalingServer::setClientKind.
     void setClientKind(NetClassify::Kind kind) { m_ClientKind = kind; }
+
+    /// A Public client that is on the host's own network after all (see
+    /// NetClassify::sharesHostNetwork). Forwarded to the SignalingServer.
+    void setClientSameNetwork(bool same) { m_ClientSameNetwork = same; }
 
     /// MW-BIND-v1 material, forwarded to the SignalingServer of whichever relay
     /// this session ends up using. See SignalingServer::setPairingIdentity and
@@ -140,10 +157,49 @@ public:
     /// benefit. Ignored by every path except the native engine.
     void setRideOutLoss(bool enabled) { m_RideOutLoss = enabled; }
 
+    /// False when the browser's decoder falls silent under the encoder's
+    /// reference repairs: the native engine then keeps one reference, heals
+    /// every loss by a keyframe and answers ref_invalidation false
+    /// (mw::native::refuseReferenceRepairs, healsByReference). Ignored by
+    /// every other path.
+    void setRefInvalidation(bool allowed) { m_RefInvalidation = allowed; }
+
+    /// True when the browser cuts each decoded frame to the size the host
+    /// announces (mw::native::SessionConfig::clientCropsToFrame). Ignored by
+    /// every path except the native engine.
+    void setCropsToFrame(bool crops) { m_CropsToFrame = crops; }
+
+    /// True when the browser reads MWSR's sharpness by zone, which the native
+    /// engine's frames then carry (mw::native::SessionConfig::mwsrZones).
+    /// Ignored by every other path.
+    void setMwsrZones(bool wanted) { m_MwsrZones = wanted; }
+
+    /// The display a native display card stands for, as the server resolved
+    /// it (LaunchRequest::displayKey). A stream worker's only.
+    void setDisplayKey(const QString& key) { m_DisplayKey = key; }
+
+    /// Whether the owner's app this stream shows is still in the settings, as
+    /// the server found it (LaunchRequest::hostAppKnown). A stream worker's only.
+    void setHostAppKnown(bool known) { m_HostAppKnown = known; }
+
+    /// The display our virtual display took the primary role from, as the
+    /// server recorded it (LaunchRequest::previousPrimary). A stream worker's only.
+    void setPreviousPrimary(const QString& key) { m_PreviousPrimary = key; }
+
     /// Whether the viewer administers MoonlightWeb here — HttpRequest::isLocal
     /// at /start. Only the native engine acts on it: anyone else is kept out
     /// of the host's windows that run as administrator (InputGate).
     void setViewerAdmin(bool admin) { m_ViewerAdmin = admin; }
+
+    /// keyboard_layout_fidelity as the server read it ("auto", "always",
+    /// "never"), handed over in the worker's config: a SYSTEM worker would read
+    /// another profile's settings.json. Empty: read the file here, which is the
+    /// right one for a session in the server's own process.
+    void setKeyboardLayoutFidelity(const QString& fidelity) { m_KeyboardLayoutFidelity = fidelity; }
+
+    /// keyboard_host_layout as the server read it, by the same road and for the
+    /// same reason. Unset: read the file here.
+    void setKeyboardHostLayout(bool enabled) { m_KeyboardHostLayout = enabled; }
 
     /// The desktop portal consent this installation already holds, replayed so
     /// the user is not asked again. Only the native engine acts on it, and only
@@ -152,15 +208,59 @@ public:
     /// portalGrantReceived().
     void setPortalRestoreToken(const QString& token) { m_PortalRestoreToken = token; }
 
+    /// The owner streams the virtual display card: on Linux, where the session
+    /// makes that monitor itself, it becomes the desktop's primary while it
+    /// streams (SessionConfig::virtualPrimary). Only the native engine acts on
+    /// it; a guest's session never sets it.
+    void setVirtualPrimary(bool primary) { m_VirtualPrimary = primary; }
+
+    /// One of the owner's apps in its own gamescope, on a Linux native host
+    /// (SessionConfig::gamescopeApp): its name and command, from the settings.
+    /// Only the native engine acts on it.
+    void setGamescopeApp(const QString& name, const QString& command)
+    {
+        m_GamescopeApp = name;
+        m_GamescopeCommand = command;
+    }
+
+    /// The chain a native Windows session carries its pictures on, as the
+    /// admin chose it (AppSettings::nativeVideoPipeline): "auto", "d3d11" or
+    /// "d3d12". Only the native engine acts on it; empty or unknown is auto.
+    void setNativeVideoPipeline(const QString& pipeline) { m_NativeVideoPipeline = pipeline; }
+
+    /// The bench's engine knobs from the settings file (AppSettings::
+    /// nativeTuning), read by the server, which owns that file: a SYSTEM
+    /// worker's own AppData is systemprofile's. Only the native engine acts on
+    /// it, and only when MW_NATIVE_TUNING is absent; empty is the engine's own
+    /// settings.
+    void setNativeTuning(const QString& spec) { m_NativeTuning = spec; }
+    /// AppSettings::rtpVideo — which codecs ride an RTP video track, per host
+    /// type (POC Ultra U1.4). MW_RTP_VIDEO overrides it.
+    void setRtpVideo(const QString& spec) { m_RtpVideo = spec; }
+
+    /// A guest of a native host on the guests' shared feed (plan « flux commun
+    /// des invités »): the feed's pipe and the token it asks, and the guest's
+    /// slot. The native engine then carries the feed's pictures instead of
+    /// capturing its own. Empty: the session captures, as every other does.
+    void setSharedFeed(const QString& pipe, const QByteArray& token, int slot)
+    {
+        m_FeedPipe = pipe;
+        m_FeedToken = token;
+        m_FeedSlot = slot;
+    }
+
     /// The client's screen, from the /start request: its refresh in
     /// millihertz (0 = it did not measure one) and whether it paints on
     /// vsync (tearing off, or a browser that cannot tear). Only the native
     /// engine acts on it: a vsync client gets a stream cadence that divides
     /// its refresh, so frames land on its grid instead of beating against it.
-    void setClientPresentation(int refreshMilliHz, bool vsync)
+    /// @p tearingReal: its tearing shows each frame as it is drawn — see
+    /// SessionConfig::clientTearingReal.
+    void setClientPresentation(int refreshMilliHz, bool vsync, bool tearingReal)
     {
         m_ClientRefreshMilliHz = refreshMilliHz;
         m_ClientVsync = vsync;
+        m_ClientTearingReal = tearingReal;
     }
 
     /// A rate this session may not exceed, alignment included. "Auto" states
@@ -301,6 +401,12 @@ private:
 
     void doLaunchApp();
     void doResumeApp();
+    /// Where the app outlives the stream (capabilities().resumableApps), ask
+    /// the host what runs before choosing: the requested app → /resume, none →
+    /// /launch, another one → refuse with `app_running` so the browser can ask
+    /// the viewer what to do. `orElse` runs when the host cannot tell.
+    void chooseByRunningApp(std::function<void()> orElse);
+    void respondAppRunning(int runningAppId);
 
     /// Single landing point for launch and resume, whichever produced it.
     void onLaunchResult(bool ok, const BackendError& err, const MediaDescriptor& media);
@@ -355,9 +461,22 @@ private:
     /// Explicitly requested transport that was stripped from the chain (see
     /// setTransportDropped). Empty when the chain honoured the request.
     QString m_TransportDropped;
+    /// The virtual display's GPU and the one its predecessor was drawn by,
+    /// when they differ (NativeHostMedia::virtualDisplayGpu) — for the browser.
+    QString m_VirtualDisplayGpu;
+    QString m_PreviousPrimaryGpu;
     /// Enable ICE-TCP candidates (true for *-tcp modes, false for *-udp modes).
     bool m_EnableIceTcp = false;
+    bool m_IceTcpPassive = false;
+    bool m_DebugIceDropUdp = false;
     bool m_LowAudio = false;
+    bool m_MicRequested = false;
+    QString m_MicDevice;
+    /// Started when the gate let the microphone in; the relay holds it from
+    /// then on, and this session (which deletes itself once streaming) lets go.
+    std::shared_ptr<MicUplink> m_Mic;
+    /// Why a requested microphone was not granted, for the /start reply.
+    QString m_MicWhy;
     /// True when session is part of the auto fallback chain (main.cpp auto mode).
     /// Disables internal WS fallback so ICE timeout → sessionEnded → tryNext().
     bool m_AutoMode = false;
@@ -375,6 +494,9 @@ private:
     /// the registry hint is stale) terminates instead of looping.
     bool m_LaunchAttempted = false;
     bool m_ResumeAttempted = false;
+    /// The /launch refusal that sent us to /resume. If the resume fails too,
+    /// this is the error the viewer is told about (see onLaunchResult).
+    std::optional<BackendError> m_LaunchRefusal;
     /// A /launch that TIMES OUT means Sunshine still holds a stale session; we
     /// /cancel and relaunch exactly once. This guards that single retry.
     bool m_LaunchTimeoutRetried = false;
@@ -403,6 +525,7 @@ private:
 
     /// Where the streaming client sits (see setClientKind).
     NetClassify::Kind m_ClientKind = NetClassify::Kind::Public;
+    bool m_ClientSameNetwork = false; ///< see setClientSameNetwork
     QString m_MwBindHostId;
     QByteArray m_MwBindHostKey;
     QByteArray m_MwBindBrowserKey;
@@ -415,8 +538,8 @@ private:
 
     /// Port for legacy WSS StreamRelay (separate from m_WsPort used for signaling).
     quint16 m_StreamRelayPort = 48002;
-    /// WebRTC media UDP port for this slot; 48010 (slot 0 base) by default.
-    quint16 m_MediaPort = 48010;
+    /// WebRTC media UDP port for this slot; 48550 (slot 0 base) by default.
+    quint16 m_MediaPort = 48550;
     /// The router hole for this slot (see setUpnpMapping); none by default.
     QString m_UpnpPublicIp;
     quint16 m_UpnpExternalPort = 0;
@@ -439,18 +562,62 @@ private:
     /// it, and only if its encoder really honours intra-refresh.
     bool m_RideOutLoss = false;
 
+    /// See setRefInvalidation. True, the engine's own repairs, unless the
+    /// /start request said otherwise.
+    bool m_RefInvalidation = true;
+
+    /// See setCropsToFrame. False, the frame on the encoder's grid, unless the
+    /// /start request said otherwise.
+    bool m_CropsToFrame = false;
+
+    /// See setMwsrZones. False, no grid, unless the /start request asked.
+    bool m_MwsrZones = false;
+
+    /// See setDisplayKey. Absent, the backend resolves the app id itself.
+    std::optional<QString> m_DisplayKey;
+
+    /// See setHostAppKnown. Absent, the backend looks the app up itself.
+    std::optional<bool> m_HostAppKnown;
+
+    /// See setPreviousPrimary. Absent, the backend reads the settings itself.
+    std::optional<QString> m_PreviousPrimary;
+
     /// See setViewerAdmin. Defaults to the trusting value only because every
     /// caller sets it; a worker whose parent predates the field is the owner
     /// path, which is the host's own administrator anyway.
     bool m_ViewerAdmin = true;
+    QString m_KeyboardLayoutFidelity;
+    std::optional<bool> m_KeyboardHostLayout;
 
     /// See setPortalRestoreToken. Empty is the honest default: a session that
     /// does not know of a consent asks for one.
     QString m_PortalRestoreToken;
 
+    /// See setVirtualPrimary. Off unless the owner's /start says so.
+    bool m_VirtualPrimary = false;
+
+    /// See setGamescopeApp. Empty on every other card.
+    QString m_GamescopeApp;
+    QString m_GamescopeCommand;
+
+    /// See setNativeVideoPipeline. Empty — a parent that predates the setting —
+    /// is auto, the engine's own table.
+    QString m_NativeVideoPipeline;
+
+    /// See setNativeTuning. Empty — a parent that predates it, or no knob.
+    QString m_NativeTuning;
+    /// See setRtpVideo. Empty — every codec on the video DataChannel.
+    QString m_RtpVideo;
+
+    /// See setSharedFeed. Empty: this session captures its own pictures.
+    QString m_FeedPipe;
+    QByteArray m_FeedToken;
+    int m_FeedSlot = -1;
+
     /// The client's screen at /start — see setClientPresentation.
     int m_ClientRefreshMilliHz = 0;
     bool m_ClientVsync = false;
+    bool m_ClientTearingReal = false;
 
     /// See setMaxFps.
     int m_MaxFps = 0;

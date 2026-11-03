@@ -32,11 +32,13 @@ application. Treat a MoonlightWeb host the way you would treat any remote-deskto
 host.
 
 **Internet access is opt-in and off by default.** While it is enabled, the
-router is asked (UPnP) to open a streaming port for the duration of each
-session, and the peers of a WebRTC connection see each other's public IP
-address. Nothing is published: no DNS record is created, no certificate is
-issued, and the web interface's ports (80/443) are not opened. Disabling it
-closes the mappings immediately.
+router is asked (UPnP) to open one port per stream slot, kept from one stream
+to the next, and up to four for the entry link's tunnel; the peers of a WebRTC
+connection see each other's public IP address. Nothing is published: no DNS
+record is created, no certificate is issued, and the web interface's ports
+(80/443) are not opened. Disabling it closes the entry link at once and keeps
+the next streams from announcing a public address; the ports already mapped
+stay on the router until MoonlightWeb quits.
 
 **Installs that enabled internet access on v0.2.4 or earlier** registered a
 `{id}.moonlightweb.top` subdomain with a publicly trusted TLS certificate.

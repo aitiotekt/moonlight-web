@@ -31,3 +31,12 @@ Dockerfile     text eol=lf
 *.cjs text eol=lf
 *.mjs text eol=lf
 *.ts  text eol=lf
+
+# The lists of official interfaces are served as they are stored, and their
+# digests are checked byte for byte against what the release tags rebuild
+# (scripts/interface-list.mjs): LF everywhere.
+bootstrap/v1/interfaces/*.json text eol=lf
+
+# Driver packages the installer re-hashes against pins compiled into the exe
+# (VirtualHidApply.h): stored and checked out byte for byte, never converted.
+backend/installer/drivers/vhid/* -text

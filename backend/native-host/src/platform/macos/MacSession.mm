@@ -23,6 +23,7 @@
 #include "../../capture/macos/SckCapture.h"
 #include "../../convert/CursorBlend.h"
 #include "../../core/CadenceAlign.h"
+#include "../../core/ClickTrace.h"
 #include "../../core/CursorPositionGate.h"
 #include "../../core/FrameCadence.h"
 #include "../../core/Log.h"
@@ -36,7 +37,9 @@
 
 #import <AppKit/AppKit.h>
 
+#include <CoreVideo/CoreVideo.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#include <mach/mach_time.h>
 
 #include <algorithm>
 #include <atomic>
@@ -102,6 +105,116 @@ FrameStamps resendStamps(int64_t nowUs)
 {
     return FrameStamps{nowUs, nowUs, nowUs, nowUs};
 }
+
+const char* acquireStatusName(capture::AcquireStatus status)
+{
+    switch (status) {
+    case capture::AcquireStatus::Ok: return "ok";
+    case capture::AcquireStatus::Timeout: return "timeout";
+    case capture::AcquireStatus::PointerOnly: return "pointer";
+    case capture::AcquireStatus::Lost: return "lost";
+    case capture::AcquireStatus::Failed: return "failed";
+    }
+    return "";
+}
+
+/// mach_absolute_time ticks → microseconds (1:1 on Apple Silicon, 125:3 on
+/// Intel), as SckCapture converts.
+int64_t machToUs(uint64_t ticks)
+{
+    static mach_timebase_info_data_t info = [] {
+        mach_timebase_info_data_t i;
+        mach_timebase_info(&i);
+        return i;
+    }();
+    return static_cast<int64_t>(ticks * info.numer / info.denom / 1000);
+}
+
+// The captured display's refresh, for the bench's click trace (clicktrace=1):
+// macOS has no DWM timing to read after a capture, and the nearest is a
+// CVDisplayLink on that display — the vsync it last reported, its period, and
+// how many it reported. Nothing of the window server's composition: no API
+// says when it composed.
+//
+// CVDisplayLink is deprecated since macOS 15 for the display links of NSView
+// and NSScreen, which want a view or a screen object; this one only wants the
+// display's id, which is what the session has. Bench only.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+class DisplayClock
+{
+public:
+    DisplayClock() = default;
+    DisplayClock(const DisplayClock&) = delete;
+    DisplayClock& operator=(const DisplayClock&) = delete;
+    ~DisplayClock() { stop(); }
+
+    uint32_t display() const { return m_Display; }
+
+    void start(uint32_t display)
+    {
+        stop();
+        m_Display = display;
+        m_Count.store(0);
+        if (CVDisplayLinkCreateWithCGDisplay(display, &m_Link) != kCVReturnSuccess || !m_Link) {
+            m_Link = nullptr;
+            log::warning("[native] click trace: no CVDisplayLink on display " +
+                         std::to_string(display) + " — the trace goes without its refresh");
+            return;
+        }
+        CVDisplayLinkSetOutputCallback(m_Link, &DisplayClock::tick, this);
+        if (CVDisplayLinkStart(m_Link) != kCVReturnSuccess) {
+            log::warning("[native] click trace: the CVDisplayLink of display " +
+                         std::to_string(display) + " would not start");
+            stop();
+            m_Display = display; // not retried on every wake-up
+        }
+    }
+
+    void stop()
+    {
+        if (m_Link) {
+            CVDisplayLinkStop(m_Link);
+            CVDisplayLinkRelease(m_Link);
+            m_Link = nullptr;
+        }
+        m_Display = 0;
+    }
+
+    /// The last vsync reported, on the steady clock, the refresh period and
+    /// how many vsyncs since start(); false before the first.
+    bool read(int64_t& vsyncUs, int64_t& periodUs, int64_t& count) const
+    {
+        count = m_Count.load();
+        if (count == 0) return false;
+        vsyncUs = m_VsyncUs.load();
+        periodUs = m_PeriodUs.load();
+        return true;
+    }
+
+private:
+    static CVReturn tick(CVDisplayLinkRef, const CVTimeStamp* now, const CVTimeStamp*,
+                         CVOptionFlags, CVOptionFlags*, void* context)
+    {
+        auto* self = static_cast<DisplayClock*>(context);
+        // Mach time onto the steady clock through "how long ago", as
+        // SckCapture does: the two tick together.
+        const int64_t agoUs = machToUs(mach_absolute_time()) - machToUs(now->hostTime);
+        self->m_VsyncUs.store(steadyNowUs() - agoUs);
+        if (now->videoTimeScale > 0 && now->videoRefreshPeriod > 0)
+            self->m_PeriodUs.store(static_cast<int64_t>(now->videoRefreshPeriod) * 1000000 /
+                                   now->videoTimeScale);
+        self->m_Count.fetch_add(1);
+        return kCVReturnSuccess;
+    }
+
+    CVDisplayLinkRef m_Link = nullptr;
+    uint32_t m_Display = 0;
+    std::atomic<int64_t> m_VsyncUs{0};
+    std::atomic<int64_t> m_PeriodUs{0};
+    std::atomic<int64_t> m_Count{0};
+};
+#pragma clang diagnostic pop
 
 std::string hzString(int milliHz)
 {
@@ -247,6 +360,11 @@ public:
             }
         }
 
+        // The client's screen as /start said it, for the loop's re-choices: a
+        // decoder that asks for fewer frames re-chooses too (setClientFpsCap),
+        // and found an unknown screen that tears instead.
+        m_ClientMilliHz.store(m_Config.clientRefreshMilliHz);
+        m_ClientVsync.store(m_Config.clientVsync);
         {
             std::string line;
             m_EncodeFps =
@@ -273,12 +391,38 @@ public:
                 // one, which clears it before), so setting the flag here would
                 // be quietly wiped.
             }
-            auto sink = std::make_unique<audio::PacedOpusSink>(m_Callbacks.onAudio);
+            auto sink = std::make_unique<audio::PacedOpusSink>(m_Callbacks.onAudio,
+                                                               m_Config.tuning.audioFrameSamples());
             std::string audioError;
             if (sink->start("ScreenCaptureKit, 48 kHz stereo", audioError))
                 m_Audio = std::move(sink);
             else
                 log::warning("[native] audio unavailable, streaming silent: " + audioError);
+        }
+
+        // "Match my screen": the display in the client's own mode, before the
+        // capture opens so the first frame is already the right size. Same
+        // policy as Windows (applyClientMode there); no mode to switch to and
+        // the session becomes what Auto would have been.
+        const bool modeChanged = applyClientMode();
+        const bool fellBack = !modeChanged && fallBackFromMatch(m_Config);
+        if (fellBack)
+            log::info("[native] \"Match my screen\" falls back to Auto: fitting " +
+                      std::to_string(m_Config.width) + "x" + std::to_string(m_Config.height));
+        if (modeChanged || fellBack) {
+            // Fitted against what the client ASKED once the mode has changed —
+            // the Selector's frame was shaped to the old mode (see Windows).
+            const FrameSize box = modeChanged
+                                      ? FrameSize{m_Config.requestedWidth, m_Config.requestedHeight}
+                                      : FrameSize{m_Config.width, m_Config.height};
+            const FrameSize frame = frameForDisplay({m_Display.pixelWidth, m_Display.pixelHeight},
+                                                    box, policyOf(m_Config));
+            log::info(std::string("[native] the frame follows ") +
+                      (modeChanged ? "the display's new mode: " : "the Auto box: ") +
+                      std::to_string(m_Config.width) + "x" + std::to_string(m_Config.height) +
+                      " -> " + std::to_string(frame.width) + "x" + std::to_string(frame.height));
+            m_Config.width = frame.width;
+            m_Config.height = frame.height;
         }
 
         if (!openCapture(m_Config.width, m_Config.height, error)) return false;
@@ -294,6 +438,7 @@ public:
             auto sink = std::make_unique<input::CgInput>();
             const capture::DesktopRect rect = m_Capture->desktopRect();
             sink->setDisplayRect(rect.left, rect.top, rect.right, rect.bottom);
+            if (m_Config.tuning.clickTrace) sink->setClickTrace(&m_ClickTrace);
             std::string inputError;
             if (sink->start(inputError))
                 m_Input = std::move(sink);
@@ -369,6 +514,7 @@ public:
             if (m_Input) m_Input->stop();
             m_Input.reset();
         }
+        m_DisplayClock.stop();
         if (m_KeepAwake != kIOPMNullAssertionID) {
             IOPMAssertionRelease(m_KeepAwake);
             m_KeepAwake = kIOPMNullAssertionID;
@@ -383,8 +529,10 @@ public:
         }
         if (!wasRunning && !m_Encoder && !m_Capture && !m_Audio) {
             // Nothing was streaming, but a mute may still have been engaged by
-            // a start() that failed after it. The speakers come back either way.
+            // a start() that failed after it. The speakers come back either way,
+            // and so does a display mode changed before the capture refused.
             m_HostMute.release();
+            restoreDisplayMode();
             return;
         }
         m_Encoder.reset();
@@ -394,6 +542,140 @@ public:
         m_Audio.reset();
         // After the capture is closed: the speakers come back.
         m_HostMute.release();
+        // And the display its own mode.
+        restoreDisplayMode();
+    }
+
+    // ── "Match my screen" ────────────────────────────────────────────────
+    //
+    // The client wants its own pixels, one for one: a display mode of the
+    // client screen's size in PIXELS. macOS lists each size twice on a Retina
+    // panel — 1:1 and HiDPI (twice the pixels of its points) — so a size is
+    // matched on pixels, and between two candidates of the same pixels the one
+    // with the scale the display already has wins: the desktop keeps the look
+    // its user chose. The exact size is taken at the highest refresh; otherwise
+    // the largest listed mode of the client's shape (within 0.5%) that fits
+    // inside it; otherwise nothing changes. kCGConfigureForAppOnly: the change
+    // is the session's — undone at stop(), and by macOS if the process dies.
+
+    /// @returns true when the display's mode was changed for this session.
+    bool applyClientMode()
+    {
+        if (!m_Config.matchClientDisplay || !m_Config.fitRequestedBox) return false;
+        const int wantW = m_Config.requestedWidth, wantH = m_Config.requestedHeight;
+        if (wantW <= 0 || wantH <= 0) return false;
+        if (m_Display.pixelWidth == wantW && m_Display.pixelHeight == wantH) return false;
+
+        const CGDirectDisplayID id = m_Display.displayId;
+        CGDisplayModeRef current = CGDisplayCopyDisplayMode(id);
+        if (!current) return false;
+        const bool currentHiDpi =
+            CGDisplayModeGetPixelWidth(current) > CGDisplayModeGetWidth(current);
+        const double wantAspect = static_cast<double>(wantW) / wantH;
+
+        NSDictionary* options =
+            @{(__bridge NSString*)kCGDisplayShowDuplicateLowResolutionModes : @YES};
+        CFArrayRef modes = CGDisplayCopyAllDisplayModes(id, (__bridge CFDictionaryRef)options);
+        CGDisplayModeRef best = nullptr;
+        bool exact = false;
+        long long bestArea = 0;
+        // Ranks two modes of the same pixel size: the display's own scale,
+        // then the higher refresh.
+        const auto better = [currentHiDpi](CGDisplayModeRef a, CGDisplayModeRef b) {
+            const bool aSame =
+                (CGDisplayModeGetPixelWidth(a) > CGDisplayModeGetWidth(a)) == currentHiDpi;
+            const bool bSame =
+                (CGDisplayModeGetPixelWidth(b) > CGDisplayModeGetWidth(b)) == currentHiDpi;
+            if (aSame != bSame) return aSame;
+            return CGDisplayModeGetRefreshRate(a) > CGDisplayModeGetRefreshRate(b);
+        };
+        const CFIndex count = modes ? CFArrayGetCount(modes) : 0;
+        for (CFIndex i = 0; i < count; ++i) {
+            auto mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+            if (!CGDisplayModeIsUsableForDesktopGUI(mode)) continue;
+            const int w = static_cast<int>(CGDisplayModeGetPixelWidth(mode));
+            const int h = static_cast<int>(CGDisplayModeGetPixelHeight(mode));
+            if (w <= 0 || h <= 0) continue;
+            if (w == wantW && h == wantH) {
+                if (!exact || better(mode, best)) best = mode;
+                exact = true;
+                continue;
+            }
+            if (exact || w > wantW || h > wantH) continue;
+            const double aspect = static_cast<double>(w) / h;
+            if (std::abs(aspect - wantAspect) / wantAspect > 0.005) continue;
+            const long long area = static_cast<long long>(w) * h;
+            if (area > bestArea || (area == bestArea && better(mode, best))) {
+                best = mode;
+                bestArea = area;
+            }
+        }
+        if (!best) {
+            log::info("[native] " + m_Display.name + " lists no mode of " + std::to_string(wantW) +
+                      "x" + std::to_string(wantH) + " or of its shape — the display keeps " +
+                      std::to_string(m_Display.pixelWidth) + "x" +
+                      std::to_string(m_Display.pixelHeight));
+            if (modes) CFRelease(modes);
+            CGDisplayModeRelease(current);
+            return false;
+        }
+
+        const int newW = static_cast<int>(CGDisplayModeGetPixelWidth(best));
+        const int newH = static_cast<int>(CGDisplayModeGetPixelHeight(best));
+        const double newHz = CGDisplayModeGetRefreshRate(best);
+        CGDisplayConfigRef config = nullptr;
+        CGError err = CGBeginDisplayConfiguration(&config);
+        if (err == kCGErrorSuccess)
+            err = CGConfigureDisplayWithDisplayMode(config, id, best, nullptr);
+        if (err == kCGErrorSuccess)
+            err = CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly);
+        else if (config)
+            CGCancelDisplayConfiguration(config);
+        if (modes) CFRelease(modes);
+        if (err != kCGErrorSuccess) {
+            log::warning("[native] " + m_Display.name + " refused " + std::to_string(newW) + "x" +
+                         std::to_string(newH) + " (CGError " + std::to_string(err) +
+                         ") — the display keeps its mode");
+            CGDisplayModeRelease(current);
+            return false;
+        }
+        m_SavedMode = current; // released by restoreDisplayMode()
+        m_SavedModeDisplay = id;
+
+        const int wasW = m_Display.pixelWidth, wasH = m_Display.pixelHeight;
+        // Read back rather than assumed: the size, the refresh and the rest of
+        // what the session keys on come from the same list the probe reads.
+        for (const platform::MacDisplay& d : platform::listDisplays())
+            if (d.displayId == id) m_Display = d;
+        m_DisplayMilliHz = m_Display.refreshMilliHz;
+        log::info("[native] " + m_Display.name + " put in " + std::to_string(newW) + "x" +
+                  std::to_string(newH) + " @ " + std::to_string(static_cast<int>(newHz + 0.5)) +
+                  " Hz for the session (" +
+                  (exact ? "the client's own size" : "the largest of its shape that fits") +
+                  ", was " + std::to_string(wasW) + "x" + std::to_string(wasH) + ")");
+        return true;
+    }
+
+    /// The mode the session changed, put back. Idempotent.
+    void restoreDisplayMode()
+    {
+        if (!m_SavedMode) return;
+        CGDisplayConfigRef config = nullptr;
+        CGError err = CGBeginDisplayConfiguration(&config);
+        if (err == kCGErrorSuccess)
+            err =
+                CGConfigureDisplayWithDisplayMode(config, m_SavedModeDisplay, m_SavedMode, nullptr);
+        if (err == kCGErrorSuccess)
+            err = CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly);
+        else if (config)
+            CGCancelDisplayConfiguration(config);
+        if (err == kCGErrorSuccess)
+            log::info("[native] the display's own mode is back");
+        else
+            log::warning("[native] the display's own mode could not be put back (CGError " +
+                         std::to_string(err) + ")");
+        CGDisplayModeRelease(m_SavedMode);
+        m_SavedMode = nullptr;
     }
 
     const SessionInfo& info() const override { return m_Info; }
@@ -409,6 +691,16 @@ public:
             return;
         }
         m_Input->inject(event);
+    }
+
+    std::string clickTraceCsv() const override
+    {
+        if (!m_Config.tuning.clickTrace) return {};
+        if (m_ClickTrace.dropped() > 0)
+            log::warning("[native] click trace: full, " + std::to_string(m_ClickTrace.dropped()) +
+                         " rows past the first " + std::to_string(ClickTrace::kMaxRows) +
+                         " not kept");
+        return m_ClickTrace.csv();
     }
 
     void setCompositeCursor(bool composite, int cursorFramePx) override
@@ -485,11 +777,7 @@ public:
 
     void setClientRefresh(int milliHz, bool vsync) override
     {
-        if (milliHz < 1000) milliHz = 0;
-        if (milliHz > 1000000) milliHz = 1000000;
-        const bool same =
-            m_ClientMilliHz.exchange(milliHz) == milliHz && m_ClientVsync.exchange(vsync) == vsync;
-        if (same) return;
+        if (!storeClientRefresh(m_ClientMilliHz, m_ClientVsync, milliHz, vsync)) return;
         m_ClientRefreshDirty.store(true);
     }
 
@@ -558,11 +846,42 @@ private:
     /// a size asked for it (the small screen). Read on the capture thread.
     bool selfDrawn() const { return m_CompositeCursor.load() && m_CursorFramePx.load() > 0; }
 
+    /// One wake-up of the capture into the click trace (clicktrace=1): what it
+    /// brought, ScreenCaptureKit's stamps on it, and the captured display's
+    /// last refresh read right after (DisplayClock). Capture thread only.
+    void traceCapture(capture::AcquireStatus status, const capture::SckFrame& frame,
+                      int64_t startUs, int64_t doneUs)
+    {
+        // Started on the first wake-up, and again when the capture moved to
+        // another display (a restart on the virtual display's successor).
+        if (m_DisplayClock.display() != m_Display.displayId)
+            m_DisplayClock.start(m_Display.displayId);
+        ClickTrace::Row row;
+        row.kind = ClickTrace::Kind::Capture;
+        row.us = doneUs;
+        row.startUs = startUs;
+        row.status = acquireStatusName(status);
+        if (status == capture::AcquireStatus::Ok) {
+            row.presentUs = frame.presentUs;
+            row.presentRawUs = frame.presentRawUs;
+            row.accumulated = frame.accumulated;
+            row.deliveredUs = frame.capturedUs;
+        }
+        int64_t vsyncUs = 0, periodUs = 0, vsyncs = 0;
+        if (m_DisplayClock.read(vsyncUs, periodUs, vsyncs)) {
+            row.vblankUs = vsyncUs;
+            row.periodUs = periodUs;
+            row.composedFrames = vsyncs;
+        }
+        m_ClickTrace.add(row);
+    }
+
     bool openCapture(int outputWidth, int outputHeight, std::string& error)
     {
         m_Capture = std::make_unique<capture::SckCapture>(
             m_Display.displayId, outputWidth, outputHeight, m_DisplayMilliHz,
             m_CompositeCursor.load() && !selfDrawn(), m_Target.hdr);
+        m_Capture->setBenchQueue(m_Config.tuning.sckQueueDepth, m_Config.tuning.sckMinIntervalUs);
         m_Patch = convert::PlanePatch{};
         // Set on every open, restarts included: the sink outlives the capture,
         // and while a display is away the pacer keeps the wire fed with silence.
@@ -735,7 +1054,18 @@ private:
         };
 
         encode::RateGovernor governor;
-        governor.start(m_Config.bitrateKbps, steadyNowUs() / 1000);
+        governor.start(m_Config.bitrateKbps, steadyNowUs() / 1000,
+                       m_Config.tuning.linkGovernor == EncoderTuning::Choice::Off,
+                       m_Config.governorFloorPercent);
+        // The bench's retrcut= (plan Wi-Fi W2 B): SCTP's retransmissions as a
+        // reason to cut. The Windows host's own since 03/10/2026; here it is
+        // off unless named, until it is measured on this host.
+        governor.setRetransCut(
+            m_Config.tuning.retransCutPermille > 0 ? m_Config.tuning.retransCutPermille : 0);
+        if (governor.retransCut() > 0)
+            log::info("[native] rate governor: also cuts at " +
+                      std::to_string(governor.retransCut()) +
+                      " SCTP chunks retransmitted in a thousand (bench retrcut=)");
         int baseKbps = governor.targetKbps();
         m_LinkKbps = baseKbps;
         bool boosted = false;
@@ -846,6 +1176,9 @@ private:
                             fb.resumed ? "the receiver is back from the background"
                             : fb.gaps > 0 || fb.evictions > 0                  ? "frames lost"
                             : fb.owdRiseMs >= encode::RateGovernor::kOveruseMs ? "delay rising"
+                            : governor.retransCut() > 0 &&
+                                    fb.retransPermille >= governor.retransCut()
+                                ? "SCTP retransmitting"
                             : governor.lastRaiseFast() ? "quiet, back to the link's last good rate"
                                                        : "quiet, raising");
                 } else if (governor.tick(nowMs)) {
@@ -884,8 +1217,11 @@ private:
             }
 
             capture::SckFrame fresh;
+            const int64_t acquireStartUs = steadyNowUs();
             const capture::AcquireStatus status =
                 modeChanged ? capture::AcquireStatus::Lost : m_Capture->acquire(timeoutMs, fresh);
+            if (m_Config.tuning.clickTrace && !modeChanged)
+                traceCapture(status, fresh, acquireStartUs, steadyNowUs());
 
             if (status != capture::AcquireStatus::Timeout && boosted) {
                 boosted = false;
@@ -1433,6 +1769,9 @@ private:
 
     platform::MacDisplay m_Display;
     IOPMAssertionID m_KeepAwake = kIOPMNullAssertionID;
+    /// The mode "Match my screen" replaced, to put back at stop().
+    CGDisplayModeRef m_SavedMode = nullptr;
+    CGDirectDisplayID m_SavedModeDisplay = 0;
     IOPMAssertionID m_Wake = kIOPMNullAssertionID;
     /// The App Nap opt-out, held from start() to stop().
     id<NSObject> m_Activity = nil;
@@ -1461,6 +1800,11 @@ private:
 
     std::mutex m_InputMutex;
     std::unique_ptr<input::CgInput> m_Input;
+
+    /// The bench's click trace (EncoderTuning::clickTrace), and the captured
+    /// display's refresh it reads. Capture thread, and the input's.
+    ClickTrace m_ClickTrace;
+    DisplayClock m_DisplayClock;
 
     /// The mode the capture was last opened on, in pixels — see
     /// displayModeChanged. Capture thread only, after start().

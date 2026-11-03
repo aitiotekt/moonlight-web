@@ -31,10 +31,13 @@ explicite, faute de quoi la propriété ci-dessus est perdue.
 | AMD AMF (en-têtes) | MIT |
 | Intel oneVPL / libvpl | MIT |
 | libva, libva-drm | MIT (Expat) |
+| Khronos Vulkan-Headers (en-têtes, `third_party/vulkan-headers`) | Apache-2.0 OR MIT |
+| libvulkan.so.1 (chargeur Khronos du système, ouvert par `dlopen`) | Apache-2.0 |
 | libdrm | MIT |
 | libpipewire-0.3 | MIT (Expat) — voir la note ci-dessous |
 | libsystemd (sd-bus) | **LGPL-2.1+** — exception bornée, voir ci-dessous |
 | ViGEmClient | BSD-3-Clause |
+| WinUHid (`third_party/winuhid` : bibliothèque cliente liée, pilote construit à part dans `drivers/vhid`) | MIT |
 | SDK Windows / Apple | Licence du SDK correspondant |
 
 ### Hors frontière : `tools/` (instruments de labo, jamais distribués)
@@ -90,7 +93,12 @@ condition durable sur le relicenciement du module, y compris propriétaire.
 ### L'exception sd-bus (décidée le 08/09/2026)
 
 **`libsystemd` (sd-bus), LGPL-2.1+, liée uniquement par le chemin portail de
-Linux** — `#if defined(MW_NATIVE_LINUX_PORTAL)`.
+Linux** — `#if defined(MW_NATIVE_LINUX_PORTAL)`. Trois fichiers l'appellent :
+`PortalScreenCast.cpp` (le portail) et, depuis le 01/10/2026,
+`MutterDisplayConfig.cpp` (la disposition des écrans de GNOME autour de l'écran
+virtuel) et `MutterScreenCast.cpp` (l'écran virtuel demandé à Mutter lui-même,
+sans fenêtre de partage). Même bibliothèque, même drapeau : le coût ci-dessous
+ne change pas.
 
 Pourquoi il a fallu choisir : le portail **ScreenCast** de xdg-desktop-portal est
 la seule route de capture d'une **AppImage** (qui ne peut porter aucune capacité,

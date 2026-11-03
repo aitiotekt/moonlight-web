@@ -18,6 +18,7 @@
 #include "server/ShareManager.h"
 
 #include "common/Logger.h"
+#include "network/LinkAddresses.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -63,6 +64,11 @@ bool ShareManager::isValidTtl(qint64 secs)
     return false;
 }
 
+bool ShareManager::isValidFeedHeight(int height)
+{
+    return height == 720 || height == 1080 || height == 1440;
+}
+
 QString ShareManager::sanitizeName(const QString& name)
 {
     QString out = name.simplified();
@@ -90,6 +96,7 @@ QJsonObject ShareManager::Permissions::toJson() const
     QJsonObject obj;
     obj[QStringLiteral("gamepad")] = gamepad;
     obj[QStringLiteral("keyboardMouse")] = keyboardMouse;
+    obj[QStringLiteral("hid")] = hid;
     return obj;
 }
 
@@ -98,6 +105,10 @@ ShareManager::Permissions ShareManager::Permissions::fromJson(const QJsonObject&
     Permissions p;
     p.gamepad = obj.value(QStringLiteral("gamepad")).toBool(false);
     p.keyboardMouse = obj.value(QStringLiteral("keyboardMouse")).toBool(false);
+    // A file or a request from before the box reads as no passthrough, and a
+    // passthrough without the gamepad is none at all: the device would reach
+    // the game while its own controller is refused.
+    p.hid = p.gamepad && obj.value(QStringLiteral("hid")).toBool(false);
     return p;
 }
 
@@ -297,18 +308,14 @@ bool ShareManager::setPermissions(int slot, const Permissions& perms)
     // board's own poll free to repaint the row from a server that had never
     // been told — the tick came back off a second after the owner made it.
     if (!s->activation.live()) {
-        if (s->lastPermissions.gamepad == perms.gamepad &&
-            s->lastPermissions.keyboardMouse == perms.keyboardMouse)
-            return true;
+        if (s->lastPermissions == perms) return true;
         s->lastPermissions = perms;
         save();
         emit slotChanged(slot);
         return true;
     }
 
-    if (s->activation.permissions.gamepad == perms.gamepad &&
-        s->activation.permissions.keyboardMouse == perms.keyboardMouse)
-        return true;
+    if (s->activation.permissions == perms) return true;
 
     s->activation.permissions = perms;
     s->lastPermissions = perms; // remembered for the next opening
@@ -319,7 +326,7 @@ bool ShareManager::setPermissions(int slot, const Permissions& perms)
     // Down to the worker before the board hears about it: a demotion that shows
     // in the UI before it takes effect on the host is a lie for as long as the
     // round trip lasts.
-    emit permissionsChanged(slot, perms.gamepad, perms.keyboardMouse);
+    emit permissionsChanged(slot, perms.gamepad, perms.keyboardMouse, perms.hid);
     emit slotChanged(slot);
     return true;
 }
@@ -365,6 +372,33 @@ bool ShareManager::setName(int slot, const QString& name)
     s->name = clean;
     save();
     emit slotChanged(slot);
+    return true;
+}
+
+bool ShareManager::setFeedHeight(int height)
+{
+    if (!isValidFeedHeight(height)) return false;
+    if (m_FeedHeight == height) return true;
+    m_FeedHeight = height;
+    save();
+    emit feedHeightChanged(height);
+    return true;
+}
+
+QString ShareManager::linkAddress(const QString& hostUuid) const
+{
+    return m_LinkAddress.value(hostUuid, QStringLiteral("auto"));
+}
+
+bool ShareManager::setLinkAddress(const QString& hostUuid, const QString& id)
+{
+    if (hostUuid.isEmpty() || !LinkAddresses::isValidId(id)) return false;
+    if (linkAddress(hostUuid) == id) return true;
+    if (id == QLatin1String("auto"))
+        m_LinkAddress.remove(hostUuid);
+    else
+        m_LinkAddress.insert(hostUuid, id);
+    save();
     return true;
 }
 
@@ -591,6 +625,14 @@ QString ShareManager::hostForSlot(int slot)
     return s->activation.hostUuid;
 }
 
+QString ShareManager::joinIdentity(int slot, const QString& cookie)
+{
+    pruneExpired();
+    Slot* s = slotFor(slot);
+    if (!s || !s->activation.live() || cookie.isEmpty()) return {};
+    return s->activation.id + QLatin1Char('/') + hash(cookie);
+}
+
 int ShareManager::appForSlot(int slot)
 {
     pruneExpired();
@@ -708,6 +750,11 @@ void ShareManager::save()
 
     QJsonObject root;
     root[QStringLiteral("slots")] = slotArray;
+    root[QStringLiteral("feedHeight")] = m_FeedHeight;
+    QJsonObject linkAddress;
+    for (auto it = m_LinkAddress.cbegin(); it != m_LinkAddress.cend(); ++it)
+        linkAddress[it.key()] = it.value();
+    root[QStringLiteral("linkAddress")] = linkAddress;
 
     QFile file(sharePath());
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -728,6 +775,14 @@ void ShareManager::load()
 
     const qint64 now = QDateTime::currentSecsSinceEpoch();
     const QJsonObject root = doc.object();
+    const int feedHeight = root.value(QStringLiteral("feedHeight")).toInt(kFeedHeight);
+    m_FeedHeight = isValidFeedHeight(feedHeight) ? feedHeight : kFeedHeight;
+    const QJsonObject linkAddress = root.value(QStringLiteral("linkAddress")).toObject();
+    for (auto it = linkAddress.begin(); it != linkAddress.end(); ++it) {
+        const QString id = it.value().toString();
+        if (!it.key().isEmpty() && id != QLatin1String("auto") && LinkAddresses::isValidId(id))
+            m_LinkAddress.insert(it.key(), id);
+    }
     const QJsonArray slotArray = root.value(QStringLiteral("slots")).toArray();
     for (const QJsonValue& v : slotArray) {
         const QJsonObject obj = v.toObject();

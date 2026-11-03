@@ -91,19 +91,40 @@ StaticFileHandler::StaticFileHandler(const QString& rootDir, const QString& vers
     if (!m_RootDir.endsWith('/')) m_RootDir += '/';
 }
 
-QStringList StaticFileHandler::listFiles() const
+// What exists for the developer and never for a user: the same set the install()
+// rules in CMakeLists drop from a packaged build. A developer run points this
+// handler straight at the source tree, so without this it would serve them, and
+// list them for the tunnel's bootstrap, which pulls every listed file across a
+// data channel before the page can start: a stray coverage report is not
+// untidiness there, it is a minute of waiting. `relative` has no leading slash.
+static bool isDevOnly(const QString& relative)
 {
-    // Directories that exist for the developer and never for a user. A packaged
-    // build has already dropped them (see the install() rules in CMakeLists),
-    // but a developer run points this handler straight at the source tree, and
-    // the difference matters more here than anywhere else: everything named in
-    // this list gets pulled across a data channel before the page can start, so
-    // a stray coverage report is not untidiness, it is a minute of waiting.
     static const QStringList kDevOnlyDirs = {
         QStringLiteral("node_modules"), QStringLiteral("test"),     QStringLiteral("scripts"),
         QStringLiteral("build"),        QStringLiteral("coverage"), QStringLiteral(".claude"),
     };
+    // Tool configuration and notes, by name at any depth, as install() matches them.
+    static const QStringList kDevOnlyFiles = {
+        QStringLiteral("eslint.config.js"),  QStringLiteral("package.json"),
+        QStringLiteral("package-lock.json"), QStringLiteral("prompt-frontend.md"),
+        QStringLiteral("tsconfig.json"),     QStringLiteral("vitest.config.js"),
+    };
 
+    const QStringList segments = relative.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    if (segments.isEmpty()) return false;
+    // Dot files are configuration for tools, not content, and the leading dot is
+    // what a scanner probes for.
+    if (std::any_of(segments.cbegin(), segments.cend(),
+                    [](const QString& s) { return s.startsWith(QLatin1Char('.')); }))
+        return true;
+    // Case-blind: Windows opens PACKAGE.JSON as package.json.
+    if (kDevOnlyDirs.contains(segments.first(), Qt::CaseInsensitive) && segments.size() > 1)
+        return true;
+    return kDevOnlyFiles.contains(segments.last(), Qt::CaseInsensitive);
+}
+
+QStringList StaticFileHandler::listFiles() const
+{
     QStringList paths;
     const QDir root(m_RootDir);
     if (!root.exists()) return paths;
@@ -114,13 +135,7 @@ QStringList StaticFileHandler::listFiles() const
         const QString relative = root.relativeFilePath(it.filePath());
         const QStringList segments = relative.split(QLatin1Char('/'));
 
-        // Dot files are configuration for tools, not content — and the leading
-        // dot is what a scanner probes for, so naming them would be worse than
-        // useless.
-        if (std::any_of(segments.cbegin(), segments.cend(),
-                        [](const QString& s) { return s.startsWith(QLatin1Char('.')); }))
-            continue;
-        if (kDevOnlyDirs.contains(segments.first())) continue;
+        if (isDevOnly(relative)) continue;
         // The DEV icons are served under the production names (servedPath).
         if (segments.size() > 1 && segments[0] == QLatin1String("assets") &&
             segments[1] == QLatin1String("dev"))
@@ -134,6 +149,12 @@ QStringList StaticFileHandler::listFiles() const
     }
     paths.sort();
     return paths;
+}
+
+qint64 StaticFileHandler::servedSize(const QString& requestPath) const
+{
+    const QFileInfo info(m_RootDir + servedPath(m_RootDir, requestPath.mid(1)));
+    return info.isFile() ? info.size() : -1;
 }
 
 QString StaticFileHandler::contentTag() const
@@ -173,6 +194,12 @@ HttpResponse StaticFileHandler::serveFile(const QString& requestPath,
 
     if (!fileInfo.canonicalFilePath().startsWith(m_RootDir))
         return HttpResponse::error(403, "Forbidden");
+
+    // Judged on the file actually reached, not on the spelling of the request:
+    // "/js/../package.json" is refused above, but "\package.json" or a symlink
+    // would get past a check of the request path. Answered like any missing file.
+    if (isDevOnly(fileInfo.canonicalFilePath().mid(m_RootDir.size())))
+        return HttpResponse::error(404, "File not found: " + safePath);
 
     // Validators for conditional requests. The ETag folds in the app version so
     // a new build always busts caches even if the packager preserves mtimes;

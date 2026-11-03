@@ -49,7 +49,20 @@ namespace mw::native::audio {
 class WasapiLoopback
 {
 public:
-    explicit WasapiLoopback(AudioCallback onPacket);
+    /// `frameSamples`: 240 (5 ms, the product), 480 or 960 (`audioframe=`).
+    /// How long a frame owed waits for a late loopback packet before silence
+    /// replaces it: one 5 ms frame. Measured on 12/10 (plan « le son et la
+    /// priorité des paquets »): none sent 74 to 260 silent frames a minute
+    /// under music, each paid back by a dropped one, heard as crackles; 2.5 ms
+    /// still let 1 to 10 through; 5 and 10 ms none, and the sound waited 1 to
+    /// 2 ms LESS in the pacer than without (no extra frame left queued after
+    /// each silence). No cost to the click either way.
+    static constexpr int kDefaultGraceUs = 5000;
+
+    /// `graceUs`: that wait (AudioPacer::take, `audiograce=<ms>`); 0 sends
+    /// silence at once.
+    explicit WasapiLoopback(AudioCallback onPacket, int frameSamples = 240,
+                            int graceUs = kDefaultGraceUs);
     ~WasapiLoopback();
     WasapiLoopback(const WasapiLoopback&) = delete;
     WasapiLoopback& operator=(const WasapiLoopback&) = delete;
@@ -70,6 +83,8 @@ private:
     void runLoop();
 
     AudioCallback m_OnPacket;
+    int m_FrameSamples;
+    int m_GraceUs;
     std::thread m_Thread;
     std::atomic<bool> m_Running{false};
     std::atomic<int64_t> m_Packets{0};

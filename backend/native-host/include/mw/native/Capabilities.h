@@ -70,6 +70,24 @@ enum class CaptureApi
 
 const char* toString(CaptureApi a);
 
+/// A packed driver version (GpuInfo::driverVersion) as Windows writes it:
+/// "32.0.101.7088". Empty for 0, a version nobody gave.
+inline std::string driverVersionText(uint64_t driverVersion)
+{
+    if (driverVersion == 0) return {};
+    return std::to_string((driverVersion >> 48) & 0xffff) + "." +
+           std::to_string((driverVersion >> 32) & 0xffff) + "." +
+           std::to_string((driverVersion >> 16) & 0xffff) + "." +
+           std::to_string(driverVersion & 0xffff);
+}
+
+/// The same four parts packed, for the list of excluded drivers and its tests.
+constexpr uint64_t driverVersionOf(uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+{
+    return (static_cast<uint64_t>(a) << 48) | (static_cast<uint64_t>(b) << 32) |
+           (static_cast<uint64_t>(c) << 16) | static_cast<uint64_t>(d);
+}
+
 /// A GPU, as the OS enumerates it.
 struct GpuInfo
 {
@@ -78,6 +96,13 @@ struct GpuInfo
     std::string name;      ///< e.g. "NVIDIA GeForce RTX 4070"
     uint32_t vendorId = 0; ///< PCI vendor id (0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel)
     uint32_t deviceId = 0;
+
+    /// The user-mode driver's version, packed as Windows gives it — four
+    /// 16-bit parts, the first in the top bits — so that versions compare as
+    /// numbers: what the D3D12 route's list of excluded drivers reads
+    /// (VideoPipelineChoice.h). 0 where the platform does not say;
+    /// driverVersionText() writes it as Windows does.
+    uint64_t driverVersion = 0;
 
     /// Opaque, platform-specific handle to the adapter this describes: a
     /// DXGI LUID on Windows, a DRM render-node path hash on Linux, a Metal
@@ -181,8 +206,9 @@ bool nameLooksVirtual(const std::string& monitorName);
 /// the ONLY thing they are ever asked to pick (§13 of the mission).
 struct DisplayInfo
 {
-    /// Stable within one process run. Carried in SessionConfig::displayId and,
-    /// above this module, used as the app id the browser launches.
+    /// An enumeration index, carried in SessionConfig::displayId. Not stable:
+    /// on Windows a display that appears or turns primary moves the others'.
+    /// Above this module the app id the browser launches is kept per `key`.
     int id = -1;
 
     /// What the user sees, already formatted by the platform layer: the OS's
@@ -232,7 +258,39 @@ struct DisplayInfo
     /// name on Windows ("\\.\DISPLAY3"). Empty on the other platforms, which
     /// change no modes yet.
     std::string osName;
+
+    /// This display's own route to a picture, when it is not the machine's
+    /// (Capabilities::capture). None means the machine's. Linux's portal
+    /// virtual display is the one case: it exists only inside a ScreenCast
+    /// session, whatever route the monitors beside it take.
+    CaptureApi capture = CaptureApi::None;
 };
+
+/// DisplayInfo::key of the display a Linux ScreenCast portal creates for the
+/// stream (source type VIRTUAL): it does not exist before the session asks for
+/// it, at the client's size, and goes with it. The server recognises it by
+/// this key rather than by name — the probe does not know the edition's name.
+constexpr const char* kPortalVirtualDisplayKey = "portal-virtual";
+
+/// DisplayInfo::key of the screen Steam's Big Picture gets in its own
+/// gamescope, on Linux (GamescopeSession.h): made at the client's size when the
+/// stream starts, kept ten minutes after the last one. Recognised by this key,
+/// like the portal's virtual display.
+constexpr const char* kGamescopeSteamDisplayKey = "gamescope-steam";
+
+/// DisplayInfo::key of the screen any app of the user's gets in its own
+/// gamescope, on Linux: one entry for them all, never a card itself — the
+/// server makes one card per app in its settings and hands the session the
+/// app's name and command (SessionConfig::gamescopeApp).
+constexpr const char* kGamescopeAppDisplayKey = "gamescope-app";
+
+/// Whether @p key is a screen the stream makes for itself at the client's size
+/// — the portal's virtual display, or a gamescope's — rather than a monitor.
+inline bool isMadeForStreamKey(const std::string& key)
+{
+    return key == kPortalVirtualDisplayKey || key == kGamescopeSteamDisplayKey ||
+           key == kGamescopeAppDisplayKey;
+}
 
 /// Why the native engine cannot run here. The caller maps every one of these to
 /// the SAME user-facing sentence (§23: "not available on this configuration —

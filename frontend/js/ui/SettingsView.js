@@ -33,14 +33,54 @@ import { t, getLanguage, setLanguage, AVAILABLE_LANGUAGES } from '../i18n/i18n.j
 import { escapeHtml } from '../util/escapeHtml.js';
 import { shortcutsGridHtml, shortcutsTitle } from '../util/shortcutsHelp.js';
 import { noticeDetailsHtml } from './PrivacyNotice.js';
+import { BMC_FULL_LOGO } from './bmcLogo.js';
+import {
+    SUPPORT_URL,
+    SUPPORT_BUTTON_AT,
+    goodSessionCount,
+    isSupportHidden,
+    setSupportHidden,
+} from '../util/supportNudge.js';
+import {
+    GamepadRemapDialog,
+    connectedPads,
+    resolvePad,
+    sourceBadge,
+} from './GamepadRemapDialog.js';
+import { padKey, padName } from '../stream/gamepadMapping.js';
+import { kindIconSvg } from './DeviceArt.js';
+import {
+    getMapping,
+    listMappings,
+    removeMapping,
+    CHANGED_EVENT,
+} from '../util/gamepadMappingsStore.js';
 import {
     SUPPORTS_CANVAS_TEARING,
-    IS_MOBILE_OR_TABLET,
+    IS_HANDHELD,
+    IS_LOW_MEMORY,
+    IS_TOUCH_DEVICE,
+    IS_TV,
     resolveTearing,
     supportsDisplayHdr,
     hdrClientCapability,
     chroma444ClientCapability,
+    supportsGamingMode,
 } from '../util/BrowserDetect.js';
+import * as RemoteNav from './RemoteNav.js';
+import {
+    HID_KINDS,
+    deviceKey,
+    hidHelpFor,
+    linkModel,
+    loadForwarded,
+    saveForwarded,
+} from '../hid/HidPassthrough.js';
+import { isGameDevice } from '../hid/hidWire.js';
+import { openHidHelp } from './HidHelpDialog.js';
+import { confirmAction } from './ConfirmDialog.js';
+import { hostUpdate, canSelfUpdate } from './HostUpdate.js';
+import { Host } from '../models/Host.js';
 import { aspectToNumber, computeAutoBitrate } from '../util/AutoBitrate.js';
 import { autoFps, measuredFps } from '../util/RefreshRate.js';
 import { ASPECT_VALUES, SCREEN_ASPECTS } from '../util/AspectRatio.js';
@@ -52,15 +92,39 @@ import {
     clampCustomSize,
     devicePixelSize,
     fitPixelBudget,
+    autoMaxHeightFor,
     readResolutionChoice,
 } from '../util/StreamResolution.js';
-
-/** True when the browser supports touch events (mobile/tablet, or touchscreen laptop). */
-const IS_TOUCH_DEVICE =
-    'ontouchstart' in window ||
-    (typeof navigator.maxTouchPoints !== 'undefined' && navigator.maxTouchPoints > 0);
+import { previewCeiling } from '../util/AutoCeiling.js';
+import {
+    CODEC_PYROWAVE,
+    PYROWAVE_FALLBACK,
+    anyHostCodesPyrowave,
+    pyrowaveBlocker,
+} from '../util/PyrowaveCodec.js';
+import { CODEC_AUTO, codecAfterAutoMigration } from '../util/CodecAuto.js';
+import {
+    loadMicDevice,
+    micRequested,
+    micSupported,
+    namedMicrophones,
+    saveMicDevice,
+} from '../audio/MicUplink.js';
 
 const STORAGE_KEY = 'mw-streaming-settings';
+// The microphone list's values, a device being its prefix and its id.
+const MIC_OFF = 'off';
+const MIC_SYSTEM = 'system';
+const MIC_PICK = 'pick';
+const MIC_DEVICE_PREFIX = 'device:';
+
+/** Why PyroWave is greyed out, by pyrowaveBlocker()'s answer. */
+const PYROWAVE_REASON_KEYS = {
+    transport: 'settings.pyrowaveNoTransport',
+    browser: 'settings.pyrowaveNoBrowser',
+    hdr: 'settings.pyrowaveNoHdr',
+    host: 'settings.pyrowaveNoHost',
+};
 
 /**
  * Enhancer choices, in menu order after 'auto': Canvas2D resampling, then each
@@ -81,6 +145,17 @@ const ENHANCER_CHOICES = [
     { value: 'nis', key: 'settings.algoBalGpu', gpu: true },
     { value: 'gl-fsr1', key: 'settings.algoQualGl', gpu: false },
     { value: 'fsr1', key: 'settings.algoQualGpu', gpu: true },
+    // MoonlightWeb's own upscaler (docs/design/upscaler-mwsr.md): FSR1's
+    // sharpness for less than SGSR1's cost, in both flavours; 'auto' takes it
+    // since v0.4.1 (BrowserDetect.pickAutoEnhancer).
+    { value: 'gl-mwsr', key: 'settings.algoMwsrGl', gpu: false },
+    { value: 'mwsr', key: 'settings.algoMwsrGpu', gpu: true },
+    // Its versions 2 and 3, Bruno's of 25/10/2026 (upscaler-mwsr.md §14.7):
+    // the same kernel after P8.0's deblocking, at a fixed strength or one set
+    // per frame from the QP in its header. WebGPU only; like every entry here
+    // they exist in debug builds only, and 'auto' never picks them.
+    { value: 'mwsr-db', key: 'settings.algoMwsrDbGpu', gpu: true },
+    { value: 'mwsr-dbq', key: 'settings.algoMwsrDbqGpu', gpu: true },
 ];
 
 export class SettingsView {
@@ -88,7 +163,7 @@ export class SettingsView {
         this.container = container;
         this.onClose = onClose || (() => {});
 
-        this._videoCodec = 'hevc';
+        this._videoCodec = CODEC_AUTO;
         this._gamingMode = true;
         this._showPerformanceStats = false;
         this._streamBitrateMbps = 20;
@@ -99,7 +174,20 @@ export class SettingsView {
         this._hdrEnabled = false;
         this._chroma444 = false;
         this._muteHostAudio = true;
+        // Send this device's microphone to the host (off by default): opened
+        // only once the host said it can take it (audio/MicUplink.js), and how
+        // it sounds (MIC_QUALITY: voice cleanup, or none at a higher bitrate).
+        this._micEnabled = true;
+        this._micChosen = false;
+        /** @type {{id: string, label: string}|null} null follows the system */
+        this._micDevice = loadMicDevice();
+        this._micQuality = 'voice';
+        this._quitAppOnStop = false;
+        // Enter fullscreen at launch (off by default): asked on the launch
+        // click, the only moment a browser lets a page go fullscreen.
+        this._fullscreenOnStart = false;
         this._touchSensitivity = 2.2;
+        this._mouseSensitivity = 1;
         // Mobile only: direct touch-screen input (absolute) instead of the
         // relative trackpad model. Off by default.
         this._touchScreen = false;
@@ -138,6 +226,9 @@ export class SettingsView {
 
         // Per-codec browser support map: { h264:bool, hevc:bool, av1:bool } or null
         this._codecSupport = null;
+        // Whether a host this page knows codes PyroWave (its card says so:
+        // util/PyrowaveCodec.js); null until the host list answers.
+        this._pyrowaveHost = null;
 
         // True when this browser holds a session worth ending — see
         // _checkSession(). False for the host machine's own browser, whichever
@@ -156,11 +247,24 @@ export class SettingsView {
         this._statsAvailable = false;
         this._statsGranted = false;
         this._statsWritable = false;
+
+        // Update section: the host's cached release check (null = no answer),
+        // the hosts it is judged against (HostUpdate.canSelfUpdate), and what
+        // a running update shows — the same run the Hosts banner follows.
+        this._updateLoaded = false;
+        this._updateInfo = null;
+        this._updateHosts = [];
+        this._updateRun = null;
+        this._updateWarmupTries = 0;
+        this._updateRetryTimer = null;
+        this._unsubUpdate = null;
+        this._destroyed = false;
     }
 
     async start() {
         await this._loadState();
         this._codecSupport = await this._checkCodecSupport();
+        await this._loadPyrowaveHost();
         this._webgpuUsable = await this._checkWebGpuSupport();
         // The static half of the HDR gate (WebGPU adapter, 10-bit decoder); the
         // display half is asked live at every render.
@@ -169,8 +273,134 @@ export class SettingsView {
         this._chroma444Capability = await chroma444ClientCapability();
         this._canLogout = await this._checkSession();
         await this._loadStatsConsent();
+        await this._loadUpdateState();
         this.render();
         this.bindEvents();
+        this._unsubUpdate = hostUpdate.subscribe((view) => {
+            this._updateRun = view;
+            this._paintUpdateSection();
+        });
+    }
+
+    /**
+     * Ask the host whether a newer MoonlightWeb exists. The same cached answer
+     * the Hosts banner reads, so asking costs the host nothing. An empty
+     * `checked_at` means its first look at the releases is still in flight:
+     * asked again shortly, a few times, rather than reporting "up to date".
+     */
+    async _loadUpdateState() {
+        try {
+            this._updateInfo = await BackendClient.checkForUpdate();
+        } catch {
+            this._updateInfo = null; // said as "could not check"
+        }
+        this._updateLoaded = true;
+        if (this._updateInfo && !this._updateInfo.checked_at && this._updateWarmupTries < 3) {
+            this._updateWarmupTries++;
+            this._updateRetryTimer = setTimeout(async () => {
+                this._updateRetryTimer = null;
+                if (this._destroyed) return;
+                await this._loadUpdateState();
+                if (!this._destroyed) this._paintUpdateSection();
+            }, 10000);
+        }
+    }
+
+    /**
+     * Update: whether this machine runs the latest MoonlightWeb, and when it
+     * does not, the same Update button, bar and messages as the Hosts banner —
+     * which a dismissed banner no longer offers, and this section always does.
+     * Absent in a booth, whose visitors can do nothing about an update.
+     */
+    _renderUpdateSection() {
+        if (BackendClient.adminLocked) return '';
+        return `
+                <div class="settings-section settings-section-update" id="settings-section-update">
+                    <h3 class="settings-section-title">${escapeHtml(t('update.sectionTitle'))}</h3>
+                    <div class="settings-update-body">${this._updateBodyHtml()}</div>
+                </div>`;
+    }
+
+    _updateBodyHtml() {
+        const run = this._updateRun;
+        const info = this._updateInfo;
+        const canUpdate = canSelfUpdate(info, this._updateHosts);
+        const installed =
+            info && info.current
+                ? `<p class="setting-desc">${escapeHtml(t('update.installed', { version: info.current }))}</p>`
+                : '';
+        const button = canUpdate
+            ? `<button class="btn btn-secondary settings-update-apply">${escapeHtml(t('update.updateNow'))}</button>`
+            : '';
+
+        if (run && run.state === 'progress') {
+            return `
+                <div class="update-banner">
+                    <span class="update-banner-text">${escapeHtml(run.label)}</span>
+                    <span class="update-banner-progress" role="progressbar"
+                          aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                        <span class="update-banner-progress-fill" style="width:0%"></span>
+                    </span>
+                </div>`;
+        }
+        if (run && run.state === 'failed') {
+            const reason = run.message ? ` — ${escapeHtml(run.message)}` : '';
+            return `
+                <div class="update-banner">
+                    <span class="update-banner-text">${escapeHtml(t('update.failed'))}${reason}</span>
+                    <span class="update-banner-actions">${button}</span>
+                </div>${installed}`;
+        }
+        if (!this._updateLoaded || (info && !info.checked_at)) {
+            return `<p class="setting-desc">${escapeHtml(t('update.checking'))}</p>`;
+        }
+        if (!info) {
+            return `<p class="setting-desc">${escapeHtml(t('update.checkFailed'))}</p>`;
+        }
+        if (!info.update_available) {
+            const upToDate = t('update.upToDate', { version: info.current || '' });
+            return `<p class="setting-desc">${escapeHtml(upToDate)}</p>`;
+        }
+        const notes = info.release_url
+            ? `<a class="update-banner-notes" href="${escapeHtml(info.release_url)}"
+                  target="_blank" rel="noopener noreferrer">${escapeHtml(t('update.releaseNotes'))}</a>`
+            : '';
+        const text = canUpdate
+            ? t('update.available', { version: info.latest })
+            : t('update.availableManual', { version: info.latest });
+        return `
+                <div class="update-banner">
+                    <span class="update-banner-text">${escapeHtml(text)}</span>
+                    <span class="update-banner-actions">${button}${notes}</span>
+                </div>${installed}`;
+    }
+
+    /**
+     * Repaint the section's body. While an update runs this is called on every
+     * animation frame: the row is built once, and after that only the bar and
+     * the words change.
+     */
+    _paintUpdateSection() {
+        const body = this.container.querySelector('.settings-update-body');
+        if (!body) return;
+        const run = this._updateRun;
+        if (!run || run.state !== 'progress') {
+            body.innerHTML = this._updateBodyHtml();
+            return;
+        }
+        let fill = /** @type {HTMLElement|null} */ (
+            body.querySelector('.update-banner-progress-fill')
+        );
+        if (!fill) {
+            body.innerHTML = this._updateBodyHtml();
+            fill = /** @type {HTMLElement} */ (body.querySelector('.update-banner-progress-fill'));
+        }
+        const label = body.querySelector('.update-banner-text');
+        if (label && label.textContent !== run.label) label.textContent = run.label;
+        const pct = Math.max(0, Math.min(100, run.percent));
+        fill.style.width = `${pct.toFixed(1)}%`;
+        const track = body.querySelector('.update-banner-progress');
+        if (track) track.setAttribute('aria-valuenow', String(Math.round(pct)));
     }
 
     /**
@@ -217,6 +447,39 @@ export class SettingsView {
         } finally {
             checkbox.disabled = false;
         }
+    }
+
+    /**
+     * "Buy me a coffee": what a coffee pays for, the link, and the one switch
+     * that hides the button everywhere — the header's and the stream bar's
+     * (util/supportNudge.js). The switch is unticked by default and lives in
+     * this browser only, like the count behind the button. It shows from the
+     * session the button is earned on, ticked or not: before that there is
+     * nothing to hide. "Reset to defaults" leaves it alone: it is not a
+     * streaming setting.
+     */
+    _renderSupportSection() {
+        const hideToggle =
+            goodSessionCount() >= SUPPORT_BUTTON_AT
+                ? `
+                    <div class="settings-field">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="settings-support-hidden"
+                                   ${isSupportHidden() ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">${escapeHtml(t('support.hideToggle'))}</span>
+                        </label>
+                    </div>`
+                : '';
+        return `
+                <div class="settings-section" id="settings-section-support">
+                    <h3 class="settings-section-title">${escapeHtml(t('support.title'))}</h3>
+                    <p class="setting-desc">${escapeHtml(t('support.desc'))}</p>
+                    <div class="settings-field">
+                        <a class="btn btn-neutral settings-support-link" href="${SUPPORT_URL}"
+                           target="_blank" rel="noopener noreferrer"
+                           aria-label="${escapeHtml(t('support.action'))}">${BMC_FULL_LOGO}</a>
+                    </div>${hideToggle}
+                </div>`;
     }
 
     /**
@@ -317,7 +580,8 @@ export class SettingsView {
         try {
             const data = await BackendClient.getStreamingSettings();
             this._mediaTrackOnlyH264 = data.media_track_only_h264 === true;
-            this._debugBuild = data.debug_build === true;
+            // A debug build, or debug mode (--debug, or Admin → Advanced).
+            this._debugBuild = data.debug_build === true || data.debug_mode === true;
 
             if (!stored) {
                 this._applySettings(data);
@@ -334,7 +598,9 @@ export class SettingsView {
 
     /** Apply a settings object to internal state (normalises field names). */
     _applySettings(data) {
-        this._videoCodec = data.video_codec || 'hevc';
+        // The server's default is HEVC on a first visit: it moves to Auto
+        // like a stored one (util/CodecAuto.js).
+        this._videoCodec = codecAfterAutoMigration(data.video_codec) || CODEC_AUTO;
         this._mediaTrackOnlyH264 = data.media_track_only_h264 === true;
         this._gamingMode = data.gaming_mode !== false;
         this._showPerformanceStats = data.show_performance_stats === true;
@@ -364,10 +630,19 @@ export class SettingsView {
         this._hdrEnabled = data.hdr_enabled === true;
         this._chroma444 = data.chroma_444_enabled === true;
         this._muteHostAudio = data.mute_host_audio !== false;
+        this._micEnabled = micRequested(data);
+        this._micChosen = data.mic_chosen === true;
+        this._micQuality = data.mic_quality === 'clean' ? 'clean' : 'voice';
+        this._quitAppOnStop = data.quit_app_on_stop === true;
+        this._fullscreenOnStart = data.fullscreen_on_start === true;
         this._touchSensitivity =
             typeof data.touch_sensitivity === 'number' && data.touch_sensitivity > 0
                 ? data.touch_sensitivity
                 : 2.2;
+        this._mouseSensitivity =
+            typeof data.mouse_sensitivity === 'number' && data.mouse_sensitivity > 0
+                ? data.mouse_sensitivity
+                : 1;
         this._touchScreen = data.touch_screen === true;
         // Allow tearing (default on): resolveTearing() owns the default, the
         // legacy keys and the "cannot tear anyway" gate — see BrowserDetect.
@@ -394,7 +669,7 @@ export class SettingsView {
     }
 
     _computeAutoBitrate(height, fps, aspect, chroma444, hdr) {
-        return computeAutoBitrate(height, fps, aspect, chroma444, hdr, IS_MOBILE_OR_TABLET);
+        return computeAutoBitrate(height, fps, aspect, chroma444, hdr, IS_HANDHELD);
     }
 
     /**
@@ -425,21 +700,53 @@ export class SettingsView {
         };
     }
 
-    /** The recommended bitrate, in Mbps, for what the controls show now. */
-    _estimateBitrate() {
-        const fps = parseInt(this.container.querySelector('#settings-stream-fps')?.value, 10);
-        const chroma444 = this.container.querySelector('#settings-chroma-444')?.checked === true;
-        // The size the choice stands for — this screen's, the custom pair, or
-        // the rung at the ratio below. "auto" resolves to the host's own
-        // format at launch, which is unknown here — aspectToNumber() reads it
-        // as the 16:9 baseline, which is what the estimate wants.
-        const choice = this._readResolutionChoice();
-        const ref = bitrateReference(choice, undefined, IS_MOBILE_OR_TABLET);
+    /**
+     * The size and rate the stream will carry for this resolution choice at
+     * this rate: what the pixel budget leaves of them, the half the viewer
+     * named kept as named (util/StreamResolution.js). The size is the one the
+     * choice stands for — this screen's, the custom pair, or the rung at the
+     * ratio below. "auto" resolves to the host's own format at launch, which
+     * is unknown here — aspectToNumber() reads it as the 16:9 baseline, which
+     * is what the estimate wants.
+     */
+    _budgetedStream(choice, rate, rateNamed) {
+        // No host here: what was learned from the one launched last.
+        const budget = previewCeiling({
+            tv: IS_TV,
+            handheld: IS_HANDHELD,
+            lowMemory: IS_LOW_MEMORY,
+            powerSave: this._powerSave,
+        });
+        const ref = bitrateReference(
+            choice,
+            undefined,
+            IS_HANDHELD,
+            IS_TV,
+            autoMaxHeightFor(budget),
+        );
         const aspect =
             choice.mode === 'fixed'
                 ? this.container.querySelector('#settings-stream-aspect')?.value ||
                   this._streamAspect
                 : ref.aspect;
+        const size = { height: ref.height, aspect };
+        if (choice.mode !== 'auto' && rateNamed) return { size, fps: rate };
+        const bounded = fitPixelBudget(size, rate, {
+            clientFps: measuredFps(),
+            resolutionNamed: choice.mode !== 'auto',
+            rateNamed,
+            budget,
+        });
+        return {
+            size: { ...bounded.size, aspect: bounded.size.aspect || aspect },
+            fps: bounded.fps,
+        };
+    }
+
+    /** The recommended bitrate, in Mbps, for what the controls show now. */
+    _estimateBitrate() {
+        const fps = parseInt(this.container.querySelector('#settings-stream-fps')?.value, 10);
+        const chroma444 = this.container.querySelector('#settings-chroma-444')?.checked === true;
         const hdr = this.container.querySelector('#settings-hdr')?.checked ?? this._hdrEnabled;
         // Auto (0) is estimated at the rate this screen runs at — what the
         // stream will actually ask for — and at 60 when none was measured.
@@ -448,24 +755,52 @@ export class SettingsView {
         // And at the size and rate the pixel budget leaves of them, since that
         // is what the stream will carry — an estimate for a 1440p120 the
         // launch turns into 1080p120 recommends a bitrate for pixels nobody
-        // ever sends (util/StreamResolution.js).
-        const bounded =
-            choice.mode === 'auto' || chosen <= 0
-                ? fitPixelBudget({ height: ref.height, aspect }, rate, { clientFps: measuredFps() })
-                : { size: { height: ref.height, aspect }, fps: rate };
+        // ever sends.
+        const bounded = this._budgetedStream(this._readResolutionChoice(), rate, chosen > 0);
         return this._computeAutoBitrate(
             bounded.size.height,
             bounded.fps,
-            bounded.size.aspect || aspect,
+            bounded.size.aspect,
             chroma444,
             hdr,
         );
+    }
+
+    /**
+     * The line of the Auto frame rate: the rate the stream will really be
+     * sent at for the resolution the controls show. That is this screen's,
+     * under Auto's ceiling — said plainly when the panel runs faster: a
+     * 165 Hz screen reading "Auto (165 FPS)" and then streaming 120 would be
+     * a label that lies, and the 165 rung right below it is there for whoever
+     * wants it — and less again where the pixel budget takes it down, a 4K
+     * rung on a 120 Hz screen streaming at 60.
+     */
+    _autoFpsLabel() {
+        const measured = autoFps();
+        if (!measured) return t('settings.fpsAuto');
+        const streamed = this._budgetedStream(this._readResolutionChoice(), measured, false).fps;
+        if (streamed < measured) return t('settings.fpsAutoBudget', { fps: streamed });
+        const panel = measuredFps();
+        return panel > measured
+            ? t('settings.fpsAutoCapped', { fps: measured, screen: panel })
+            : t('settings.fpsAutoMeasured', { fps: measured });
+    }
+
+    /** Put the Auto frame rate's line in step with the resolution shown. */
+    _syncAutoFpsLabel() {
+        const option = this.container.querySelector('#settings-stream-fps option[value="0"]');
+        if (option) option.textContent = this._autoFpsLabel();
     }
 
     /** Show whether the bitrate is the estimate's or the user's own. */
     _syncBitrateMark() {
         const mark = this.container.querySelector('#settings-bitrate-auto');
         if (mark) mark.textContent = this._bitrateAuto ? t('settings.bitrateAuto') : '';
+        // The way back to the estimate, offered only once it has been left:
+        // a stray click on the track (a TV's cursor) was otherwise kept for
+        // good, with nothing to undo it but a reset of every setting.
+        const back = this.container.querySelector('#settings-bitrate-back-to-auto');
+        if (back) back.hidden = this._bitrateAuto;
     }
 
     /**
@@ -481,6 +816,90 @@ export class SettingsView {
         if (slider) slider.value = mbps;
         if (label) label.textContent = mbps;
         this._streamBitrateMbps = mbps;
+    }
+
+    /** The list's value for what is chosen. */
+    _micValue() {
+        if (!this._micEnabled) return MIC_OFF;
+        return this._micDevice ? MIC_DEVICE_PREFIX + this._micDevice.id : MIC_SYSTEM;
+    }
+
+    /**
+     * The list's options: off, the system's, then the named microphones. The one
+     * picked earlier stays there when it is not listed (not plugged in, or no
+     * name to compare with yet). Nothing named yet: the entry that asks for names.
+     *
+     * @param {{id: string, label: string}[]} named
+     */
+    _micListHtml(named) {
+        const value = this._micValue();
+        const option = (v, text) =>
+            '<option value="' +
+            escapeHtml(v) +
+            '"' +
+            (v === value ? ' selected' : '') +
+            '>' +
+            escapeHtml(text) +
+            '</option>';
+        const devices = [...named];
+        const saved = this._micDevice;
+        if (saved && !devices.some((d) => d.id === saved.id)) devices.push(saved);
+        return [
+            option(MIC_OFF, t('settings.micOff')),
+            option(MIC_SYSTEM, t('settings.micSystem')),
+            ...devices.map((d) => option(MIC_DEVICE_PREFIX + d.id, d.label || d.id)),
+            ...(named.length === 0 ? [option(MIC_PICK, t('settings.micPick'))] : []),
+        ].join('');
+    }
+
+    /** The named microphones into the list, as far as this site may see them. */
+    async _fillMicList(list) {
+        let named = [];
+        try {
+            named = namedMicrophones(await navigator.mediaDevices.enumerateDevices());
+        } catch (e) {
+            console.info('[Mic] could not list the microphones:', e && e.message);
+        }
+        list.innerHTML = this._micListHtml(named);
+        return named;
+    }
+
+    /**
+     * "Choose a microphone…": a browser names its microphones only once one has
+     * been allowed, so one is opened for the time of the question. The viewer's
+     * choice stands until they pick in the list that comes back.
+     */
+    async _askMicNames(list) {
+        list.value = this._micValue();
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            stream.getTracks().forEach((track) => track.stop());
+        } catch (e) {
+            const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+            Toast.warning(t(denied ? 'stream.micDenied' : 'stream.micError'));
+            return;
+        }
+        await this._fillMicList(list);
+        try {
+            list.showPicker();
+        } catch (_e) {
+            /* no picker, or the gesture is spent: the list is there to open */
+        }
+    }
+
+    /** What the viewer just selected, kept. */
+    _takeMicChoice(list) {
+        const value = list.value;
+        this._micChosen = true;
+        this._micEnabled = value !== MIC_OFF;
+        if (value === MIC_OFF) return;
+        this._micDevice = value.startsWith(MIC_DEVICE_PREFIX)
+            ? {
+                  id: value.slice(MIC_DEVICE_PREFIX.length),
+                  label: list.selectedOptions[0]?.textContent || '',
+              }
+            : null;
+        saveMicDevice(this._micDevice);
     }
 
     /** Persist current internal state to localStorage (all clients)
@@ -509,6 +928,8 @@ export class SettingsView {
             mute_host_audio: this._muteHostAudio,
             seamless_switching: true,
             touch_sensitivity: this._touchSensitivity,
+            // Per device: it answers this device's mouse.
+            mouse_sensitivity: this._mouseSensitivity,
             touch_screen: this._touchScreen,
             tearing_enabled: this._tearing,
             // Marks the value above as a real choice rather than the old OFF
@@ -521,6 +942,11 @@ export class SettingsView {
             video_enhancement: this._videoEnhancement,
             video_enhancement_algo: this._videoEnhancementAlgo,
             // Per-device only (server ignores these unknown fields).
+            mic_enabled: this._micEnabled,
+            mic_chosen: this._micChosen,
+            mic_quality: this._micQuality,
+            quit_app_on_stop: this._quitAppOnStop,
+            fullscreen_on_start: this._fullscreenOnStart,
             power_save: this._powerSave,
             power_save_backup: this._powerSaveBackup,
             gamepad_profile: this._gamepadProfile,
@@ -530,9 +956,14 @@ export class SettingsView {
         // Persist to server when on localhost, so settings.json is updated
         // and all other clients get these defaults on first visit.
         const host = window.location.hostname;
-        if (host === 'localhost' || host === '127.0.0.1') {
+        if ((host === 'localhost' || host === '127.0.0.1') && !BackendClient.adminLocked) {
+            // PyroWave is a device's own choice (the one on Ethernet), never
+            // the codec every other browser starts with: the server's default
+            // keeps what it had.
+            const shared = { ...settings };
+            if (shared.video_codec === CODEC_PYROWAVE) delete shared.video_codec;
             try {
-                await BackendClient.saveStreamingSettings(settings);
+                await BackendClient.saveStreamingSettings(shared);
             } catch (err) {
                 console.warn('[Settings] Failed to save to server:', err);
             }
@@ -603,6 +1034,33 @@ export class SettingsView {
     }
 
     /**
+     * Whether a host this page knows codes PyroWave: the menu offers it only
+     * then. Unknown (null) when the list does not answer — the option stays
+     * open, and the launch asks Auto of a host that cannot.
+     */
+    async _loadPyrowaveHost() {
+        try {
+            const data = await BackendClient.getHosts();
+            this._pyrowaveHost = anyHostCodesPyrowave(data?.hosts);
+            this._updateHosts = (data?.hosts || []).map((h) => new Host(h));
+        } catch {
+            this._pyrowaveHost = null;
+        }
+    }
+
+    /**
+     * Why PyroWave cannot be chosen here ('transport' | 'browser' | 'hdr' |
+     * 'host'), or null when it can (util/PyrowaveCodec.js).
+     */
+    _pyrowaveBlocker() {
+        return pyrowaveBlocker({
+            hostCodes: this._pyrowaveHost,
+            hdr: this._hdrEnabled,
+            mediaTrackOnly: this._mediaTrackOnlyH264 || this._powerSave,
+        });
+    }
+
+    /**
      * Probe WebGPU usability for the Video Enhancement feature (consumed by the
      * UI graying in a later commit). Probes the adapter, NOT the device — the
      * device is created by the renderer at launch (Canvas2D fallback on failure).
@@ -624,17 +1082,31 @@ export class SettingsView {
      * 3. Fallback chain: h264 > hevc > av1
      *
      * Does NOT modify this._videoCodec (user preference remains in storage).
+     *
+     * PyroWave shows as itself where it can be chosen (_pyrowaveBlocker), and
+     * elsewhere as the codec its launch falls back to (util/PyrowaveCodec.js).
      */
     _getEffectiveCodec() {
         if (this._mediaTrackOnlyH264) return 'h264';
+        if (this._videoCodec === CODEC_AUTO) return CODEC_AUTO;
+        if (this._videoCodec === CODEC_PYROWAVE) {
+            return this._pyrowaveBlocker()
+                ? this._effectiveCodecFrom(PYROWAVE_FALLBACK)
+                : CODEC_PYROWAVE;
+        }
+        return this._effectiveCodecFrom(this._videoCodec);
+    }
+
+    /** The fallback chain above, from @p codec (one of the browser's three). */
+    _effectiveCodecFrom(codec) {
         // HDR has no H.264 path (H.264 HDR isn't decodable in practice): when HDR
         // is on, H.264 is excluded from selection / fallback entirely.
         const hdr = this._hdrEnabled;
         if (!this._codecSupport) {
-            return hdr && this._videoCodec === 'h264' ? 'hevc' : this._videoCodec;
+            return hdr && codec === 'h264' ? 'hevc' : codec;
         }
-        if (this._codecSupport[this._videoCodec] && !(hdr && this._videoCodec === 'h264')) {
-            return this._videoCodec;
+        if (this._codecSupport[codec] && !(hdr && codec === 'h264')) {
+            return codec;
         }
         if (hdr) {
             if (this._codecSupport.hevc) return 'hevc';
@@ -644,14 +1116,222 @@ export class SettingsView {
         if (this._codecSupport.h264) return 'h264';
         if (this._codecSupport.hevc) return 'hevc';
         if (this._codecSupport.av1) return 'av1';
-        return this._videoCodec;
+        return codec;
     }
 
     destroy() {
+        this._destroyed = true;
         if (this._saveTimer) {
             clearTimeout(this._saveTimer);
             this._saveTimer = null;
         }
+        if (this._updateRetryTimer) {
+            clearTimeout(this._updateRetryTimer);
+            this._updateRetryTimer = null;
+        }
+        if (this._unsubUpdate) this._unsubUpdate();
+        this._unsubUpdate = null;
+        this._stopPadWatch();
+    }
+
+    // --- Controllers ---
+    //
+    // Every pad plugged into this browser, how MoonlightWeb reads it, and the
+    // dialog to check or remap it. Mappings live in this browser only
+    // (gamepadMappingsStore), so the list also offers to forget the saved
+    // layouts of pads that are not plugged in right now.
+    //
+    // A wheel's, radio's or stick's row also has the HID passthrough's switch,
+    // « As itself »: on, the stream sends the real device to the host instead
+    // of an Xbox pad, when the host can (hid/HidPassthrough.js). The first
+    // click opens Chrome's chooser narrowed to that model; Chrome then keeps
+    // the permission of a device with a serial number, and the switch is a
+    // plain switch, kept in this browser. When no native host this page knows
+    // can take a device (a Mac, Windows without the driver, Sunshine only),
+    // switching it on explains why and what to do instead (HidHelpDialog).
+
+    _startPadWatch() {
+        if (this._padWatch || !navigator.getGamepads) return;
+        this._loadHidHelp();
+        const tick = () => {
+            this._renderPads();
+            this._refreshHid();
+        };
+        this._padWatch = { timer: setInterval(tick, 500), tick };
+        window.addEventListener('gamepadconnected', tick);
+        window.addEventListener('gamepaddisconnected', tick);
+        window.addEventListener(CHANGED_EVENT, tick);
+        tick();
+    }
+
+    _stopPadWatch() {
+        if (!this._padWatch) return;
+        clearInterval(this._padWatch.timer);
+        window.removeEventListener('gamepadconnected', this._padWatch.tick);
+        window.removeEventListener('gamepaddisconnected', this._padWatch.tick);
+        window.removeEventListener(CHANGED_EVENT, this._padWatch.tick);
+        this._padWatch = null;
+    }
+
+    _renderPads() {
+        const list = this.container.querySelector('.settings-pads');
+        if (!list) return;
+        const pads = connectedPads();
+        const saved = listMappings();
+        // HID passthrough: the devices this browser may open, and the switches.
+        const allowed = this._hidAllowed || new Map();
+        const wanted = navigator.hid ? loadForwarded() : new Set();
+        const hidModel = (key, kind) => {
+            const usb = navigator.hid && key.startsWith('usb:') ? key.slice(4) : null;
+            return usb && (HID_KINDS.includes(kind) || allowed.has(usb)) ? usb : null;
+        };
+        const rows = pads.map((gp) => {
+            const key = padKey(gp);
+            const res = resolvePad(gp);
+            return { gp, key, res, model: hidModel(key, res.kind) };
+        });
+        const present = new Set(rows.map((r) => r.key));
+        const absent = saved.filter((m) => !present.has(m.key));
+        // Allowed devices the Gamepad API does not show (yet: Chrome shows a
+        // pad once a button is pressed) keep their switch on a row of their own.
+        const hidOnly = Array.from(allowed).filter(([model]) => !present.has(`usb:${model}`));
+        const sig =
+            rows
+                .map((r) =>
+                    [r.key, r.res.source, r.res.kind, !!getMapping(r.key), r.model].join(':'),
+                )
+                .join('|') +
+            '#' +
+            absent.map((m) => m.key).join('|') +
+            '#' +
+            Array.from(allowed.keys()).join('|') +
+            '#' +
+            Array.from(wanted).join('|');
+        if (sig === this._padSig) return;
+        this._padSig = sig;
+
+        const btn = (cls, key, label) =>
+            `<button type="button" class="btn btn-secondary ${cls}" data-key="${escapeHtml(key)}">${escapeHtml(label)}</button>`;
+        const hidSwitch = (model) => `
+                    <label class="settings-pad-hid" title="${escapeHtml(t('settings.hidAsItselfDesc'))}">
+                        <input type="checkbox" class="settings-hid-toggle" data-model="${escapeHtml(model)}" ${allowed.has(model) && wanted.has(model) ? 'checked' : ''}>
+                        <span>${escapeHtml(t('settings.hidAsItself'))}</span>
+                    </label>`;
+        let html = rows.length
+            ? rows
+                  .map(
+                      ({ gp, key, res, model }) => `
+                <div class="settings-pad">
+                    <span class="settings-pad-kind" title="${escapeHtml(t(`gamepad.remap.kind.${res.kind}`))}">${kindIconSvg(res.kind)}</span>
+                    <span class="settings-pad-name">${escapeHtml(padName(gp))}</span>
+                    ${res.kind === 'remote' ? '' : sourceBadge(res.source)}
+                    ${model ? hidSwitch(model) : ''}
+                    ${btn('settings-pad-test', key, t(res.kind === 'remote' ? 'settings.controllersRemote' : 'settings.controllersTest'))}
+                    ${getMapping(key) ? btn('settings-pad-reset', key, t('settings.controllersReset')) : ''}
+                </div>`,
+                  )
+                  .join('')
+            : hidOnly.length
+              ? ''
+              : `<p class="setting-desc">${escapeHtml(t('settings.controllersNone'))}</p>`;
+        html += hidOnly
+            .map(
+                ([model, name]) => `
+                <div class="settings-pad">
+                    <span class="settings-pad-name">${escapeHtml(name)}</span>
+                    ${hidSwitch(model)}
+                </div>`,
+            )
+            .join('');
+        if (absent.length) {
+            html += `<span class="setting-desc">${escapeHtml(t('settings.controllersSaved'))}</span>`;
+            html += absent
+                .map(
+                    (m) => `
+                <div class="settings-pad is-absent">
+                    <span class="settings-pad-name">${escapeHtml(m.name || m.key)}</span>
+                    ${sourceBadge('user')}
+                    ${btn('settings-pad-reset', m.key, t('settings.controllersDelete'))}
+                </div>`,
+                )
+                .join('');
+        }
+        list.innerHTML = html;
+        list.querySelectorAll('.settings-pad-test').forEach((b) =>
+            b.addEventListener('click', () =>
+                new GamepadRemapDialog({
+                    padKey: /** @type {HTMLElement} */ (b).dataset.key,
+                    mode: 'auto',
+                }).open(),
+            ),
+        );
+        list.querySelectorAll('.settings-pad-reset').forEach((b) =>
+            b.addEventListener('click', () =>
+                removeMapping(/** @type {HTMLElement} */ (b).dataset.key),
+            ),
+        );
+        list.querySelectorAll('.settings-hid-toggle').forEach((box) =>
+            box.addEventListener('change', () =>
+                this._toggleHid(/** @type {HTMLInputElement} */ (box)),
+            ),
+        );
+    }
+
+    /**
+     * The game devices this browser may open, by vid:pid (one entry for a
+     * device with several interfaces, like the G923's vendor one); the rows
+     * follow when it changes.
+     */
+    async _refreshHid() {
+        if (!navigator.hid) return;
+        let devices = [];
+        try {
+            devices = (await navigator.hid.getDevices()).filter((d) => isGameDevice(d.collections));
+        } catch {
+            devices = [];
+        }
+        const next = new Map();
+        for (const d of devices)
+            if (!next.has(deviceKey(d))) next.set(deviceKey(d), d.productName || deviceKey(d));
+        const sig = Array.from(next.keys()).sort().join('|');
+        if (sig === this._hidSig) return;
+        this._hidSig = sig;
+        this._hidAllowed = next;
+        this._renderPads();
+    }
+
+    /** Whether this page's hosts can take a device as itself (hidHelpFor). */
+    async _loadHidHelp() {
+        if (!navigator.hid) return;
+        try {
+            const data = await BackendClient.getHosts();
+            this._hidHelp = hidHelpFor(data?.hosts);
+        } catch {
+            this._hidHelp = null; // unknown: the switch works, the stream decides
+        }
+    }
+
+    /** « As itself » clicked: the chooser the first time, a plain switch after. */
+    async _toggleHid(box) {
+        const model = box.dataset.model;
+        if (box.checked && this._hidHelp) {
+            box.checked = false;
+            openHidHelp(this._hidHelp);
+            return;
+        }
+        if (box.checked && !this._hidAllowed?.has(model)) {
+            const [vid, pid] = model.split(':').map((h) => parseInt(h, 16));
+            // Still inside the click: Chrome opens its chooser only then.
+            const chosen = await linkModel(navigator.hid, vid, pid);
+            if (!chosen.length) box.checked = false;
+            await this._refreshHid();
+            return;
+        }
+        const keys = loadForwarded();
+        if (box.checked) keys.add(model);
+        else keys.delete(model);
+        saveForwarded(keys);
+        this._renderPads();
     }
 
     // --- Auto-save ---
@@ -664,10 +1344,12 @@ export class SettingsView {
         this._saveTimer = setTimeout(async () => {
             this._saveTimer = null;
 
-            // When MediaTrack transport is forced, only H.264 is available
-            const codec = this._mediaTrackOnlyH264
-                ? 'h264'
-                : this.container.querySelector('#settings-video-codec')?.value || this._videoCodec;
+            // When MediaTrack transport is forced, only H.264 is available.
+            // Otherwise the preference, set when the menu changes: the menu
+            // itself shows the effective codec, and reading it back here would
+            // put a PyroWave chosen for another host, or an AV1 this browser
+            // cannot decode, away at the next change of anything else.
+            const codec = this._mediaTrackOnlyH264 ? 'h264' : this._videoCodec;
             const gamingMode =
                 this.container.querySelector('#settings-gaming-mode')?.checked ?? this._gamingMode;
             const showPerf =
@@ -694,6 +1376,10 @@ export class SettingsView {
                 this.container.querySelector('#settings-sensitivity')?.value,
             );
             const sensitivity = isNaN(sensRaw) ? this._touchSensitivity : sensRaw;
+            const mouseSensRaw = parseFloat(
+                this.container.querySelector('#settings-mouse-sensitivity')?.value,
+            );
+            const mouseSensitivity = isNaN(mouseSensRaw) ? this._mouseSensitivity : mouseSensRaw;
             const touchScreen =
                 this.container.querySelector('#settings-touch-screen')?.checked ??
                 this._touchScreen;
@@ -731,6 +1417,7 @@ export class SettingsView {
             this._hdrEnabled = hdr;
             this._chroma444 = chroma444;
             this._touchSensitivity = sensitivity;
+            this._mouseSensitivity = mouseSensitivity;
             this._touchScreen = touchScreen;
             this._tearing = tearing;
             this._videoWorker = videoWorker;
@@ -747,7 +1434,7 @@ export class SettingsView {
 
     /** Reset all streaming preferences to their default values. */
     async _resetDefaults() {
-        this._videoCodec = 'hevc';
+        this._videoCodec = CODEC_AUTO;
         // Default preset leaves mouse gaming mode OFF (opt-in per user request).
         this._gamingMode = false;
         this._showPerformanceStats = false;
@@ -761,7 +1448,15 @@ export class SettingsView {
         this._hdrEnabled = false;
         this._chroma444 = false;
         this._muteHostAudio = true;
+        this._micEnabled = true;
+        this._micChosen = false;
+        this._micDevice = null;
+        saveMicDevice(null);
+        this._micQuality = 'voice';
+        this._quitAppOnStop = false;
+        this._fullscreenOnStart = false;
         this._touchSensitivity = 2.2;
+        this._mouseSensitivity = 1;
         this._touchScreen = false;
         this._tearing = SUPPORTS_CANVAS_TEARING;
         this._videoWorker = 'auto';
@@ -922,18 +1617,37 @@ export class SettingsView {
         const tearingLocked = tearingUnavailable ? ' settings-field-locked' : psLocked;
         const tearingChecked = this._tearing && !tearingUnavailable ? 'checked' : '';
 
-        // Codec options (explicit, no "Auto")
+        // Codec options (explicit, no "Auto"). PyroWave last, for a device on
+        // Ethernet: greyed out like an AV1 this browser cannot decode when no
+        // host here codes it, this browser cannot decode it, HDR is ticked or
+        // the transport is the <video> one — the option's title and, chosen,
+        // the note under the menu say which (util/PyrowaveCodec.js).
+        // Auto first, the default (util/CodecAuto.js): this browser's decoders
+        // never grey it out, it picks among them at the launch.
         const codecs = [
+            { value: CODEC_AUTO, label: t('settings.codecAuto') },
             { value: 'h264', label: t('settings.codecH264') },
             { value: 'hevc', label: t('settings.codecHevc') },
             { value: 'av1', label: t('settings.codecAv1') },
         ];
         const effectiveCodec = this._getEffectiveCodec();
+        const pyrowaveBlocked = this._pyrowaveBlocker();
+        const pyrowaveWhy = pyrowaveBlocked ? t(PYROWAVE_REASON_KEYS[pyrowaveBlocked]) : '';
+        const pyrowaveLabel = !pyrowaveBlocked
+            ? t('settings.codecPyrowave')
+            : pyrowaveBlocked === 'hdr'
+              ? t('settings.codecHdrUnavailable', { codec: 'PyroWave' })
+              : t('settings.codecUnavailable', { codec: 'PyroWave' });
+        const pyrowaveOption =
+            `<option value="${CODEC_PYROWAVE}"` +
+            (effectiveCodec === CODEC_PYROWAVE ? ' selected' : '') +
+            (pyrowaveBlocked ? ` disabled title="${this.esc(pyrowaveWhy)}"` : '') +
+            `>${this.esc(pyrowaveLabel)}</option>`;
         const codecOptions = codecs
             .map((c) => {
-                const browserDisabled = this._codecSupport && !this._codecSupport[c.value];
-                const mediaTrackDisabled =
-                    this._mediaTrackOnlyH264 && (c.value === 'hevc' || c.value === 'av1');
+                const browserDisabled =
+                    c.value !== CODEC_AUTO && this._codecSupport && !this._codecSupport[c.value];
+                const mediaTrackDisabled = this._mediaTrackOnlyH264 && c.value !== 'h264';
                 // H.264 has no usable HDR path: disable it while HDR is enabled.
                 const hdrDisabledCodec = this._hdrEnabled && c.value === 'h264';
                 const disabled = browserDisabled || mediaTrackDisabled || hdrDisabledCodec;
@@ -956,7 +1670,18 @@ export class SettingsView {
             this._codecSupport[this._videoCodec] === false &&
             effectiveCodec !== this._videoCodec;
         let codecHintHtml = '';
-        if (codecChanged) {
+        if (this._videoCodec === CODEC_PYROWAVE && !this._mediaTrackOnlyH264) {
+            // Chosen: what it asks of the network, or why it cannot run here
+            // and what streams instead.
+            codecHintHtml = `<div class="settings-note">${this.esc(
+                pyrowaveBlocked
+                    ? t('settings.codecPyrowaveFallback', {
+                          reason: pyrowaveWhy,
+                          effective: effectiveCodec.toUpperCase(),
+                      })
+                    : t('settings.codecPyrowaveNote'),
+            )}</div>`;
+        } else if (codecChanged) {
             codecHintHtml = `<div class="settings-note">
                 ${this.esc(
                     t('settings.codecFallback', {
@@ -1007,7 +1732,9 @@ export class SettingsView {
         const sizeText = device ? device.width + '×' + device.height : '?';
         const resolutionDesc =
             resolutionMode === 'auto'
-                ? t('settings.resolutionAutoDesc', { size: sizeText })
+                ? t(IS_TV ? 'settings.resolutionAutoDescTv' : 'settings.resolutionAutoDesc', {
+                      size: sizeText,
+                  })
                 : resolutionMode === 'device'
                   ? t('settings.resolutionDeviceDesc', { size: sizeText })
                   : resolutionMode === 'custom'
@@ -1060,18 +1787,9 @@ export class SettingsView {
         // FPS options. Auto first and default: the rate this very screen
         // refreshes at, which is also what the native host's virtual display
         // is created at — one streamed frame per refresh, neither judder nor
-        // frames encoded for nothing. Its label names the rate Auto will ask
-        // for when there is a measurement, and says so plainly when the panel
-        // runs faster than Auto's ceiling: a 165 Hz screen reading "Auto
-        // (165 FPS)" and then streaming 120 would be a label that lies, and
-        // the 165 rung right below it is there for whoever wants it.
-        const measured = autoFps();
-        const panel = measuredFps();
-        const autoLabel = !measured
-            ? t('settings.fpsAuto')
-            : panel > measured
-              ? t('settings.fpsAutoCapped', { fps: measured, screen: panel })
-              : t('settings.fpsAutoMeasured', { fps: measured });
+        // frames encoded for nothing. Its label names the rate Auto will
+        // stream at when there is a measurement (_autoFpsLabel).
+        const autoLabel = this._autoFpsLabel();
         const fpsValues = [15, 30, 60, 75, 90, 120, 144, 165, 240];
         const fpsOptions = [
             `<option value="0" ${this._streamFps > 0 ? '' : 'selected'}>${this.esc(autoLabel)}</option>`,
@@ -1112,7 +1830,18 @@ export class SettingsView {
         // IS the behaviour: a visible switch would turn "we guessed your pad
         // wrong" into a question the user has no way to answer. In debug it is
         // the only way to tell a detection bug from a mapping bug.
-        const gamepadProfileHtml = this._debugBuild
+        // Hidden in debug too (13/10): nobody needed it since September. Kept
+        // behind localStorage mw_gamepad_profile_menu = '1'; while hidden, the
+        // profile stays 'auto' so a forced pad cannot outlive its menu.
+        let showGamepadProfile = false;
+        try {
+            showGamepadProfile =
+                this._debugBuild && localStorage.getItem('mw_gamepad_profile_menu') === '1';
+        } catch {
+            showGamepadProfile = false;
+        }
+        if (!showGamepadProfile) this._gamepadProfile = 'auto';
+        const gamepadProfileHtml = showGamepadProfile
             ? `
                     <div class="settings-field">
                         <label class="settings-label" for="settings-gamepad-profile">
@@ -1223,6 +1952,10 @@ export class SettingsView {
                             <span>1 Mbps</span>
                             <span>150 Mbps</span>
                         </div>
+                        <button type="button" id="settings-bitrate-back-to-auto"
+                                class="btn btn-secondary btn-small"${this._bitrateAuto ? ' hidden' : ''}>
+                            ${t('settings.bitrateBackToAuto')}
+                        </button>
                     </div>
                 </div>
 
@@ -1250,7 +1983,7 @@ export class SettingsView {
                         </label>
                         <span class="setting-desc">${t('settings.videoCodecDesc')}</span>
                         <select id="settings-video-codec" class="settings-select"${psDisabled}>
-                            ${codecOptions}
+                            ${codecOptions}${pyrowaveOption}
                         </select>
                         ${codecHintHtml}
                     </div>
@@ -1264,6 +1997,51 @@ export class SettingsView {
                             </span>
                         </label>
                         <span class="setting-desc">${t('settings.muteHostDesc')}</span>
+                    </div>
+
+                    <div class="settings-field${micSupported() ? '' : ' settings-field-locked'}">
+                        <label class="settings-label" for="settings-mic-device">
+                            ${t('settings.micDevice')}
+                        </label>
+                        <span class="setting-desc">${t(
+                            micSupported() ? 'settings.micDeviceDesc' : 'settings.micUnsupported',
+                        )}</span>
+                        <select id="settings-mic-device" class="settings-select"
+                                ${micSupported() ? '' : 'disabled'}>
+                            ${this._micListHtml([])}
+                        </select>
+                        <select id="settings-mic-quality" class="settings-select u-mt-2"
+                                aria-label="${t('settings.micQuality')}"
+                                ${this._micEnabled && micSupported() ? '' : 'disabled'}>
+                            <option value="voice" ${this._micQuality === 'voice' ? 'selected' : ''}>
+                                ${t('settings.micQualityVoice')}
+                            </option>
+                            <option value="clean" ${this._micQuality === 'clean' ? 'selected' : ''}>
+                                ${t('settings.micQualityClean')}
+                            </option>
+                        </select>
+                    </div>
+
+                    <div class="settings-field">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="settings-quit-app-on-stop"
+                                ${this._quitAppOnStop ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">
+                                <strong>${t('settings.quitAppOnStop')}</strong>
+                            </span>
+                        </label>
+                        <span class="setting-desc">${t('settings.quitAppOnStopDesc')}</span>
+                    </div>
+
+                    <div class="settings-field">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="settings-fullscreen-on-start"
+                                ${this._fullscreenOnStart ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">
+                                <strong>${t('settings.fullscreenOnStart')}</strong>
+                            </span>
+                        </label>
+                        <span class="setting-desc">${t('settings.fullscreenOnStartDesc')}</span>
                     </div>
 
                     <!-- Allow tearing: disables VSync pacing + desynchronized
@@ -1295,7 +2073,7 @@ export class SettingsView {
                     ${gamepadProfileHtml}
 
                     ${
-                        IS_TOUCH_DEVICE
+                        !supportsGamingMode()
                             ? ''
                             : `
                     <div class="settings-field">
@@ -1307,6 +2085,21 @@ export class SettingsView {
                             </span>
                         </label>
                         <span class="setting-desc">${t('settings.gamingModeDesc')}</span>
+                    </div>
+
+                    <div class="settings-field">
+                        <label class="settings-label" for="settings-mouse-sensitivity">
+                            ${t('settings.mouseSensitivity')} <strong id="settings-mouse-sensitivity-value">${this._mouseSensitivity.toFixed(2)}</strong>×
+                        </label>
+                        <span class="setting-desc">${t('settings.mouseSensitivityDesc')}</span>
+                        <input type="range" id="settings-mouse-sensitivity"
+                               class="settings-slider"
+                               min="0.25" max="4" step="0.05"
+                               value="${this._mouseSensitivity}" />
+                        <div class="settings-slider-labels">
+                            <span>0.25×</span>
+                            <span>4×</span>
+                        </div>
                     </div>`
                     }
 
@@ -1322,12 +2115,13 @@ export class SettingsView {
                         <span class="setting-desc">Decodes &amp; renders video off the UI thread (OffscreenCanvas). <strong>Auto</strong> keeps it off: measured slower on macOS (22 ms) and no faster elsewhere. Falls back automatically if unsupported. DataChannel/WSS transports only.</span>
                     </div>
 
-                    <!-- Finger input, mobile/tablet only. A touchscreen laptop is
-                         driven by its trackpad or a mouse: both settings only act on
-                         the touch path (StreamViewTouch), so neither is offered
-                         there — gate on the platform type, not on IS_TOUCH_DEVICE. -->
+                    <!-- Finger input: on whatever has a touch screen, a touchscreen
+                         PC included. Its fingers go through the same touch path
+                         (StreamViewTouch) as a tablet's, and a Surface asked for
+                         both modes, mouse and finger (issue #46). Not on a TV,
+                         whose user agent reads like a phone's (IS_TOUCH_DEVICE). -->
                     ${
-                        IS_MOBILE_OR_TABLET
+                        IS_TOUCH_DEVICE
                             ? `
                     <div class="settings-field">
                         <label class="settings-checkbox-label">
@@ -1403,12 +2197,30 @@ export class SettingsView {
                         : ''
                 }
 
+                <!-- ── Controllers ─────────────────────────────────────────── -->
+                <!-- Per browser: a layout belongs to the pad in this hand, not
+                     to the machine, so nothing here is saved to the server. -->
+                <div class="settings-section settings-section-controllers">
+                    <h3 class="settings-section-title">${t('settings.controllers')}</h3>
+                    <span class="setting-desc">${t('settings.controllersDesc')}</span>
+                    <div class="settings-pads"></div>
+                    <!-- The HID passthrough's switch sits on each wheel's,
+                         radio's or stick's row; WebHID only (Chrome, Edge). -->
+                    ${navigator.hid ? `<span class="setting-desc">${t('settings.hidDesc')}</span>` : ''}
+                </div>
+
                 <!-- ── Privacy ─────────────────────────────────────────────── -->
                 <!-- Here rather than in Admin: it concerns everyone who streams
                      through this machine, and Admin is a door most users never
                      open. The switch is still the owner's alone — shown to all,
                      operable from the machine itself. -->
                 ${this._renderPrivacySection()}
+
+                <!-- ── Update ──────────────────────────────────────────────── -->
+                ${this._renderUpdateSection()}
+
+                <!-- ── Buy me a coffee ─────────────────────────────────────── -->
+                ${this._renderSupportSection()}
 
                 <!-- ── Reset ───────────────────────────────────────────────── -->
                 <div class="settings-section">
@@ -1464,6 +2276,13 @@ export class SettingsView {
                 sensLabel.textContent = parseFloat(sensSlider.value).toFixed(1);
             });
         }
+        const mouseSlider = this.container.querySelector('#settings-mouse-sensitivity');
+        const mouseLabel = this.container.querySelector('#settings-mouse-sensitivity-value');
+        if (mouseSlider && mouseLabel) {
+            mouseSlider.addEventListener('input', () => {
+                mouseLabel.textContent = parseFloat(mouseSlider.value).toFixed(2);
+            });
+        }
     }
 
     /**
@@ -1477,6 +2296,7 @@ export class SettingsView {
             touch: IS_TOUCH_DEVICE,
             touchScreen: this._touchScreen,
             isMac: /Mac/.test(navigator.platform),
+            remote: RemoteNav.isActive(),
         };
     }
 
@@ -1492,14 +2312,49 @@ export class SettingsView {
     }
 
     bindEvents() {
+        // Update: the section's body is repainted as the run goes, so the
+        // button is reached through its section rather than bound itself.
+        const updateSection = this.container.querySelector('#settings-section-update');
+        if (updateSection) {
+            updateSection.addEventListener('click', (e) => {
+                if (/** @type {Element} */ (e.target).closest('.settings-update-apply')) {
+                    hostUpdate.start(this._updateInfo);
+                }
+            });
+        }
+
+        // Controllers: the list follows what is plugged in.
+        this._padSig = '';
+        this._startPadWatch();
+        this._hidSig = null;
+        this._renderPads();
+        this._refreshHid();
+
         // Anonymous statistics: consent given, or withdrawn, on the spot.
         const statsChk = this.container.querySelector('#settings-stats-consent');
         if (statsChk) {
             statsChk.addEventListener('change', () => this._setStatsConsent(statsChk));
         }
 
+        // Buy me a coffee: the link opens its own tab by itself (a plain link);
+        // the switch hides the button everywhere, or brings it back.
+        const supportChk = /** @type {HTMLInputElement|null} */ (
+            this.container.querySelector('#settings-support-hidden')
+        );
+        if (supportChk)
+            supportChk.addEventListener('change', () => setSupportHidden(supportChk.checked));
+
+        // A codec picked is the preference at once (the menu shows only the
+        // effective one, see _getEffectiveCodec); re-rendered for the note
+        // under it, which PyroWave fills.
         const codecSelect = this.container.querySelector('#settings-video-codec');
-        if (codecSelect) codecSelect.addEventListener('change', () => this._autoSave());
+        if (codecSelect)
+            codecSelect.addEventListener('change', () => {
+                this._videoCodec = codecSelect.value;
+                this.render();
+                this.bindEvents();
+                this._autoSave();
+            });
 
         // Resolution / FPS / HDR changes recompute the recommended bitrate
         // from the 1080p60 SDR reference before saving.
@@ -1510,6 +2365,7 @@ export class SettingsView {
                 // Auto with it (the debug-only dropdown follows on re-render).
                 this._streamAspect = 'auto';
                 this._applyAutoBitrate();
+                this._syncAutoFpsLabel();
                 const choice = this._readResolutionChoice();
                 const custom = choice.mode === 'custom';
                 const showing = !!this.container.querySelector('#settings-custom-width');
@@ -1533,6 +2389,7 @@ export class SettingsView {
                 const fallback = id.endsWith('width') ? this._customWidth : this._customHeight;
                 input.value = String(clampCustomSize(input.value, fallback) & ~1);
                 this._applyAutoBitrate();
+                this._syncAutoFpsLabel();
                 this._autoSave();
             });
         }
@@ -1544,6 +2401,7 @@ export class SettingsView {
             aspectSelect.addEventListener('change', () => {
                 this._streamAspect = aspectSelect.value;
                 this._applyAutoBitrate();
+                this._syncAutoFpsLabel();
                 this._autoSave();
             });
 
@@ -1573,10 +2431,49 @@ export class SettingsView {
                 this._autoSave();
             });
 
+        const quitAppCheck = this.container.querySelector('#settings-quit-app-on-stop');
+        if (quitAppCheck)
+            quitAppCheck.addEventListener('change', () => {
+                this._quitAppOnStop = quitAppCheck.checked;
+                this._autoSave();
+            });
+
+        const fullscreenCheck = this.container.querySelector('#settings-fullscreen-on-start');
+        if (fullscreenCheck)
+            fullscreenCheck.addEventListener('change', () => {
+                this._fullscreenOnStart = fullscreenCheck.checked;
+                this._autoSave();
+            });
+
         const muteHostCheck = this.container.querySelector('#settings-mute-host');
         if (muteHostCheck)
             muteHostCheck.addEventListener('change', () => {
                 this._muteHostAudio = muteHostCheck.checked;
+                this._autoSave();
+            });
+
+        const micList = /** @type {HTMLSelectElement|null} */ (
+            this.container.querySelector('#settings-mic-device')
+        );
+        const micQuality = /** @type {HTMLSelectElement|null} */ (
+            this.container.querySelector('#settings-mic-quality')
+        );
+        if (micList && !micList.disabled) {
+            micList.addEventListener('change', () => {
+                if (micList.value === MIC_PICK) {
+                    this._askMicNames(micList);
+                    return;
+                }
+                this._takeMicChoice(micList);
+                if (micQuality) micQuality.disabled = !this._micEnabled;
+                this._autoSave();
+            });
+            // Names already allowed on this site show without a prompt.
+            this._fillMicList(micList);
+        }
+        if (micQuality)
+            micQuality.addEventListener('change', () => {
+                this._micQuality = micQuality.value === 'clean' ? 'clean' : 'voice';
                 this._autoSave();
             });
 
@@ -1590,6 +2487,17 @@ export class SettingsView {
                 this._bitrateAuto = !isNaN(value) && value === this._estimateBitrate();
                 this._syncBitrateMark();
                 this._autoSave();
+            });
+
+        const bitrateBack = this.container.querySelector('#settings-bitrate-back-to-auto');
+        if (bitrateBack)
+            bitrateBack.addEventListener('click', () => {
+                this._bitrateAuto = true;
+                this._applyAutoBitrate();
+                this._syncBitrateMark();
+                this._autoSave();
+                // The button just hid itself: the focus goes to the slider.
+                if (bitrateSlider) bitrateSlider.focus();
             });
 
         const gamingCheck = this.container.querySelector('#settings-gaming-mode');
@@ -1626,6 +2534,8 @@ export class SettingsView {
 
         const sensSlider = this.container.querySelector('#settings-sensitivity');
         if (sensSlider) sensSlider.addEventListener('change', () => this._autoSave());
+        const mouseSensSlider = this.container.querySelector('#settings-mouse-sensitivity');
+        if (mouseSensSlider) mouseSensSlider.addEventListener('change', () => this._autoSave());
 
         // Language selector — changing it persists the choice and reloads.
         const langSelect = this.container.querySelector('#settings-language');
@@ -1656,7 +2566,7 @@ export class SettingsView {
      * through _checkAuth(), which now finds no session.
      */
     async _logout(btn) {
-        if (!window.confirm(t('settings.logoutConfirm'))) return;
+        if (!(await confirmAction(t('settings.logoutConfirm')))) return;
 
         btn.disabled = true;
         try {

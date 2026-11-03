@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  MoonlightWeb updates itself from the web UI. The user of the active local
+  session may run the update helper through pkexec without a password; anyone
+  else (a remote SSH session, an inactive seat) still has to authenticate.
+  Safe to waive because the helper takes no argument: it only upgrades the
+  moonlightweb package from its own signed repository. See moonlightweb-update.
+-->
+<policyconfig>
+  <vendor>MoonlightWeb</vendor>
+  <vendor_url>https://moonlightweb.top/</vendor_url>
+  <action id="top.moonlightweb.update">
+    <description>Update MoonlightWeb</description>
+    <message>Authentication is required to update MoonlightWeb</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/opt/moonlightweb/bin/moonlightweb-update</annotate>
+  </action>
+</policyconfig>

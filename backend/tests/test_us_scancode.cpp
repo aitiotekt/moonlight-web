@@ -18,6 +18,7 @@ void run_us_scancode_tests()
 {
     SECTION("UsScanCode");
 
+    using mw::native::input::isExtendedKey;
     using mw::native::input::usScanCode;
 
     // The top letter row, left to right: QWERTY spells itself out.
@@ -78,9 +79,12 @@ void run_us_scancode_tests()
     CHECK_EQ(usScanCode(0xA5), 0xE038u); // VK_RMENU   → AltGr
     CHECK_EQ(usScanCode(0x5B), 0xE05Bu); // VK_LWIN
 
-    // NumLock's own make code is NOT extended — the flag is added downstream so
-    // Windows does not read a bare 0x45 as Pause.
+    // NumLock is a bare 0x45, as a keyboard sends it, and nothing adds the
+    // prefix downstream: injected as 0xE0 0x45, Windows read it as no key at
+    // all, and the host's NumLock never followed the client's (25/10/2026).
     CHECK_EQ(usScanCode(0x90), 0x0045u);
+    CHECK(!isExtendedKey(0x90));
+    CHECK(isExtendedKey(0x6F)); // VK_DIVIDE keeps it
 
     // Pause is refused on purpose: its make code is a three-byte sequence no
     // single INPUT can carry, so it has to go out as a virtual key instead.

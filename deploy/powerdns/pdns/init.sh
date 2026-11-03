@@ -6,6 +6,7 @@
 #
 #   MW_DOMAIN          parent zone (e.g. example.top)              [required]
 #   MW_PUBLIC_IP       public IPv4 of this DNS box                 [required]
+#   MW_PUBLIC_IP6      public IPv6 of this DNS box                 [optional]
 #   PDNS_AUTH_API_KEY  REST API key (set via MW_PDNS_API_KEY in
 #                      .env; consumed by the official wrapper)     [required]
 set -eu
@@ -38,6 +39,7 @@ if ! $PDNSUTIL list-all-zones 2>/dev/null | grep -qx "$MW_DOMAIN"; then
     $PDNSUTIL add-record "$MW_DOMAIN" api A  "$MW_PUBLIC_IP"
     $PDNSUTIL add-record "$MW_DOMAIN" dnsapi A "$MW_PUBLIC_IP"
     $PDNSUTIL add-record "$MW_DOMAIN" updates A "$MW_PUBLIC_IP"
+    $PDNSUTIL add-record "$MW_DOMAIN" metrics A "$MW_PUBLIC_IP"
     $PDNSUTIL add-record "$MW_DOMAIN" @   NS "ns1.${MW_DOMAIN}."
     $PDNSUTIL add-record "$MW_DOMAIN" @   NS "ns2.${MW_DOMAIN}."
     $PDNSUTIL secure-zone "$MW_DOMAIN"
@@ -68,13 +70,60 @@ ensure_a api    # api    — PowerDNS REST API (direct, compatibility)
 ensure_a dnsapi # dnsapi — restricted DNS-registration API (mw-proxy, 0.2.0+)
 ensure_a stats  # stats  — Umami analytics dashboard
 ensure_a updates # updates — update relay / version census (mw-proxy, 0.3.0+)
-# No `metrics` record: the session census is off until someone turns it on, and
-# it takes BOTH this record and a site block in the Caddyfile (README).
+ensure_a metrics # metrics — session census (mw-proxy /v1/session, 0.3.0+). The
+                 # Caddyfile's site block needs this record first: Caddy orders a
+                 # certificate for every name it serves.
 ensure_a stream # stream — rendezvous host: bootstrap page + /v1 API (0.3.0+)
 # stream.dev — the staging rendezvous (docker-compose.dev.yml), same address:
 # production's Caddy fronts it. A label of its own so MW_DOMAIN=dev.{domain} on
 # a host moves rendezvous, STUN and the handed-out address together.
 ensure_a stream.dev
+
+# The same names over IPv6, once MW_PUBLIC_IP6 is set — plus ns1/ns2, which
+# also need an IPv6 glue at the registrar. Any AAAA already on a name counts,
+# so one added by hand during a name-by-name rollout is left alone. A refusal
+# only warns: this is optional, and failing here would take the DNS down.
+# Trimmed, because pdnsutil — unlike compose — chokes on a stray space.
+MW_PUBLIC_IP6="$(printf '%s' "${MW_PUBLIC_IP6:-}" | tr -d '[:space:]')"
+ensure_aaaa() {  # ensure_aaaa <name>  — add an AAAA record to MW_PUBLIC_IP6 if absent
+    name="$1"
+    fqdn="$( [ "$name" = "@" ] && echo "$MW_DOMAIN" || echo "${name}.${MW_DOMAIN}" )"
+    if ! $PDNSUTIL list-zone "$MW_DOMAIN" 2>/dev/null \
+         | grep -qiE "^${fqdn}\.?[[:space:]].*[[:space:]]AAAA[[:space:]]"; then
+        echo "[mw] Adding missing AAAA record ${fqdn} -> $MW_PUBLIC_IP6"
+        if $PDNSUTIL add-record "$MW_DOMAIN" "$name" AAAA "$MW_PUBLIC_IP6"; then
+            NEED_RECTIFY=1
+        else
+            echo "[mw] WARN could not add AAAA ${fqdn} -> $MW_PUBLIC_IP6 (check MW_PUBLIC_IP6)"
+        fi
+    fi
+}
+if [ -n "$MW_PUBLIC_IP6" ]; then
+    for n in @ www api dnsapi stats updates metrics stream stream.dev ns1 ns2; do
+        ensure_aaaa "$n"
+    done
+fi
+
+# The domain sends and receives no mail. Saying so in DNS keeps anyone from
+# sending phishing "from" it, which is how a clean domain lands on a domain
+# blocklist (Spamhaus DBL): an SPF that authorises no sender, a DMARC that has
+# receivers reject what fails it, and a null MX (RFC 7505). Each is added only
+# when its name carries nothing of the kind, so a fork that runs mail on its
+# domain keeps its own records — it just has to set them before first boot.
+ensure_rr() {  # ensure_rr <name> <type> <content-substring> <content>
+    name="$1"; type="$2"; match="$3"; content="$4"
+    fqdn="$( [ "$name" = "@" ] && echo "$MW_DOMAIN" || echo "${name}.${MW_DOMAIN}" )"
+    if ! $PDNSUTIL list-zone "$MW_DOMAIN" 2>/dev/null \
+         | grep -iE "^${fqdn}\.?[[:space:]].*[[:space:]]${type}[[:space:]]" \
+         | grep -qF -- "$match"; then
+        echo "[mw] Adding missing ${type} record ${fqdn} -> ${content}"
+        $PDNSUTIL add-record "$MW_DOMAIN" "$name" "$type" "$content"
+        NEED_RECTIFY=1
+    fi
+}
+ensure_rr @      TXT 'v=spf1'   '"v=spf1 -all"'
+ensure_rr _dmarc TXT 'v=DMARC1' '"v=DMARC1; p=reject"'
+ensure_rr @      MX  ''         '0 .'   # any MX at all counts: mail is set up
 
 # Zones created before default-soa-content was set (zz-mw.conf) carry the image
 # placeholder SOA ("a.misconfigured.dns.server.invalid"); swap in a real one.

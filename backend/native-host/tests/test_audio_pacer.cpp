@@ -18,6 +18,15 @@
 #include "audio/AudioPacer.h"
 #include "native_test_framework.h"
 
+#ifdef MW_NATIVE_TESTS_HAVE_OPUS
+#include "audio/OpusEncoder.h"
+
+#include <opus.h>
+
+#include <cstdint>
+#include <string>
+#endif
+
 #include <vector>
 
 using mw::native::audio::AudioPacer;
@@ -113,6 +122,16 @@ void run_audio_pacer_tests()
         CHECK(allEqual(out, 3.0f));
     }
 
+    SECTION("AudioPacer::peakOf — the largest absolute sample, a negative one included");
+    {
+        std::vector<float> frame(AudioPacer::kFrameFloats, 0.0f);
+        CHECK_EQ(AudioPacer::peakOf(frame.data()), 0.0f);
+        frame[3] = 0.25f;
+        frame[AudioPacer::kFrameFloats - 1] = -0.5f; // the last float counts
+        CHECK_EQ(AudioPacer::peakOf(frame.data()), 0.5f);
+        CHECK_EQ(AudioPacer::peakOf(nullptr), 0.0f);
+    }
+
     SECTION("AudioPacer — silence pushed by the endpoint is queued like any sample");
     {
         AudioPacer pacer(4);
@@ -147,6 +166,26 @@ void run_audio_pacer_tests()
         CHECK(pacer.take(out.data(), 15'500) == AudioPacer::Take::Frame);
         CHECK(allEqual(out, 0.3f));
         CHECK_EQ(pacer.nextDueUs(), int64_t(15'000));
+    }
+
+    SECTION("AudioPacer — another grace than two periods (audiograce= on Windows)");
+    {
+        AudioPacer pacer(8);
+        CHECK_EQ(pacer.underrunGraceUs(), int64_t(10'000));
+        pacer.setUnderrunGraceUs(2'500);
+        CHECK_EQ(pacer.underrunGraceUs(), int64_t(2'500));
+        pacer.start(0);
+        std::vector<float> out(AudioPacer::kFrameFloats);
+        // Owed at 5 ms: waits until 7.5 ms, not 15.
+        CHECK(pacer.take(out.data(), 7'499) == AudioPacer::Take::Deferred);
+        CHECK(pacer.take(out.data(), 7'500) == AudioPacer::Take::Silence);
+        // The partial frame does not count as a frame, but is held all the same.
+        std::vector<float> half = tone(100, 0.2f);
+        pacer.push(half.data(), 100);
+        CHECK_EQ(pacer.queuedFrames(), size_t(0));
+        CHECK_EQ(pacer.queuedSamples(), size_t(100));
+        pacer.setUnderrunGraceUs(-1);
+        CHECK_EQ(pacer.underrunGraceUs(), int64_t(10'000));
     }
 
     SECTION("AudioPacer — 20 ms bursts with 9 ms of jitter: no silence, no drop (the macOS case)");
@@ -200,4 +239,91 @@ void run_audio_pacer_tests()
         CHECK_EQ(pacer.dueFrames(1'004'000), 0);
         CHECK_EQ(pacer.dueFrames(1'005'000), 1);
     }
+
+    // `audioframe=10|20` (plan audio + DSCP, A3 L2): the same pacer, a longer
+    // frame — its period, its size, its grace and its cap all follow.
+    SECTION("AudioPacer — 20 ms frames: one due every 20 ms, 960 samples each, in order");
+    {
+        AudioPacer pacer(2, 960);
+        CHECK_EQ(pacer.frameSamples(), 960);
+        CHECK_EQ(pacer.frameFloats(), size_t(1920));
+        CHECK_EQ(pacer.framePeriodUs(), int64_t(20'000));
+        CHECK_EQ(pacer.underrunGraceUs(), int64_t(40'000));
+        pacer.start(0);
+        CHECK_EQ(pacer.dueFrames(19'999), 0);
+        CHECK_EQ(pacer.dueFrames(20'000), 1);
+        // Two 10 ms WASAPI bursts make one frame.
+        std::vector<float> a = tone(480, 0.25f);
+        pacer.push(a.data(), 480);
+        CHECK_EQ(pacer.queuedFrames(), size_t(0));
+        pacer.push(a.data(), 480);
+        CHECK_EQ(pacer.queuedFrames(), size_t(1));
+        std::vector<float> out(pacer.frameFloats());
+        CHECK(pacer.pop(out.data()));
+        CHECK(allEqual(out, 0.25f));
+        CHECK_EQ(pacer.nextDueUs(), int64_t(40'000));
+        // The cap counts these frames: two of them, 40 ms.
+        std::vector<float> one = tone(960, 1.0f), two = tone(960, 2.0f), three = tone(960, 3.0f);
+        pacer.push(one.data(), 960);
+        pacer.push(two.data(), 960);
+        pacer.push(three.data(), 960);
+        CHECK_EQ(pacer.queuedFrames(), size_t(2));
+        CHECK_EQ(pacer.droppedFrames(), int64_t(1));
+        CHECK(pacer.pop(out.data()));
+        CHECK(allEqual(out, 2.0f));
+        // The grace is two of these periods.
+        AudioPacer late(2, 960);
+        late.start(0);
+        std::vector<float> o(late.frameFloats());
+        CHECK(late.take(o.data(), 20'000 + 39'999) == AudioPacer::Take::Deferred);
+        CHECK(late.take(o.data(), 20'000 + 40'000) == AudioPacer::Take::Silence);
+    }
+
+    SECTION("AudioPacer — 10 ms frames; a frame size Opus cannot take falls back to 5 ms");
+    {
+        AudioPacer ten(4, 480);
+        CHECK_EQ(ten.framePeriodUs(), int64_t(10'000));
+        ten.start(0);
+        CHECK_EQ(ten.dueFrames(25'000), 2);
+        AudioPacer odd(4, 300);
+        CHECK_EQ(odd.frameSamples(), 240);
+        CHECK_EQ(odd.framePeriodUs(), int64_t(5'000));
+        CHECK(AudioPacer::isFrameSamples(960));
+        CHECK(!AudioPacer::isFrameSamples(120));
+        // peakOf reads a longer frame to its end when told its size.
+        std::vector<float> f(1920, 0.0f);
+        f[1919] = -0.75f;
+        CHECK_EQ(AudioPacer::peakOf(f.data()), 0.0f); // a 5 ms frame's worth only
+        CHECK_EQ(AudioPacer::peakOf(f.data(), f.size()), 0.75f);
+    }
+
+#ifdef MW_NATIVE_TESTS_HAVE_OPUS
+    SECTION("OpusEncoder — 5, 10 and 20 ms frames decode to as many samples; others refused");
+    {
+        int decodeErr = 0;
+        OpusDecoder* dec = opus_decoder_create(48000, 2, &decodeErr);
+        CHECK(dec != nullptr);
+        for (int samples : {240, 480, 960}) {
+            mw::native::audio::OpusEncoder enc;
+            std::string error;
+            CHECK(enc.open(error, samples));
+            CHECK_EQ(enc.frameSamples(), samples);
+            std::vector<float> pcm = tone(static_cast<size_t>(samples), 0.25f);
+            std::vector<uint8_t> packet;
+            const size_t n = enc.encode(pcm.data(), packet);
+            CHECK(n > 0);
+            if (dec && n > 0) {
+                std::vector<float> back(static_cast<size_t>(960) * 2);
+                CHECK_EQ(opus_decode_float(dec, packet.data(), static_cast<opus_int32>(n),
+                                           back.data(), 960, 0),
+                         samples);
+            }
+        }
+        if (dec) opus_decoder_destroy(dec);
+        mw::native::audio::OpusEncoder odd;
+        std::string error;
+        CHECK(!odd.open(error, 300));
+        CHECK(!error.empty());
+    }
+#endif
 }

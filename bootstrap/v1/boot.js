@@ -26,11 +26,24 @@ import {
     hostIdFromLocation,
     hostKeyFromLocation,
     knownInstances,
+    forgetInstance,
     landingPathFromLocation,
     shareTokenFromLocation,
     rememberLastHost,
+    shellFetchOrder,
+    storeShellFile,
     SHELL_CACHE,
 } from './tunnel.js';
+import {
+    appVersionOf,
+    cacheMatchesList,
+    cacheMatchesManifest,
+    fetchList,
+    interfacePolicy,
+    isRelease,
+    judgeFile,
+    officialDigest,
+} from './official.js';
 
 const ui = {
     stage: document.getElementById('stage'),
@@ -39,6 +52,7 @@ const ui = {
     status: document.getElementById('status'),
     note: document.getElementById('note'),
     instances: document.getElementById('instance-menu'),
+    forget: document.getElementById('forget'),
 };
 
 function say(stage, detail) {
@@ -136,7 +150,7 @@ function raf() {
     requestAnimationFrame(raf);
 }
 requestAnimationFrame(raf);
-const heartbeat = setInterval(render, 250);
+let heartbeat = setInterval(render, 250);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -153,17 +167,77 @@ async function settle() {
     ticking = false;
 }
 
-function fail(message, hint) {
+function fail(message, hint, heading = 'Not connected') {
     ticking = false;
     clearInterval(heartbeat);
     document.body.dataset.state = 'failed';
-    say('Not connected', message);
+    say(heading, message);
     if (ui.note) ui.note.textContent = hint || '';
     // Every path into here ends on a page the person is left looking at, and on
     // most of them the machine in the address is exactly the one that cannot
     // help them. This is the moment the caption becomes a way out.
     paintInstances(true);
+    paintForget(true);
+    // Failing while put away: the failure is for whoever comes back, who will
+    // get a fresh attempt instead (see "Coming back to a page that had failed").
+    if (document.visibilityState === 'hidden') {
+        failedWhenHidden = true;
+        lookLikeOpening();
+    }
 }
+
+/** Back to work after a failure the page had already shown: the bar runs again
+ *  from where it stopped, and leaving is no longer on offer. */
+function resume() {
+    // Recovered: coming back to this page is no reason to start it over.
+    failedWhenHidden = false;
+    document.body.dataset.state = 'working';
+    if (ui.note) ui.note.textContent = '';
+    paintInstances(false);
+    paintForget(false);
+    ticking = true;
+    heartbeat = setInterval(render, 250);
+    requestAnimationFrame(raf);
+}
+
+/* ── Coming back to a page that had failed ────────────────────────────────
+ *
+ * A phone keeps a tab it has put away, and shows it again as it was when the
+ * person comes back — on iOS often first as the picture it took on the way out,
+ * while the page itself wakes or reloads behind it. A failure from the last
+ * visit was then the first thing the next one saw: "Not connected" for a couple
+ * of seconds over a machine that was switched on by now, before the page
+ * started over (01/11/2026, Chrome on an iPhone).
+ *
+ * So a failure does not outlive the page being put away. The moment it is
+ * hidden, the page goes back to its opening look — that is what the phone's
+ * picture shows next time — and the moment it is shown again, it starts over:
+ * a fresh attempt now, rather than whenever the slow retries below would have
+ * got round to it. The same goes for a page the browser brings back from its
+ * back-forward cache. */
+let failedWhenHidden = false;
+
+function lookLikeOpening() {
+    document.body.dataset.state = 'working';
+    if (ui.note) ui.note.textContent = '';
+    paintInstances(false);
+    paintForget(false);
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        if (document.body.dataset.state !== 'failed') return;
+        failedWhenHidden = true;
+        lookLikeOpening();
+        return;
+    }
+    if (failedWhenHidden) location.reload();
+});
+
+window.addEventListener('pageshow', (event) => {
+    if (event.persisted && (failedWhenHidden || document.body.dataset.state === 'failed'))
+        location.reload();
+});
 
 /* ── The machine, and the way to another one ───────────────────────────────
  *
@@ -201,9 +275,16 @@ function fail(message, hint) {
  * a plain contradiction of the machines listed a centimetre below, so the button
  * says what pressing it does: "Choose a machine".
  *
- * Read-only, always: nothing here writes to that register. Only the application
- * can, because only the application ever gets close enough to a machine to be
- * told what it calls itself.
+ * Except once the machine has answered. That is so once the connection is
+ * made, whatever fails after it — its interface refused or cut off, the worker
+ * refused or too old, the application not starting — and already when it
+ * answered but the network carried no direct connection. The dead caption
+ * stays empty rather than deny it (27/10/2026).
+ *
+ * Nothing here adds to that register or renames a row in it. Only the
+ * application can, because only the application ever gets close enough to a
+ * machine to be told what it calls itself. The one write this page makes is
+ * the removal below, and only when the person asks for it.
  */
 
 /** Neither name nor identifier is ours; both are drawn as text, never as HTML. */
@@ -242,6 +323,8 @@ let closeMenu = null;
 /* The machine this page is for, so that a repaint after the outcome is known
    does not have to be handed it again from wherever the failure happened. */
 let paintedHostId = null;
+/* Set once the connection to that machine is made: it has answered. */
+let answered = false;
 
 /**
  * @param {boolean} choosing  false while connecting (a caption), true once that
@@ -261,8 +344,9 @@ function paintInstances(choosing) {
 
     if (!choosing || others.length === 0) {
         // An identifier this browser has never reached names nothing it can
-        // show — and only a page that has given up may say so out loud.
-        const label = current ? current.name : choosing ? 'No server found' : '';
+        // show — and only a page that has given up may say so out loud, never
+        // once the machine has answered.
+        const label = current ? current.name : choosing && !answered ? 'No server found' : '';
         if (!label) {
             mount.hidden = true;
             return;
@@ -359,6 +443,45 @@ function paintInstances(choosing) {
     });
 }
 
+/* ── Forgetting the machine that did not answer ────────────────────────────
+ *
+ * A browser that has been to many machines keeps every one of them in its
+ * menu, including the one that was retired, sold or reinstalled under a new
+ * identifier. Opening it lands here, on "Not connected", for good — and the
+ * row stays in every menu after that. So this page, which is exactly where
+ * that machine shows itself to be gone, offers to drop it.
+ *
+ * Discreet on purpose: the usual reason for this page is a machine that is
+ * merely switched off, and the offer must not read as the thing to do about
+ * it. Only offered for a machine that is in the list — there is nothing to
+ * remove otherwise — and the removal is from this browser only: the machine,
+ * its pairing and its address are untouched, and opening that address again
+ * once it answers puts it back.
+ *
+ * Once it is done the page stops calling that machine: the person has just
+ * said they are done with it, and a handover a minute later would put the row
+ * straight back.
+ */
+let forgotten = false;
+
+function paintForget(show) {
+    const btn = ui.forget;
+    if (!btn) return;
+    const listed = !!paintedHostId && knownInstances().some((e) => e.id === paintedHostId);
+    btn.hidden = !show || forgotten || !listed;
+}
+
+if (ui.forget) {
+    ui.forget.addEventListener('click', () => {
+        if (!paintedHostId) return;
+        forgetInstance(paintedHostId);
+        forgotten = true;
+        paintForget(false);
+        if (ui.note) ui.note.textContent = 'Removed from this browser’s list of machines.';
+        paintInstances(true);
+    });
+}
+
 const STAGE_WORDS = {
     identity: 'Preparing this browser…',
     calling: 'Looking for your machine…',
@@ -378,6 +501,8 @@ const STAGE_PROGRESS = {
 };
 const MANIFEST_AT = 0.45;
 const SHELL_AT = 0.92;
+/* How many of the application's files are fetched at once (see fetchShell). */
+const SHELL_FETCH_WORKERS = 12;
 
 /**
  * What the cache currently holds, if anything usable.
@@ -409,6 +534,94 @@ function writeStamp(hostId, version) {
     }
 }
 
+/* ── Only the official interface ──────────────────────────────────────────
+ *
+ * Every machine reached through here shares this one origin, and so does the
+ * interface each of them serves: whatever it runs, it runs beside the pairing
+ * keys and the sessions of every other machine this browser knows (D26). The
+ * machine itself cannot be vouched for — it is its owner's, key and disk
+ * included — but the code it sends can. So every file is held against the list
+ * of the release the machine says it runs (official.js), before it is stored:
+ * a file that differs stops the start with nothing of it run, and a file that
+ * is not part of the interface is never stored, so never served.
+ *
+ * How strictly depends on where this page was served from (interfacePolicy):
+ * the staging server refuses, and production too while PRODUCTION_ENFORCES is
+ * set; otherwise production only reports. A build between two releases has no
+ * list; the staging server lets it through, and its own hashes keep the cache
+ * honest as before.
+ */
+const policy = interfacePolicy(location.hostname);
+
+/** The machine serves an interface that is not the official one. */
+function refusal(why) {
+    const err = new Error('This machine serves a modified interface.');
+    err.hint = 'MoonlightWeb only opens the official one, so nothing from it was run.';
+    err.refused = true;
+    err.why = why;
+    return err;
+}
+
+/** Said in the console of a production page while it only reports. */
+function reportOnly(why) {
+    console.warn(
+        `[MW] Interface check: ${why} — this machine will be refused once production enforces the check`,
+    );
+}
+
+/**
+ * What this machine's interface is held against.
+ *
+ * @returns {Promise<{version: string|null, list: Map<string, string>|null, enforce: boolean}>}
+ *   `list` null where none applies; `enforce` whether a difference stops the start
+ */
+async function officialCheck(manifestVersion) {
+    const version = appVersionOf(manifestVersion);
+    let list = null;
+    try {
+        list = await fetchList(version);
+    } catch (e) {
+        // The introduction server could not say, which is no verdict on the
+        // machine: a refusal here would be a lie.
+        if (policy.enforce)
+            throw new Error(`this page could not check it (${e.message}) — reload the page`);
+        console.warn(`[MW] Interface check skipped: ${e.message}`);
+        return { version, list: null, enforce: false };
+    }
+    if (list) return { version, list, enforce: policy.enforce };
+
+    const why = `version ${version || manifestVersion} is not an official release`;
+    if (!isRelease(version) && policy.unreleasedAllowed) {
+        console.info(
+            `[MW] Interface check: ${version || manifestVersion} is a build between releases, let through here`,
+        );
+    } else if (policy.enforce) {
+        throw refusal(why);
+    } else {
+        reportOnly(why);
+    }
+    return { version, list: null, enforce: false };
+}
+
+/**
+ * Whether the cache holds what this machine's interface should be: the official
+ * one, file for file, where a list applies — this machine's own hashes
+ * otherwise, as before. Where production only reports, the list's verdict is
+ * said and the hashes decide, unless `report` is false: the download has
+ * just said it, and the console would show the same line twice.
+ */
+async function shellIsTrusted(cache, files, manifest, check, { report = true } = {}) {
+    if (check.list) {
+        const { ok, differs } = await cacheMatchesList(cache, check.list, location.origin, {
+            prune: check.enforce,
+        });
+        if (check.enforce) return ok;
+        if (report && differs.length)
+            reportOnly(`${differs.join(', ')} differ from the official ${check.version}`);
+    }
+    return cacheMatchesManifest(cache, files, manifest.sha256);
+}
+
 /**
  * Pull the application down and put it where the service worker will find it.
  *
@@ -419,7 +632,8 @@ function writeStamp(hostId, version) {
  * The file list comes from the host rather than from anything published here.
  * Guessing it by reading index.html would miss every module a script imports at
  * runtime, and hard-coding it here would make this page need a release every
- * time the application gained a file.
+ * time the application gained a file. What each of those files must BE is what
+ * is published here, per release.
  */
 async function fetchShell(tunnel, hostId) {
     say('Checking for updates…', '');
@@ -433,6 +647,8 @@ async function fetchShell(tunnel, hostId) {
     const files = Array.isArray(manifest.files) ? manifest.files : [];
     if (files.length === 0) throw new Error('your machine reported no interface files');
 
+    const check = await officialCheck(manifest.version);
+
     const stamp = cachedStamp();
     if (stamp && stamp.hostId === hostId && stamp.version === manifest.version) {
         // Trust the stamp only as far as the cache backs it up: a browser may
@@ -440,8 +656,13 @@ async function fetchShell(tunnel, hostId) {
         // would hand the service worker an empty shelf.
         const cache = await caches.open(SHELL_CACHE);
         if (await cache.match('/index.html')) {
-            progress(SHELL_AT);
-            return manifest.version;
+            if (await shellIsTrusted(cache, files, manifest, check)) {
+                progress(SHELL_AT);
+                return manifest.version;
+            }
+            console.warn(
+                '[MW] The cached interface is not what your machine serves — fetching it again',
+            );
         }
     }
 
@@ -454,31 +675,317 @@ async function fetchShell(tunnel, hostId) {
     const fresh = await caches.open(SHELL_CACHE);
 
     let done = 0;
-    // A handful at a time. One at a time is needlessly slow over a channel with
-    // a round trip; all at once would put the whole application in the host's
-    // send queue at the same moment.
-    const queue = [...files];
+    const differs = [];
+    const unlisted = [];
+    // The first thing that went wrong. Every worker stops at it, so the cache is
+    // only cleared once nothing more can be written to it.
+    let failure = null;
+    // A dozen at a time, the largest first. One at a time is needlessly slow over
+    // a channel with a round trip; all at once would put the whole application in
+    // the host's send queue at the same moment, and the last request would wait
+    // out its timeout behind every other answer. Four left the channel half idle
+    // 115 ms away (bench of 24/10): each answer waits a round trip before it
+    // starts, and more of them in flight fill those waits.
+    const queue = shellFetchOrder(files, manifest.sizes);
     const worker = async () => {
-        for (;;) {
+        while (!failure) {
             const path = queue.shift();
             if (!path) return;
-            const response = await tunnel.fetch(path);
-            if (response.ok) await fresh.put(path, response);
+            try {
+                const response = await tunnel.fetch(path);
+                if (response.ok) {
+                    // Judged BEFORE it is stored: the cache is shared with every
+                    // tab of this origin, and none of them may be served a file
+                    // that has not passed.
+                    const bytes = new Uint8Array(await response.arrayBuffer());
+                    const verdict = check.list
+                        ? judgeFile(check.list, path, await officialDigest(path, bytes))
+                        : 'unchecked';
+                    if (verdict === 'differs') differs.push(path);
+                    if (verdict === 'unlisted') unlisted.push(path);
+                    if (verdict === 'differs' && check.enforce)
+                        throw refusal(`${path} is not the file ${check.version} shipped`);
+                    if (!(verdict === 'unlisted' && check.enforce) && !failure) {
+                        await storeShellFile(
+                            fresh,
+                            path,
+                            new Response(bytes, {
+                                status: response.status,
+                                headers: response.headers,
+                            }),
+                        );
+                    }
+                }
+            } catch (e) {
+                failure = failure || e;
+                return;
+            }
             done++;
             progress(MANIFEST_AT + (SHELL_AT - MANIFEST_AT) * (done / files.length));
             say('Fetching the interface…', `${done} of ${files.length} files`);
         }
     };
-    await Promise.all([worker(), worker(), worker(), worker()]);
+    await Promise.all(Array.from({ length: SHELL_FETCH_WORKERS }, worker));
+    if (failure) {
+        await caches.delete(SHELL_CACHE);
+        throw failure;
+    }
+    if (check.list && !check.enforce && differs.length) {
+        reportOnly(`${differs.join(', ')} differ from the official ${check.version}`);
+    }
+    if (check.list && unlisted.length) {
+        // Leftovers of an earlier install, often: an installer that does not
+        // remove what a release dropped leaves it on the disk, and the machine
+        // lists what is on its disk.
+        console.info(
+            `[MW] Not part of the official ${check.version}, left out: ${unlisted.join(', ')}`,
+        );
+    }
+    if (check.list && !differs.length)
+        console.info(`[MW] Interface check: the official ${check.version}`);
 
     // The navigation the service worker answers is this one, so it has to be
     // there under the name the worker looks for.
     const index = await fresh.match('/index.html');
     if (!index) throw new Error('your machine did not send its main page');
     await fresh.put('/', index.clone());
+    // Checked like a cached copy: another page of this origin could have
+    // written over it while it came down.
+    if (!(await shellIsTrusted(fresh, files, manifest, check, { report: false }))) {
+        await caches.delete(SHELL_CACHE);
+        throw new Error('the interface changed while it was being fetched');
+    }
 
     writeStamp(hostId, manifest.version);
     return manifest.version;
+}
+
+/* Written by the application (HostListView's UPDATE_PENDING_KEY) the moment it
+   asks the host to update itself, and removed again if that update fails.
+
+   The installer takes the host down, which closes the connection, which sends
+   the application back here — while the new build is still being installed. A
+   single attempt then finds the machine offline and says "Not connected" over an
+   update that is going perfectly well, and the person has to refresh by hand
+   once it is done. With the note present, this page keeps calling instead, for
+   as long as an install plus the host coming back can reasonably take. */
+const UPDATE_PENDING_KEY = 'mw-update-pending';
+const UPDATE_WAIT_MS = 10 * 60 * 1000;
+const UPDATE_RETRY_MS = 3000;
+
+function updatePendingSince() {
+    try {
+        return Number(sessionStorage.getItem(UPDATE_PENDING_KEY) || 0);
+    } catch {
+        return 0;
+    }
+}
+
+function clearUpdatePending() {
+    try {
+        sessionStorage.removeItem(UPDATE_PENDING_KEY);
+    } catch {
+        /* the note expires on its own */
+    }
+}
+
+/**
+ * Connect, and while an update this tab started is under way, keep trying.
+ *
+ * Every failure counts during that window, not only "offline": the relay can
+ * also report the host gone, or an attempt can land on the old server in its
+ * last seconds and time out. Outside the window, the first failure is final, as
+ * it always was.
+ */
+async function connectThroughUpdate(hostId) {
+    const since = updatePendingSince();
+    const waitUntil = since ? since + UPDATE_WAIT_MS : 0;
+    // No detail: the line under the bar shows the stage when the detail is empty,
+    // and that line is the only one visible while this page is working.
+    const updateWords = ['Your machine is installing an update — waiting for it…', ''];
+    if (Date.now() < waitUntil) say(...updateWords);
+
+    for (;;) {
+        const tunnel = new Tunnel(hostId);
+        const waiting = Date.now() < waitUntil;
+        tunnel.onstatus = (stage) => {
+            if (!waiting) say(STAGE_WORDS[stage] || stage, '');
+            if (STAGE_PROGRESS[stage]) progress(STAGE_PROGRESS[stage]);
+        };
+        try {
+            await tunnel.connect();
+            clearUpdatePending();
+            return tunnel;
+        } catch (e) {
+            if (Date.now() >= waitUntil) {
+                clearUpdatePending();
+                throw e;
+            }
+            // A failed attempt can leave its relay socket or peer connection
+            // open; the next one starts from nothing.
+            tunnel.close();
+            say(...updateWords);
+            await sleep(UPDATE_RETRY_MS);
+        }
+    }
+}
+
+/* When the introduction server restarts — a deploy, a reboot of the machine it
+   runs on — every call made in that minute fails: the server is not there, or
+   it is back and the machine's own line to it is not yet. One attempt then said
+   "Not connected" over something that fixes itself, and the person had to know
+   to refresh.
+
+   The page still says it at once — the failure is real while it lasts, and the
+   way to another machine is offered as before — and keeps calling underneath
+   for about a minute, more slowly as it goes: each call counts against the
+   server's limit on attempts per address. The first one through picks the start
+   up where it stopped. Only failures the transport marks `transient` are
+   retried: a machine at its connection limit or a page out of date is a plain
+   answer. */
+const PASSING_WAIT_MS = 60 * 1000;
+const PASSING_PAUSES_MS = [2000, 3000, 5000, 5000, 10000];
+const PASSING_NOTE =
+    'Trying again every few seconds for a minute — this page carries on by itself as soon ' +
+    'as your machine answers.';
+
+/** The explanation under a failure: its own when it has one. */
+function failureHint(e) {
+    return (
+        e.hint ||
+        'If your machine is switched off or has no internet access, nothing here ' +
+            'can reach it. That is by design, not a fault.'
+    );
+}
+
+/* Written when this page hands a tab over to a machine, and never removed: the
+   application does not know about it, which is the point. A tab that comes
+   back here for the machine it had open has watched that machine go away
+   under it — an update, a restart, a reboot — rather than typed the address of
+   one that is switched off.
+
+   That is the case the update note above covers, except when the host's own
+   application is too old to write that note: 0.3.1 updating to 0.4.0 came
+   back here as a plain failure, gave up after a minute, and a Windows install
+   takes longer than that (18/10/2026). Such a tab keeps calling, slowly and
+   with nothing new on screen, for as long as an update may take. */
+const OPENED_HOST_KEY = 'mw-opened-host';
+const OPENED_RETRY_MS = 10000;
+
+function openedHostHere() {
+    try {
+        return sessionStorage.getItem(OPENED_HOST_KEY) || '';
+    } catch {
+        return '';
+    }
+}
+
+function rememberOpenedHost(hostId) {
+    try {
+        sessionStorage.setItem(OPENED_HOST_KEY, hostId);
+    } catch {
+        /* a failure after a restart gives up after a minute, as before */
+    }
+}
+
+/**
+ * Show a passing failure, and keep calling under it.
+ * @returns {Promise<Tunnel | null>} the tunnel once a call gets through, or null
+ *   once the page has given up and shows the last failure for good
+ */
+async function connectThroughRestart(hostId, first) {
+    const startedAt = Date.now();
+    fail(first.message, PASSING_NOTE);
+    const giveUpAt = startedAt + PASSING_WAIT_MS;
+    let last = first;
+    for (let i = 0; ; i++) {
+        const pause = PASSING_PAUSES_MS[Math.min(i, PASSING_PAUSES_MS.length - 1)];
+        if (Date.now() + pause > giveUpAt) break;
+        await sleep(pause);
+        const tunnel = new Tunnel(hostId);
+        try {
+            await tunnel.connect();
+            return tunnel;
+        } catch (e) {
+            tunnel.close();
+            last = e;
+            if (!e.transient) break;
+            // The words can change underneath — the server back, the machine
+            // not yet. Only the words: fail() again would close a menu the
+            // person may have open.
+            say('Not connected', e.message);
+        }
+    }
+    if (last.answered) answered = true;
+    fail(last.message, failureHint(last));
+    if (!last.transient || openedHostHere() !== hostId) return null;
+
+    // The machine this tab had open: the failure stays on screen as it is,
+    // and the page carries on by itself the moment the machine answers.
+    while (Date.now() + OPENED_RETRY_MS < startedAt + UPDATE_WAIT_MS) {
+        await sleep(OPENED_RETRY_MS);
+        const tunnel = new Tunnel(hostId);
+        try {
+            await tunnel.connect();
+            return tunnel;
+        } catch (e) {
+            tunnel.close();
+            if (!e.transient) return null;
+        }
+    }
+    return null;
+}
+
+/**
+ * The revision of the service worker this page needs where the check is
+ * enforced: the first that serves only the files this page checked (sw.js,
+ * SW_REVISION). A worker older than this answers nothing when asked.
+ */
+const WORKER_REVISION = 2;
+/**
+ * How long an older worker has to make way for the current one. The browser
+ * activates the new worker only once the old one has finished what it was
+ * doing, and that worker gives a request it handed to a page up to 30 s
+ * (sw.js, CLIENT_TIMEOUT_MS): one in flight from another tab must not make this
+ * start say "out of date".
+ */
+const WORKER_UPDATE_MS = 35000;
+
+/** The revision @p worker answers with, or 0 for one too old to answer. */
+function workerRevision(worker) {
+    return new Promise((resolve) => {
+        const channel = new MessageChannel();
+        const timer = setTimeout(() => resolve(0), 1000);
+        channel.port1.onmessage = (event) => {
+            clearTimeout(timer);
+            resolve(Number(event.data?.revision) || 0);
+        };
+        worker.postMessage({ type: 'mw-sw-revision' }, [channel.port2]);
+    });
+}
+
+/**
+ * The worker in charge, once it is one this page may hand over to: an older
+ * one is asked to update, and its successor takes over at once (sw.js,
+ * skipWaiting). The browser looks for that update by itself after a
+ * navigation, so this usually answers on the first try — the wait is only for
+ * the first start after a release of this file.
+ *
+ * @returns {Promise<ServiceWorker|null>} null if none came within the time
+ */
+async function currentWorker(registration) {
+    const giveUpAt = Date.now() + WORKER_UPDATE_MS;
+    for (;;) {
+        const active = registration.active;
+        if (active && (await workerRevision(active)) >= WORKER_REVISION) return active;
+        if (Date.now() >= giveUpAt) return null;
+        try {
+            await registration.update();
+        } catch {
+            /* asked again on the next turn */
+        }
+        await sleep(500);
+    }
 }
 
 async function main() {
@@ -508,26 +1015,28 @@ async function main() {
         return;
     }
 
-    const tunnel = new Tunnel(hostId);
-    tunnel.onstatus = (stage) => {
-        say(STAGE_WORDS[stage] || stage, '');
-        if (STAGE_PROGRESS[stage]) progress(STAGE_PROGRESS[stage]);
-    };
-
+    let tunnel;
     try {
-        await tunnel.connect();
+        tunnel = await connectThroughUpdate(hostId);
     } catch (e) {
         // The failure names its own explanation when it has a better one than
         // "your machine is off" — a connection that was refused by the network
         // rather than never answered has nothing to do with the machine.
-        fail(
-            e.message,
-            e.hint ||
-                'If your machine is switched off or has no internet access, nothing here ' +
-                    'can reach it. That is by design, not a fault.',
-        );
-        return;
+        if (!e.transient) {
+            if (e.answered) answered = true;
+            fail(e.message, failureHint(e));
+            return;
+        }
+        tunnel = await connectThroughRestart(hostId, e);
+        if (!tunnel) return;
+        if (forgotten) {
+            tunnel.close();
+            return;
+        }
+        resume();
     }
+    // Whatever fails from here on, a machine answered.
+    answered = true;
 
     if (tunnel.firstContact) {
         // Said once, and said honestly: this is the connection the pinning
@@ -541,22 +1050,52 @@ async function main() {
     try {
         await fetchShell(tunnel, hostId);
     } catch (e) {
+        if (e.refused) {
+            // Nothing of it was run, and nothing more is asked of it.
+            console.warn(`[MW] Refused: ${e.why}`);
+            tunnel.close();
+            fail(e.message, e.hint, 'Not opened');
+            return;
+        }
         fail(`The interface did not come through: ${e.message}.`, '');
         return;
     }
 
     say('Starting…', '');
+    let registration;
     try {
         await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-        await navigator.serviceWorker.ready;
+        registration = await navigator.serviceWorker.ready;
     } catch (e) {
         fail(`This browser refused to install the application: ${e.message}.`, '');
         return;
     }
+    // Asked while the bar catches up, which it does for over a second anyway.
+    const worker = policy.enforce ? currentWorker(registration) : null;
 
     // Everything real is done. The rest is the bar catching up, its moment at
     // the end, and the floor on how briefly this page may exist.
     await settle();
+
+    // Tell the worker the cache was just checked: it hands the cached
+    // interface only to a navigation that follows one (sw.js, R1). In its
+    // memory, not in storage, which every page of this origin can write.
+    //
+    // Where the check is enforced, only a worker that serves nothing but the
+    // checked files is told: an older one would hand a file the cache lacks
+    // to the machine for (sw.js, SW_REVISION). Elsewhere the older word goes
+    // too, so the worker in place keeps opening as it always did.
+    const current = worker ? await worker : registration.active;
+    if (worker && !current) {
+        fail('This page is out of date — reload it.', '');
+        return;
+    }
+    try {
+        current?.postMessage({ type: 'mw-shell-verified' });
+        if (!worker) current?.postMessage({ type: 'mw-shell-checked' });
+    } catch {
+        /* the navigation below comes back here, and says so if it loops */
+    }
 
     // Remembered so that stream.{domain} on its own — no identifier — opens the
     // machine this browser last used, rather than an application with nothing
@@ -574,6 +1113,7 @@ async function main() {
     } catch {
         /* worst case the seal is shown twice; nothing breaks */
     }
+    rememberOpenedHost(hostId);
 
     // The identifier moves from the path to the fragment. The application uses
     // ordinary absolute paths for its own routes and its own assets, and a

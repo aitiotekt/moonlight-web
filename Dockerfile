@@ -48,15 +48,21 @@ FROM debian:${DEBIAN_RELEASE} AS build
 
 # qt6-base-dev covers Core/Gui/Widgets/Network; WebSockets is a separate module.
 # libssl-dev is required by both the server (TLS listener, ACME) and
-# moonlight-common-c (the GameStream crypto).
+# moonlight-common-c (the GameStream crypto). git applies our submodule patches
+# at configure time (mw_apply_patch in backend/CMakeLists.txt).
+# libpipewire-0.3-dev is headers only for the viewer's microphone: the server
+# opens libpipewire with dlopen (src/streaming/MicOutputPipeWire.cpp), and the
+# native host's own PipeWire code stays off here — it also needs libdrm & co.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         cmake \
+        git \
         ninja-build \
         pkg-config \
         libssl-dev \
+        libpipewire-0.3-dev \
         qt6-base-dev \
         qt6-websockets-dev \
  && rm -rf /var/lib/apt/lists/*
@@ -90,7 +96,7 @@ RUN cmake -S backend -B /tmp/build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DMW_VERSION="${MW_VERSION}" \
  && cmake --build /tmp/build -j "$(nproc)" \
- && cmake --install /tmp/build --prefix /stage \
+ && cmake --install /tmp/build --prefix /stage --component app \
  && rm -rf /tmp/build
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
@@ -103,6 +109,13 @@ FROM debian:${DEBIAN_RELEASE}-slim
 #
 # jq is used by the entrypoint to merge MW_HTTP_PORT / MW_HTTPS_PORT / MW_UPNP
 # into settings.json without clobbering the rest of the file.
+#
+# pipewire-bin is how the viewer's microphone reaches the host's PipeWire once
+# its socket is mounted (docker/README.md, "The microphone"): it carries the
+# client.conf libpipewire refuses to start without, and pulls the library and
+# the client modules under the right name on bookworm and trixie alike — about
+# 16 MB, most of its dependencies already being Qt's. Opened on first use, so
+# an image run without the socket starts all the same.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -110,6 +123,7 @@ RUN apt-get update \
         libqt6svg6 \
         libqt6websockets6 \
         libqt6widgets6 \
+        pipewire-bin \
         qt6-qpa-plugins \
         tzdata \
  && rm -rf /var/lib/apt/lists/*
@@ -142,10 +156,10 @@ VOLUME ["/data"]
 
 # Documentation only — EXPOSE publishes nothing. 443 is the web UI and the
 # signalling upgrade, 80 the redirect and the ACME http-01 challenge; the UDP
-# block carries WebRTC media, one port per stream slot (48010 + slot), plus the
+# block carries WebRTC media, one port per stream slot (48550 + slot), plus the
 # 47999 Internet Access maps alongside 80/443. `--network host` is still the
 # supported layout. Full table: docker/README.md.
-EXPOSE 443/tcp 80/tcp 47999/udp 48010-48033/udp
+EXPOSE 443/tcp 80/tcp 47999/udp 48550-48573/udp
 
 # --status talks to the running instance over loopback and exits non-zero when
 # nothing answers, so it doubles as the liveness probe. start-period covers the

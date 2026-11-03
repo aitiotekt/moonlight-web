@@ -222,6 +222,70 @@
     gap: var(--space-2);
     margin-left: auto;
 }
+/* The header's buttons carry their name beside the icon wherever there is
+   room for it; on a phone (Responsive, below) they are icons alone. The
+   tooltip stays for the icon-only case and says it in a few words. */
+.btn-icon.has-label {
+    width: auto;
+    min-width: 38px;
+    gap: var(--space-2);
+    padding: 0 var(--space-3);
+}
+.header-btn-label {
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+/* Buy me a coffee (util/supportNudge.js says when it shows): the yellow of
+   "Add manually" (.btn-neutral), with the official cup. .btn's display would
+   beat the [hidden] attribute, hence the explicit rule. */
+.header-btn-bmc {
+    text-decoration: none;
+}
+.header-btn-bmc[hidden] {
+    display: none;
+}
+.header-btn-bmc-logo {
+    display: inline-flex;
+}
+.bmc-logo {
+    width: auto;
+    height: 1.4em;
+    flex-shrink: 0;
+}
+/* The cup with its wordmark (bmcLogo.js), where the button has room for a
+   name. The brand draws the words near-black; on these dark, yellow-tinted
+   buttons they are white. The cup alone stands in for it on a phone. */
+.bmc-full-logo {
+    width: auto;
+    height: 1.9em;
+    flex-shrink: 0;
+    color: #fff;
+}
+.header-btn-bmc-full {
+    display: inline-flex;
+}
+.header-btn-bmc .header-btn-bmc-logo {
+    display: none;
+}
+/* The visit it first appears on, it lights up a few times, then settles —
+   inside the button: the notched clip-path would cut any glow around it. */
+.header-btn-bmc.is-new {
+    animation: bmc-intro 1.2s ease-in-out 5;
+}
+@keyframes bmc-intro {
+    50% {
+        background: rgba(252, 238, 10, 0.34);
+        color: var(--accent-strong);
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .header-btn-bmc.is-new {
+        animation: none;
+        background: rgba(252, 238, 10, 0.2);
+    }
+}
 
 /* ── Main content — the ONLY scroll container of the app ────────────────── */
 #main-content {
@@ -231,6 +295,41 @@
     overflow-x: hidden;
     padding: var(--space-6) var(--space-5) var(--space-8);
     width: 100%;
+}
+
+/* ── On a TV, the document scrolls instead ──────────────────────────────────
+   A TV browser's own cursor (TV Bro, TCL Browser) scrolls the DOCUMENT when it
+   reaches an edge of the screen. With #main-content as the scroller nothing
+   moved, and the host list stayed cut at the bottom (03/10/2026, a Mi TV).
+   Under RemoteNav (.remote-nav, TVs only) the page grows with its content and
+   the header sticks to the top; the stream is position:fixed, untouched. */
+html.remote-nav {
+    height: auto;
+    overflow-x: hidden;
+    overflow-y: auto;
+    /* Whatever is scrolled to (a focused card) lands below the header, whose
+       height RemoteNav measures into --app-header-h. */
+    scroll-padding-top: calc(var(--app-header-h, 64px) + 16px);
+    scrollbar-width: thin;
+    scrollbar-color: var(--surface-4) transparent;
+}
+html.remote-nav body {
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+}
+html.remote-nav #app {
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+}
+html.remote-nav #main-content {
+    flex: 1 0 auto;
+    overflow: visible;
+}
+html.remote-nav .app-header {
+    position: sticky;
+    top: 0;
 }
 
 /* Inner views are centered with a max width — the scrollbar stays on the
@@ -287,5 +386,29 @@
        at?" — which is the question a second device makes urgent. */
     .version {
         display: none;
+    }
+
+    /* Three icons, no names: Buy me a coffee, Admin, Settings. The coffee
+       drops its yellow box to look like its two neighbours; the cup keeps
+       its yellow coffee. Scoped to .header-actions to outweigh .btn-neutral,
+       which components.css loads after this file. */
+    .header-btn-label {
+        display: none;
+    }
+    .header-btn-bmc .header-btn-bmc-logo {
+        display: inline-flex;
+    }
+    .btn-icon.has-label {
+        width: 38px;
+        padding: 0;
+    }
+    .header-actions .header-btn-bmc {
+        width: 38px;
+        height: 38px;
+        padding: 0;
+        color: var(--text-2);
+        background: transparent;
+        box-shadow: none;
+        clip-path: none;
     }
 }

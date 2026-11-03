@@ -76,6 +76,13 @@ public:
     static constexpr qint64 kTtlSecs = 8 * 3600;
     static bool isValidTtl(qint64 secs);
 
+    /// The height of the picture a native host's guests watch, chosen by the
+    /// owner on the board: one for every guest, since they share one feed
+    /// (plan « flux commun des invités »). 720, 1080 or 1440 — never above the
+    /// host's own display, which the engine sees to (it never upscales).
+    static constexpr int kFeedHeight = 1080;
+    static bool isValidFeedHeight(int height);
+
     /// Wrong PINs before the activation is destroyed outright. Whoever holds a
     /// leaked link can therefore kill the share, never brute-force into it.
     static constexpr int kMaxPinFailures = 10;
@@ -110,6 +117,17 @@ public:
     {
         bool gamepad = false;
         bool keyboardMouse = false;
+        /// The HID passthrough: a wheel, radio or joystick the guest's
+        /// browser sends as itself (WebHID), recreated on the host. Only ever
+        /// with the gamepad, since it is one too as far as the game is
+        /// concerned; fromJson() drops it otherwise. Not part of the badge.
+        bool hid = false;
+
+        bool operator==(const Permissions& o) const
+        {
+            return gamepad == o.gamepad && keyboardMouse == o.keyboardMouse && hid == o.hid;
+        }
+        bool operator!=(const Permissions& o) const { return !(*this == o); }
 
         /// The badge the board shows. A real table over both flags: keyboard
         /// and mouse without a gamepad is "desktop", not "full" — the two are
@@ -198,6 +216,20 @@ public:
     /// Rename a player row. An empty name restores the default "Player N".
     /// False for a slot outside the player range.
     bool setName(int slot, const QString& name);
+
+    /// The guests' picture height (kFeedHeight until the owner picks one).
+    int feedHeight() const { return m_FeedHeight; }
+    /// Pick it, for every guest at once — those already watching included:
+    /// feedHeightChanged() rebuilds their feed at the new size. False for a
+    /// height not offered.
+    bool setFeedHeight(int height);
+
+    /// The address a guest link of @p hostUuid carries, as the owner picked it
+    /// on that host's board: "auto" until they do (LinkAddresses for the forms).
+    QString linkAddress(const QString& hostUuid) const;
+    /// Remember it for that host. False for an empty host or an id of no known
+    /// form; "auto" forgets the host's entry.
+    bool setLinkAddress(const QString& hostUuid, const QString& id);
     QString name(int slot);
 
     /// Revoke the activation: token, PIN and cookies die, and any live stream
@@ -278,6 +310,15 @@ public:
     QString hostForSlot(int slot);
     /// The app id captured when the slot was shared, -1 when Off.
     int appForSlot(int slot);
+    /// Who a join on @p slot is: this activation, and the device whose raw
+    /// mw_player @p cookie it carries. A guest's Sunshine identity is reused by
+    /// the same one only (startPlayerStream): the row closed and reopened, or
+    /// another device of the invitation, starts a session of its own instead
+    /// of picking up the last guest's app. Empty when the slot is Off.
+    QString joinIdentity(int slot, const QString& cookie);
+
+    /// The cookie a player's browser keeps once it has entered the PIN.
+    static constexpr const char* kPlayerCookie = "mw_player";
 
 signals:
     /// A slot's observable state changed — the owner's board should refresh.
@@ -290,7 +331,10 @@ signals:
     /// The input policy of a slot changed. main.cpp forwards it to the slot's
     /// worker, which swaps it under the running stream — no reconnect, and the
     /// keys held under the old policy are released on the way.
-    void permissionsChanged(int slot, bool gamepad, bool keyboardMouse);
+    void permissionsChanged(int slot, bool gamepad, bool keyboardMouse, bool hid);
+
+    /// The owner picked another height for the guests' picture.
+    void feedHeightChanged(int height);
 
 private:
     struct Activation
@@ -381,6 +425,8 @@ private:
     static QString sanitizeName(const QString& name);
 
     QHash<int, Slot> m_Slots;
+    int m_FeedHeight = kFeedHeight;
+    QHash<QString, QString> m_LinkAddress; ///< host uuid → LinkAddresses id
     QHash<QString, RateEntry> m_RateLimits;
     QTimer* m_SweepTimer = nullptr;
 

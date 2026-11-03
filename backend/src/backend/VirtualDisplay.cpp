@@ -352,6 +352,28 @@ bool processElevated()
     return ok && elevation.TokenIsElevated;
 }
 
+bool elevatedTaskRunning()
+{
+    ComScope com;
+    if (!com.usable()) return false;
+    ComPtr<ITaskService> service;
+    HRESULT hr = CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_ITaskService, reinterpret_cast<void**>(service.out()));
+    if (FAILED(hr)) return false;
+    VARIANT none;
+    VariantInit(&none);
+    if (FAILED(service->Connect(none, none, none, none))) return false;
+    ComPtr<ITaskFolder> root;
+    Bstr rootPath(QStringLiteral("\\"));
+    if (FAILED(service->GetFolder(rootPath.b, root.out()))) return false;
+    Bstr name(taskName());
+    ComPtr<IRegisteredTask> task;
+    if (FAILED(root->GetTask(name.b, task.out())) || !task) return false;
+    TASK_STATE state = TASK_STATE_UNKNOWN;
+    if (FAILED(task->get_State(&state))) return false;
+    return state == TASK_STATE_RUNNING;
+}
+
 Status probe()
 {
     Status st;
@@ -393,7 +415,59 @@ void resetAtStartup()
     VirtualDisplayJob::instance().deactivate(nullptr);
 }
 
-#else // macOS: the engine's own display (mw::native::vdisplay); Linux: step 3
+#elif defined(Q_OS_LINUX) // the portal's VIRTUAL source, made by the stream itself
+
+bool nodePresent()
+{
+    // The probe lists it whenever the portal offers the source type.
+    return anyOurs(NativeProbeService::instance().snapshot());
+}
+
+bool nodeEnabled()
+{
+    return false;
+}
+
+bool processElevated()
+{
+    return false;
+}
+
+bool elevatedTaskRunning()
+{
+    return false;
+}
+
+bool isOurs(const mw::native::DisplayInfo& display)
+{
+    return display.key == mw::native::kPortalVirtualDisplayKey;
+}
+
+Status probe()
+{
+    Status st;
+    st.supported = st.installed = nodePresent();
+    st.method = st.supported ? QStringLiteral("portal") : QString();
+    return st;
+}
+
+bool applyInProcess(const Request& req, Result* result)
+{
+    // Never reached from /start (livesInStream): nothing to turn on or off.
+    Q_UNUSED(req);
+    Result res;
+    res.ok = true;
+    res.stage = QStringLiteral("done");
+    if (result) *result = res;
+    return true;
+}
+
+void resetAtStartup()
+{
+    AppSettings().clearVirtualDisplay();
+}
+
+#else // macOS: the engine's own display (mw::native::vdisplay)
 
 bool nodePresent()
 {
@@ -406,6 +480,11 @@ bool nodeEnabled()
 }
 
 bool processElevated()
+{
+    return false;
+}
+
+bool elevatedTaskRunning()
 {
     return false;
 }
@@ -475,11 +554,13 @@ bool applyInProcess(const Request& req, Result* result)
             w = kWidth;
             h = kHeight;
         }
-        int hz = req.refresh;
-        if (!normaliseRate(hz)) hz = kRefreshHz;
+        // CoreGraphics takes whole hertz; the stream's rate is one on macOS.
+        int milli = req.refreshMilliHz;
+        const int hz = normaliseRate(milli) ? (milli + kMilliHz / 2) / kMilliHz : kRefreshHz;
         spec.width = w;
         spec.height = h;
         spec.refreshHz = hz;
+        spec.hdr = req.hdr;
         spec.name = displayName().toStdString();
         res.previousPrimary = QString::number(mw::native::vdisplay::mainDisplay());
         std::string error;
@@ -502,5 +583,14 @@ void resetAtStartup()
 }
 
 #endif
+
+bool livesInStream()
+{
+#if defined(Q_OS_LINUX)
+    return true;
+#else
+    return false;
+#endif
+}
 
 } // namespace VirtualDisplay

@@ -525,6 +525,34 @@ void run_selector_tests()
         CHECK_EQ(a.width, 8);
         CHECK_EQ(a.height, 8);
 
+        // A grid of 64x16, the 780M's AV1 (C13.12): 1080p down to the largest
+        // exact 16:9 on it; the other common sizes are whole already.
+        a = alignedToGrid({1920, 1080}, 64, 16);
+        CHECK_EQ(a.width, 1792);
+        CHECK_EQ(a.height, 1008);
+        for (const FrameSize& s :
+             {FrameSize{1280, 720}, FrameSize{2560, 1440}, FrameSize{3840, 2160}}) {
+            const FrameSize kept = alignedToGrid(s, 64, 16);
+            CHECK_EQ(kept.width, s.width);
+            CHECK_EQ(kept.height, s.height);
+        }
+        // Off the grid and with no exact shape on it: whole blocks, within
+        // the frame, close to its shape.
+        a = alignedToGrid({1366, 768}, 64, 16);
+        CHECK_EQ(a.width % 64, 0);
+        CHECK_EQ(a.height % 16, 0);
+        CHECK(a.width <= 1366 && a.height <= 768);
+        CHECK(std::abs(double(a.width) / a.height - 1366.0 / 768.0) < 0.01);
+        // Square blocks: what alignedToBlocks gives.
+        a = alignedToGrid({1366, 768}, 8, 8);
+        CHECK_EQ(a.width, 1352);
+        CHECK_EQ(a.height, 760);
+        a = alignedToGrid({1920, 1080}, 0, 16);
+        CHECK_EQ(a.width, 1920);
+        a = alignedToGrid({40, 10}, 64, 16);
+        CHECK_EQ(a.width, 64);
+        CHECK_EQ(a.height, 16);
+
         // Unknown sizes change nothing.
         f = frameForDisplay({0, 0}, {1920, 1080});
         CHECK_EQ(f.width, 1920);
@@ -643,6 +671,59 @@ void run_selector_tests()
         CHECK(fallBackFromMatch(r));
         CHECK_EQ(r.width, 2532);
         CHECK(!r.allowUpscale);
+
+        // "Match my screen" on the portal's virtual monitor (Linux, C0 of plan
+        // Idées Punktfunk): no mode to change, the display is made at the
+        // client's size — pinned to the made display's bounds and even — and
+        // select() then streams it to the pixel, phone shape and all.
+        Capabilities made = hybridMachine();
+        DisplayInfo virt;
+        virt.id = 7;
+        virt.gpuId = made.displays.front().gpuId;
+        virt.width = 1920;
+        virt.height = 1080;
+        virt.refreshMilliHz = 60000;
+        virt.kind = DisplayKind::Virtual;
+        virt.key = kPortalVirtualDisplayKey;
+        made.displays.push_back(virt);
+        SessionConfig v;
+        v.displayId = 7;
+        v.clientCodecs = {Codec::H264};
+        v.fitRequestedBox = v.allowUpscale = v.matchClientDisplay = true;
+        v.width = 1170;
+        v.height = 2533;
+        CHECK(sizeVirtualMonitorToClient(made, v));
+        CHECK(!v.matchClientDisplay);
+        CHECK(!fallBackFromMatch(v));
+        CHECK_EQ(made.displays.back().width, 1170);
+        CHECK_EQ(made.displays.back().height, 2532);
+        Selection vs;
+        std::string verr;
+        CHECK(select(made, v, vs, verr));
+        CHECK_EQ(vs.width, 1170);
+        CHECK_EQ(vs.height, 2532);
+        // Past the bounds: pinned, the box rule fitting the rest.
+        SessionConfig big = v;
+        big.matchClientDisplay = true;
+        big.width = 5120;
+        big.height = 300;
+        CHECK(sizeVirtualMonitorToClient(made, big));
+        CHECK_EQ(made.displays.back().width, kMadeDisplayMax);
+        CHECK_EQ(made.displays.back().height, kMadeDisplayMin);
+        // Any other display, or a config that did not ask: nothing changes,
+        // and the caller falls back from the match as before.
+        SessionConfig real = v;
+        real.matchClientDisplay = true;
+        real.displayId = made.displays.front().id;
+        const int realWidth = made.displays.front().width;
+        CHECK(!sizeVirtualMonitorToClient(made, real));
+        CHECK(real.matchClientDisplay);
+        CHECK_EQ(made.displays.front().width, realWidth);
+        SessionConfig autoAsked = v;
+        autoAsked.matchClientDisplay = false;
+        autoAsked.width = 2560;
+        CHECK(!sizeVirtualMonitorToClient(made, autoAsked));
+        CHECK_EQ(made.displays.back().width, kMadeDisplayMax);
     }
 
     SECTION("Selector — default display");

@@ -1,0 +1,988 @@
+diff --git a/include/juice/juice.h b/include/juice/juice.h
+index e43db6c..ee5cf45 100644
+--- a/include/juice/juice.h
++++ b/include/juice/juice.h
+@@ -93,6 +93,11 @@ typedef enum juice_concurrency_mode {
+ typedef enum juice_ice_tcp_mode {
+ 	JUICE_ICE_TCP_MODE_NONE = 0, // ICE-TCP is disabled
+ 	JUICE_ICE_TCP_MODE_ACTIVE,   // ICE-TCP will operate as a client
++	// MoonlightWeb patch: as a client, and also as a server for a peer that only dials (a
++	// browser). The agent listens on the TCP port of its UDP socket while its checks run, and
++	// offers it as a passive host candidate. A connection is kept only once its first frame
++	// is a Binding request that passes the agent's own integrity check.
++	JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE,
+ } juice_ice_tcp_mode_t;
+ 
+ typedef struct juice_config {
+diff --git a/src/agent.c b/src/agent.c
+index 2378346..b15f505 100644
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -271,7 +271,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
+ 		}
+ 	}
+ 
+-	if (agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_ACTIVE) {
++	if (agent->ice_tcp_mode != JUICE_ICE_TCP_MODE_NONE) {
+ 		if (records_count > 0) {
+ 			// RFC 6544: The connection-address encoded into the candidate-attribute for
+ 			// active candidates MUST be set to the IP address that will be used for the
+@@ -292,6 +292,24 @@ int agent_gather_candidates(juice_agent_t *agent) {
+ 					}
+ 				}
+ 			}
++			// MoonlightWeb patch: the passive candidates, on the port of the UDP socket, which
++			// the listener shares. None when it could not bind there.
++			if (agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE &&
++			    conn_tcp_listening(agent)) {
++				for (int i = 0; i < 2; ++i) {
++					int family = families[i];
++					for (int j = 0; j < records_count; ++j) {
++						addr_record_t *record = records + j;
++						if (record->addr.ss_family == family) {
++							addr_record_t tcp_record;
++							memcpy(&tcp_record, record, sizeof(addr_record_t));
++							tcp_record.socktype = SOCK_STREAM;
++							agent_add_local_tcp_passive_candidate(agent, &tcp_record);
++							break;
++						}
++					}
++				}
++			}
+ 		} else {
+ 			JLOG_WARN("No local host candidates gathered, unable to add TCP candidates");
+ 		}
+@@ -769,8 +787,47 @@ int agent_get_selected_candidate_pair(juice_agent_t *agent, ice_candidate_t *loc
+ 		return -1;
+ 	}
+ 
+-	if (local)
++	if (local) {
+ 		*local = pair->local ? *pair->local : agent->local.candidates[0];
++		// MoonlightWeb patch: a pair without its own local candidate reported the first one in
++		// the list, and one matched by its mapped address can be the UDP candidate on the port
++		// the listener shares: a UDP one, for a pair over TCP. The local candidate of the same
++		// transport and family says what the pair runs on: the passive one for a peer that dialled.
++		bool tcp = pair->remote->transport != ICE_CANDIDATE_TRANSPORT_UDP;
++		// A peer that dialled reached one address of the listener, the one getsockname() named
++		// on its connection: the passive candidate of that address, or one made of it, since a
++		// family offers only its first address (the tunnel rewrites that one anyway).
++		bool named = false;
++		if (pair->remote->transport == ICE_CANDIDATE_TRANSPORT_TCP_TYPE_ACTIVE &&
++		    agent->tcp_passive_local.len > 0) {
++			const addr_record_t *accepted = &agent->tcp_passive_local;
++			for (int i = 0; i < agent->local.candidates_count && !named; ++i) {
++				const ice_candidate_t *c = agent->local.candidates + i;
++				if (c->transport == ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE &&
++				    addr_is_equal((const struct sockaddr *)&c->resolved.addr,
++				                  (const struct sockaddr *)&accepted->addr, true)) {
++					*local = *c;
++					named = true;
++				}
++			}
++			if (!named)
++				named = ice_create_local_candidate(ICE_CANDIDATE_TYPE_HOST, 1,
++				                                   agent->local.candidates_count, accepted, local,
++				                                   ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE) == 0;
++		}
++		if (!named &&
++		    (!pair->local || (pair->local->transport != ICE_CANDIDATE_TRANSPORT_UDP) != tcp)) {
++			for (int i = 0; i < agent->local.candidates_count; ++i) {
++				const ice_candidate_t *c = agent->local.candidates + i;
++				if ((c->transport != ICE_CANDIDATE_TRANSPORT_UDP) == tcp &&
++				    (!tcp || c->transport != pair->remote->transport) &&
++				    c->resolved.addr.ss_family == pair->remote->resolved.addr.ss_family) {
++					*local = *c;
++					break;
++				}
++			}
++		}
++	}
+ 	if (remote)
+ 		*remote = *pair->remote;
+ 
+@@ -787,6 +844,28 @@ int agent_conn_recv(juice_agent_t *agent, char *buf, size_t len, const addr_reco
+ 	return 0; // ignore errors
+ }
+ 
++// MoonlightWeb patch: whether the first frame of a connection the listener accepted lets it in.
++// Nothing else of the connection has been read, and nothing has been allocated for it: only a
++// Binding request carrying our ufrag and a valid MESSAGE-INTEGRITY under our password does, and
++// only while the checks run. The parser is the one every UDP datagram already goes through.
++int agent_conn_tcp_admit(juice_agent_t *agent, char *buf, size_t len) {
++	if (agent->state != JUICE_STATE_CONNECTING && agent->state != JUICE_STATE_CONNECTED)
++		return -1;
++
++	if (!is_stun_datagram(buf, len))
++		return -1;
++
++	stun_message_t msg;
++	if (stun_read(buf, len, &msg) < 0)
++		return -1;
++
++	if (msg.msg_class != STUN_CLASS_REQUEST || msg.msg_method != STUN_METHOD_BINDING ||
++	    !msg.has_integrity)
++		return -1;
++
++	return agent_verify_stun_binding(agent, buf, len, &msg) == 0 ? 0 : -1;
++}
++
+ int agent_conn_fail(juice_agent_t *agent) {
+ 	agent_change_state(agent, JUICE_STATE_FAILED);
+ 	atomic_store(&agent->selected_entry, NULL); // disallow sending
+@@ -923,7 +1002,10 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
+ 				continue;
+ 
+ 			if (entry_is_tcp(entry)) {
+-			    if (entry->tcp_state == TCP_STATE_DISCONNECTED)
++				// MoonlightWeb patch: an active remote cannot be dialled, its connection is
++				// the one the listener accepted
++			    if (entry->tcp_state == TCP_STATE_DISCONNECTED &&
++				    entry->pair->remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_ACTIVE)
+ 					conn_tcp_connect(agent, &entry->record); // First attempt a TCP connection
+ 
+ 				if(entry->tcp_state != TCP_STATE_CONNECTED)
+@@ -2352,13 +2434,25 @@ int agent_add_remote_reflexive_candidate(juice_agent_t *agent, ice_candidate_typ
+ 		JLOG_ERROR("Invalid type for remote reflexive candidate");
+ 		return -1;
+ 	}
+-	if (ice_find_candidate_from_addr(&agent->remote, record, ICE_CANDIDATE_TYPE_UNKNOWN)) {
+-		JLOG_VERBOSE("A remote candidate exists for the remote address");
+-		return 0;
++	// MoonlightWeb patch: a request that came in over TCP makes a TCP candidate (the peer dialled,
++	// so it is active), and only a candidate of the same transport is the same address
++	bool is_tcp = record->socktype == SOCK_STREAM;
++	for (int i = 0; i < agent->remote.candidates_count; ++i) {
++		const ice_candidate_t *other = agent->remote.candidates + i;
++		if (other->transport == ICE_CANDIDATE_TRANSPORT_TCP_TYPE_ACTIVE &&
++		    other->type != ICE_CANDIDATE_TYPE_PEER_REFLEXIVE)
++			continue; // announced, and so without a pair: not the connection the request came on
++		if ((other->transport != ICE_CANDIDATE_TRANSPORT_UDP) == is_tcp &&
++		    addr_is_equal((const struct sockaddr *)&other->resolved.addr,
++		                  (const struct sockaddr *)&record->addr, true)) {
++			JLOG_VERBOSE("A remote candidate exists for the remote address");
++			return 0;
++		}
+ 	}
+ 	ice_candidate_t candidate;
+ 	if (ice_create_local_candidate(type, 1, agent->local.candidates_count, record, &candidate,
+-	                               ICE_CANDIDATE_TRANSPORT_UDP)) {
++	                               is_tcp ? ICE_CANDIDATE_TRANSPORT_TCP_TYPE_ACTIVE
++	                                      : ICE_CANDIDATE_TRANSPORT_UDP)) {
+ 		JLOG_ERROR("Failed to create reflexive candidate");
+ 		return -1;
+ 	}
+@@ -2396,6 +2490,21 @@ int agent_add_local_tcp_active_candidate(juice_agent_t *agent, addr_record_t *re
+ 	return 0;
+ }
+ 
++int agent_add_local_tcp_passive_candidate(juice_agent_t *agent, addr_record_t *record) {
++	ice_candidate_t candidate;
++	if (ice_create_local_candidate(ICE_CANDIDATE_TYPE_HOST, 1, agent->local.candidates_count,
++	                               record, &candidate, ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE)) {
++		JLOG_ERROR("Failed to create passive TCP candidate");
++		return -1;
++	}
++	if (ice_add_candidate(&candidate, &agent->local)) {
++		JLOG_ERROR("Failed to add passive TCP candidate to local description");
++		return -1;
++	}
++
++	return 0;
++}
++
+ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // local may be NULL
+                              ice_candidate_t *remote) {
+ 	ice_candidate_pair_t pair;
+@@ -2411,12 +2520,18 @@ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // lo
+ 	}
+ 
+ 	if (remote->transport != ICE_CANDIDATE_TRANSPORT_UDP) {
+-		if (agent->ice_tcp_mode != JUICE_ICE_TCP_MODE_ACTIVE) {
++		if (agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_NONE) {
+ 			JLOG_WARN("ICE-TCP is disabled, ignoring TCP candidate");
+ 			return 0;
+ 		}
+ 
+-		if (remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE &&
++		// MoonlightWeb patch: an active remote is a peer that dialled our listener, known only
++		// from the request it sent over the connection. One announced in the description is never
++		// dialled and would take the single TCP place below from the peer that does dial.
++		bool listened = remote->transport == ICE_CANDIDATE_TRANSPORT_TCP_TYPE_ACTIVE &&
++		                remote->type == ICE_CANDIDATE_TYPE_PEER_REFLEXIVE &&
++		                agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE;
++		if (!listened && remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE &&
+ 		    remote->transport != ICE_CANDIDATE_TRANSPORT_TCP_TYPE_SO) {
+ 			JLOG_INFO("TCP candidate is not passive or simultaneous open, ignoring");
+ 			return 0;
+diff --git a/src/agent.h b/src/agent.h
+index bccdde3..1bd47b0 100644
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -154,6 +154,10 @@ struct juice_agent {
+ 
+ 	thread_t resolver_thread;
+ 	bool resolver_thread_started;
++
++	// MoonlightWeb patch: the local address of the connection the passive listener accepted, as
++	// getsockname() gives it (len 0 before one). Set and read under the conn lock.
++	addr_record_t tcp_passive_local;
+ };
+ 
+ juice_agent_t *agent_create(const juice_config_t *config);
+@@ -181,6 +185,7 @@ int agent_get_selected_candidate_pair(juice_agent_t *agent, ice_candidate_t *loc
+ int agent_conn_recv(juice_agent_t *agent, char *buf, size_t len, const addr_record_t *src);
+ int agent_conn_update(juice_agent_t *agent, timestamp_t *next_timestamp);
+ int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_state_t state);
++int agent_conn_tcp_admit(juice_agent_t *agent, char *buf, size_t len);
+ int agent_conn_fail(juice_agent_t *agent);
+ 
+ int agent_input(juice_agent_t *agent, char *buf, size_t len, const addr_record_t *src,
+@@ -224,6 +229,7 @@ int agent_add_local_reflexive_candidate(juice_agent_t *agent, ice_candidate_type
+ int agent_add_remote_reflexive_candidate(juice_agent_t *agent, ice_candidate_type_t type,
+                                          uint32_t priority, const addr_record_t *record);
+ int agent_add_local_tcp_active_candidate(juice_agent_t *agent, addr_record_t *record);
++int agent_add_local_tcp_passive_candidate(juice_agent_t *agent, addr_record_t *record);
+ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local,
+                              ice_candidate_t *remote); // local may be NULL
+ int agent_add_candidate_pairs_for_remote(juice_agent_t *agent, ice_candidate_t *remote);
+diff --git a/src/conn.c b/src/conn.c
+index 307d5b2..af7dc71 100644
+--- a/src/conn.c
++++ b/src/conn.c
+@@ -23,13 +23,13 @@
+ static conn_mode_entry_t mode_entries[MODE_ENTRIES_SIZE] = {
+     {conn_poll_registry_init, conn_poll_registry_cleanup, conn_poll_init, conn_poll_cleanup,
+      conn_poll_lock, conn_poll_unlock, conn_poll_interrupt, conn_poll_send, conn_poll_tcp_connect, conn_poll_get_addrs,
+-     NULL, NULL, NULL, MUTEX_INITIALIZER, NULL},
++     conn_poll_tcp_listening, NULL, NULL, NULL, MUTEX_INITIALIZER, NULL},
+     {conn_mux_registry_init, conn_mux_registry_cleanup, conn_mux_init, conn_mux_cleanup,
+      conn_mux_lock, conn_mux_unlock, conn_mux_interrupt, conn_mux_send, NULL, conn_mux_get_addrs,
+-     conn_mux_listen, conn_mux_get_registry, conn_mux_can_release_registry, MUTEX_INITIALIZER, NULL},
++     NULL, conn_mux_listen, conn_mux_get_registry, conn_mux_can_release_registry, MUTEX_INITIALIZER, NULL},
+     {NULL, NULL, conn_thread_init, conn_thread_cleanup,
+      conn_thread_lock, conn_thread_unlock, conn_thread_interrupt, conn_thread_send, NULL, conn_thread_get_addrs,
+-     NULL, NULL, NULL, MUTEX_INITIALIZER, NULL}
++     NULL, NULL, NULL, NULL, MUTEX_INITIALIZER, NULL}
+ };
+ 
+ #define MODE_ENTRIES_SIZE 3
+@@ -262,6 +262,14 @@ void conn_tcp_connect(juice_agent_t *agent, const addr_record_t *dst) {
+ 		entry->tcp_connect_func(agent, dst);
+ }
+ 
++bool conn_tcp_listening(juice_agent_t *agent) {
++	if (!agent->conn_impl)
++		return false;
++
++	conn_mode_entry_t *entry = get_agent_mode_entry(agent);
++	return entry->tcp_listening_func ? entry->tcp_listening_func(agent) : false;
++}
++
+ int conn_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {
+ 	if (!agent->conn_impl)
+ 		return -1;
+diff --git a/src/conn.h b/src/conn.h
+index d86b672..0870428 100644
+--- a/src/conn.h
++++ b/src/conn.h
+@@ -46,6 +46,7 @@ typedef struct conn_mode_entry {
+ 	                 int ds);
+ 	void (*tcp_connect_func)(juice_agent_t *agent, const addr_record_t *dst);
+ 	int (*get_addrs_func)(juice_agent_t *agent, addr_record_t *records, size_t size);
++	bool (*tcp_listening_func)(juice_agent_t *agent); // MoonlightWeb patch, may be NULL
+ 	int (*mux_listen_func)(conn_registry_t *registry, juice_cb_mux_incoming_t cb, void *user_ptr);
+ 	conn_registry_t *(*get_registry_func)(udp_socket_config_t *config);
+ 	bool (*can_release_registry_func)(conn_registry_t *registry);
+@@ -64,5 +65,6 @@ int conn_send(juice_agent_t *agent, const addr_record_t *dst, const char *data,
+               int ds);
+ void conn_tcp_connect(juice_agent_t *agent, const addr_record_t *dst);
+ int conn_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size);
++bool conn_tcp_listening(juice_agent_t *agent);
+ 
+ #endif
+diff --git a/src/conn_poll.c b/src/conn_poll.c
+index 7d6ed7b..beeeee7 100644
+--- a/src/conn_poll.c
++++ b/src/conn_poll.c
+@@ -31,6 +31,33 @@ typedef struct registry_impl {
+ 
+ typedef enum conn_state { CONN_STATE_NEW = 0, CONN_STATE_READY, CONN_STATE_FINISHED } conn_state_t;
+ 
++// MoonlightWeb patch: the passive ICE-TCP listener (JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE). It shares
++// the address and port of the agent's UDP socket and lives only while the checks run. A connection
++// it accepts waits here, read no further than its first frame, until that frame passes
++// agent_conn_tcp_admit(); it then becomes the agent's TCP connection and the listener closes.
++#define TCP_PASSIVE_PENDING_MAX 4
++#define TCP_PASSIVE_PER_ADDRESS_MAX 2 // of those places, for one source address
++#define TCP_PASSIVE_FIRST_FRAME_TIMEOUT 2000 // msecs
++#define TCP_PASSIVE_FIRST_FRAME_MIN 20       // a STUN header
++#define TCP_PASSIVE_FIRST_FRAME_MAX 1024
++
++// MoonlightWeb patch: the datagrams sent while the TCP socket would block. Upstream kept one and
++// dropped every other until it went out: over a long round trip SCTP lost a datagram each time
++// the socket filled, and a page's first download stalled on the retransmissions (2 to 5 s per
++// large file at 115 ms). They wait here, framed and in order, after the one tcp_ice_write()
++// holds. Bounded, so a link that cannot keep up still loses datagrams as UDP would, rather than
++// growing a delay the stream's congestion control cannot see.
++#define TCP_SEND_QUEUE_MAX (256 * 1024)
++
++typedef struct tcp_passive_pending {
++	socket_t sock;
++	addr_record_t src;
++	timestamp_t deadline;
++	uint16_t length;   // of the first frame, once its 2-byte header is in
++	uint16_t received; // the header included
++	char buffer[2 + TCP_PASSIVE_FIRST_FRAME_MAX];
++} tcp_passive_pending_t;
++
+ typedef struct conn_impl {
+ 	conn_registry_t *registry;
+ 	conn_state_t state;
+@@ -43,6 +70,15 @@ typedef struct conn_impl {
+ 	mutex_t send_mutex;
+ 	int send_ds;
+ 	timestamp_t next_timestamp;
++	char *tcp_queue;       // MoonlightWeb patch: TCP_SEND_QUEUE_MAX bytes once needed
++	size_t tcp_queue_start, tcp_queue_end;
++	socket_t listen_sock;  // MoonlightWeb patch: passive ICE-TCP
++	bool tcp_passive;      // tcp_sock came from the listener
++	bool polled_tcp;       // what conn_poll_prepare() put in the array, for conn_poll_process()
++	bool polled_listen;
++	int polled_pending;
++	int pending_count;
++	tcp_passive_pending_t pending[TCP_PASSIVE_PENDING_MAX];
+ } conn_impl_t;
+ 
+ typedef struct pfds_record {
+@@ -58,6 +94,16 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd);
+ void conn_poll_change_tcp_fail(juice_agent_t *agent);
+ void conn_poll_change_tcp_state(juice_agent_t *agent, tcp_state_t state);
+ int conn_poll_run(conn_registry_t *registry);
++static void tcp_queue_reset(conn_impl_t *conn_impl);
++static bool tcp_queue_push(conn_impl_t *conn_impl, const char *data, size_t size);
++static int tcp_queue_flush(conn_impl_t *conn_impl);
++static socket_t tcp_passive_listen(socket_t udp_sock);
++static void tcp_passive_trim(juice_agent_t *agent, timestamp_t now);
++static void tcp_passive_close(conn_impl_t *conn_impl);
++static void tcp_passive_drop(conn_impl_t *conn_impl, int k);
++static bool tcp_passive_same_source(const addr_record_t *a, const addr_record_t *b);
++static int tcp_passive_oldest(const conn_impl_t *conn_impl, const addr_record_t *src);
++static nfds_t tcp_passive_process(juice_agent_t *agent, pfds_record_t *pfds, nfds_t i);
+ 
+ static thread_return_t THREAD_CALL conn_thread_entry(void *arg) {
+ 	thread_set_name_self("juice poll");
+@@ -148,15 +194,23 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
+ 		}
+ 
+ 		conn_impl_t *conn_impl = agent->conn_impl;
+-		if (!conn_impl ||
+-		    (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY)) {
++		if (!conn_impl)
++			continue;
++		if (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY) {
++			// MoonlightWeb patch: a finished connection listens no more, though its agent lives on
++			tcp_passive_close(conn_impl);
+ 			continue;
+ 		}
+ 
++		tcp_passive_trim(agent, now);
++
+ 		size++;
+ 		if (conn_impl->tcp_sock != INVALID_SOCKET) {
+ 			size++;
+ 		}
++		if (conn_impl->listen_sock != INVALID_SOCKET)
++			size++;
++		size += conn_impl->pending_count;
+ 	}
+ 
+ 	if (pfds->size != size) {
+@@ -203,6 +257,7 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
+ 		udp_pfd->events = POLLIN;
+ 		i++;
+ 
++		conn_impl->polled_tcp = conn_impl->tcp_sock != INVALID_SOCKET;
+ 		if (conn_impl->tcp_sock != INVALID_SOCKET) {
+ 			struct pollfd *tcp_pfd = pfds->pfds + i;
+ 			tcp_pfd->fd = conn_impl->tcp_sock;
+@@ -210,12 +265,33 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
+ 				tcp_pfd->events = POLLOUT;
+ 			} else {
+ 				tcp_pfd->events = POLLIN;
+-				if(conn_impl->tcp_ice_write_context.pending)
++				// MoonlightWeb patch: the senders set it under the send mutex
++				mutex_lock(&conn_impl->send_mutex);
++				if(conn_impl->tcp_ice_write_context.pending ||
++				   conn_impl->tcp_queue_end > conn_impl->tcp_queue_start)
+ 					tcp_pfd->events |= POLLOUT;
++				mutex_unlock(&conn_impl->send_mutex);
+ 			}
+ 
+ 			i++;
+ 		}
++
++		conn_impl->polled_listen = conn_impl->listen_sock != INVALID_SOCKET;
++		if (conn_impl->polled_listen) {
++			struct pollfd *listen_pfd = pfds->pfds + i;
++			listen_pfd->fd = conn_impl->listen_sock;
++			listen_pfd->events = POLLIN;
++			i++;
++		}
++		conn_impl->polled_pending = conn_impl->pending_count;
++		for (int k = 0; k < conn_impl->pending_count; ++k) {
++			struct pollfd *pending_pfd = pfds->pfds + i;
++			pending_pfd->fd = conn_impl->pending[k].sock;
++			pending_pfd->events = POLLIN;
++			i++;
++			if (*next_timestamp > conn_impl->pending[k].deadline)
++				*next_timestamp = conn_impl->pending[k].deadline;
++		}
+ 	}
+ 
+ 	mutex_unlock(&registry->mutex);
+@@ -338,17 +414,30 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd) {
+ 
+ 			conn_poll_change_tcp_state(agent, TCP_STATE_CONNECTED);
+ 		} else {
++			// MoonlightWeb patch: under the send mutex, like every other write of this context.
++			// Without it an application thread's datagram and this flush interleaved their
++			// bytes on the wire, which breaks the framing for good. And a would-block is not a
++			// failure, any other error is.
+ 			tcp_ice_write_context_t *context = &conn_impl->tcp_ice_write_context;
+-			if(context->pending) {
+-				int ret = tcp_ice_write(conn_impl->tcp_sock, NULL, 0, context);
+-				if (ret >= 0) {
+-					JLOG_DEBUG("Finished sending ICE-TCP datagram");
+-				} else if (ret == -SEAGAIN || ret == -SEWOULDBLOCK) {
+-					JLOG_WARN("TCP send failed, errno=%d", -ret);
+-					conn_poll_change_tcp_fail(agent);
+-					return;
++			mutex_lock(&conn_impl->send_mutex);
++			int ret = 0, err = 0;
++			if (context->pending) {
++				ret = tcp_ice_write(conn_impl->tcp_sock, NULL, 0, context);
++				err = sockerrno;
++			}
++			if (!context->pending) { // then the queue, behind it
++				int flushed = tcp_queue_flush(conn_impl);
++				if (flushed < 0) {
++					ret = -1;
++					err = -flushed;
+ 				}
+ 			}
++			mutex_unlock(&conn_impl->send_mutex);
++			if (ret < 0 && err != SEAGAIN && err != SEWOULDBLOCK) {
++				JLOG_WARN("TCP send failed, errno=%d", err);
++				conn_poll_change_tcp_fail(agent);
++				return;
++			}
+ 		}
+ 	}
+ 
+@@ -400,12 +489,15 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd) {
+ 
+ void conn_poll_change_tcp_fail(juice_agent_t *agent) {
+ 	conn_impl_t *conn_impl = agent->conn_impl;
++	mutex_lock(&conn_impl->send_mutex); // MoonlightWeb patch: a sender may be using it
+ 	if (conn_impl->tcp_sock != INVALID_SOCKET) {
+ 		closesocket(conn_impl->tcp_sock);
+ 		conn_impl->tcp_sock = INVALID_SOCKET;
+ 	}
+ 	memset(&conn_impl->tcp_ice_write_context, 0, sizeof(tcp_ice_write_context_t));
+ 	memset(&conn_impl->tcp_ice_read_context, 0, sizeof(tcp_ice_read_context_t));
++	tcp_queue_reset(conn_impl);
++	mutex_unlock(&conn_impl->send_mutex);
+ 	conn_poll_change_tcp_state(agent, TCP_STATE_FAILED);
+ }
+ 
+@@ -478,15 +570,19 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
+ 		conn_poll_process_udp(agent, udp_pfd);
+ 		i++;
+ 
+-		if (conn_impl->tcp_sock == INVALID_SOCKET)
+-			continue;
++		// What was polled, not what exists now: a connection the bookkeeping just opened has no
++		// slot in the array, and reading one past its end was an overflow
++		if (conn_impl->polled_tcp) {
++			if (i >= pfds->size)
++				break;
+ 
+-		struct pollfd *tcp_pfd = pfds->pfds + i;
+-		if (tcp_pfd->fd != conn_impl->tcp_sock)
+-			break;
++			struct pollfd *tcp_pfd = pfds->pfds + i;
++			if (tcp_pfd->fd == conn_impl->tcp_sock)
++				conn_poll_process_tcp(agent, tcp_pfd);
++			i++;
++		}
+ 
+-		conn_poll_process_tcp(agent, tcp_pfd);
+-		i++;
++		i = tcp_passive_process(agent, pfds, i);
+ 	}
+ 
+ 	mutex_unlock(&registry->mutex);
+@@ -551,6 +647,10 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
+ 	memset(&conn_impl->tcp_ice_write_context, 0, sizeof(tcp_ice_write_context_t));
+ 	memset(&conn_impl->tcp_ice_read_context, 0, sizeof(tcp_ice_read_context_t));
+ 
++	conn_impl->listen_sock = INVALID_SOCKET;
++	if (agent->ice_tcp_mode == JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE)
++		conn_impl->listen_sock = tcp_passive_listen(conn_impl->udp_sock);
++
+ 	agent->conn_impl = conn_impl;
+ 	return 0;
+ }
+@@ -562,7 +662,16 @@ void conn_poll_cleanup(juice_agent_t *agent) {
+ 
+ 	mutex_destroy(&conn_impl->send_mutex);
+ 	closesocket(conn_impl->udp_sock);
++	tcp_passive_close(conn_impl);
++	if (conn_impl->tcp_passive && conn_impl->tcp_sock != INVALID_SOCKET) {
++		// Reset rather than leave our end of it in TIME_WAIT: the next session's listener binds
++		// this same port
++		struct linger abortive = {1, 0};
++		setsockopt(conn_impl->tcp_sock, SOL_SOCKET, SO_LINGER, (const char *)&abortive,
++		           sizeof(abortive));
++	}
+ 	closesocket(conn_impl->tcp_sock);
++	tcp_queue_reset(conn_impl);
+ 	free(agent->conn_impl);
+ 	agent->conn_impl = NULL;
+ }
+@@ -616,14 +725,28 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
+ 	JLOG_VERBOSE("Sending datagram, size=%d", size);
+ 
+ 	int ret;
++	bool flush_later = false;
+ 	if (dst->socktype == SOCK_STREAM) {
+ 		tcp_ice_write_context_t *context = &conn_impl->tcp_ice_write_context;
+-		if (!context->pending) {
++		bool queued = conn_impl->tcp_queue_end > conn_impl->tcp_queue_start;
++		if (!context->pending && !queued) {
++			// MoonlightWeb patch: tcp_ice_write() returns send()'s -1, not an errno
+ 			ret = tcp_ice_write(conn_impl->tcp_sock, data, size, context);
+-			if (context->pending && (ret == SEAGAIN || ret == SEWOULDBLOCK))
+-				ret = (int)size; // datagram is buffered, consider it sent
++			if (ret < 0 && ret != -SEMSGSIZE) {
++				int err = sockerrno;
++				if (context->pending && (err == SEAGAIN || err == SEWOULDBLOCK)) {
++					ret = (int)size; // datagram is buffered, consider it sent
++					flush_later = true;
++				} else {
++					ret = -err;
++				}
++			}
++		} else if (size > TCP_ICE_BUFFER_SIZE) {
++			ret = -SEMSGSIZE;
++		} else if (tcp_queue_push(conn_impl, data, size)) {
++			ret = (int)size; // goes out after the ones before it, on POLLOUT
+ 		} else {
+-			// another datagram is buffered, drop
++			// MoonlightWeb patch: the queue is full, drop
+ 			ret = -SEAGAIN;
+ 		}
+ 	} else {
+@@ -650,6 +773,8 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
+ 	}
+ 
+ 	mutex_unlock(&conn_impl->send_mutex);
++	if (flush_later)
++		conn_poll_interrupt(agent); // so that the next poll watches for POLLOUT
+ 	return ret;
+ }
+ 
+@@ -672,6 +797,365 @@ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst) {
+ 	mutex_unlock(&conn_impl->registry->mutex);
+ }
+ 
++static void tcp_queue_reset(conn_impl_t *conn_impl) {
++	free(conn_impl->tcp_queue);
++	conn_impl->tcp_queue = NULL;
++	conn_impl->tcp_queue_start = conn_impl->tcp_queue_end = 0;
++}
++
++// Under the send mutex. False when it does not fit: the caller drops it.
++static bool tcp_queue_push(conn_impl_t *conn_impl, const char *data, size_t size) {
++	size_t used = conn_impl->tcp_queue_end - conn_impl->tcp_queue_start;
++	if (used + 2 + size > TCP_SEND_QUEUE_MAX)
++		return false;
++
++	if (!conn_impl->tcp_queue && !(conn_impl->tcp_queue = malloc(TCP_SEND_QUEUE_MAX)))
++		return false;
++
++	if (conn_impl->tcp_queue_end + 2 + size > TCP_SEND_QUEUE_MAX) {
++		memmove(conn_impl->tcp_queue, conn_impl->tcp_queue + conn_impl->tcp_queue_start, used);
++		conn_impl->tcp_queue_start = 0;
++		conn_impl->tcp_queue_end = used;
++	}
++	uint16_t header = htons((uint16_t)size); // RFC 4571 framing, as tcp_ice_write() does
++	memcpy(conn_impl->tcp_queue + conn_impl->tcp_queue_end, &header, 2);
++	memcpy(conn_impl->tcp_queue + conn_impl->tcp_queue_end + 2, data, size);
++	conn_impl->tcp_queue_end += 2 + size;
++	return true;
++}
++
++// Under the send mutex, once tcp_ice_write() holds nothing: as much of the queue as the socket
++// takes. 0, or -errno on a failure other than would-block.
++static int tcp_queue_flush(conn_impl_t *conn_impl) {
++#if defined(__APPLE__) || defined(_WIN32)
++	int flags = 0;
++#else
++	int flags = MSG_NOSIGNAL;
++#endif
++	while (conn_impl->tcp_queue_start < conn_impl->tcp_queue_end) {
++		int len = send(conn_impl->tcp_sock, conn_impl->tcp_queue + conn_impl->tcp_queue_start,
++		               (int)(conn_impl->tcp_queue_end - conn_impl->tcp_queue_start), flags);
++		if (len < 0) {
++			int err = sockerrno;
++			return err == SEAGAIN || err == SEWOULDBLOCK ? 0 : -err;
++		}
++		conn_impl->tcp_queue_start += (size_t)len;
++	}
++	conn_impl->tcp_queue_start = conn_impl->tcp_queue_end = 0;
++	return 0;
++}
++
++bool conn_poll_tcp_listening(juice_agent_t *agent) {
++	conn_impl_t *conn_impl = agent->conn_impl;
++	return conn_impl->listen_sock != INVALID_SOCKET;
++}
++
++static socket_t tcp_passive_listen(socket_t udp_sock) {
++	addr_record_t name;
++	memset(&name, 0, sizeof(name));
++	name.len = sizeof(name.addr);
++	if (getsockname(udp_sock, (struct sockaddr *)&name.addr, &name.len) != 0) {
++		JLOG_WARN("Passive ICE-TCP: getsockname failed, errno=%d", sockerrno);
++		return INVALID_SOCKET;
++	}
++	uint16_t port = addr_get_port((struct sockaddr *)&name.addr);
++
++	socket_t sock = socket(name.addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
++	if (sock == INVALID_SOCKET) {
++		JLOG_WARN("Passive ICE-TCP: socket creation failed, errno=%d", sockerrno);
++		return INVALID_SOCKET;
++	}
++
++	const sockopt_t disabled = 0;
++	if (name.addr.ss_family == AF_INET6) // dual-stack, like the UDP socket
++		setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&disabled, sizeof(disabled));
++#ifndef _WIN32
++	// A connection of the previous session may sit in TIME_WAIT on this port. This lets the
++	// listener bind regardless; it never lets two listeners share the port.
++	const sockopt_t enabled = 1;
++	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&enabled, sizeof(enabled));
++#endif
++
++	ctl_t nbio = 1;
++	if (ioctlsocket(sock, FIONBIO, &nbio)) {
++		JLOG_WARN("Passive ICE-TCP: setting non-blocking mode failed, errno=%d", sockerrno);
++		goto error;
++	}
++	if (bind(sock, (const struct sockaddr *)&name.addr, name.len) != 0) {
++		JLOG_INFO("Passive ICE-TCP: cannot bind TCP port %hu, errno=%d, no passive candidate", port,
++		          sockerrno);
++		goto error;
++	}
++	if (listen(sock, TCP_PASSIVE_PENDING_MAX) != 0) {
++		JLOG_WARN("Passive ICE-TCP: listen failed on port %hu, errno=%d", port, sockerrno);
++		goto error;
++	}
++
++	JLOG_INFO("Passive ICE-TCP: listening on TCP port %hu", port);
++	return sock;
++
++error:
++	closesocket(sock);
++	return INVALID_SOCKET;
++}
++
++static void tcp_passive_close(conn_impl_t *conn_impl) {
++	if (conn_impl->listen_sock != INVALID_SOCKET) {
++		JLOG_DEBUG("Passive ICE-TCP: closing the listener");
++		closesocket(conn_impl->listen_sock);
++		conn_impl->listen_sock = INVALID_SOCKET;
++	}
++	while (conn_impl->pending_count > 0)
++		tcp_passive_drop(conn_impl, conn_impl->pending_count - 1);
++}
++
++static void tcp_passive_drop(conn_impl_t *conn_impl, int k) {
++	closesocket(conn_impl->pending[k].sock);
++	--conn_impl->pending_count;
++	if (k != conn_impl->pending_count)
++		conn_impl->pending[k] = conn_impl->pending[conn_impl->pending_count];
++}
++
++// Whether two connections come from the same source: the same IPv4 address, or the same IPv6
++// /64, the block one subscriber gets whole.
++static bool tcp_passive_same_source(const addr_record_t *a, const addr_record_t *b) {
++	const struct sockaddr *sa = (const struct sockaddr *)&a->addr;
++	const struct sockaddr *sb = (const struct sockaddr *)&b->addr;
++	if (sa->sa_family != sb->sa_family)
++		return false;
++	if (sa->sa_family == AF_INET6)
++		return memcmp(&((const struct sockaddr_in6 *)sa)->sin6_addr,
++		              &((const struct sockaddr_in6 *)sb)->sin6_addr, 8) == 0;
++	return addr_is_equal(sa, sb, false);
++}
++
++// The oldest waiting connection from the source of `src`, or, with NULL, the oldest of all; -1 if
++// there is none. The oldest has the earliest deadline.
++static int tcp_passive_oldest(const conn_impl_t *conn_impl, const addr_record_t *src) {
++	int oldest = -1;
++	for (int k = 0; k < conn_impl->pending_count; ++k) {
++		const tcp_passive_pending_t *pending = conn_impl->pending + k;
++		if (src && !tcp_passive_same_source(&pending->src, src))
++			continue;
++		if (oldest < 0 || pending->deadline < conn_impl->pending[oldest].deadline)
++			oldest = k;
++	}
++	return oldest;
++}
++
++// Under the registry lock, before each poll: the listener closes once the checks are over, and
++// a connection that did not send its first frame in time is closed.
++static void tcp_passive_trim(juice_agent_t *agent, timestamp_t now) {
++	conn_impl_t *conn_impl = agent->conn_impl;
++	if (conn_impl->listen_sock == INVALID_SOCKET && conn_impl->pending_count == 0)
++		return;
++
++	if (agent->state == JUICE_STATE_COMPLETED || agent->state == JUICE_STATE_FAILED ||
++	    conn_impl->tcp_passive) {
++		tcp_passive_close(conn_impl);
++		return;
++	}
++
++	for (int k = conn_impl->pending_count - 1; k >= 0; --k) {
++		if (conn_impl->pending[k].deadline <= now) {
++			JLOG_INFO("Passive ICE-TCP: no first frame in time, closing the connection");
++			tcp_passive_drop(conn_impl, k);
++		}
++	}
++}
++
++static void tcp_passive_accept(juice_agent_t *agent) {
++	conn_impl_t *conn_impl = agent->conn_impl;
++	// Bounded: whatever is left waits for the next poll
++	for (int left = 2 * TCP_PASSIVE_PENDING_MAX; left > 0; --left) {
++		addr_record_t src;
++		memset(&src, 0, sizeof(src));
++		src.len = sizeof(src.addr);
++		socket_t sock = accept(conn_impl->listen_sock, (struct sockaddr *)&src.addr, &src.len);
++		if (sock == INVALID_SOCKET)
++			return; // none left, or an error the next poll reports again
++
++		addr_unmap_inet6_v4mapped((struct sockaddr *)&src.addr, &src.len);
++		src.socktype = SOCK_STREAM;
++
++		// One source (an IPv4 address, an IPv6 /64) keeps at most TCP_PASSIVE_PER_ADDRESS_MAX
++		// places, its newest connection taking its oldest one's; a full list makes room by closing
++		// its oldest connection, whatever it has sent: none has authenticated, and a peer sends its
++		// whole check within the round trip of its handshake. Whoever fills the places can no
++		// longer keep it out.
++		int same = 0;
++		for (int k = 0; k < conn_impl->pending_count; ++k)
++			if (tcp_passive_same_source(&conn_impl->pending[k].src, &src))
++				++same;
++		if (same >= TCP_PASSIVE_PER_ADDRESS_MAX) {
++			JLOG_INFO("Passive ICE-TCP: too many connections waiting from one source, closing its "
++			          "oldest");
++			tcp_passive_drop(conn_impl, tcp_passive_oldest(conn_impl, &src));
++		} else if (conn_impl->pending_count >= TCP_PASSIVE_PENDING_MAX) {
++			JLOG_INFO("Passive ICE-TCP: too many connections waiting, closing the oldest");
++			tcp_passive_drop(conn_impl, tcp_passive_oldest(conn_impl, NULL));
++		}
++
++		ctl_t nbio = 1;
++		if (ioctlsocket(sock, FIONBIO, &nbio)) {
++			closesocket(sock);
++			continue;
++		}
++
++		tcp_passive_pending_t *pending = conn_impl->pending + conn_impl->pending_count++;
++		pending->sock = sock;
++		pending->src = src;
++		pending->deadline = current_timestamp() + TCP_PASSIVE_FIRST_FRAME_TIMEOUT;
++		pending->length = 0;
++		pending->received = 0;
++
++		if (JLOG_DEBUG_ENABLED) {
++			char src_str[ADDR_MAX_STRING_LEN];
++			addr_record_to_string(&src, src_str, ADDR_MAX_STRING_LEN);
++			JLOG_DEBUG("Passive ICE-TCP: accepted a connection from %s", src_str);
++		}
++	}
++}
++
++// The first frame passed the gate: the connection becomes the agent's TCP connection, and the
++// frame goes in as any datagram would, making the peer-reflexive candidate and its pair.
++static void tcp_passive_adopt(juice_agent_t *agent, int k) {
++	conn_impl_t *conn_impl = agent->conn_impl;
++	tcp_passive_pending_t *pending = conn_impl->pending + k;
++
++	char frame[TCP_PASSIVE_FIRST_FRAME_MAX];
++	size_t len = pending->length;
++	memcpy(frame, pending->buffer + 2, len);
++	if (agent_conn_tcp_admit(agent, frame, len) != 0) {
++		JLOG_INFO("Passive ICE-TCP: the first frame is no authenticated Binding request, closing");
++		tcp_passive_drop(conn_impl, k);
++		return;
++	}
++	if (conn_impl->tcp_sock != INVALID_SOCKET) {
++		JLOG_INFO("Passive ICE-TCP: the agent already has a TCP connection, closing");
++		tcp_passive_drop(conn_impl, k);
++		return;
++	}
++
++	socket_t sock = pending->sock;
++	addr_record_t src = pending->src;
++	--conn_impl->pending_count; // taken out without closing it
++	if (k != conn_impl->pending_count)
++		conn_impl->pending[k] = conn_impl->pending[conn_impl->pending_count];
++	tcp_passive_close(conn_impl); // the listener and every other connection still waiting
++
++	const sockopt_t enabled = 1; // the stream rides it, frame by frame
++	setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&enabled, sizeof(enabled));
++
++	// The address the peer reached, for the selected pair's local candidate: the listener binds
++	// the wildcard, and the candidate offered is only the first address of its family
++	addr_record_t local;
++	memset(&local, 0, sizeof(local));
++	local.len = sizeof(local.addr);
++	if (getsockname(sock, (struct sockaddr *)&local.addr, &local.len) == 0) {
++		addr_unmap_inet6_v4mapped((struct sockaddr *)&local.addr, &local.len);
++		local.socktype = SOCK_STREAM;
++		agent->tcp_passive_local = local;
++	}
++
++	mutex_lock(&conn_impl->send_mutex);
++	conn_impl->tcp_sock = sock;
++	memcpy(&conn_impl->tcp_dst, &src, sizeof(conn_impl->tcp_dst));
++	memset(&conn_impl->tcp_ice_write_context, 0, sizeof(tcp_ice_write_context_t));
++	memset(&conn_impl->tcp_ice_read_context, 0, sizeof(tcp_ice_read_context_t));
++	tcp_queue_reset(conn_impl);
++	conn_impl->tcp_state = TCP_STATE_CONNECTED;
++	conn_impl->tcp_passive = true;
++	mutex_unlock(&conn_impl->send_mutex);
++
++	if (JLOG_INFO_ENABLED) {
++		char src_str[ADDR_MAX_STRING_LEN];
++		addr_record_to_string(&src, src_str, ADDR_MAX_STRING_LEN);
++		JLOG_INFO("Passive ICE-TCP: connection from %s admitted", src_str);
++	}
++
++	agent_conn_recv(agent, frame, len, &conn_impl->tcp_dst);
++	if (agent_conn_tcp_state(agent, &conn_impl->tcp_dst, TCP_STATE_CONNECTED) != 0) {
++		JLOG_WARN("Passive ICE-TCP: no candidate pair for the connection, closing it");
++		mutex_lock(&conn_impl->send_mutex);
++		closesocket(conn_impl->tcp_sock);
++		conn_impl->tcp_sock = INVALID_SOCKET;
++		conn_impl->tcp_state = TCP_STATE_DISCONNECTED;
++		mutex_unlock(&conn_impl->send_mutex);
++		return;
++	}
++	if (agent_conn_update(agent, &conn_impl->next_timestamp) != 0) {
++		JLOG_WARN("Agent update failed");
++		conn_impl->state = CONN_STATE_FINISHED;
++	}
++}
++
++static void tcp_passive_read(juice_agent_t *agent, struct pollfd *pfd) {
++	conn_impl_t *conn_impl = agent->conn_impl;
++	int k = 0;
++	while (k < conn_impl->pending_count && conn_impl->pending[k].sock != pfd->fd)
++		++k;
++	if (k == conn_impl->pending_count)
++		return; // closed since the poll
++
++	if (pfd->revents & (POLLERR | POLLNVAL) || (pfd->revents & POLLHUP && !(pfd->revents & POLLIN))) {
++		tcp_passive_drop(conn_impl, k);
++		return;
++	}
++	if (!(pfd->revents & POLLIN))
++		return;
++
++	tcp_passive_pending_t *pending = conn_impl->pending + k;
++	while (pending->received < 2 || pending->received < 2 + pending->length) {
++		size_t want = pending->received < 2 ? 2 : 2 + (size_t)pending->length;
++		int len = recv(pending->sock, pending->buffer + pending->received,
++		               (int)(want - pending->received), 0);
++		if (len < 0 && (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK))
++			return; // the rest comes later, or the deadline closes it
++		if (len <= 0) {
++			tcp_passive_drop(conn_impl, k); // closed, or failed
++			return;
++		}
++
++		pending->received += (uint16_t)len;
++		if (pending->received == 2) {
++			uint16_t header;
++			memcpy(&header, pending->buffer, 2);
++			pending->length = ntohs(header);
++			if (pending->length < TCP_PASSIVE_FIRST_FRAME_MIN ||
++			    pending->length > TCP_PASSIVE_FIRST_FRAME_MAX) {
++				JLOG_INFO("Passive ICE-TCP: a first frame of %hu bytes, closing", pending->length);
++				tcp_passive_drop(conn_impl, k);
++				return;
++			}
++		}
++	}
++
++	tcp_passive_adopt(agent, k);
++}
++
++static nfds_t tcp_passive_process(juice_agent_t *agent, pfds_record_t *pfds, nfds_t i) {
++	conn_impl_t *conn_impl = agent->conn_impl;
++	struct pollfd *listen_pfd = NULL;
++	if (conn_impl->polled_listen && i < pfds->size)
++		listen_pfd = pfds->pfds + i++;
++
++	int polled = conn_impl->polled_pending;
++	for (int k = 0; k < polled && i < pfds->size; ++k) {
++		struct pollfd *pending_pfd = pfds->pfds + i++;
++		if (pending_pfd->revents && conn_impl->state != CONN_STATE_FINISHED)
++			tcp_passive_read(agent, pending_pfd);
++	}
++
++	// Accepted last: a connection it closes to make room may have a descriptor polled above,
++	// whose number a new one could reuse
++	if (listen_pfd && conn_impl->listen_sock != INVALID_SOCKET &&
++	    listen_pfd->fd == conn_impl->listen_sock && (listen_pfd->revents & POLLIN) &&
++	    conn_impl->state != CONN_STATE_FINISHED)
++		tcp_passive_accept(agent);
++	return i;
++}
++
+ int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {
+ 	conn_impl_t *conn_impl = agent->conn_impl;
+ 
+diff --git a/src/conn_poll.h b/src/conn_poll.h
+index b850089..ae786e6 100644
+--- a/src/conn_poll.h
++++ b/src/conn_poll.h
+@@ -28,6 +28,7 @@ int conn_poll_interrupt(juice_agent_t *agent);
+ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
+                         int ds);
+ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst);
++bool conn_poll_tcp_listening(juice_agent_t *agent);
+ int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size);
+ 
+ #endif
+diff --git a/src/ice.c b/src/ice.c
+index 61e134e..1ccb1ba 100644
+--- a/src/ice.c
++++ b/src/ice.c
+@@ -365,6 +365,10 @@ int ice_generate_candidate_sdp(const ice_candidate_t *candidate, char *buffer, s
+ 			transport = "TCP";
+ 			suffix = "tcptype active";
+ 			break;
++		case  ICE_CANDIDATE_TRANSPORT_TCP_TYPE_PASSIVE:
++			transport = "TCP";
++			suffix = "tcptype passive";
++			break;
+ 		default:
+ 			JLOG_ERROR("Unknown candidate transport");
+ 			return -1;

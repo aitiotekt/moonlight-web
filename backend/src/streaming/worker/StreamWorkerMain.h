@@ -37,6 +37,12 @@
  *     EOF                 — parent died: teardown, exit
  *   stdout (worker → parent):
  *     {"event":"response","code":<http>,"body":{...}} — the /start HTTP reply
+ *     {"event":"captureHold","held":…,"display_mhz":…} — the capture's verdict
+ *                        on its display, just before "ended" (vddmatch)
+ *     {"event":"mouseKeys","on":true,"saved":{…}} / {"event":"mouseKeys","on":false}
+ *                        — Mouse Keys turned on for a host with no pointing
+ *                        device, or let go; put back by the parent if the
+ *                        worker dies holding them
  *     {"event":"ended"}                               — session over (any cause)
  * All logging goes to the log file / stderr; stdout carries only the protocol.
  */

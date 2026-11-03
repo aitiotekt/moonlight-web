@@ -27,7 +27,7 @@ cask "moonlightweb" do
   url "https://github.com/linckosz/moonlight-web/releases/download/v#{version}/moonlightweb-#{version}-macos-arm64.pkg",
       verified: "github.com/linckosz/moonlight-web/"
   name "MoonlightWeb"
-  desc "Stream your Sunshine games to any device with a browser"
+  desc "Stream your gaming PC to any device with a browser"
   homepage "https://moonlightweb.top/"
 
   livecheck do

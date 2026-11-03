@@ -71,9 +71,11 @@ import /etc/caddy/stream.caddy
 api.@MW_DOMAIN@ {
 	@TLS_LINE@
 	import no_index
+	# Per subscriber: an IPv6 /64 is one (subscriber_key, stream.caddy).
+	import subscriber_key
 	rate_limit {
 		zone mw_api {
-			key {remote_host}
+			key {mw_subscriber}
 			events 60
 			window 1m
 		}
@@ -91,9 +93,11 @@ api.@MW_DOMAIN@ {
 dnsapi.@MW_DOMAIN@ {
 	@SITE_TLS_LINE@
 	import no_index
+	# Per subscriber: an IPv6 /64 is one (subscriber_key, stream.caddy).
+	import subscriber_key
 	rate_limit {
 		zone mw_dnsapi {
-			key {remote_host}
+			key {mw_subscriber}
 			events 60
 			window 1m
 		}
@@ -110,9 +114,11 @@ dnsapi.@MW_DOMAIN@ {
 updates.@MW_DOMAIN@ {
 	@SITE_TLS_LINE@
 	import no_index
+	# Per subscriber: an IPv6 /64 is one (subscriber_key, stream.caddy).
+	import subscriber_key
 	rate_limit {
 		zone mw_updates {
-			key {remote_host}
+			key {mw_subscriber}
 			events 60
 			window 1m
 		}
@@ -135,21 +141,31 @@ packages.@MW_DOMAIN@ {
 	file_server
 }
 
-# Session census (0.3.0+) — DELIBERATELY NOT SERVED HERE.
+# Session census (0.3.0+) — the shape and length of each stream, in aggregate,
+# on the same mw-proxy container (exact path /v1/session, see session.go). It
+# lands in its own Umami website (MW_UMAMI_SESSIONS_WEBSITE_ID).
 #
-# The code exists (mw-proxy/session.go, exact path /v1/session) and instances
-# know how to report to it, but it is switched OFF at the only two points that
-# matter: there is no `metrics` A record and no site block for it. Both are
-# needed to turn it on — see "Session census" in README.md, which carries the
-# block to paste back.
-#
-# Leaving the block here without the record is worse than not having it: Caddy
-# would order a certificate for a name that does not resolve, fail, and keep
-# retrying forever. Whoever turns this on adds the record FIRST.
+# This block needs the `metrics` A record to exist FIRST (pdns/init.sh adds it):
+# Caddy orders a certificate for every name it serves, and for a name that does
+# not resolve it fails and keeps retrying forever.
 #
 # Its own hostname rather than a path on updates.* stays the right shape: it
 # means the census can be switched off fleet-wide by deleting one record, while
 # the update path — which must keep working — is untouched.
+metrics.@MW_DOMAIN@ {
+	@SITE_TLS_LINE@
+	import no_index
+	# Per subscriber: an IPv6 /64 is one (subscriber_key, stream.caddy).
+	import subscriber_key
+	rate_limit {
+		zone mw_metrics {
+			key {mw_subscriber}
+			events 60
+			window 1m
+		}
+	}
+	reverse_proxy mw-proxy:8080
+}
 
 # Analytics dashboard — self-hosted Umami (privacy-friendly, cookieless).
 # Serves both the tracker script (/script.js) and the admin dashboard. Not

@@ -170,6 +170,19 @@ func (h *hostLine) dropSession(id string) bool {
 	return true
 }
 
+// alive reports whether the line is still up: not shut down, not displaced.
+func (h *hostLine) alive() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.gone
+}
+
+func (h *hostLine) sessionCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.sessions)
+}
+
 // shutdown marks the line dead and returns the sessions to hang up.
 func (h *hostLine) shutdown() []*session {
 	h.mu.Lock()
@@ -232,6 +245,23 @@ func (h *hub) onlineCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return len(h.lines)
+}
+
+// sessionCount is the browsers bridged onto every line. Each line is read under
+// its own lock, after the hub's is released: a line is never locked while the
+// hub is, so the two never nest.
+func (h *hub) sessionCount() int {
+	h.mu.Lock()
+	lines := make([]*hostLine, 0, len(h.lines))
+	for _, l := range h.lines {
+		lines = append(lines, l)
+	}
+	h.mu.Unlock()
+	n := 0
+	for _, l := range lines {
+		n += l.sessionCount()
+	}
+	return n
 }
 
 // ── Frame helpers ───────────────────────────────────────────────────────────

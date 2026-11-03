@@ -28,7 +28,10 @@
 #include <QElapsedTimer>
 #include <QTimer>
 
+#include <memory>
+
 class IMediaEngine;
+class MicUplink;
 
 class StreamRelay : public QObject
 {
@@ -83,6 +86,11 @@ public:
     /// moved to its dedicated thread (Session does, right after creation).
     void setClipboardEnabled(bool enabled);
 
+    /// The viewer's microphone (MicUplink.h), already started: the page's
+    /// binary messages on this socket are its frames. Set before the relay
+    /// moves to its thread, like the clipboard; stopped with the relay.
+    void setMicUplink(std::shared_ptr<MicUplink> mic) { m_Mic = std::move(mic); }
+
 signals:
     void sessionEnded();
     void clientConnected();
@@ -93,6 +101,7 @@ private slots:
     void onAudioSample(const QByteArray& data);
     void onNewWsConnection();
     void onWsTextMessage(const QString& message);
+    void onWsBinaryMessage(const QByteArray& message);
     void onWsDisconnected();
 
     void onShimConnectionStarted();
@@ -147,6 +156,7 @@ private:
     // Same lifetime discipline as m_ClipboardEnabled: written before the move
     // to the relay thread, read-only afterwards.
     InputMsg::Policy m_InputPolicy;
+    std::shared_ptr<MicUplink> m_Mic;
     bool m_UseVideoFragmentation =
         false;              // WSS fragmentation OFF — full frames sent as single WS messages
     uint32_t m_FrameId = 0; // Monotonic frame ID for fragmentation

@@ -44,12 +44,17 @@ function entry(id, name) {
     return { id, name, url: `https://stream.moonlightweb.top/${id}`, seen: Date.now() };
 }
 
+const menu = () => document.getElementById('instance-menu');
+const names = () =>
+    [...menu().querySelectorAll('.instance-item-name')].map((n) => n.textContent.trim());
+
 describe('LoginView server selection', () => {
     let view;
     let container;
 
     const open = async () => {
-        document.body.innerHTML = '<div id="host"></div>';
+        document.body.innerHTML =
+            '<header><div class="instance-menu" id="instance-menu" hidden></div></header><div id="host"></div>';
         container = document.getElementById('host');
         view = new LoginView(container, () => {});
         await view.start();
@@ -70,40 +75,42 @@ describe('LoginView server selection', () => {
     it('offers nothing when this browser has been nowhere else', async () => {
         register([entry(HERE, 'DualRTX')]);
         await open();
-        expect(container.querySelector('#login-server-select')).toBeNull();
+        expect(menu().hidden).toBe(true);
+        expect(menu().querySelector('.instance-btn')).toBeNull();
     });
 
-    it('lists the other machines, on both authentication forms', async () => {
+    it('lives in the page header, not in the login box', async () => {
         register([entry(HERE, 'DualRTX'), entry(THERE, 'UM790Pro')]);
         await open();
+        expect(menu().hidden).toBe(false);
+        expect(menu().querySelector('.instance-btn')).not.toBeNull();
+        expect(container.querySelector('.instance-menu, #login-server-select')).toBeNull();
 
-        const select = container.querySelector('#login-server-select');
-        expect(select).not.toBeNull();
-        const options = [...select.options].map((o) => o.textContent.trim());
-        expect(options).toEqual(['login.serverCurrent', 'UM790Pro']);
-
+        // Switching to the certificate form leaves the header alone.
         container.querySelector('#btn-toggle-auth-method').click();
         expect(container.querySelector('#login-cert-input')).not.toBeNull();
-        expect(container.querySelector('#login-server-select')).not.toBeNull();
+        expect(menu().querySelector('.instance-btn')).not.toBeNull();
+    });
+
+    it('lists this machine under a neutral label, then the others', async () => {
+        register([entry(HERE, 'DualRTX'), entry(THERE, 'UM790Pro')]);
+        await open();
+        expect(names()).toEqual(['login.serverCurrent', 'UM790Pro']);
+        expect(menu().querySelector('.instance-name').textContent).toBe('login.serverCurrent');
     });
 
     it('never names the machine being unlocked', async () => {
         register([entry(HERE, 'DualRTX'), entry(THERE, 'UM790Pro')]);
         await open();
-        expect(container.innerHTML).not.toContain('DualRTX');
+        expect(document.body.innerHTML).not.toContain('DualRTX');
     });
 
     it('names a machine this browser has never reached no more than any other', async () => {
         // The identifier in the address is not in the register: every entry is
-        // somewhere else, and the selected row still says nothing about here.
+        // somewhere else, and the current row still says nothing about here.
         register([entry(THERE, 'UM790Pro')]);
         await open();
-        const select = container.querySelector('#login-server-select');
-        expect([...select.options].map((o) => o.value)).toEqual([
-            '',
-            `https://stream.moonlightweb.top/${THERE}`,
-        ]);
-        expect(select.value).toBe('');
+        expect(names()).toEqual(['login.serverCurrent', 'UM790Pro']);
     });
 
     it('leaves for the chosen machine, and does nothing for the current row', async () => {
@@ -111,8 +118,6 @@ describe('LoginView server selection', () => {
         await open();
 
         const assign = [];
-        const select = container.querySelector('#login-server-select');
-
         const original = Object.getOwnPropertyDescriptor(window, 'location');
         delete window.location;
         window.location = {
@@ -124,14 +129,21 @@ describe('LoginView server selection', () => {
             },
         };
 
-        select.value = '';
-        select.dispatchEvent(new Event('change'));
+        const items = menu().querySelectorAll('.instance-item');
+        items[0].click();
         expect(assign).toEqual([]);
 
-        select.value = `https://stream.moonlightweb.top/${THERE}`;
-        select.dispatchEvent(new Event('change'));
+        items[1].click();
         expect(assign).toEqual([`https://stream.moonlightweb.top/${THERE}`]);
 
         if (original) Object.defineProperty(window, 'location', original);
+    });
+
+    it('hands the header back empty when the login screen goes', async () => {
+        register([entry(HERE, 'DualRTX'), entry(THERE, 'UM790Pro')]);
+        await open();
+        view.destroy();
+        expect(menu().hidden).toBe(true);
+        expect(menu().innerHTML).toBe('');
     });
 });

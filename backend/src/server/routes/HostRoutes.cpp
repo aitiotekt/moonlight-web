@@ -17,6 +17,7 @@
 
 #include "server/routes/HostRoutes.h"
 
+#include "server/ClientUniqueId.h"
 #include "server/HttpServer.h"
 #include "server/RestRouter.h"
 #include "backend/ComputerManager.h"
@@ -257,8 +258,9 @@ void registerHostRoutes(HttpServer& server, ComputerManager& computerManager)
         }
         // Same field the browser already sends on /start, so one identity
         // follows a user through the whole flow.
-        computerManager.handleGetAppList(uuid, req.queryParams.value("client_uniqueid"),
-                                         std::move(respond));
+        computerManager.handleGetAppList(
+            uuid, sanitizeClientUniqueId(req.queryParams.value("client_uniqueid")),
+            std::move(respond));
     });
 
     // Phase 4: App asset proxy — PNG (async, fetches on demand if not cached)

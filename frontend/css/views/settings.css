@@ -3,12 +3,98 @@
 .settings-view,
 .admin-view { width: 100%; }
 
+/* The page's title and its ✕ never scroll away: the way out of a long page
+   stays one click (or, on a TV, one Back that never reaches the page) away.
+   Over the first pixels of scroll the row slides up by --vh-lift, an opaque
+   band fades in behind it and a hairline in the app header's colour grows from
+   the centre. ViewHeaderScroll.js publishes the progress (--vh-p, --vh-pg) on
+   the scroller. A sticky inset counts from the scroller's padding edge, so
+   top: 0 is exactly where the title sits at rest; --vh-pad is that padding
+   (#main-content's, layout.css), which the band covers up to the app header. */
 .settings-header,
 .admin-header {
+    --vh-pad: var(--space-6);
+    --vh-lift: 18px;
+    --vh-gap: 6px; /* title row → hairline */
+    --vh-band: rgba(7, 11, 15, 0.94);
+    position: sticky;
+    top: calc(-1 * var(--vh-lift) * var(--vh-p, 0));
+    z-index: 50;
     display: flex;
     align-items: center;
     justify-content: space-between;
     margin-bottom: var(--space-5);
+}
+/* The band: the whole width of the scroller (100vw, clipped by its
+   overflow-x), no blur, a short fade at its foot so the hairline stays the
+   only edge. */
+.settings-header::before,
+.admin-header::before {
+    content: '';
+    position: absolute;
+    z-index: -1;
+    top: calc(-1 * (var(--vh-pad) - var(--vh-lift) * var(--vh-p, 0)));
+    bottom: calc(-1 * var(--vh-gap));
+    left: 50%;
+    width: 100vw;
+    transform: translateX(-50%);
+    background: var(--vh-band);
+    -webkit-mask-image: linear-gradient(#000 calc(100% - 4px), transparent);
+    mask-image: linear-gradient(#000 calc(100% - 4px), transparent);
+    opacity: var(--vh-pg, 0);
+    pointer-events: none;
+}
+.settings-header::after,
+.admin-header::after {
+    content: '';
+    position: absolute;
+    bottom: calc(-1 * var(--vh-gap));
+    left: 50%;
+    width: 90vw;
+    height: 1px;
+    background: linear-gradient(
+        90deg,
+        transparent 0%,
+        var(--border-1) 22%,
+        var(--border-1) 78%,
+        transparent 100%
+    );
+    transform: translateX(-50%) scaleX(var(--vh-p, 0));
+    pointer-events: none;
+}
+/* Whatever keyboard focus scrolls to lands below the band, not under it. */
+#main-content:has(.settings-header, .admin-header) {
+    scroll-padding-top: 72px;
+}
+@media (max-width: 600px) {
+    .settings-header,
+    .admin-header {
+        --vh-pad: var(--space-3);
+        --vh-lift: 8px;
+    }
+    /* Edge to edge, with a shorter fade. */
+    .settings-header::after,
+    .admin-header::after {
+        width: 100vw;
+        background: linear-gradient(
+            90deg,
+            transparent 0%,
+            var(--border-1) 14%,
+            var(--border-1) 86%,
+            transparent 100%
+        );
+    }
+}
+/* On a TV the document scrolls (layout.css): the title sticks under the app
+   header instead, from where it sits at rest. */
+html.remote-nav .settings-header,
+html.remote-nav .admin-header {
+    top: calc(
+        var(--app-header-h, 64px) + var(--vh-pad) - var(--vh-lift) * var(--vh-p, 0)
+    );
+}
+html.remote-nav:has(.settings-header, .admin-header) {
+    scroll-padding-top: calc(var(--app-header-h, 64px) + 88px);
 }
 .settings-header h2,
 .admin-header h2 {

@@ -26,10 +26,23 @@ import {
     verifyHostSignature,
     extractFingerprint,
     IDENTITY_REFUSED,
+    isBindRefusedClose,
 } from '../util/pairingCrypto.js';
 import { defaultIceServers } from './IceServers.js';
+import {
+    CHUNK_FLAG_KEYFRAME,
+    CHUNK_FLAG_SIDE_BLOCK,
+    readMwsrZoneBlock,
+} from '../stream/MwsrZoneBlock.js';
 import { isViewMessage } from './hostMessages.js';
+import { attachFloodCounter, floodMode } from './FloodCounter.js';
+import { attachUltraSink, ultraSinkMode } from './UltraSink.js';
+import { RtpStallWatch, receivedPackets, rtpStallWatchOn } from './RtpStallWatch.js';
+import { attachRtpVideo, passEncodedAudio, rtpLegacyApi } from './RtpVideo.js';
+import { closeHidChannel, createHidChannel, sendHidFrame } from '../hid/hidWire.js';
 import { setAudioJitterBufferTarget } from '../util/AudioJitter.js';
+import { armDscpCarrier, dscpCarrierMode, prepareDscpCarrier } from '../util/DscpCarrier.js';
+import { MIC_SOCKET_BACKLOG } from '../audio/MicSocketSender.js';
 
 /**
  * Describe a WebSocket close code for diagnostic logging.
@@ -118,6 +131,10 @@ export class WebRtcDataChannel {
         this.audioElement = null;
         // Cleanup for the autoplay gesture retry, when play() was rejected.
         this._audioRetryCleanup = null;
+        // The viewer's microphone (audio/MicUplink.js), when the host took it:
+        // it answers the same audio section sendrecv. Set by StreamView.
+        /** @type {import('../audio/MicUplink.js').MicUplink|null} */
+        this.mic = null;
 
         // WSS mode: legacy StreamRelay WebSocket passthrough.
         // When true, this class acts as a simple WS client that receives
@@ -142,12 +159,17 @@ export class WebRtcDataChannel {
         this.onOpen = null; // All DataChannels open
         this.onClose = null; // Disconnected / error
         this.onError = null; // Error event
-        this.onVideo = null; // (frame: Uint8Array, isKeyframe: boolean, backendTs: number)
+        this.onVideo = null; // (frame: Uint8Array, isKeyframe: boolean, backendTs: number, frameId: number, zones: MWSR zones | null)
+        // (frameId: number, offset: number, bytes: Uint8Array): the front of a
+        // frame still on the audio road (POC Ultra, decode by slices).
+        this.onVideoPart = null;
         this.onAudio = null; // (sample: Uint8Array)
         this.onStats = null; // (msg: object) stats/pong messages from backend
         this.onTakeover = null; // () session taken over by another device
         this.onRevoked = null; // () this device's access was revoked by the admin
         this.onSessionEnded = null; // () the owner ended the session we were invited to
+        this.onHostEnded = null; // () the host ended the stream on purpose (app closed there)
+        this.onHostLost = null; // () the host side failed (Sunshine crashed, encoder died)
 
         // Stats
         this.stats = {
@@ -159,6 +181,9 @@ export class WebRtcDataChannel {
             // ride-outs that ran their course without the stream recovering.
             stalls: 0,
             rideOutFailed: 0,
+            // Frames that carried MWSR's zones (the native host, asked at
+            // /start: stream/MwsrZoneBlock.js).
+            mwsrZoneFrames: 0,
         };
 
         // Reassembly buffers: Map<frame_id, { chunks: Uint8Array[], total: number, keyframe: boolean, firstChunkTime: number }>
@@ -204,6 +229,8 @@ export class WebRtcDataChannel {
         // caller (StreamView → MoonlightApp) can relaunch with the next
         // transport in the priority chain (… → wss is a distinct attempt).
         this._chainFallback = false;
+        // A share-link guest, never paired: no MW-BIND hello (StreamView sets it).
+        this._unpairedGuest = false;
 
         // ICE connection timeout: if ICE doesn't reach "connected" in time,
         // trigger WebSocket fallback (UDP blocked, corporate firewall).
@@ -346,6 +373,9 @@ export class WebRtcDataChannel {
                 console.log('[WSS] WS connected, stream ready');
                 this.connected = true;
                 if (this.onOpen) this.onOpen();
+                // No audio track to answer here: the microphone goes on this
+                // socket as frames (audio/MicSocketSender.js). Not awaited.
+                if (this.mic) this.mic.attachSocket((bytes) => this._sendMicFrame(bytes));
             };
 
             this.signalingWs.onmessage = (evt) => this._onWssMessage(evt);
@@ -402,6 +432,10 @@ export class WebRtcDataChannel {
                 console.log('[WebRTC] Signaling WS connected, waiting for ICE config...');
                 // MW-BIND-v1: announce our key and nonce. The host holds its SDP
                 // offer until this arrives, since its signature covers the nonce.
+                // Not for a share-link guest: never paired, it is sent an
+                // unsigned offer, which a key this browser holds from pairing
+                // with the same host as its owner would refuse (S9.2, 11/10).
+                if (this._unpairedGuest) return;
                 beginHandshake().then((identity) => {
                     this._mwBind = identity;
                     if (identity) this._sendSignaling(helloMessage(identity));
@@ -462,7 +496,11 @@ export class WebRtcDataChannel {
                     }, this.WS_GRACE_PERIOD_MS);
                 } else {
                     // Close code tells us what went wrong
-                    if (evt.code === 1015) {
+                    if (isBindRefusedClose(evt)) {
+                        // The host refused our key: final, like a refusal of its
+                        // own signature here (see IDENTITY_REFUSED).
+                        this._onError(IDENTITY_REFUSED);
+                    } else if (evt.code === 1015) {
                         this._onError(
                             'Erreur de securite TLS. ' + "Verifiez la date et l'heure du systeme.",
                         );
@@ -490,6 +528,27 @@ export class WebRtcDataChannel {
      * Send a JSON message (typically input command) to the backend.
      * Uses the input DataChannel in normal mode, or the signaling WS in WSS/fallback mode.
      */
+    /** One HID passthrough report frame; false when the channel is not open. */
+    sendHid(frame) {
+        return sendHidFrame(this._hidDc, frame);
+    }
+
+    /**
+     * One microphone frame on the WSS socket. Dropped while the socket is
+     * backed up: a voice that arrives late is worse than one missing 20 ms.
+     *
+     * @param {Uint8Array} bytes
+     * @returns {boolean} whether it was sent
+     */
+    _sendMicFrame(bytes) {
+        const ws = this.signalingWs;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+        if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > MIC_SOCKET_BACKLOG)
+            return false;
+        ws.send(bytes);
+        return true;
+    }
+
     send(obj) {
         // WSS mode or WS fallback mode: send via text on the signaling WS
         if (this._wssMode || this._wsFallback) {
@@ -684,6 +743,25 @@ export class WebRtcDataChannel {
         // Clear reassembly buffers
         this._reassembly.clear();
 
+        if (this._rtpStallWatch) {
+            this._rtpStallWatch.stop();
+            this._rtpStallWatch = null;
+        }
+        if (this._rtpVideo) {
+            for (const rtp of this._rtpVideo) rtp.stop();
+            this._rtpVideo = null;
+        }
+        if (this._ultra) {
+            this._ultra.stop();
+            this._ultra = null;
+        }
+        if (this._flood) {
+            this._flood.stop();
+            this._flood = null;
+        }
+        closeHidChannel(this._hidDc);
+        this._hidDc = null;
+
         // Close DataChannels
         for (const [label, dc] of Object.entries(this.dataChannels)) {
             if (dc && dc.readyState !== 'closed') {
@@ -733,6 +811,63 @@ export class WebRtcDataChannel {
     // PeerConnection setup
     // =========================================================================
 
+    /**
+     * A frame off the RTP video track (POC Ultra U1.4). The track can open
+     * before the DataChannels, and the decoder is only made once they are:
+     * until then the frames from the latest keyframe on are held.
+     */
+    _onRtpVideoFrame(frame, isKeyframe, backendTs, lost = false, frameId = undefined) {
+        if (this._rtpStallWatch) this._rtpStallWatch.noteFrame();
+        // A keyframe closes the request, as on the DataChannel path.
+        if (isKeyframe) {
+            this._idrOutstanding = false;
+            this._idrBackoffMs = this.IDR_THROTTLE_MS;
+        }
+        // The audio road carries the host's wire frame id: a frame given up on
+        // shows as a gap in it, and StreamView repairs it as on the
+        // DataChannel — named to a host that heals by invalidation (deltas
+        // decode on), a keyframe asked for otherwise.
+        if (frameId !== undefined) {
+            if (!this.connected) {
+                if (isKeyframe) this._rtpHeld = [];
+                if (this._rtpHeld && this._rtpHeld.length < 240)
+                    this._rtpHeld.push([frame, isKeyframe, backendTs, frameId]);
+                return;
+            }
+            if (this.onVideo) this.onVideo(frame, isKeyframe, backendTs, frameId);
+            return;
+        }
+        // A frame went missing before this one (the audio road gave up on its
+        // chunks): deltas wait for the keyframe asked for. These frames carry
+        // no host frame number, so nothing names the loss to a host that heals
+        // by invalidation, and no refresh wave is told of it either: the
+        // keyframe is the only repair, whatever the host's mode (the N95 froze
+        // at 0 i/s behind a suppressed request, 05/10/2026).
+        if (lost && !isKeyframe) this._rtpBroken = true;
+        if (this._rtpBroken) {
+            if (!isKeyframe) {
+                this._requestIdrFrame('RTP frame lost', true);
+                return;
+            }
+            this._rtpBroken = false;
+        }
+        if (!this.connected) {
+            if (isKeyframe) this._rtpHeld = [];
+            if (this._rtpHeld && this._rtpHeld.length < 240)
+                this._rtpHeld.push([frame, isKeyframe, backendTs]);
+            return;
+        }
+        if (this.onVideo) this.onVideo(frame, isKeyframe, backendTs, 0);
+    }
+
+    _flushRtpHeld() {
+        const held = this._rtpHeld;
+        this._rtpHeld = null;
+        if (!held || !this.onVideo) return;
+        for (const [frame, isKeyframe, backendTs, frameId = 0] of held)
+            this.onVideo(frame, isKeyframe, backendTs, frameId);
+    }
+
     _createPeerConnection() {
         console.log('[WebRTC] Creating RTCPeerConnection');
 
@@ -747,6 +882,8 @@ export class WebRtcDataChannel {
             bundlePolicy: 'max-bundle',
             rtcpMuxPolicy: 'require',
         };
+        // The bench's other road for the RTP video (U1.4 ter, RtpVideo.js).
+        if (rtpLegacyApi()) config.encodedInsertableStreams = true;
         console.log('[WebRTC] ICE servers:', JSON.stringify(iceServers));
 
         this.pc = new RTCPeerConnection(config);
@@ -757,8 +894,56 @@ export class WebRtcDataChannel {
         // gesture-blessed element (autoplay unlock); on desktop it returns false
         // and we play it on our own <audio> element.
         this.pc.ontrack = (evt) => {
+            // The video on an RTP track (POC Ultra U1.4), when the host's
+            // rtp_video setting put the session's codec there: its frames
+            // come to the same onVideo as the DataChannel's.
+            // "vaudio": the same frames cut in Opus packets (the bench's
+            // `aroad`, U1.4 ter), never played.
+            if (evt.track.kind === 'video' || /^[vu]audio$/.test(evt.transceiver?.mid || '')) {
+                const rtp = attachRtpVideo(evt, {
+                    onVideo: (frame, isKeyframe, backendTs, lost, frameId) =>
+                        this._onRtpVideoFrame(frame, isKeyframe, backendTs, lost, frameId),
+                    onUltra: (buf, arrivalMs) => this._ultra?.sink.onMessage(buf, arrivalMs),
+                    onVideoPart: (fid, off, bytes) => {
+                        if (this.connected && this.onVideoPart) this.onVideoPart(fid, off, bytes);
+                    },
+                    // The audio road's missing chunks, asked again (U1.4 quater).
+                    onNack: (nack) => {
+                        const dc = this.dataChannels.input;
+                        if (dc && dc.readyState === 'open')
+                            dc.send(JSON.stringify({ type: 'aroadnack', ...nack }));
+                    },
+                    // The last chunk received, for the host's send window (W4).
+                    onAck: (ack) => {
+                        const dc = this.dataChannels.input;
+                        if (dc && dc.readyState === 'open')
+                            dc.send(JSON.stringify({ type: 'aroadack', ...ack }));
+                    },
+                });
+                (this._rtpVideo ||= []).push(rtp);
+                // A video track Chrome stopped feeding (a loss, its PLI ignored
+                // by the host): packets in, no frame out — ask a keyframe.
+                // Bench key mw_rtp_stallwatch=0 turns it off (a "before" pass).
+                if (
+                    evt.track.kind === 'video' &&
+                    evt.transceiver?.mid === 'video' &&
+                    !this._rtpStallWatch &&
+                    rtpStallWatchOn()
+                ) {
+                    this._rtpStallWatch = new RtpStallWatch({
+                        packets: () => receivedPackets(evt.receiver),
+                        onStall: () => {
+                            if (this.connected)
+                                this._requestIdrFrame('RTP video track stalled', true);
+                        },
+                    });
+                    this._rtpStallWatch.start(250);
+                }
+                return;
+            }
             if (evt.track.kind !== 'audio') return;
             console.log('[WebRTC] Audio track received');
+            if (rtpLegacyApi()) passEncodedAudio(evt.receiver);
             // The browser's buffer is the whole of the audio latency: aim it.
             setAudioJitterBufferTarget(this.pc);
             const stream = new MediaStream([evt.track]);
@@ -883,6 +1068,21 @@ export class WebRtcDataChannel {
         this.dataChannels.input = this.pc.createDataChannel('input', inputInit);
         this._setupDataChannel('input', this.dataChannels.input);
 
+        // Bench only (plan Idées Punktfunk, A0): the host's flood on DC#3,
+        // counted when localStorage says `mw_flood`. Not one of the channels
+        // the connection waits for.
+        const flood = floodMode();
+        if (flood) this._flood = attachFloodCounter(this.pc, flood);
+
+        // Bench only (POC Ultra U1.1): the host's synthetic Ultra stream on
+        // DC#5, timed when localStorage says `mw_ultra_sink`.
+        const ultra = ultraSinkMode();
+        if (ultra) this._ultra = attachUltraSink(this.pc, ultra);
+
+        // The HID passthrough's reports (DC#4, hid/hidWire.js): unordered, never
+        // retransmitted, and not one of the channels the connection waits for.
+        this._hidDc = createHidChannel(this.pc);
+
         console.log('[WebRTC] Channels created (video=DC#0, audio=RTP, input=DC#2)');
     }
 
@@ -905,6 +1105,8 @@ export class WebRtcDataChannel {
                 this._clearWsCloseTimer();
 
                 if (this.onOpen) this.onOpen();
+                // RTP frames that came before the decoder existed (U1.4).
+                this._flushRtpHeld();
 
                 // Close signaling WS — no longer needed
                 this._closeSignalingWs();
@@ -945,6 +1147,10 @@ export class WebRtcDataChannel {
                         if (this.onRevoked) this.onRevoked();
                     } else if (msg.type === 'session-ended') {
                         if (this.onSessionEnded) this.onSessionEnded();
+                    } else if (msg.type === 'host-ended') {
+                        if (this.onHostEnded) this.onHostEnded();
+                    } else if (msg.type === 'host-lost') {
+                        if (this.onHostLost) this.onHostLost();
                     } else {
                         console.log('[WebRTC] Input DC message:', msg);
                     }
@@ -1063,6 +1269,13 @@ export class WebRtcDataChannel {
             console.log('[WebRTC] Remote description set (offer)');
             await this._flushPendingCandidates();
 
+            // The viewer's microphone, when the host offered to take it.
+            const micOn = this.mic ? this.mic.prepare(this.pc, sdp) : false;
+            // The bench's silent carrier (DscpCarrier.js), off by default; the
+            // microphone holds that sender when both are asked.
+            const carrier = micOn ? null : dscpCarrierMode();
+            prepareDscpCarrier(this.pc, carrier);
+
             // Create answer. Stereo Opus decode for the RTP audio track:
             // without stereo=1 in the answer fmtp the browser decodes MONO
             // and downmixes (L+R)/2 → ~-6 dB quieter.
@@ -1073,6 +1286,9 @@ export class WebRtcDataChannel {
             });
             await this.pc.setLocalDescription(modifiedAnswer);
             console.log('[WebRTC] Local description set (answer), sending...');
+            armDscpCarrier(this.pc, carrier);
+            // Not awaited: a permission prompt must not hold the answer back.
+            if (micOn) this.mic.attach();
 
             // Start ICE timeout: if ICE doesn't reach connected/completed
             // within ICE_TIMEOUT_MS, the connection has failed (likely UDP
@@ -1209,7 +1425,11 @@ export class WebRtcDataChannel {
         const frameId = view.getUint32(0, false); // offset 0, big endian
         const chunkIndex = view.getUint16(4, false); // offset 4, big endian
         const totalChunks = view.getUint16(6, false); // offset 6, big endian
-        const isKeyframe = view.getUint8(8) !== 0; // offset 8
+        // offset 8: bit 0 a keyframe, bit 1 a side block ahead of the
+        // bitstream (MWSR's zones, sent only to a page that asked for them).
+        const flags = view.getUint8(8);
+        const isKeyframe = (flags & CHUNK_FLAG_KEYFRAME) !== 0;
+        const sideBlock = (flags & CHUNK_FLAG_SIDE_BLOCK) !== 0;
         const payloadSize = view.getUint32(9, false); // offset 9, big endian
         const backendTs = view.getUint32(13, false); // offset 13, big endian
         const payload = new Uint8Array(
@@ -1226,6 +1446,7 @@ export class WebRtcDataChannel {
                 total: totalChunks,
                 received: 0,
                 keyframe: isKeyframe,
+                sideBlock: sideBlock, // Same for all chunks in a frame
                 firstChunkTime: performance.now(),
                 completed: false,
                 backendTs: backendTs, // Same for all chunks in a frame
@@ -1285,11 +1506,34 @@ export class WebRtcDataChannel {
             totalSize += entry.chunks[i].length;
         }
 
-        const assembled = new Uint8Array(totalSize);
+        let assembled = new Uint8Array(totalSize);
         let offset = 0;
         for (let i = 0; i < entry.total; i++) {
             assembled.set(entry.chunks[i], offset);
             offset += entry.chunks[i].length;
+        }
+
+        // MWSR's zones ahead of the bitstream: taken off before the decoder
+        // sees the frame. A block whose length cannot be right leaves no way
+        // to the bitstream: the frame is lost, as an incomplete one is.
+        let zones = null;
+        if (entry.sideBlock) {
+            const split = readMwsrZoneBlock(assembled);
+            if (!split || split.bitstream.length === 0) {
+                this.stats.framesDropped++;
+                if (this._frameLogCount < 10) {
+                    console.warn(
+                        '[WebRTC] Dropping frame #' + frameId + ': its side block is damaged',
+                    );
+                    this._frameLogCount++;
+                }
+                if (this.onFrameLoss) this.onFrameLoss(frameId, entry.keyframe);
+                this._requestIdrFrame('damaged side block #' + frameId);
+                return;
+            }
+            assembled = split.bitstream;
+            zones = split.zones;
+            if (zones) this.stats.mwsrZoneFrames++;
         }
 
         this.stats.framesAssembled++;
@@ -1382,9 +1626,10 @@ export class WebRtcDataChannel {
             this._rideOutFailed = false;
         }
 
-        // Emit video frame with backend timestamp for latency calculations
+        // Emit video frame with backend timestamp for latency calculations,
+        // and its zones when it carried them (null: the sharpness law).
         if (this.onVideo) {
-            this.onVideo(assembled, entry.keyframe, entry.backendTs, frameId);
+            this.onVideo(assembled, entry.keyframe, entry.backendTs, frameId, zones);
         }
     }
 
@@ -1508,12 +1753,13 @@ export class WebRtcDataChannel {
      *  Client-side throttle with exponential backoff: at most one request per adaptive
      *  interval (500ms base, doubling to 4s while no keyframe arrives); backend also
      *  throttles server-side. */
-    _requestIdrFrame(reason) {
+    _requestIdrFrame(reason, force = false) {
         const now = performance.now();
 
         // The host heals what it is told it lost: StreamView tells it. Nothing
         // this transport could ask for on its own would help — see the flag.
-        if (this.healsByInvalidation) {
+        // `force`: a loss nobody can name (the RTP road's), the keyframe or nothing.
+        if (this.healsByInvalidation && !force) {
             this._idrSuppressed++;
             if (this._idrSuppressed <= 3 || this._idrSuppressed % 50 === 0) {
                 console.log(
@@ -1537,7 +1783,7 @@ export class WebRtcDataChannel {
         // job and we fall back to exactly today's recovery. "One cycle" is
         // counted in frames received when the host said how long its wave is,
         // on the clock otherwise — see rideOutFrames.
-        if (this.rideOutLoss && !this._rideOutFailed) {
+        if (this.rideOutLoss && !this._rideOutFailed && !force) {
             if (!this._rideOutSince) {
                 this._rideOutSince = now;
                 this._rideOutFramesSeen = 0;
@@ -1737,6 +1983,10 @@ export class WebRtcDataChannel {
                     this.onRevoked();
                 } else if (msg.type === 'session-ended' && this.onSessionEnded) {
                     this.onSessionEnded();
+                } else if (msg.type === 'host-ended' && this.onHostEnded) {
+                    this.onHostEnded();
+                } else if (msg.type === 'host-lost' && this.onHostLost) {
+                    this.onHostLost();
                 }
             } catch (e) {
                 /* ignore non-JSON text */
@@ -1804,6 +2054,10 @@ export class WebRtcDataChannel {
                     if (this.onRevoked) this.onRevoked();
                 } else if (msg.type === 'session-ended') {
                     if (this.onSessionEnded) this.onSessionEnded();
+                } else if (msg.type === 'host-ended') {
+                    if (this.onHostEnded) this.onHostEnded();
+                } else if (msg.type === 'host-lost') {
+                    if (this.onHostLost) this.onHostLost();
                 }
             } catch (e) {
                 /* non-JSON text — ignore */

@@ -38,8 +38,10 @@
 // copyleft or worse: libdbus is `GPL-2+ or AFL-2.1` (the GPL arm would end this
 // module's separability, the AFL arm is GPL-incompatible), GDBus and sd-bus are
 // LGPL. sd-bus was chosen on 08/09/2026 as a deliberate, BOUNDED exception —
-// one library, this file only, behind MW_NATIVE_LINUX_PORTAL. LICENSE.md
-// § "L'exception sd-bus" says exactly what it costs and what it does not.
+// one library, behind MW_NATIVE_LINUX_PORTAL, in this file, in
+// MutterDisplayConfig.cpp (GNOME's layout around the virtual monitor) and in
+// MutterScreenCast.cpp (GNOME's own screen cast). LICENSE.md § "L'exception
+// sd-bus" says exactly what it costs and what it does not.
 //
 // ── The shape of the conversation ───────────────────────────────────────────
 //
@@ -63,6 +65,20 @@
 // The dialog is not a detail: it is why the portal is a fallback and not the
 // default. A host that asks permission at every launch is not the zero-setup
 // product the mission describes.
+//
+// ── ⚠️ Who may ask ──────────────────────────────────────────────────────────
+//
+// xdg-desktop-portal learns who is calling by opening /proc/<pid>/root of the
+// caller (1.18, Ubuntu 24.04), and the kernel lets it only if its own
+// capabilities cover the caller's: the package's worker holds CAP_SYS_ADMIN
+// and CAP_SYS_NICE (moonlightweb-launch), the portal holds none, so every call
+// came back "Portal operation not allowed: Unable to open /proc/<pid>/root"
+// (the .deb on the UM790Pro, 30/09/2026). A process that holds capabilities
+// therefore asks through a helper of its own making — the same binary, exec'd
+// with every capability dropped and none to regain — which holds the portal
+// session for the stream's length and hands the PipeWire descriptor back over
+// a socket. The capture keeps its capabilities (the queues at high priority);
+// a process without any (the AppImage, a test run by hand) asks directly.
 
 namespace mw::native::capture {
 
@@ -94,7 +110,11 @@ struct PortalStream
     int x = 0;
     int y = 0;
 
-    bool valid() const { return nodeId != 0 && pipewireFd >= 0; }
+    /// The node is on the session's own PipeWire, reached without a
+    /// descriptor: KWin's virtual output (setKwinVirtualOutput) streams there.
+    bool sessionPipeWire = false;
+
+    bool valid() const { return nodeId != 0 && (pipewireFd >= 0 || sessionPipeWire); }
 };
 
 class PortalScreenCast
@@ -121,6 +141,47 @@ public:
     /// almost always this.
     static bool available(std::string& reason);
 
+    /// The portal's AvailableSourceTypes bitmask (1 monitor, 2 window, 4
+    /// virtual), 0 when no portal answers. GNOME 42 says 3, GNOME 48 says 7.
+    static uint32_t sourceTypes();
+    static constexpr uint32_t kSourceMonitor = 1;
+    static constexpr uint32_t kSourceVirtual = 4;
+
+    /// Ask for a VIRTUAL source rather than a monitor: the compositor creates
+    /// a monitor for this session alone, sized by the PipeWire format the
+    /// consumer negotiates, and removes it when the session closes. Before
+    /// start().
+    void setVirtual(bool virtualMonitor);
+
+    /// Ask KWin for the virtual monitor instead of the portal — KDE Plasma 6,
+    /// whose portal offers no VIRTUAL source (KwinVirtualOutput.h): an output
+    /// named after @p name, of @p width × @p height. No dialog and no token;
+    /// the same helper carries the request where this process holds a
+    /// capability, since KWin cannot read such a process either. Before start().
+    void setKwinVirtualOutput(const std::string& name, int width, int height);
+
+    /// Ask Mutter itself instead of the portal — GNOME's own screen cast
+    /// (MutterScreenCast.h): a virtual monitor of @p width × @p height at
+    /// @p refreshHz or, with @p connector, that monitor as it is. No dialog,
+    /// no token, and never through the helper: Mutter looks at no caller.
+    /// The node is on the session's own PipeWire. Before start().
+    void setMutter(const std::string& connector, int width, int height, int refreshHz);
+
+    /// The pointer painted into the pictures rather than sent beside them:
+    /// cursor_mode 2 instead of 4 on the portal, 1 instead of 2 on Mutter's
+    /// route. A GNOME virtual monitor before GNOME 48, whose pictures carry it
+    /// anyway (MutterScreenCast::embedsPointer). Before start().
+    void setEmbedCursor(bool embed);
+
+    /// Whether the compositor has ended the stream of its own accord since
+    /// start(): the monitor it recorded went, the desktop was locked. Mutter's
+    /// route says so; the others never do, and this is false there.
+    bool ended();
+
+    /// After a start() on Mutter's route that failed: Mutter refused the
+    /// route outright (MutterScreenCast::refused), where the portal may serve.
+    bool routeRefused() const;
+
     /// Run the whole handshake. Blocking, and ⚠️ WAITS ON A HUMAN unless
     /// @p restoreToken replays an earlier grant: the portal shows a dialog and
     /// nothing comes back until it is answered. @p timeoutMs bounds that wait.
@@ -134,6 +195,13 @@ public:
     void stop();
 
 private:
+    /// The handshake in this process, or through the helper (see above).
+    bool startHere(const std::string& restoreToken, int timeoutMs, PortalStream& out,
+                   std::string& error);
+    bool startInHelper(const std::string& restoreToken, int timeoutMs, PortalStream& out,
+                       std::string& error);
+    void stopHelper();
+
     struct Impl;
     std::unique_ptr<Impl> d;
 };

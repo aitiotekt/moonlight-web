@@ -16,8 +16,11 @@
  */
 
 #include "DataChannelRelay.h"
+#include "AudioPathLog.h"
 #include "ClipboardBridge.h"
 #include "InputMessageCodec.h"
+#include "PacketMarking.h"
+#include "RxBufSection.h"
 #include "IMediaEngine.h"
 #include "ExitNotice.h"
 // Only for the cursor-mode message, which is meaningless to any other engine:
@@ -28,8 +31,16 @@ extern "C" {
 #include "Limelight.h"
 }
 
+#include "SctpCounters.h"
+#include "SctpFlood.h"
+#include "common/Logger.h"
+
 #include <rtc/rtc.hpp>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QJsonArray>
+#include <QRandomGenerator>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
@@ -38,8 +49,11 @@ extern "C" {
 #include <QDateTime>
 #include <QMap>
 #include <QVector>
+#include <algorithm>
 #include <mutex>
 #include <chrono>
+#include <optional>
+#include <variant>
 #include <random>
 #include <cstring>
 
@@ -56,6 +70,15 @@ extern "C" {
 
 /// Strip HEVC emulation prevention bytes (00 00 03) from RBSP data.
 /// Returns cleaned data with 0x03 removal bytes omitted.
+// The host's steady clock in µs: the clock frames are stamped on (backendTs)
+// and the pong's `host` field reads.
+static int64_t steadyUs()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 static QByteArray removeHvcEp(const QByteArray& data)
 {
     QByteArray result;
@@ -501,10 +524,17 @@ DataChannelRelay::DataChannelRelay(IMediaEngine* engine, QObject* parent)
             << "— input: direct (libdatachannel thread)";
     if (native) {
         native->setDirectFrameSink([this](const NativeMediaEngine::FrameView& view) {
+            // The engine computes zones only for a client that asked for
+            // them (`mwsr_map`), so a frame that has some is this client's.
+            mwsrzoneblock::Zones zones;
+            zones.codes = view.mwsrZones;
+            zones.cols = view.mwsrZonesX;
+            zones.rows = view.mwsrZonesY;
+            zones.scale = view.mwsrScale;
             handleVideoFrame(QByteArray::fromRawData(reinterpret_cast<const char*>(view.data),
                                                      static_cast<qsizetype>(view.size)),
                              view.keyframe, static_cast<int>(view.frameNumber),
-                             view.presentationTimeUs);
+                             view.presentationTimeUs, view.mwsrZones ? &zones : nullptr);
         });
     } else {
         connect(m_Shim, &IMediaEngine::videoFrameReady, this, &DataChannelRelay::onVideoFrame,
@@ -525,6 +555,35 @@ DataChannelRelay::DataChannelRelay(IMediaEngine* engine, QObject* parent)
         m["low"] = low;
         m["high"] = high;
         QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
+        try {
+            m_InputDc->send(std::string(j.constData(), j.size()));
+        } catch (const std::exception&) {}
+    });
+
+    // What the host's OS asked of a recreated HID device, for the page to
+    // pass to the real one (output reports, features). Same thread as rumble.
+    connect(m_Shim, &IMediaEngine::hidRequest, this,
+            [this](int slot, int kind, int reportId, QByteArray data) {
+                if (m_Stopping.load() || !m_InputDc) return;
+                static const char* const kKinds[] = {"output", "getfeature", "setfeature"};
+                QJsonObject m;
+                m["type"] = "hidrequest";
+                m["slot"] = slot;
+                m["kind"] = QLatin1String(kKinds[qBound(0, kind, 2)]);
+                m["reportId"] = reportId;
+                m["data"] = QString::fromLatin1(data.toBase64());
+                QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
+                try {
+                    m_InputDc->send(std::string(j.constData(), j.size()));
+                } catch (const std::exception&) {}
+            });
+
+    // Force feedback a game asked of a recreated wheel, for the page to play on
+    // the real one. Reliable and ordered like the rest of this channel: an
+    // effect's start must never overtake its parameters.
+    connect(m_Shim, &IMediaEngine::hidFfb, this, [this](QJsonObject m) {
+        if (m_Stopping.load() || !m_InputDc) return;
+        const QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
         try {
             m_InputDc->send(std::string(j.constData(), j.size()));
         } catch (const std::exception&) {}
@@ -613,6 +672,19 @@ DataChannelRelay::DataChannelRelay(IMediaEngine* engine, QObject* parent)
                 } catch (const std::exception&) {}
             });
 
+    // The guests' shared feed changes codec (native host): the browser comes
+    // back in it, as from its own codec fallback.
+    connect(m_Shim, &IMediaEngine::sharedFeedCodecChanged, this, [this](QString codec) {
+        if (m_Stopping.load() || !m_InputDc) return;
+        QJsonObject m;
+        m["type"] = "feedcodec";
+        m["codec"] = codec;
+        QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
+        try {
+            m_InputDc->send(std::string(j.constData(), j.size()));
+        } catch (const std::exception&) {}
+    });
+
     // ICE connection timeout: emit iceTimedOut() if PC doesn't reach
     // Connected within m_IceTimeoutMs after setRemoteDescription().
     // Triggers WebSocket fallback when UDP is blocked (corporate firewall).
@@ -652,6 +724,67 @@ void DataChannelRelay::setClipboardEnabled(bool enabled)
 DataChannelRelay::~DataChannelRelay()
 {
     qInfo() << "[DataChannelRelay] Destructor";
+    // The freezes the stats tick had not told yet, the last one included.
+    logClosedFreezes(QDateTime::currentMSecsSinceEpoch(), true);
+    // And the host's own upload, if it was still going.
+    logHostUplink(m_UplinkNotice.finish());
+    // The bench's cap on it (hostcap=), if one was set.
+    m_HostCap.stop();
+    // What SCTP had to repair during the session. A T3 timeout is a repair
+    // that waited out the retransmission timer (200 ms at least) instead of a
+    // fast retransmit — on a LAN, the one way a single frame arrives that late.
+    // Here and not in stop(), which a closing peer has usually entered first.
+    if (m_SctpAtOpenSet.load()) {
+        const mw::sctp::Counters d = mw::sctp::readCounters() - m_SctpAtOpen;
+        qInfo() << "[DataChannelRelay] SCTP this session:" << d.sent << "data chunks sent,"
+                << d.retrans << "retransmitted (" << d.fast << "fast)," << d.t3 << "T3 timeouts";
+        // How the window took those repairs (plan Wi-Fi W1): a loss inside a
+        // recovery already under way, a chunk lost twice, sends the window or
+        // max burst held back.
+        qInfo() << "[DataChannelRelay] SCTP window this session:" << d.fastInRtt
+                << "losses inside a recovery," << d.multFast << "chunks fast-retransmitted twice,"
+                << d.cwndHeld << "sends held by the window," << d.burstHeld
+                << "windows trimmed to max burst," << d.sacks << "SACKs," << d.packetsOut
+                << "packets out," << d.dupIn << "duplicate chunks in";
+    }
+    // What the bench's pacing cost: the frames that waited, and how long.
+    if (m_Sender && m_PaceMultiple > 0) {
+        const FrameSender::PacingStats p = m_Sender->pacingStats();
+        qInfo().noquote() << QStringLiteral(
+                                 "[DataChannelRelay] bench pacing this session: %1 frames, %2 "
+                                 "waited at least once, %3 ms waited in all, the longest %4 ms "
+                                 "inside one frame")
+                                 .arg(p.frames)
+                                 .arg(p.pacedFrames)
+                                 .arg(p.waitedUs / 1000.0, 0, 'f', 1)
+                                 .arg(p.maxFrameWaitUs / 1000.0, 0, 'f', 2);
+    }
+    // The bench's frame log (`relaylog=1`): next to this process's log.
+    if (m_FrameLog) {
+        const QString logFile = Logger::instance()->logFilePath();
+        const QString dir =
+            logFile.isEmpty() ? QDir::tempPath() : QFileInfo(logFile).absolutePath();
+        const QString path = dir + QStringLiteral("/relay-frames-%1-%2.csv")
+                                       .arg(QCoreApplication::applicationPid())
+                                       .arg(QDateTime::currentMSecsSinceEpoch());
+        const bool ok = m_FrameLog->writeCsv(path.toStdString());
+        qInfo() << "[DataChannelRelay] frame log:" << m_FrameLog->summary().c_str()
+                << (ok ? "— written to" : "— could NOT be written to") << path;
+    }
+    // The bench's audio log (`audiolog=1`): the same place, the same way.
+    if (m_AudioLog) {
+        AudioPathLog& audioLog = AudioPathLog::instance();
+        audioLog.stop();
+        const QString logFile = Logger::instance()->logFilePath();
+        const QString dir =
+            logFile.isEmpty() ? QDir::tempPath() : QFileInfo(logFile).absolutePath();
+        const QString path = dir + QStringLiteral("/relay-audio-%1-%2.csv")
+                                       .arg(QCoreApplication::applicationPid())
+                                       .arg(QDateTime::currentMSecsSinceEpoch());
+        const bool ok = audioLog.writeCsv(path.toStdString());
+        qInfo() << "[DataChannelRelay] audio log:" << audioLog.summary().c_str()
+                << (ok ? "— written to" : "— could NOT be written to") << path;
+    }
     // Static call: dynamic dispatch is meaningless in a destructor.
     DataChannelRelay::stop();
 }
@@ -669,25 +802,155 @@ DataChannelRelay::~DataChannelRelay()
 /// stream's bitrate — see SendBacklog::sendBufferBytesFor for the figures and
 /// the freeze that showed a fixed 256 KiB hiding a whole second at 2 Mbit/s.
 ///
+/// ⚠️ Read on 03/10/2026 (plan Wi-Fi W2 C): below 256 KiB this never took.
+/// libdatachannel's SctpTransport raises SO_SNDBUF to its largest message
+/// (Configuration::maxMessageSize, 256 KiB unset) right after reading the
+/// sysctl, so every session has had 256 KiB whatever the bitrate — a second
+/// at 2 Mbit/s, ~100 ms at 20. Only the bench's `sctpbuf=` (@p bufferKb)
+/// lowers it, by lowering the largest message along with it (setupPeerConnection).
+///
 /// A sysctl, read by each SCTP socket at creation: it must be set before the
 /// peer connection, and setting it again for another session in the same
 /// process is fine.
-void applySctpSettings(int bitrateKbps)
+void applySctpSettings(int bitrateKbps, int congestionModule, int bufferKb, int maxBurst)
 {
-    const size_t bytes = SendBacklog::sendBufferBytesFor(bitrateKbps);
+    const size_t bytes = bufferKb > 0 ? static_cast<size_t>(bufferKb) * 1024
+                                      : SendBacklog::sendBufferBytesFor(bitrateKbps);
     rtc::SctpSettings settings;
     settings.sendBufferSize = bytes;
+    // Bench knobs, never settings: unset, libdatachannel's defaults stand (a
+    // 200 ms minimum RTO, a 20 ms delayed SACK). They exist for one A/B — the
+    // click-to-photon tail of 25/09/2026, one click in ten ~205 ms late, has
+    // the shape of a T3 timeout at that minimum RTO: a lone flag frame whose
+    // last packet is lost has nothing behind it to trigger a fast retransmit.
+    bool ok = false;
+    const int rtoMinMs = qEnvironmentVariableIntValue("MW_SCTP_RTO_MIN_MS", &ok);
+    if (ok && rtoMinMs > 0) settings.minRetransmitTimeout = std::chrono::milliseconds(rtoMinMs);
+    const int sackMs = qEnvironmentVariableIntValue("MW_SCTP_SACK_DELAY_MS", &ok);
+    if (ok && sackMs >= 0) settings.delayedSackTime = std::chrono::milliseconds(sackMs);
+    // The bench's `sctpcc=` (plan Idées Punktfunk, A0.3): which loss-driven
+    // window the link is held to. Unset, usrsctp's own (RFC 2581).
+    if (congestionModule >= 0) {
+        settings.congestionControlModule = static_cast<unsigned int>(congestionModule);
+        static const char* const kModules[] = {"RFC 2581", "HSTCP", "H-TCP", "RTCC"};
+        qWarning() << "[DataChannelRelay] SCTP bench override: congestion control"
+                   << kModules[congestionModule & 3];
+    }
+    // `sctpburst=` (plan Wi-Fi W2.5), the Windows and Linux native hosts' own unless
+    // said: how many packets usrsctp sends at one opportunity.
+    // libdatachannel holds it at 10; a frame of 20 to 35 packets then waits 2
+    // to 4 SACK round trips, and a round trip is 8-9 ms on a Mac in Wi-Fi
+    // against 3-4 on Ethernet.
+    if (maxBurst >= 0) {
+        settings.maxBurst = static_cast<size_t>(maxBurst);
+        qInfo() << "[DataChannelRelay] SCTP max burst:"
+                << (maxBurst > 0 ? QString::number(maxBurst) + " packets"
+                                 : QStringLiteral("no limit"));
+    }
     rtc::SetSctpSettings(settings);
-    qInfo() << "[DataChannelRelay] SCTP send buffer set to" << (bytes / 1024) << "KiB for"
-            << bitrateKbps << "kbps, so bufferedAmount reflects the real backlog";
+    if (bufferKb > 0)
+        qWarning() << "[DataChannelRelay] SCTP bench override (sctpbuf=): send buffer" << bufferKb
+                   << "KiB, the largest message with it";
+    else
+        qInfo() << "[DataChannelRelay] SCTP send buffer asked at" << (bytes / 1024) << "KiB for"
+                << bitrateKbps << "kbps (libdatachannel keeps 256 KiB at least)";
+    if (settings.minRetransmitTimeout || settings.delayedSackTime)
+        qInfo() << "[DataChannelRelay] SCTP bench override: min RTO"
+                << (settings.minRetransmitTimeout ? settings.minRetransmitTimeout->count() : -1)
+                << "ms, delayed SACK"
+                << (settings.delayedSackTime ? settings.delayedSackTime->count() : -1) << "ms";
+}
+
+void DataChannelRelay::setLinkBench(const mw::native::EncoderTuning& tuning)
+{
+    m_Loss.configure(tuning.lossPermille, tuning.lossBurst);
+    m_SctpCongestion = tuning.sctpCongestion;
+    m_FloodKbps = tuning.floodKbps;
+    m_FloodBytes = tuning.floodBytes > 0 ? tuning.floodBytes : SctpFlood::kDefaultBytes;
+    m_FloodLikeVideo = tuning.floodLikeVideo;
+    m_UltraSynthKb = tuning.ultraSynthKb;
+    m_UltraUnordered = tuning.ultraUnordered;
+    m_AroadPace = tuning.aroadPace;
+    m_AroadWindowKb = tuning.aroadWindowKb;
+    // PyroWave sends its whole frame every time (~178 KB at 170 Mbit/s), and
+    // the host spends ~12 us a packet whatever its size: its chunks are the
+    // biggest a 1500-byte MTU holds, which Ultra's cabled LAN has (POC Ultra
+    // P-B, design §6.41: -0.4 ms on the way down). aroadchunk= says otherwise.
+    const bool pyrowave = tuning.enc12 == mw::native::EncoderTuning::Encoder12::Pyrowave;
+    if (tuning.aroadChunk > 0 || pyrowave) {
+        m_AroadChunk = static_cast<size_t>(tuning.aroadChunk > 0 ? tuning.aroadChunk : 1400);
+        qInfo() << "[DataChannelRelay] audio road chunks of" << m_AroadChunk << "bytes"
+                << (tuning.aroadChunk > 0 ? "(aroadchunk=)" : "(PyroWave's default)");
+    }
+    if (tuning.aroadBudgetPct > 0) {
+        std::lock_guard<std::mutex> budget(m_AroadBudgetMutex);
+        m_AroadBudget.setShare(tuning.aroadBudgetPct / 100.0);
+        qInfo() << "[DataChannelRelay] audio road resends:" << tuning.aroadBudgetPct
+                << "% of what it sent (aroadbudget=)";
+    }
+    m_PaceMultiple = tuning.paceMultiple;
+    m_PaceBurstKb = tuning.paceBurstKb;
+    m_SctpBufferKb = tuning.sctpBufferKb;
+    m_LinkHoldMs = tuning.linkHoldMs;
+    m_SctpMaxBurst = tuning.sctpMaxBurst >= 0 ? tuning.sctpMaxBurst : kNativeSctpMaxBurst;
+    m_SctpScheduler = tuning.sctpScheduler;
+    m_SctpMtu = tuning.sctpMtu;
+    m_RxBufVideo = tuning.rxBufVideo;
+    m_HostCapMbps = tuning.hostCapMbps > 0 ? static_cast<unsigned>(tuning.hostCapMbps) : 0;
+    if (tuning.relayLog && !m_FrameLog) {
+        m_FrameLog = std::make_unique<RelayFrameLog>();
+        qWarning() << "[DataChannelRelay] bench frame log on (relaylog=1): each video frame's way "
+                      "through the relay, written next to the log when the session ends";
+    }
+    if (tuning.clickTrace && !m_ClickTraceLog) {
+        m_ClickTraceLog = true;
+        qWarning() << "[DataChannelRelay] bench click trace on (clicktrace=1): a line for each "
+                      "stamped input, when it came off the channel and when it was handled";
+    }
+    if (tuning.audioLog && !m_AudioLog) {
+        m_AudioLog = true;
+        AudioPathLog::instance().start();
+        qWarning() << "[DataChannelRelay] bench audio log on (audiolog=1): each audio packet's "
+                      "way through the host, written next to the log when the session ends";
+    }
+    if (m_Loss.active())
+        qWarning() << "[DataChannelRelay] bench losses: video messages thrown away before SCTP,"
+                   << tuning.lossPermille << "per thousand, bursts of"
+                   << (tuning.lossBurst > 1 ? tuning.lossBurst : 1);
+}
+
+void DataChannelRelay::applyPacing()
+{
+    if (!m_Sender || m_PaceMultiple <= 0) return;
+    if (m_StreamBitrateKbps <= 0) {
+        qWarning() << "[DataChannelRelay] bench pacing asked for, but the stream's bitrate is "
+                      "unknown: not paced";
+        return;
+    }
+    const int64_t bytesPerSecond =
+        static_cast<int64_t>(m_StreamBitrateKbps) * 1000 / 8 * m_PaceMultiple;
+    const size_t burst = static_cast<size_t>(m_PaceBurstKb > 0 ? m_PaceBurstKb : 16) * 1024;
+    // A run no longer than the burst: chunks of that size at most, header
+    // included, so pacing has something to space.
+    m_ChunkPayload = burst < 16000 + 17 ? burst - 17 : 16000;
+    m_Sender->setPacing(bytesPerSecond, burst);
+    qWarning().noquote() << QStringLiteral(
+                                "[DataChannelRelay] bench pacing (pace=%1): a frame's chunks "
+                                "handed to SCTP at %2 Mbit/s at most, %3 KB at a time, chunks "
+                                "of %4 bytes")
+                                .arg(m_PaceMultiple)
+                                .arg(bytesPerSecond * 8 / 1e6, 0, 'f', 1)
+                                .arg(burst / 1024)
+                                .arg(m_ChunkPayload);
 }
 
 bool DataChannelRelay::prepare(const rtc::Configuration& config, bool isInternet)
 {
     // Before the peer connection, since each SCTP socket reads this when it is
     // made.
-    applySctpSettings(m_StreamBitrateKbps);
+    applySctpSettings(m_StreamBitrateKbps, m_SctpCongestion, m_SctpBufferKb, m_SctpMaxBurst);
     m_Backlog.setBitrateKbps(m_StreamBitrateKbps);
+    applyPacing();
 
     if (m_Pc) {
         qWarning() << "[DataChannelRelay] already prepared";
@@ -709,7 +972,49 @@ bool DataChannelRelay::setRemoteDescription(const std::string& sdp)
         return false;
     }
     try {
-        m_Pc->setRemoteDescription(rtc::Description(sdp));
+        const rtc::Description answer(sdp);
+        m_Pc->setRemoteDescription(answer);
+        logMicAnswer(sdp, "[DataChannelRelay]");
+        // A browser without Encoded Transform answers the video track
+        // inactive: the video then stays on the DataChannel (U1.4).
+        if (m_VideoTrack || m_UltraTrack) {
+            bool video = false, ultra = false;
+            for (int i = 0; i < answer.mediaCount(); ++i) {
+                const auto entry = answer.media(i);
+                if (!std::holds_alternative<const rtc::Description::Media*>(entry)) continue;
+                const auto* media = std::get<const rtc::Description::Media*>(entry);
+                const bool taken = !media->isRemoved() &&
+                                   media->direction() != rtc::Description::Direction::Inactive;
+                if (media->mid() == "video" || media->mid() == "vaudio") video = taken;
+                if (media->mid() == "ultra" || media->mid() == "uaudio") ultra = taken;
+            }
+            m_RtpVideoAccepted.store(m_VideoTrack && video);
+            m_UltraRtpAccepted.store(m_UltraTrack && ultra);
+            qInfo() << "[DataChannelRelay] RTP video track"
+                    << (m_VideoTrack ? (video ? "accepted"
+                                              : "REFUSED by the browser, video on the DataChannel")
+                                     : "not offered")
+                    << "| Ultra RTP track"
+                    << (m_UltraTrack ? (ultra ? "accepted" : "refused") : "not offered");
+        }
+        // The silent section (rxbuf=): whether the browser kept it, and with
+        // which codec. Safari, iOS and the TVs have no console to ask.
+        if (m_RxBufTrack) {
+            bool found = false, removed = false, inactive = false;
+            std::vector<int> pts;
+            for (int i = 0; i < answer.mediaCount(); ++i) {
+                const auto entry = answer.media(i);
+                if (!std::holds_alternative<const rtc::Description::Media*>(entry)) continue;
+                const auto* media = std::get<const rtc::Description::Media*>(entry);
+                if (media->mid() != "rxbuf") continue;
+                found = true;
+                removed = media->isRemoved();
+                inactive = media->direction() == rtc::Description::Direction::Inactive;
+                pts = media->payloadTypes();
+            }
+            qInfo() << "[DataChannelRelay] rxbuf: the silent video section"
+                    << QString::fromStdString(mw::rxbuf::verdict(found, removed, inactive, pts));
+        }
         qInfo() << "[DataChannelRelay] Remote description set — starting ICE timeout ("
                 << m_IceTimeoutMs << "ms)";
         // Start ICE connection timer. The remote description is set, so ICE
@@ -741,7 +1046,38 @@ void DataChannelRelay::setupPeerConnection(const rtc::Configuration& config)
 {
     qInfo() << "[DataChannelRelay] Creating PeerConnection";
 
-    m_Pc = std::make_shared<rtc::PeerConnection>(config);
+    // `sctpbuf=`: libdatachannel raises usrsctp's send buffer to the largest
+    // message, so that comes down with it (see applySctpSettings). Both ways:
+    // the page may send nothing bigger either, which only the clipboard ever
+    // comes near — a bench has none.
+    rtc::Configuration pcConfig = config;
+    if (m_SctpBufferKb > 0) pcConfig.maxMessageSize = static_cast<size_t>(m_SctpBufferKb) * 1024;
+    // `sctpmtu=` (plan Wi-Fi W2.6): usrsctp sizes its packets from the path
+    // MTU (mtu - 108, path MTU discovery off), 1172 bytes at libdatachannel's
+    // 1280, so a frame goes in ~16 % fewer packets at 1500. Only our sends:
+    // the browser's SCTP keeps its own size. DTLS fragments its handshake
+    // from it too, so a path that does not hold it never connects.
+    if (m_SctpMtu > 0) {
+        pcConfig.mtu = static_cast<size_t>(m_SctpMtu);
+        qWarning() << "[DataChannelRelay] SCTP bench override (sctpmtu=): path MTU" << m_SctpMtu
+                   << "bytes, SCTP packets of" << (m_SctpMtu - 108) << "bytes";
+    }
+
+    PacketMarking::apply();
+    m_Pc = std::make_shared<rtc::PeerConnection>(pcConfig);
+
+    // `sctpss=` (plan Wi-Fi W2.3): the host's small messages on the input
+    // channel wait behind the video's 16 KB chunks inside usrsctp. Its stream
+    // scheduler is a sysctl the SCTP socket copies when it is made, after
+    // DTLS; usrsctp_init, which the peer connection just ran, resets it.
+    if (m_SctpScheduler >= 0) {
+        static const char* const kSchedulers[] = {
+            "default",  "round robin",    "round robin by packet",
+            "priority", "fair bandwidth", "first come"};
+        const bool ok = mw::sctp::setStreamScheduler(m_SctpScheduler);
+        qWarning() << "[DataChannelRelay] SCTP bench override (sctpss=): stream scheduler"
+                   << kSchedulers[m_SctpScheduler % 6] << (ok ? "" : "— REFUSED by usrsctp");
+    }
 
     // --- Local description callback ---
     m_Pc->onLocalDescription([this](const rtc::Description& sdp) {
@@ -828,8 +1164,14 @@ void DataChannelRelay::createDataChannels()
     // MONO Opus decoder and downmixes the stereo Sunshine stream (L+R)/2, which
     // plays ~-6 dB quieter than moonlight-qt and loses the stereo image.
     {
-        auto audioDesc = rtc::Description::Audio("audio", rtc::Description::Direction::SendOnly);
-        audioDesc.addOpusCodec(111, "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1");
+        // Sendrecv for the viewer's microphone (RelayBase::setMicUplink), and
+        // for the bench's silent carrier (PacketMarking::carrierOffered).
+        const bool carrier = PacketMarking::carrierOffered();
+        const bool sendRecv = carrier || m_Mic;
+        auto audioDesc =
+            rtc::Description::Audio("audio", sendRecv ? rtc::Description::Direction::SendRecv
+                                                      : rtc::Description::Direction::SendOnly);
+        audioDesc.addOpusCodec(111, micOpusFmtp());
 
         // Declared in the description, before addTrack: the PeerConnection
         // routes incoming RTCP by the SSRCs it finds there, so an SSRC known
@@ -847,6 +1189,13 @@ void DataChannelRelay::createDataChannels()
             auto packetizer = std::make_shared<rtc::OpusRtpPacketizer>(rtpConfig);
             packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(64));
             m_AudioTrack->setMediaHandler(packetizer);
+            if (m_Mic) {
+                wireMicUplink(*m_AudioTrack, "[DataChannelRelay]");
+            } else if (carrier) {
+                // The carrier's packets carry nothing: dropped as they come.
+                m_AudioTrack->onMessage([](rtc::message_variant) {});
+                qInfo() << "[DataChannelRelay] Audio offered sendrecv (MW_DSCP_CARRIER bench key)";
+            }
 
             m_AudioTrack->onOpen([this]() { qInfo() << "[DataChannelRelay] Audio Track open"; });
             m_AudioTrack->onClosed(
@@ -885,6 +1234,30 @@ void DataChannelRelay::createDataChannels()
     // lifetime is abandoned wherever it is, and the receiver jumps to what is
     // current. A lone loss on a healthy link still gets its fast retransmit
     // within a round trip, and one timer-driven retry inside the lifetime.
+    // Before the first createDataChannel(), like the audio track (above).
+    createRtpVideoTracks();
+
+    // `rxbuf=` (plan « Gels du lien », point 1; the native host's default
+    // since 20/10, rxbuf=0 takes it out): a video section nothing is ever
+    // sent on. Chrome's UDP socket keeps 64 KB of receive buffer
+    // (services/network/p2p/socket_udp.cc) unless a video channel asks for
+    // more, 256 KB (WebRTC-ReceiveBufferSize), on the transport the whole
+    // bundle shares: a DataChannel stream has none, and a 40 Mbit/s frame
+    // arriving at line rate is more than 64 KB. The page answers it like any
+    // RTP video section, and nothing arrives there. Offered beside the bench's
+    // RTP roads too: the audio road (PyroWave's) is an Opus track. H.264 and
+    // VP8, so that every browser shares one (RxBufSection.h).
+    if (m_RxBufVideo) {
+        auto desc = rtc::Description::Video("rxbuf", rtc::Description::Direction::SendOnly);
+        desc.addH264Codec(mw::rxbuf::kH264Pt);
+        desc.addVP8Codec(mw::rxbuf::kVp8Pt);
+        std::random_device rd;
+        desc.addSSRC(static_cast<uint32_t>(rd()), "rxbuf");
+        m_RxBufTrack = m_Pc->addTrack(desc);
+        qInfo() << "[DataChannelRelay] rxbuf: a silent video section offered, for the "
+                   "browser's UDP receive buffer";
+    }
+
     rtc::DataChannelInit videoConfig;
     videoConfig.reliability.unordered = false;
     // Must match the frontend's negotiated channel config.
@@ -893,6 +1266,15 @@ void DataChannelRelay::createDataChannels()
     videoConfig.id = 0;
 
     m_VideoDc = m_Pc->createDataChannel("video", videoConfig);
+    if (m_VideoDc && m_FrameLog) {
+        m_FrameLogDc = m_VideoDc;
+        m_FrameLog->setBufferedProbe(
+            [](void* ctx) -> size_t {
+                const auto dc = static_cast<DataChannelRelay*>(ctx)->m_FrameLogDc.lock();
+                return dc ? dc->bufferedAmount() : 0;
+            },
+            this);
+    }
     if (m_VideoDc) {
         m_VideoDc->onOpen([this]() {
             qInfo() << "[DataChannelRelay] Video DataChannel open";
@@ -903,6 +1285,44 @@ void DataChannelRelay::createDataChannels()
                 this, [this]() { sendBufferedKeyframe(); }, Qt::QueuedConnection);
         });
         m_VideoDc->onClosed([this]() { qInfo() << "[DataChannelRelay] Video DataChannel closed"; });
+    }
+    // `linkhold=` (plan Wi-Fi W2 C): the native session asks, at each picture,
+    // whether video has waited outside usrsctp for longer than the key says.
+    // Not whether it waits at all: on Ethernet a frame bigger than usrsctp's
+    // room overflows for a millisecond or two and is gone, and holding on that
+    // halved the frame rate (03/10/2026) — held pictures come out bigger and
+    // overflow again. So the probe dates the start of each backlog, and the
+    // channel's "buffered amount low" (at 0) closes it. `bufferedAmount` is an
+    // atomic in libdatachannel, so the capture thread may read it; the
+    // channel is held weakly and a closed one is never busy.
+    if (m_VideoDc && m_LinkHoldMs > 0) {
+        if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim)) {
+            std::weak_ptr<rtc::DataChannel> weak = m_VideoDc;
+            auto since = std::make_shared<std::atomic<int64_t>>(-1);
+            m_VideoDc->setBufferedAmountLowThreshold(0);
+            m_VideoDc->onBufferedAmountLow([since]() { since->store(-1); });
+            const int64_t graceUs = static_cast<int64_t>(m_LinkHoldMs) * 1000;
+            native->setLinkBusyProbe([weak, since, graceUs]() {
+                const auto dc = weak.lock();
+                if (!dc || !dc->isOpen() || dc->bufferedAmount() == 0) {
+                    since->store(-1);
+                    return false;
+                }
+                const int64_t nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count();
+                int64_t from = since->load();
+                if (from < 0 && since->compare_exchange_strong(from, nowUs)) from = nowUs;
+                return nowUs - from >= graceUs;
+            });
+            qWarning() << "[DataChannelRelay] bench link hold (linkhold=): the session holds "
+                          "its pictures once video has waited outside usrsctp ("
+                       << (m_SctpBufferKb > 0 ? m_SctpBufferKb : 256) << "KiB) for" << m_LinkHoldMs
+                       << "ms";
+        } else {
+            qWarning() << "[DataChannelRelay] linkhold= asked for, but this engine is not the "
+                          "native one: nothing held";
+        }
     }
 
     // --- Input DataChannel (bidirectional, JSON text) ---
@@ -918,9 +1338,17 @@ void DataChannelRelay::createDataChannels()
             m_ClipboardSettings.reset();
             if (m_ClipboardEnabled) ClipboardBridge::instance()->setSubscription(this, false);
             m_Connected = true;
+            if (!m_SctpAtOpenSet.load()) {
+                m_SctpAtOpen = mw::sctp::readCounters();
+                m_SctpAtOpenSet.store(true);
+            }
             // All 3 DataChannels are open when we reach here
             // (they all open together as part of SCTP association)
             emit dataChannelsOpen();
+
+            // The bench's cap on the host's other uploads (hostcap=), the
+            // stream exempt with its own marking.
+            if (m_HostCapMbps > 0) m_HostCap.start(m_HostCapMbps, PacketMarking::current()[1]);
 
             if (m_ClipboardEnabled) {
                 // Only advertise capabilities; the client must configure directions first.
@@ -929,6 +1357,13 @@ void DataChannelRelay::createDataChannels()
                     m_InputDc->send(std::string(kCaps));
                 } catch (const std::exception&) {}
             }
+
+            // Whether this host recreates WebHID devices: the page sends the
+            // devices it was asked to from this answer.
+            sendHidCaps();
+            // Whether the mouse is this player's: a guest without one keeps
+            // their own pointer over the picture.
+            sendInputCaps();
 
             // Start periodic stats timer — marshal to the Qt main thread:
             // this callback runs on a libdatachannel thread and QTimer::start()
@@ -948,21 +1383,125 @@ void DataChannelRelay::createDataChannels()
         // Input messages arrive from browser on this channel
         m_InputDc->onMessage([this](const std::variant<rtc::binary, rtc::string>& msg) {
             if (!std::holds_alternative<rtc::string>(msg)) return;
+            // Taken first, before any lock or parse: a stamped message reports
+            // this as its arrival.
+            const int64_t recvUs = steadyUs();
             if (m_DirectInput) {
                 // Parse and inject here, on the receiving thread, whatever the
                 // engine. A message that finds the relay stopping leaves; one
                 // that got in before stop() took the lock finishes first.
                 std::lock_guard<std::mutex> lk(m_InputMutex);
                 if (m_Stopping.load()) return;
-                onInputMessage(std::get<rtc::string>(msg));
+                onInputMessage(std::get<rtc::string>(msg), recvUs);
                 return;
             }
             // The queued form, kept for a flag nothing clears today: the relay
             // thread handles the message on its next turn.
             std::string text = std::get<rtc::string>(msg);
             QMetaObject::invokeMethod(
-                this, [this, text]() { onInputMessage(text); }, Qt::QueuedConnection);
+                this, [this, text, recvUs]() { onInputMessage(text, recvUs); },
+                Qt::QueuedConnection);
         });
+    }
+
+    // --- HID DataChannel (the HID passthrough's input reports, plan P2) ---
+    // Unordered and never retransmitted: each report carries the device's
+    // whole state, so the next one repairs a loss, and the page sends an
+    // unchanged report again every 500 ms. Negotiated, so it adds nothing to
+    // the offer; binary [slot][report id][seq u16 LE][report], applied on this
+    // thread like the direct input, under the same lock and the same policy.
+    {
+        rtc::DataChannelInit hidConfig;
+        hidConfig.negotiated = true;
+        hidConfig.id = 4;
+        hidConfig.reliability.unordered = true;
+        hidConfig.reliability.maxRetransmits = 0;
+        m_HidDc = m_Pc->createDataChannel("hid", hidConfig);
+        if (m_HidDc) {
+            m_HidDc->onMessage([this](const std::variant<rtc::binary, rtc::string>& msg) {
+                if (!std::holds_alternative<rtc::binary>(msg)) return;
+                const rtc::binary& frame = std::get<rtc::binary>(msg);
+                std::lock_guard<std::mutex> lk(m_InputMutex);
+                if (m_Stopping.load() || !m_InputPolicy.hid) return;
+                m_Shim->hidInput(reinterpret_cast<const uint8_t*>(frame.data()), frame.size());
+            });
+        }
+    }
+
+    // --- Ultra DataChannel (bench only: `ultra=synthetic:<KiB>`, POC U1.1) ---
+    // What an intra codec would ask of SCTP, without the codec: per video frame
+    // sent, a train of incompressible chunks in the video's own format (header
+    // with frameId and the frame's backendTs) on channel id 5 — id 4 is the
+    // HID passthrough's. Negotiated, so it adds nothing to the offer; a client
+    // without `mw_ultra_sink` drops what lands on the id. Its own FrameSender,
+    // with the video's queue depth, so that a full link evicts Ultra frames,
+    // never the video, and the drops are counted apart.
+    if (m_UltraSynthKb > 0) {
+        rtc::DataChannelInit ultraConfig;
+        ultraConfig.negotiated = true;
+        ultraConfig.id = 5;
+        if (m_UltraUnordered) {
+            ultraConfig.reliability.unordered = true;
+            ultraConfig.reliability.maxRetransmits = 0;
+        } else {
+            ultraConfig.reliability.unordered = false;
+            ultraConfig.reliability.maxPacketLifeTime =
+                std::chrono::milliseconds(kVideoFrameLifetimeMs);
+        }
+        m_UltraDc = m_Pc->createDataChannel("ultra", ultraConfig);
+        if (m_UltraDc) {
+            FrameSender::Options ultraOptions;
+            ultraOptions.multimediaPriority = true;
+            ultraOptions.maxQueuedDeltas = 1;
+            m_UltraSender = std::make_unique<FrameSender>(ultraOptions);
+            // Incompressible bytes: SCTP compresses nothing, but a capture of
+            // the wire or a middlebox might, and the bench must not lean on it.
+            m_UltraPayload.resize(static_cast<size_t>(m_UltraSynthKb) * 1024);
+            uint64_t x = 0x9E3779B97F4A7C15ull;
+            for (auto& b : m_UltraPayload) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b = static_cast<uint8_t>(x);
+            }
+            m_UltraDc->onOpen([this]() { m_UltraOpen.store(true); });
+            m_UltraDc->onClosed([this]() { m_UltraOpen.store(false); });
+            qWarning().noquote() << "[DataChannelRelay] bench Ultra synthetic on DC#5:"
+                                 << m_UltraSynthKb << "KiB per video frame,"
+                                 << (m_UltraUnordered ? "unordered, no retransmission"
+                                                      : "ordered, 500 ms lifetime");
+        }
+    }
+
+    // --- Flood DataChannel (bench only: `flood=`, plan Idées Punktfunk A0) ---
+    // What SCTP carries to the real receiver, on the id the FEC channel is to
+    // have (3) and with its reliability — unordered, never retransmitted — or
+    // the video channel's, to compare the two the same way. Negotiated, so it
+    // adds nothing to the offer; a client without `mw_flood` drops what lands
+    // on the id. See SctpFlood.h.
+    if (m_FloodKbps != 0) {
+        rtc::DataChannelInit floodConfig;
+        floodConfig.negotiated = true;
+        floodConfig.id = 3;
+        if (m_FloodLikeVideo) {
+            floodConfig.reliability.unordered = false;
+            floodConfig.reliability.maxPacketLifeTime =
+                std::chrono::milliseconds(kVideoFrameLifetimeMs);
+        } else {
+            floodConfig.reliability.unordered = true;
+            floodConfig.reliability.maxRetransmits = 0;
+        }
+        m_FloodDc = m_Pc->createDataChannel("flood", floodConfig);
+        if (m_FloodDc) {
+            m_Flood = std::make_unique<SctpFlood>(m_FloodDc, m_FloodKbps, m_FloodBytes);
+            m_FloodDc->onOpen([this]() {
+                qInfo() << "[DataChannelRelay] Flood DataChannel open (bench)";
+                if (m_Flood && !m_Stopping.load()) m_Flood->start();
+            });
+            qWarning().noquote() << "[DataChannelRelay] bench flood on DC#3,"
+                                 << (m_FloodLikeVideo ? "ordered, 500 ms lifetime"
+                                                      : "unordered, no retransmission");
+        }
     }
 
     // Guard on the ordering invariant above: everything we want negotiated is
@@ -997,7 +1536,8 @@ void DataChannelRelay::onVideoFrame(const QByteArray& data, int frameType, int f
 }
 
 void DataChannelRelay::handleVideoFrame(const QByteArray& data, bool isKeyframe, int frameNumber,
-                                        qint64 presentationTimeUs)
+                                        qint64 presentationTimeUs,
+                                        const mwsrzoneblock::Zones* zones)
 {
     // Balance the worker→relay pending counter (incremented before each emit).
     // m_Shim lifetime is guaranteed: the shim is Qt-parented to this relay
@@ -1022,6 +1562,35 @@ void DataChannelRelay::handleVideoFrame(const QByteArray& data, bool isKeyframe,
 
     // Re-check after acquiring the lock: stop() may have run while we waited.
     if (m_Stopping.load()) return;
+
+    // A guest of the shared feed takes its pictures from the feed's pipe,
+    // which can hand over two or three at once after a hiccup on either side
+    // of it: with one delta held, all but the last would be evicted, each a
+    // hole and a keyframe the whole feed pays for (12/10 bench: 8 evictions in
+    // a minute, bufferedAmount 0 throughout). Known on the first frame — the
+    // engine joins the feed before any picture comes.
+    if (!m_SenderDepthKnown) {
+        m_SenderDepthKnown = true;
+        auto* native = qobject_cast<NativeMediaEngine*>(m_Shim);
+        if (native && native->isFeedSubscriber() && m_Sender)
+            m_Sender->setMaxQueuedDeltas(kFeedGuestQueuedDeltas);
+    }
+
+    if (m_FrameLog) {
+        // The capture on the host's clock, as sendFragmented stamps backendTs:
+        // what the client's per-frame log carries, and how a pass joins the two.
+        int64_t captureUs = -1;
+        if (m_Shim) {
+            const int64_t firstMs = m_Shim->firstFrameArrivalSteadyMs();
+            const int64_t presUs =
+                presentationTimeUs >= 0 ? presentationTimeUs : m_Shim->framePresentationTimeUs();
+            if (firstMs > 0 && presUs >= 0) captureUs = firstMs * 1000 + presUs;
+        }
+        const mw::sctp::Counters c = mw::sctp::readCounters();
+        m_FrameLog->begin(frameNumber, isKeyframe, static_cast<size_t>(data.size()), captureUs,
+                          steadyUs(), RelayFrameLog::Sctp{c.retrans, c.fast, c.t3},
+                          m_SrttMs.load());
+    }
 
     // Worker dropped deltas due to relay-thread backlog — enter awaiting-IDR
     // recovery (guards inside are no-ops when stopping).
@@ -1056,6 +1625,26 @@ void DataChannelRelay::handleVideoFrame(const QByteArray& data, bool isKeyframe,
             patchHevcKeyframe(frameData);
         }
         m_HevcPatched = true; // Only the first keyframe is checked
+    }
+
+    // POC Ultra U1.4: the video on its RTP track, when the answer took it.
+    if (m_RtpVideoAccepted.load(std::memory_order_relaxed)) {
+        if (!m_VideoTrack->isOpen()) {
+            if (isKeyframe) {
+                m_BufferedKeyframe = QByteArray(frameData.constData(), frameData.size());
+                m_BufferedKeyframePresUs = presentationTimeUs;
+                m_HaveBufferedKeyframe = true;
+                m_NewKeyframeArrived = false;
+            }
+            return;
+        }
+        if (!isKeyframe && !m_RtpVideoSentKeyframe) {
+            sendIdrRequestThrottled();
+            return;
+        }
+        if (isKeyframe && m_HaveBufferedKeyframe) m_NewKeyframeArrived = true;
+        sendRtpVideo(frameData, isKeyframe, presentationTimeUs, frameNumber);
+        return;
     }
 
     // Buffer keyframes arriving before the Video DC is ready.
@@ -1100,8 +1689,12 @@ void DataChannelRelay::handleVideoFrame(const QByteArray& data, bool isKeyframe,
         // seen on the first delta after it, not on the next keyframe the
         // backed-off cooldown lets through.
         const int64_t nowMs = QDateTime::currentMSecsSinceEpoch();
-        const bool shedding = m_Backlog.note(m_VideoDc->bufferedAmount(), nowMs);
-        if (shedding) m_Freezes.note(nowMs - m_Backlog.ageMs(nowMs), nowMs);
+        const size_t gatedBuffered = m_VideoDc->bufferedAmount();
+        const bool shedding = m_Backlog.note(gatedBuffered, nowMs);
+        if (m_FrameLog)
+            m_FrameLog->decide(frameNumber, RelayFrameLog::Outcome::Gated, gatedBuffered,
+                               m_Backlog.ageMs(nowMs), steadyUs());
+        if (shedding) m_Freezes.note(nowMs - m_Backlog.ageMs(nowMs), nowMs, LinkFreezeLog::Backlog);
         if (m_IdrWaitsForDrain) {
             if (!m_Backlog.backedUp()) requestIdrOnDrain();
         } else if (shedding) {
@@ -1123,7 +1716,7 @@ void DataChannelRelay::handleVideoFrame(const QByteArray& data, bool isKeyframe,
         m_NewKeyframeArrived = true;
     }
 
-    sendFragmented(frameData, isKeyframe, m_VideoDc, presentationTimeUs, frameNumber);
+    sendFragmented(frameData, isKeyframe, m_VideoDc, presentationTimeUs, frameNumber, zones);
 }
 
 // --- Buffered keyframe ---
@@ -1135,6 +1728,15 @@ void DataChannelRelay::sendBufferedKeyframe()
     std::lock_guard<std::mutex> lk(m_VideoMutex);
 
     if (!m_HaveBufferedKeyframe) return;
+    if (m_RtpVideoAccepted.load()) {
+        // The RTP track's turn (U1.4): it calls back here when it opens.
+        if (m_Stopping.load() || !m_VideoTrack->isOpen()) return;
+        if (!m_NewKeyframeArrived) sendRtpVideo(m_BufferedKeyframe, true, m_BufferedKeyframePresUs);
+        m_BufferedKeyframe.clear();
+        m_HaveBufferedKeyframe = false;
+        m_NewKeyframeArrived = false;
+        return;
+    }
     if (m_Stopping.load() || !m_VideoDc || !m_VideoDc->isOpen()) return;
 
     // Stale buffer guard: if a NEW keyframe was already sent directly
@@ -1197,6 +1799,8 @@ void DataChannelRelay::sendBufferedKeyframe()
 void DataChannelRelay::onAudioSample(const QByteArray& data)
 {
     if (m_Stopping.load()) return;
+    // `audiolog=1`: when the packet reached this thread, before the lock.
+    const int64_t inUs = m_AudioLog ? steadyUs() : 0;
 
     // Serialize against track teardown in stop().
     std::lock_guard<std::mutex> lk(m_AudioMutex);
@@ -1204,10 +1808,14 @@ void DataChannelRelay::onAudioSample(const QByteArray& data)
         static int notReady = 0;
         if (++notReady <= 3)
             qInfo() << "[DataChannelRelay] onAudioSample dropped — audio track not ready";
+        if (m_AudioLog)
+            AudioPathLog::instance().relayed(static_cast<size_t>(data.size()), inUs, 0,
+                                             AudioPathLog::Outcome::NotReady, m_AudioRtpTs);
         return;
     }
 
     // Send the Opus packet as one RTP frame; the OpusRtpPacketizer wraps it.
+    const uint32_t rtpTs = m_AudioRtpTs;
     auto frameInfo = std::make_shared<rtc::FrameInfo>(m_AudioRtpTs);
     // Advance by the negotiated Opus frame size (48 kHz clock): one clean tick per
     // packet. A jittery arrival-time clock makes NetEq time-stretch → robotic audio.
@@ -1217,19 +1825,41 @@ void DataChannelRelay::onAudioSample(const QByteArray& data)
     if (data.size() > 0)
         std::memcpy(bin.data(), data.constData(), static_cast<size_t>(data.size()));
 
+    AudioPathLog::Outcome outcome = AudioPathLog::Outcome::Sent;
     try {
         m_AudioTrack->sendFrame(std::move(bin), *frameInfo);
     } catch (const std::exception& e) {
+        outcome = AudioPathLog::Outcome::Error;
         if (!m_Stopping.load())
             qWarning() << "[DataChannelRelay] audio sendFrame error:" << e.what();
     }
+    if (m_AudioLog)
+        AudioPathLog::instance().relayed(static_cast<size_t>(data.size()), inUs, steadyUs(),
+                                         outcome, rtpTs);
 }
 
 void DataChannelRelay::onShimConnectionTerminated(int errorCode)
 {
     qInfo() << "[DataChannelRelay] Shim connection terminated, code=" << errorCode;
+    // Graceful termination: the host ended the stream on purpose, typically
+    // because the app was closed there. Say so before the channels drop, or
+    // the browser reads the close as a connection error. Any other code is
+    // the host side failing (Sunshine crashed, its encoder hung the GPU, the
+    // native engine died): the browser link is fine, so say which side went.
+    sendExitNotice(errorCode == ML_ERROR_GRACEFUL_TERMINATION ? "host-ended" : "host-lost");
     if (!m_Stopping.exchange(true)) {
         m_Connected = false;
+        emit sessionEnded();
+    }
+}
+
+void DataChannelRelay::endFromSignaling()
+{
+    // No exit notice: there is no channel to the page yet, only the signalling
+    // socket, which is the side that gave up.
+    if (!m_Stopping.exchange(true)) {
+        m_Connected = false;
+        if (m_IceCheckTimer) m_IceCheckTimer->stop();
         emit sessionEnded();
     }
 }
@@ -1242,7 +1872,7 @@ void DataChannelRelay::onShimConnectionTerminated(int errorCode)
 // clipboard bridge hops to the main thread on its own, and the one piece of
 // video state touched (requestidr) goes under m_VideoMutex.
 
-void DataChannelRelay::onInputMessage(const std::string& message)
+void DataChannelRelay::onInputMessage(const std::string& message, int64_t recvUs)
 {
     if (m_Stopping.load() || !m_Connected) return;
 
@@ -1261,12 +1891,39 @@ void DataChannelRelay::onInputMessage(const std::string& message)
     if (m_Shim) {
         if (const qint64 silentMs = m_Shim->noteClientAlive(); silentMs > 0) {
             const int64_t nowMs = QDateTime::currentMSecsSinceEpoch();
-            m_Freezes.note(nowMs - silentMs, nowMs);
+            m_Freezes.note(nowMs - silentMs, nowMs, LinkFreezeLog::InputSilent);
         }
     }
 
     // An invited player only gets what the owner ticked. Dropped in silence.
     if (!InputMsg::allowed(type, m_InputPolicy)) return;
+
+    // A message the client stamped (the click → flag probe, the uplink bench)
+    // is answered once handled, whatever its type: when it arrived, and, by the
+    // reply's own time, when its handling (the injection) ended. Measurement
+    // only — nothing else sends a stamp, and the input itself is unchanged.
+    //
+    // Built in place and never copied: until 08/10/2026 it was emplaced from a
+    // temporary, whose destructor answered at once — "handled" 40 µs after it
+    // arrived, before the injection had even begun — and the client, keeping
+    // the first answer, read ~0 ms of injection where SendInput took 8.
+    struct StampReply
+    {
+        StampReply(DataChannelRelay* r, double i, int64_t u)
+            : relay(r)
+            , id(i)
+            , recvUs(u)
+        {}
+        StampReply(const StampReply&) = delete;
+        StampReply& operator=(const StampReply&) = delete;
+        ~StampReply() { relay->sendInputStamp(id, recvUs); }
+        DataChannelRelay* relay;
+        double id;
+        int64_t recvUs;
+    };
+    std::optional<StampReply> stampReply;
+    if (const QJsonValue stamp = msg.value(QStringLiteral("stamp")); stamp.isDouble())
+        stampReply.emplace(this, stamp.toDouble(), recvUs > 0 ? recvUs : steadyUs());
 
     if (m_ClipboardSettings.handleMessage(
             type, msg, m_ClipboardEnabled,
@@ -1301,10 +1958,21 @@ void DataChannelRelay::onInputMessage(const std::string& message)
     }
 
     if (type == "unblockinput") {
-        // The viewer is locked out — an elevated window holds the foreground
-        // and Windows refuses every event, the pointer's included, so they
-        // cannot click their way to another window. This asks the shell to
-        // minimise the desktop, which is not input and so is not refused.
+        // The viewer is held back by an administrator window that has the
+        // host's foreground. This asks the shell to minimise the desktop,
+        // which is not input and so is not refused.
+        //
+        // Two cases, and the client offers the button in both. Windows' own
+        // refusal (UIPI): every event is dropped, the pointer's included, so
+        // there is no other window to click. And our policy: an invited
+        // player is not let into administrator windows (viewerAdmin, unless
+        // the owner set share_guests_admin_windows). Their pointer still
+        // works there, but a game run as administrator that fills the screen
+        // leaves nothing else to click, and Win+D is held back with the rest.
+        // So a guest with keyboard or mouse may minimise the host's windows,
+        // the owner's game included, mid-play. Bruno's decision of 22/10/2026,
+        // what 0.3.1 and 0.4.0 already did; the wiki tells the owner
+        // (Security §6.4c).
         //
         // Behind the keyboard/mouse policy above, deliberately: it moves the
         // host's windows about, which is exactly what a view-only guest may
@@ -1357,6 +2025,66 @@ void DataChannelRelay::onInputMessage(const std::string& message)
         return;
     }
 
+    if (type == "fpsstep") {
+        // "Auto"'s detection (frontend CadenceStepper.js): the client asks
+        // for the stream to run above its own rate while it measures whether
+        // what it shows gets younger — or, with 0, to come back. The session
+        // answers at once and the answer goes straight back, so a trial starts
+        // and ends within one round trip. See Session::setClientFpsStep.
+        //
+        // Native host only: a GameStream host's frame rate is fixed at launch.
+        if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim)) {
+            const mw::native::FpsStep step = native->setClientFpsStep(msg["fps"].toInt(0));
+            QJsonObject reply;
+            reply["type"] = "fpsstep";
+            reply["fps"] = step.fps;
+            reply["asked"] = step.askedFps;
+            reply["verdict"] = step.verdict == mw::native::FpsStep::Verdict::Applied  ? "applied"
+                               : step.verdict == mw::native::FpsStep::Verdict::Capped ? "capped"
+                               : step.verdict == mw::native::FpsStep::Verdict::Base   ? "base"
+                                                                                      : "refused";
+            if (step.why && *step.why) reply["why"] = QString::fromUtf8(step.why);
+            const QByteArray json = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+            if (m_InputDc && !m_Stopping.load()) {
+                try {
+                    m_InputDc->send(std::string(json.constData(), json.size()));
+                } catch (const std::exception& e) {
+                    if (!m_Stopping.load())
+                        qWarning() << "[DataChannelRelay] fpsstep reply error:" << e.what();
+                }
+            }
+        }
+        return;
+    }
+
+    if (type == "decodequeue") {
+        // Frames waiting at the client's decoder, said when a second one
+        // does and when it is back to one. A host streaming at its own
+        // display's rate skips presents on it rather than let them queue
+        // there (cadence=host-guarded). See Session::setClientDecodeQueue.
+        //
+        // Native host only: a GameStream host sends what it captures.
+        if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim))
+            native->setClientDecodeQueue(msg["depth"].toInt(0));
+        return;
+    }
+
+    if (type == "vsyncgrid") {
+        // When the client's screen refreshes, on this host's clock, and the
+        // lead a frame needs to be ready there: the host takes one picture
+        // per refresh that lead before it (cadence=deadline). See
+        // Session::setClientVsyncGrid.
+        //
+        // Native host only: a GameStream host sends what it captures.
+        if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim))
+            native->setClientVsyncGrid(
+                msg["periodUs"].toDouble(0), static_cast<int64_t>(msg["phaseUs"].toDouble(0)),
+                static_cast<int64_t>(msg["leadUs"].toDouble(0)), msg["tearing"].toBool(false),
+                // A page from before the field aims.
+                msg["steady"].toBool(true), msg["budgetFps"].toDouble(0));
+        return;
+    }
+
     if (type == "clientbitrate") {
         // The viewer's automatic bitrate follows the frame the host really
         // streams (its own display's size under Auto, a mode change): the
@@ -1393,6 +2121,30 @@ void DataChannelRelay::onInputMessage(const std::string& message)
             m_LinkQueueMs.store(fb.owdRiseMs, std::memory_order_relaxed);
             fb.gaps = msg["gaps"].toInt(0);
             fb.receivedFps = msg["fps"].toInt(0);
+            // What SCTP sent again since the last report, per thousand chunks:
+            // the rate governor cuts on it (retrcut=, 3 by default on the
+            // Windows host; plan Wi-Fi W2 B).
+            {
+                const mw::sctp::Counters now = mw::sctp::readCounters();
+                if (m_LinkSctpSet) {
+                    const mw::sctp::Counters d = now - m_LinkSctp;
+                    fb.retransPermille =
+                        d.sent > 0 ? static_cast<int>(int64_t(d.retrans) * 1000 / d.sent) : 0;
+                }
+                m_LinkSctp = now;
+                m_LinkSctpSet = true;
+                // The audio road's chunks the page asked again, per thousand
+                // sent: the same signal, where SCTP has no say.
+                const int64_t sent = m_AroadSent.load(std::memory_order_relaxed);
+                const int64_t resent = m_AroadResent.load(std::memory_order_relaxed);
+                const int64_t dSent = sent - m_LinkAroadSent;
+                const int64_t dResent = resent - m_LinkAroadResent;
+                m_LinkAroadSent = sent;
+                m_LinkAroadResent = resent;
+                if (dSent > 0)
+                    fb.retransPermille =
+                        std::max(fb.retransPermille, static_cast<int>(dResent * 1000 / dSent));
+            }
             // Present, and true, only on the first report after the page came
             // back from the background (StreamView._resyncAfterHidden).
             fb.resumed = msg["resumed"].toBool(false);
@@ -1400,10 +2152,18 @@ void DataChannelRelay::onInputMessage(const std::string& message)
             // of them missing is the link frozen upstream, held key or not —
             // the input watchdog only sees a silence while something is held.
             // The one report the browser itself delayed says so (`resumed`).
+            // How late the page's timer sent this one (`late`, absent from a
+            // page before it) is taken out of the gap: a gap the page made
+            // itself is not the link's, and what is left starts after it. The
+            // figure still goes with a freeze to its log line.
             const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+            const qint64 pageLateMs = msg["late"].toInt(-1);
             if (m_LastLinkstatsMs > 0 && !fb.resumed &&
-                nowMs - m_LastLinkstatsMs >= kLinkstatsSilentMs) {
-                m_Freezes.note(m_LastLinkstatsMs + kLinkstatsPeriodMs, nowMs);
+                LinkFreezeLog::reportsGapOnLink(nowMs - m_LastLinkstatsMs, pageLateMs) >=
+                    kLinkstatsSilentMs) {
+                m_Freezes.note(m_LastLinkstatsMs + kLinkstatsPeriodMs +
+                                   std::max<qint64>(0, pageLateMs),
+                               nowMs, LinkFreezeLog::Reports, pageLateMs);
             }
             m_LastLinkstatsMs = nowMs;
             if (!m_LinkReportsSeen) {
@@ -1420,28 +2180,14 @@ void DataChannelRelay::onInputMessage(const std::string& message)
 
     if (type == "keydown" || type == "keyup") {
         bool down = (type == "keydown");
-        const InputMsg::KeyPlan plan = InputMsg::resolveKey(msg, m_Shim->keyboardMode());
-        InputMsg::logKey(msg, m_Shim->keyboardMode(), plan, down);
-        if (plan.isText()) {
-            // The client's layout puts a character here that this key's US
-            // position would not produce. The engine decides what it can do
-            // with that: a real press/release on the native host, a one-shot
-            // text injection on Sunshine (where the release has nothing to do).
-            m_Shim->sendKeyChar(plan.text, down, InputMsg::modifierMask(msg));
-        } else {
-            // `hold`: a movement key the client wants kept down through a brief
-            // stall instead of released at the short grace period (see the shim).
-            m_Shim->sendKeyEvent(plan.keyCode, down, InputMsg::modifierMask(msg), plan.flags,
-                                 msg["hold"].toBool(false));
-        }
+        InputMsg::sendKey(*m_Shim, msg, down);
     } else if (type == "inputstate") {
         // Client heartbeat: its authoritative held-input state, sent while (and
         // only while) something is held. Re-presses whatever the watchdog
         // released during a stall but the user is genuinely still holding.
-        QVector<IMediaEngine::HeldKey> held = InputMsg::parseHeldKeys(msg, m_Shim->keyboardMode());
-        quint32 buttons = static_cast<quint32>(msg["buttons"].toInt(0));
-        InputMsg::filterHeldState(m_InputPolicy, held, buttons);
-        m_Shim->syncHeldInputs(held, buttons, msg["buttonsHold"].toBool(false));
+        const InputMsg::HeldState held = InputMsg::readHeldState(
+            msg, m_Shim->keyboardMode(), m_Shim->layoutFidelity(), m_InputPolicy);
+        m_Shim->syncHeldInputs(held.keys, held.buttons, held.buttonsHold);
     } else if (type == "mousemove") {
         // Absolute mouse position (non-gaming mode)
         if (msg.contains("x") && msg.contains("y") && msg.contains("referenceWidth") &&
@@ -1470,19 +2216,52 @@ void DataChannelRelay::onInputMessage(const std::string& message)
     } else if (type == "secureattention") {
         // Ctrl+Alt+Suppr: the one combination a browser can never deliver — the
         // OS running the viewer eats it first — so it arrives as a message of
-        // its own, from a button. Whether it reaches the host's secure desktop
+        // its own, from the touch keyboard bar (Ctrl and Alt down, then Del).
+        // Whether it reaches the host's secure desktop
         // depends on the host (IMediaEngine::sendSecureAttention).
         m_Shim->sendSecureAttention();
     } else if (type == "textinput") {
-        // Virtual/soft keyboard text (UTF-8) — forwarded as a text event.
-        m_Shim->sendUtf8Text(msg["text"].toString());
+        // Virtual/soft keyboard text: as text, or as US keys on a host that
+        // cannot type text without an input method (InputMsg::planText).
+        // What was left to that input method is named back to the page, which
+        // says once why it may not arrive.
+        const QString viaIme = InputMsg::sendText(*m_Shim, msg["text"].toString());
+        if (!viaIme.isEmpty() && m_InputDc && !m_Stopping.load()) {
+            QJsonObject m;
+            m["type"] = "textviaime";
+            m["text"] = viaIme;
+            const QByteArray json = QJsonDocument(m).toJson(QJsonDocument::Compact);
+            try {
+                m_InputDc->send(std::string(json.constData(), json.size()));
+            } catch (const std::exception& e) {
+                if (!m_Stopping.load())
+                    qWarning() << "[DataChannelRelay] textviaime send error:" << e.what();
+            }
+        }
     } else if (type == "locksync") {
         // Align the host's toggle locks (Num/Caps/Scroll) with the client's,
         // sent once per session on the browser's first real keyboard event.
         m_Shim->syncLockKeys(msg["numLock"].toBool(false), msg["capsLock"].toBool(false),
                              msg["scrollLock"].toBool(false));
+    } else if (type == "aroadnack") {
+        resendAudioRoad(msg);
+    } else if (type == "aroadack") {
+        // {"type":"aroadack","t":"v"|"u","s":seq,"i":index}: the last chunk
+        // the page's worker received, for the road's window (aroadwin=).
+        if (m_AroadPacer) {
+            m_AroadPacer->ack(static_cast<uint16_t>(msg["s"].toInt()),
+                              static_cast<uint16_t>(msg["i"].toInt()));
+            if (++m_AroadAcks % 3000 == 0)
+                qInfo() << "[DataChannelRelay] audio road window:" << m_AroadPacer->inFlight()
+                        << "bytes in flight, frames dropped" << m_AroadPacer->droppedFrames()
+                        << "| resets" << m_AroadPacer->windowResets() << "| longest wait"
+                        << m_AroadPacer->maxQueueUs() / 1000 << "ms";
+        }
     } else if (type == "requestidr") {
-        qInfo() << "[DataChannelRelay] Requesting IDR frame from Sunshine (browser request)";
+        const QString reason = msg["reason"].toString();
+        qInfo().noquote()
+            << "[DataChannelRelay] Requesting IDR frame from Sunshine (browser request" +
+                   (reason.isEmpty() ? QStringLiteral(")") : QStringLiteral(": ") + reason + ")");
         std::lock_guard<std::mutex> lk(m_VideoMutex);
         m_AwaitingIdr = true;
         sendIdrRequestThrottled();
@@ -1494,11 +2273,14 @@ void DataChannelRelay::onInputMessage(const std::string& message)
         // no longer remembers, or a hole wider than a DPB could cover, is
         // answered the old way. Never for a GameStream engine, which has no
         // such call: the receiver only sends this when /start said it could.
+        // Nor when the engine says it no longer can (a client that refuses
+        // repairs, the shared feed): one keyframe, not one per id.
         auto* native = qobject_cast<NativeMediaEngine*>(m_Shim);
         const qint64 from = msg["from"].toDouble(-1);
         const qint64 to = msg["to"].toDouble(-1);
         bool healed = false;
-        if (native && from >= 0 && to >= from && to - from < 16) {
+        if (native && native->referenceInvalidation() && from >= 0 && to >= from &&
+            to - from < 16) {
             healed = true;
             for (qint64 id = from; id <= to; ++id) {
                 const int64_t slot =
@@ -1513,7 +2295,10 @@ void DataChannelRelay::onInputMessage(const std::string& message)
         }
         if (!healed) {
             qInfo() << "[DataChannelRelay] invalidateref" << from << ".." << to
-                    << "could not be mapped — requesting a keyframe instead";
+                    << (native && !native->referenceInvalidation()
+                            ? "not healed by reference on this stream"
+                            : "could not be mapped")
+                    << "— requesting a keyframe instead";
             std::lock_guard<std::mutex> lk(m_VideoMutex);
             m_AwaitingIdr = true;
             sendIdrRequestThrottled();
@@ -1527,6 +2312,26 @@ void DataChannelRelay::onInputMessage(const std::string& message)
         pong["type"] = "pong";
         pong["seq"] = seq;
         pong["ts"] = ts;
+        // The host's steady clock as it answers, in µs: the clock frames are
+        // stamped on (backendTs), for a client that puts its own on it — the
+        // content-age probe (frontend ContentAgeProbe.js). Exact in a double.
+        pong["host"] = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                               std::chrono::steady_clock::now().time_since_epoch())
+                                               .count());
+        // cadence=deadline (native host): whether the host wants the client's
+        // refresh grid, and whether it aims its pictures at it right now — the
+        // client drops its render reserve and counts its misses only then
+        // (frontend VsyncGrid.js).
+        if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim)) {
+            const auto grid = native->vsyncGridStatus();
+            if (grid.wanted) pong["grid"] = true;
+            if (grid.followed) {
+                QJsonObject deadline;
+                deadline["presentUs"] = grid.presentUs;
+                deadline["aimed"] = grid.aimed;
+                pong["deadline"] = deadline;
+            }
+        }
         QByteArray pongJson = QJsonDocument(pong).toJson(QJsonDocument::Compact);
         if (m_InputDc && !m_Stopping.load()) {
             try {
@@ -1557,8 +2362,61 @@ void DataChannelRelay::onInputMessage(const std::string& message)
         // engine's encoding of it.
         m_Shim->sendControllerRemoval(static_cast<uint8_t>(msg["index"].toInt(0)),
                                       static_cast<uint16_t>(msg["mask"].toInt(0)));
+    } else if (type == "hidattach") {
+        // A device the page reads through WebHID, to recreate here. The answer
+        // says whether it was, and why not: the page shows it by the device.
+        const int slot = msg["slot"].toInt(-1);
+        const QString why = (slot < 0 || slot > 7) ? QStringLiteral("slot out of range")
+                                                   : m_Shim->hidAttach(slot, msg);
+        QJsonObject r{{QStringLiteral("type"), QStringLiteral("hidattached")},
+                      {QStringLiteral("slot"), slot},
+                      {QStringLiteral("ok"), why.isEmpty()},
+                      {QStringLiteral("why"), why}};
+        const QByteArray j = QJsonDocument(r).toJson(QJsonDocument::Compact);
+        try {
+            if (m_InputDc) m_InputDc->send(std::string(j.constData(), j.size()));
+        } catch (const std::exception&) {}
+        // After the answer: a wheel kept from the last stream replays its
+        // force feedback, which the page plays only on a device it knows.
+        if (why.isEmpty()) m_Shim->hidAttached(slot);
+    } else if (type == "hiddetach") {
+        m_Shim->hidDetach(msg["slot"].toInt(-1));
+    } else if (type == "hidreply") {
+        // The real device's answer to an hidrequest (a HID++ reply under
+        // Linux): one report, at most the 63 bytes of HID++'s longest.
+        const QByteArray data = QByteArray::fromBase64(msg["data"].toString().toLatin1()).left(64);
+        m_Shim->hidReply(msg["slot"].toInt(-1), msg["reportId"].toInt(-1), data);
+    } else if (type == "uprobe") {
+        // The uplink bench's dated message: nothing to inject, only its stamp
+        // to answer (above).
     } else {
         qWarning() << "[DataChannelRelay] Unknown input type:" << type;
+    }
+}
+
+void DataChannelRelay::sendInputStamp(double id, int64_t recvUs)
+{
+    QJsonObject reply;
+    reply["type"] = "inputstamp";
+    reply["id"] = id;
+    reply["recv"] = static_cast<double>(recvUs);
+    const int64_t doneUs = steadyUs();
+    reply["done"] = static_cast<double>(doneUs);
+    // The bench's click trace: the same two stamps on this side, so the host's
+    // own files can date a click's arrival without the client's.
+    if (m_ClickTraceLog)
+        qInfo().noquote() << QStringLiteral("[DataChannelRelay] click trace: input stamp %1 "
+                                            "received at steady %2 us, handled at %3 us")
+                                 .arg(static_cast<qint64>(id))
+                                 .arg(recvUs)
+                                 .arg(doneUs);
+    const QByteArray json = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+    if (!m_InputDc || m_Stopping.load()) return;
+    try {
+        m_InputDc->send(std::string(json.constData(), json.size()));
+    } catch (const std::exception& e) {
+        if (!m_Stopping.load())
+            qWarning() << "[DataChannelRelay] inputstamp send failed:" << e.what();
     }
 }
 
@@ -1571,7 +2429,8 @@ void DataChannelRelay::onInputMessage(const std::string& message)
 
 void DataChannelRelay::sendFragmented(const QByteArray& data, bool isKeyframe,
                                       std::shared_ptr<rtc::DataChannel>& dc,
-                                      qint64 presentationTimeUs, int frameNumber)
+                                      qint64 presentationTimeUs, int frameNumber,
+                                      const mwsrzoneblock::Zones* zones)
 {
     if (m_Stopping.load() || !dc || !dc->isOpen()) return;
     if (data.isEmpty()) return;
@@ -1599,12 +2458,32 @@ void DataChannelRelay::sendFragmented(const QByteArray& data, bool isKeyframe,
     // What this actually bounds is LATENCY, which is why it is now measured in
     // time; see SendBacklog.h.
     const int64_t backlogNowMs = QDateTime::currentMSecsSinceEpoch();
+    size_t bufferedSeen = 0; // for the bench's frame log
     if (!isKeyframe) {
         size_t bufAmt = dc->bufferedAmount();
+        bufferedSeen = bufAmt;
         if (m_Backlog.note(bufAmt, backlogNowMs)) {
             m_DeltaDroppedCount++;
             m_BackpressureDropCount++;
-            m_Freezes.note(backlogNowMs - m_Backlog.ageMs(backlogNowMs), backlogNowMs);
+            m_Freezes.note(backlogNowMs - m_Backlog.ageMs(backlogNowMs), backlogNowMs,
+                           LinkFreezeLog::Backlog);
+
+            // The engine that heals by reference invalidation can be told
+            // which frame never left (namedrops, plan §9-25). No wire id was
+            // spent on it, so the client sees no hole; the next delta predicts
+            // from a frame the client has, and neither a keyframe nor the
+            // refresh wave is waited for. The same gesture as the sender's
+            // evictions (design §9.10.2): a stall longer than the encoder's
+            // references reach ends in the keyframe the session asks for.
+            auto* native = qobject_cast<NativeMediaEngine*>(m_Shim);
+            // The rate it overflowed at, for the governor (ovfgood=).
+            if (native) native->noteOverflow();
+            const bool named = native && frameNumber >= 0 && native->nameLinkDrops() &&
+                               native->referenceInvalidation();
+            if (named) {
+                native->invalidateReference(static_cast<uint32_t>(frameNumber));
+                m_NamedDeltaDropCount++;
+            }
 
             // Set sticky awaiting state. The keyframe is asked for when the
             // buffer drains (requestIdrOnDrain): asked for now, it would come
@@ -1618,8 +2497,9 @@ void DataChannelRelay::sendFragmented(const QByteArray& data, bool isKeyframe,
             // largest frame the encoder can make. MediaTrackRelay documents
             // where that leads — "every stall became an IDR storm […] the
             // stream collapsed outright". Riding out drops one delta and lets
-            // the refresh wave repair the picture instead.
-            if (!ridingOutLoss()) {
+            // the refresh wave repair the picture instead. A named drop needs
+            // neither.
+            if (!named && !ridingOutLoss()) {
                 m_AwaitingIdr = true;
                 if (!m_IdrWaitsForDrain) {
                     m_IdrWaitsForDrain = true;
@@ -1631,8 +2511,14 @@ void DataChannelRelay::sendFragmented(const QByteArray& data, bool isKeyframe,
                 qInfo() << "[DataChannelRelay] Dropped delta frame (link not draining)"
                         << "bufferedAmount=" << bufAmt
                         << "backlogMs=" << m_Backlog.ageMs(backlogNowMs)
-                        << "totalDropped=" << m_DeltaDroppedCount;
+                        << "totalDropped=" << m_DeltaDroppedCount
+                        << (named ? "named to the encoder" : "");
             }
+            if (m_FrameLog)
+                m_FrameLog->decide(frameNumber,
+                                   named ? RelayFrameLog::Outcome::NamedDrop
+                                         : RelayFrameLog::Outcome::BacklogDrop,
+                                   bufAmt, m_Backlog.ageMs(backlogNowMs), steadyUs());
             return;
         }
     } else {
@@ -1650,9 +2536,15 @@ void DataChannelRelay::sendFragmented(const QByteArray& data, bool isKeyframe,
         // + one keyframe, bounding latency to well under a second instead of
         // letting it run away.
         size_t bufAmt = dc->bufferedAmount();
+        bufferedSeen = bufAmt;
         if (m_Backlog.note(bufAmt, backlogNowMs)) {
             m_KeyframeBackpressureWarnings++;
-            m_Freezes.note(backlogNowMs - m_Backlog.ageMs(backlogNowMs), backlogNowMs);
+            if (m_FrameLog)
+                m_FrameLog->decide(frameNumber, RelayFrameLog::Outcome::KeyframeDrop, bufAmt,
+                                   m_Backlog.ageMs(backlogNowMs), steadyUs());
+            m_Freezes.note(backlogNowMs - m_Backlog.ageMs(backlogNowMs), backlogNowMs,
+                           LinkFreezeLog::Backlog);
+            if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim)) native->noteOverflow();
             if (m_KeyframeBackpressureWarnings <= 5) {
                 qInfo() << "[DataChannelRelay] Dropped keyframe (link not draining)"
                         << "bufferedAmount=" << bufAmt
@@ -1684,6 +2576,11 @@ void DataChannelRelay::sendFragmented(const QByteArray& data, bool isKeyframe,
     // Video-only path now (audio is a native RTP Opus track, not fragmented over
     // a DataChannel), so this always uses the video frameId sequence.
     uint32_t frameId = m_FrameId++;
+    if (m_FrameLog) {
+        m_FrameLog->decide(frameNumber, RelayFrameLog::Outcome::Sent, bufferedSeen,
+                           m_Backlog.ageMs(backlogNowMs), steadyUs());
+        m_FrameLog->sent(frameNumber, frameId);
+    }
     // Remember which engine frame went out under this wire id, so a receiver
     // naming a lost id can be answered with a reference invalidation. The slot
     // packs both so a stale entry from 512 frames ago is never mistaken for
@@ -1741,24 +2638,53 @@ void DataChannelRelay::sendFragmented(const QByteArray& data, bool isKeyframe,
     // The engine that stamps its frames gets told when each one left; the
     // others hand over a null sink and the sender reads no clock for them.
     FrameSentSink* sink = (frameNumber >= 0 && m_Shim) ? m_Shim->frameSentSink() : nullptr;
+    // The bench's frame log stands between the sender and the engine's sink:
+    // it keeps the stamps, then hands them on.
+    if (m_FrameLog && frameNumber >= 0) {
+        m_FrameLog->setInner(sink);
+        sink = m_FrameLog.get();
+    }
     const uint32_t reportedNumber = static_cast<uint32_t>(frameNumber < 0 ? 0 : frameNumber);
     // The engine that stamps its frames also wants to know WHICH ones the
     // sender threw away: those are the numbers it can invalidate.
     auto* native = qobject_cast<NativeMediaEngine*>(m_Shim);
     const bool nameEvictions = native && frameNumber >= 0 && native->referenceInvalidation();
     std::vector<uint32_t> evictedNumbers;
-    std::vector<uint32_t>* evictedOut = nameEvictions ? &evictedNumbers : nullptr;
+    std::vector<uint32_t>* evictedOut = (nameEvictions || m_FrameLog) ? &evictedNumbers : nullptr;
     bool evicted = false;
     if (m_DirectVideoSend) {
         // Direct mode: `data` may be borrowed from the encoder (valid only for
         // this call), so the chunks are cut here, once, straight from it —
         // the header and the slice written together, nothing copied before
         // and nothing left for the sender to copy after.
+        // MWSR's zones, when the frame has them: the side block, ahead of the
+        // bitstream in the same chunks.
+        const std::vector<uint8_t> zoneBlock =
+            zones ? mwsrzoneblock::write(*zones) : std::vector<uint8_t>();
         auto fragments = FrameSender::buildFragments(
             reinterpret_cast<const uint8_t*>(data.constData()), static_cast<size_t>(data.size()),
-            isKeyframe, frameId, backendTs);
-        evicted = m_Sender->enqueueFragments(dc, std::move(fragments), isKeyframe, reportedNumber,
-                                             sink, evictedOut);
+            isKeyframe, frameId, backendTs, m_ChunkPayload, zoneBlock.data(), zoneBlock.size());
+        // The bench's losses (`loss=`, LinkLoss.h): messages that never reach
+        // SCTP, so the receiver meets holes SCTP knows nothing of. A frame that
+        // loses every message still spent its wire id: a gap, as on a link.
+        if (m_Loss.active()) {
+            const uint64_t before = m_Loss.dropped();
+            fragments.erase(
+                std::remove_if(fragments.begin(), fragments.end(),
+                               [this](const FrameSender::Fragment&) { return m_Loss.dropNext(); }),
+                fragments.end());
+            const uint64_t dropped = m_Loss.dropped();
+            if (dropped != before && (dropped <= 3 || dropped / 500 != before / 500))
+                qInfo() << "[DataChannelRelay] bench losses:" << dropped << "messages in"
+                        << m_Loss.losses() << "losses so far";
+        }
+        if (fragments.empty() && m_FrameLog)
+            m_FrameLog->decide(frameNumber, RelayFrameLog::Outcome::BenchLoss, bufferedSeen,
+                               m_Backlog.ageMs(backlogNowMs), steadyUs());
+        evicted = fragments.empty()
+                      ? false
+                      : m_Sender->enqueueFragments(dc, std::move(fragments), isKeyframe,
+                                                   reportedNumber, sink, evictedOut);
     } else {
         // Queued mode: the frame is already ours (copied out of the GameStream
         // engine), the sender cuts it on its own thread as it always has.
@@ -1774,6 +2700,10 @@ void DataChannelRelay::sendFragmented(const QByteArray& data, bool isKeyframe,
     // damage need no keyframe for it (same bargain as the SCTP drop above);
     // every other stream asks for one. GameStream engines never ride out, so
     // this is exactly their previous behaviour.
+    if (m_FrameLog) {
+        for (uint32_t n : evictedNumbers)
+            m_FrameLog->evicted(n);
+    }
     if (evicted && nameEvictions && !evictedNumbers.empty()) {
         for (uint32_t n : evictedNumbers)
             native->invalidateReference(n);
@@ -1786,7 +2716,61 @@ void DataChannelRelay::sendFragmented(const QByteArray& data, bool isKeyframe,
     // no governor to tell.
     if (evicted && native) native->noteEviction();
 
+    // The bench's synthetic Ultra stream rides on the frames the native
+    // engine sends (direct mode), with the same stamp.
+    if (m_DirectVideoSend && (m_UltraSender || m_UltraTrack)) sendUltraSynthetic(backendTs);
+
     m_FrameCount++;
+}
+
+void DataChannelRelay::sendUltraSynthetic(uint32_t backendTs)
+{
+    if (m_UltraRtpAccepted.load(std::memory_order_relaxed)) {
+        // On its RTP track (U1.4): one frame = a VP8 key frame's 10-byte
+        // header (so Chrome assembles every frame on its own, none depending
+        // on another), then the DataChannel's 17-byte header for a single
+        // chunk, then the payload. The client strips the 10 bytes.
+        if (!m_UltraTrack->isOpen() || m_UltraPayload.empty()) return;
+        static const uint8_t kVp8Key[10] = {0x10, 0x00, 0x00, 0x9d, 0x01,
+                                            0x2a, 0x80, 0x07, 0x38, 0x04}; // 1920x1080
+        // On the audio road (U1.4 ter) no VP8 header: the chunks carry it all.
+        const size_t prefix = m_UltraAudioRoad ? 0 : sizeof(kVp8Key);
+        const uint32_t size = static_cast<uint32_t>(m_UltraPayload.size());
+        const uint32_t seq = m_UltraSeq++;
+        rtc::binary frame(prefix + kFragHeaderSize + size);
+        std::memcpy(frame.data(), kVp8Key, prefix);
+        // [frame_id:4][chunk_index:2][total_chunks:2][is_keyframe:1][payload_size:4][backend_ts:4]
+        auto* h = reinterpret_cast<uint8_t*>(frame.data()) + prefix;
+        const auto put32 = [](uint8_t* at, uint32_t v) {
+            for (int i = 0; i < 4; ++i)
+                at[i] = static_cast<uint8_t>(v >> (24 - 8 * i));
+        };
+        put32(h, seq);
+        h[4] = h[5] = h[6] = 0;
+        h[7] = 1;
+        h[8] = 0;
+        put32(h + 9, size);
+        put32(h + 13, backendTs);
+        std::memcpy(h + kFragHeaderSize, m_UltraPayload.data(), size);
+        rtc::FrameInfo info(backendTs);
+        info.isKeyFrame = true;
+        try {
+            if (m_UltraAudioRoad)
+                sendAudioRoad(m_UltraTrack, m_UltraRoadHistory, m_UltraAudioRoadSeq++,
+                              reinterpret_cast<const uint8_t*>(frame.data()), frame.size(), true,
+                              backendTs);
+            else
+                m_UltraTrack->sendFrame(std::move(frame), info);
+        } catch (const std::exception& e) {
+            qWarning() << "[DataChannelRelay] Ultra RTP send failed:" << e.what();
+        }
+        return;
+    }
+    if (!m_UltraOpen.load(std::memory_order_relaxed) || m_UltraPayload.empty()) return;
+    auto fragments =
+        FrameSender::buildFragments(m_UltraPayload.data(), m_UltraPayload.size(),
+                                    /*isKeyframe=*/false, m_UltraSeq++, backendTs, m_ChunkPayload);
+    m_UltraSender->enqueueFragments(m_UltraDc, std::move(fragments), /*isKeyframe=*/false);
 }
 
 // --- Stats timer (1s interval) ---
@@ -1795,6 +2779,21 @@ void DataChannelRelay::onStatsTimerTick()
 {
     if (m_Stopping.load() || !m_Connected) return;
     if (!m_InputDc || !m_InputDc->isOpen()) return;
+    if (m_FrameLog && m_Pc) {
+        if (const auto rtt = m_Pc->rtt()) m_SrttMs.store(static_cast<int>(rtt->count()));
+    }
+
+    // SCTP's counters for the freezes' lines, then the lines of the freezes
+    // that are over.
+    {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        m_FreezeSctp.emplace_back(nowMs, mw::sctp::readCounters());
+        while (m_FreezeSctp.size() > 2 && nowMs - m_FreezeSctp.front().first > kFreezeSctpKeepMs)
+            m_FreezeSctp.pop_front();
+        // Before the freezes' lines, which say what the host sent around them.
+        sampleHostUplink(nowMs);
+        logClosedFreezes(nowMs, false);
+    }
 
     double hostRttMs = 0.0;
     int64_t decodeLatUs = m_LastDecodeLatencyUs.load(std::memory_order_acquire);
@@ -1827,6 +2826,7 @@ void DataChannelRelay::onStatsTimerTick()
             // pinned just above the watermark read like a healthy one.
             qInfo() << "[DataChannelRelay] Drop counters — worker:" << workerDrops
                     << "senderQueue:" << senderDrops << "sctpDelta:" << m_DeltaDroppedCount
+                    << "sctpDeltaNamed:" << m_NamedDeltaDropCount
                     << "sctpKeyframe:" << m_KeyframeBackpressureWarnings
                     << "gatedDelta:" << m_AwaitingIdrDropCount
                     << "pendingVideoFrames:" << (m_Shim ? m_Shim->pendingVideoFrames() : 0)
@@ -1868,6 +2868,21 @@ void DataChannelRelay::onStatsTimerTick()
         const QJsonObject stages = m_Shim->takeStageStats();
         if (!stages.isEmpty()) stats["stages"] = stages;
     }
+    // What "Auto"'s detection reads of the native cadence (frontend
+    // CadenceStepper.js): how fast the captured display presents, the
+    // stream's own rate, the step in force, the display's refresh. Absent
+    // from every other host, and from a guest on the shared feed.
+    if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim)) {
+        const mw::native::CadenceStatus c = native->cadenceStatus();
+        if (c.baseFps > 0) {
+            QJsonObject cadence;
+            cadence["presents"] = c.presentsPerSecond;
+            cadence["base"] = c.baseFps;
+            cadence["step"] = c.stepFps;
+            cadence["display"] = c.displayHz;
+            stats["cadence"] = cadence;
+        }
+    }
 
     QByteArray statsJson = QJsonDocument(stats).toJson(QJsonDocument::Compact);
 
@@ -1877,6 +2892,149 @@ void DataChannelRelay::onStatsTimerTick()
         if (!m_Stopping.load()) {
             qWarning() << "[DataChannelRelay] Stats send error:" << e.what();
         }
+    }
+}
+
+// kbit/s as the log's Mbit/s: one decimal under 10.
+static QString mbps(int64_t kbps)
+{
+    return QString::number(static_cast<double>(kbps) / 1000.0, 'f', kbps < 10000 ? 1 : 0);
+}
+
+void DataChannelRelay::logClosedFreezes(qint64 nowMs, bool all)
+{
+    const std::vector<LinkFreezeLog::Episode> closed = m_Freezes.takeClosed(nowMs, all);
+    if (closed.empty()) return;
+    const mw::sctp::Counters nowSctp = mw::sctp::readCounters();
+    const auto clock = [](qint64 ms) {
+        return QDateTime::fromMSecsSinceEpoch(ms).toString(QStringLiteral("HH:mm:ss.zzz"));
+    };
+    for (const LinkFreezeLog::Episode& ep : closed) {
+        // Between the last reading before it began and the first after it
+        // ended: the stats tick reads once a second, so up to a second on
+        // each side.
+        mw::sctp::Counters before = m_FreezeSctp.empty() ? nowSctp : m_FreezeSctp.front().second;
+        mw::sctp::Counters after = nowSctp;
+        for (const auto& [atMs, c] : m_FreezeSctp) {
+            if (atMs <= ep.startMs) before = c;
+            if (atMs >= ep.endMs) {
+                after = c;
+                break;
+            }
+        }
+        const mw::sctp::Counters d = after - before;
+        QString seen;
+        const auto add = [&seen](const char* what) {
+            if (!seen.isEmpty()) seen += QStringLiteral(" + ");
+            seen += QLatin1String(what);
+        };
+        if (ep.sources & LinkFreezeLog::Backlog) add("the video's send buffer not draining");
+        if (ep.sources & LinkFreezeLog::InputSilent) add("the input link silent");
+        if (ep.sources & LinkFreezeLog::Reports) add("the receiver's link reports missing");
+        if (seen.isEmpty()) seen = QStringLiteral("nothing named");
+        const QString page =
+            ep.pageLateMs >= 0
+                ? QStringLiteral("; the page sent the report that ended the gap %1 ms late")
+                      .arg(ep.pageLateMs)
+                : QString();
+        // What the host itself sent besides the stream meanwhile: a link that
+        // froze under the host's own upload is not one that froze on its own.
+        const mw::hostuplink::Meter::Window up = m_Uplink.around(ep.startMs, ep.endMs);
+        const QString uplink =
+            up.samples > 0
+                ? QStringLiteral(
+                      "; the host sent ~%1 Mbit/s besides this stream around it (peak %2)")
+                      .arg(mbps(up.meanKbps), mbps(up.peakKbps))
+                : QString();
+        qInfo().noquote() << QStringLiteral("[LinkFreeze] #%1%2: %3 ms, %4 to %5, seen by %6; "
+                                            "SCTP around it: %7 chunks sent again (%8 fast), "
+                                            "%9 T3%10%11")
+                                 .arg(ep.number)
+                                 .arg(ep.stretched ? QStringLiteral(" (stretched)") : QString())
+                                 .arg(ep.endMs - ep.startMs)
+                                 .arg(clock(ep.startMs), clock(ep.endMs), seen)
+                                 .arg(d.retrans)
+                                 .arg(d.fast)
+                                 .arg(d.t3)
+                                 .arg(page, uplink);
+    }
+}
+
+void DataChannelRelay::sampleHostUplink(qint64 nowMs)
+{
+    if (!m_Pc) return;
+    // The adapter follows the path: looked up again when the selected pair's
+    // remote address changes, checked every few ticks.
+    if (--m_UplinkRecheckTicks <= 0) {
+        m_UplinkRecheckTicks = kUplinkRecheckTicks;
+        rtc::Candidate local;
+        rtc::Candidate remote;
+        bool selected = false;
+        try {
+            selected = m_Pc->getSelectedCandidatePair(&local, &remote);
+        } catch (const std::exception&) {}
+        const std::optional<std::string> address = selected ? remote.address() : std::nullopt;
+        // No pair yet: look again at the next tick rather than in ten.
+        if (!address && m_UplinkRemote.empty()) m_UplinkRecheckTicks = 1;
+        if (address && *address != m_UplinkRemote) {
+            logHostUplink(m_UplinkNotice.finish());
+            m_UplinkRemote = *address;
+            m_UplinkAdapter = mw::hostuplink::adapterTowards(*address);
+            m_Uplink = {};
+            m_UplinkNotice = {};
+            if (m_UplinkAdapter.valid()) {
+                qInfo().noquote() << QStringLiteral("[HostUpload] watching \"%1\" for what this PC "
+                                                    "sends besides the stream (the route to %2)")
+                                         .arg(QString::fromStdString(m_UplinkAdapter.name),
+                                              QString::fromStdString(*address));
+            } else {
+                qInfo().noquote() << QStringLiteral(
+                                         "[HostUpload] no adapter found on the route to %1: "
+                                         "what this PC sends besides the stream is not measured")
+                                         .arg(QString::fromStdString(*address));
+            }
+        }
+    }
+    if (!m_UplinkAdapter.valid()) return;
+    const std::optional<uint64_t> adapterBytes = mw::hostuplink::sentBytes(m_UplinkAdapter);
+    if (!adapterBytes) return;
+    uint64_t streamBytes = 0;
+    try {
+        streamBytes = m_Pc->bytesSent();
+    } catch (const std::exception&) {
+        return;
+    }
+    if (const auto rate = m_Uplink.add(nowMs, *adapterBytes, m_UplinkAdapter.bits, streamBytes))
+        logHostUplink(m_UplinkNotice.feed(*rate));
+}
+
+void DataChannelRelay::logHostUplink(const mw::hostuplink::Notice::Event& ev)
+{
+    using Kind = mw::hostuplink::Notice::Kind;
+    switch (ev.kind) {
+    case Kind::None: return;
+    case Kind::Started:
+        qInfo().noquote() << QStringLiteral(
+                                 "[HostUpload] this PC sends ~%1 Mbit/s besides the stream "
+                                 "on \"%2\" (the stream's own data: ~%3 Mbit/s), for %4 s already")
+                                 .arg(mbps(ev.lastKbps),
+                                      QString::fromStdString(m_UplinkAdapter.name),
+                                      mbps(ev.streamKbps))
+                                 .arg(ev.durationMs / 1000);
+        return;
+    case Kind::Still:
+        qInfo().noquote() << QStringLiteral("[HostUpload] still ~%1 Mbit/s besides the stream "
+                                            "(mean %2, peak %3) for %4 s")
+                                 .arg(mbps(ev.lastKbps), mbps(ev.meanKbps), mbps(ev.peakKbps))
+                                 .arg(ev.durationMs / 1000);
+        return;
+    case Kind::Ended:
+        qInfo().noquote() << QStringLiteral("[HostUpload] over: ~%1 Mbit/s besides the stream on "
+                                            "average for %2 s, peak %3")
+                                 .arg(mbps(ev.meanKbps))
+                                 .arg(ev.durationMs / 1000)
+                                 .arg(mbps(ev.peakKbps));
+        return;
     }
 }
 
@@ -1911,6 +3069,36 @@ void DataChannelRelay::sendExitNotice(const char* type)
     }
 }
 
+void DataChannelRelay::sendHidCaps()
+{
+    if (!m_InputDc || !m_InputDc->isOpen() || !m_Shim || m_Stopping.load()) return;
+    const QJsonObject caps = hidCapsMessage(m_InputPolicy, *m_Shim);
+    const QByteArray j = QJsonDocument(caps).toJson(QJsonDocument::Compact);
+    try {
+        m_InputDc->send(std::string(j.constData(), j.size()));
+    } catch (const std::exception&) {}
+}
+
+void DataChannelRelay::sendInputCaps()
+{
+    if (!m_InputDc || !m_InputDc->isOpen() || m_Stopping.load()) return;
+    const QByteArray j = inputCapsMessage(m_InputPolicy);
+    try {
+        m_InputDc->send(std::string(j.constData(), j.size()));
+    } catch (const std::exception&) {}
+}
+
+void DataChannelRelay::onHidPolicyChanged()
+{
+    // Under m_InputMutex when the stream is up (see setInputPolicy), the lock
+    // the hid channel's reports and the page's hidattach are handled under.
+    if (!m_Shim) return;
+    if (!m_InputPolicy.hid)
+        for (int slot = 0; slot < kHidSlots; ++slot)
+            m_Shim->hidDetach(slot);
+    sendHidCaps();
+}
+
 void DataChannelRelay::stop()
 {
     // The relay lives on its own session thread. If stop() is called from another
@@ -1932,6 +3120,11 @@ void DataChannelRelay::stop()
         if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim))
             native->setDirectFrameSink(nullptr);
     }
+    // linkhold=: a WebSocket fallback must not ask a channel that is going.
+    if (m_LinkHoldMs > 0) {
+        if (auto* native = qobject_cast<NativeMediaEngine*>(m_Shim))
+            native->setLinkBusyProbe(nullptr);
+    }
 
     const bool wasStopping = m_Stopping.exchange(true);
     // Cleanup stays on the relay thread, not in an asynchronous RTC close callback.
@@ -1943,6 +3136,9 @@ void DataChannelRelay::stop()
     }
 
     qInfo() << "[DataChannelRelay::stop] ENTER, frameCount=" << m_FrameCount;
+
+    // The microphone's device first: nothing more will come for it.
+    stopMic();
 
     // Stop ICE timeout timer
     if (m_IceCheckTimer) {
@@ -1975,6 +3171,7 @@ void DataChannelRelay::stop()
 
         // Reset backpressure counters and IDR state for next session
         m_DeltaDroppedCount = 0;
+        m_NamedDeltaDropCount = 0;
         m_KeyframeBackpressureWarnings = 0;
         m_BackpressureDropCount = 0;
         m_AwaitingIdrDropCount = 0;
@@ -1996,6 +3193,30 @@ void DataChannelRelay::stop()
     }
 
     closeDc(m_InputDc, "input");
+    closeDc(m_HidDc, "hid");
+
+    // The bench's Ultra stream: its channel closed first, so a send blocked on
+    // it returns, then its sender joined. What the queue threw away is the
+    // number the transport lab wants.
+    if (m_UltraSender) {
+        m_UltraOpen.store(false);
+        closeDc(m_UltraDc, "ultra");
+        const uint64_t drops = m_UltraSender->queueDropCount();
+        m_UltraSender->stop();
+        qInfo() << "[DataChannelRelay] bench Ultra synthetic:" << m_UltraSeq << "frames of"
+                << m_UltraSynthKb << "KiB queued," << drops << "dropped by the sender's queue";
+        m_UltraSender.reset();
+    }
+    // The bench's flood: its channel closed first, so a send blocked on it
+    // errors out and the thread joins at once.
+    if (m_Flood) {
+        closeDc(m_FloodDc, "flood");
+        m_Flood->stop();
+        m_Flood.reset();
+    }
+    if (m_Loss.active())
+        qInfo() << "[DataChannelRelay] bench losses:" << m_Loss.dropped() << "video messages in"
+                << m_Loss.losses() << "losses this session";
 
     // Direct input: a message may be halfway through injection on a
     // libdatachannel thread. Wait it out — m_Stopping is set, so the next one
@@ -2017,6 +3238,13 @@ void DataChannelRelay::stop()
             } catch (...) {}
             m_AudioTrack.reset();
         }
+    }
+    // The bench's silent video section: nothing was ever sent on it.
+    if (m_RxBufTrack) {
+        try {
+            m_RxBufTrack->close();
+        } catch (...) {}
+        m_RxBufTrack.reset();
     }
 
     // Stop the sender thread AFTER closing the DataChannels: a send that is
@@ -2105,4 +3333,356 @@ void DataChannelRelay::onIceCheckTimeout()
     if (!m_Stopping.exchange(true)) {
         emit sessionEnded();
     }
+}
+
+// --- RTP video track (POC Ultra U1.4) ---
+
+void DataChannelRelay::setRtpVideoPolicy(const QString& spec, bool nativeHost)
+{
+    m_RtpVideoSpec = spec.trimmed().toLower();
+    m_RtpVideoNativeHost = nativeHost;
+}
+
+bool DataChannelRelay::rtpVideoActive() const
+{
+    return m_RtpVideoAccepted.load(std::memory_order_relaxed);
+}
+
+void DataChannelRelay::createRtpVideoTracks()
+{
+    if (m_RtpVideoSpec.isEmpty() || !m_Pc || !m_Shim) return;
+    // `native:h264+hevc;other:h264`: the section of this host's type.
+    QStringList named;
+    const QString wanted =
+        m_RtpVideoNativeHost ? QStringLiteral("native") : QStringLiteral("other");
+    for (const QString& section : m_RtpVideoSpec.split(';', Qt::SkipEmptyParts)) {
+        const int colon = section.indexOf(':');
+        if (colon < 0 || section.left(colon).trimmed() != wanted) continue;
+        for (QString item : section.mid(colon + 1).split('+', Qt::SkipEmptyParts))
+            named << item.trimmed();
+    }
+    const int format = m_Shim->negotiatedVideoFormat();
+    const QString codec = (format & VIDEO_FORMAT_MASK_AV1)    ? QStringLiteral("av1")
+                          : (format & VIDEO_FORMAT_MASK_H265) ? QStringLiteral("hevc")
+                                                              : QStringLiteral("h264");
+    const bool ultra = named.contains(QStringLiteral("ultra")) && m_UltraSynthKb > 0;
+    qInfo() << "[DataChannelRelay] RTP video policy" << m_RtpVideoSpec << "| host" << wanted
+            << "| codec" << codec << "format" << format << "| video on"
+            << (named.contains(codec) ? "RTP" : "the DataChannel") << "| ultra on"
+            << (ultra ? "RTP" : "-");
+
+    std::random_device rd;
+    // The bench's other road (U1.4 ter, item `aroad`): the frames cut in
+    // packets on an Opus track. Chrome holds each received video frame for
+    // its 64 Hz metronome before the transform; an audio frame goes at once.
+    m_RtpVideoAudioRoad = named.contains(codec) && named.contains(QStringLiteral("aroad"));
+    if (m_RtpVideoAudioRoad) {
+        auto desc = rtc::Description::Audio("vaudio", rtc::Description::Direction::SendOnly);
+        const int pt = 110;
+        desc.addOpusCodec(pt);
+        const uint32_t ssrc = rd();
+        desc.addSSRC(ssrc, "vaudio");
+        m_VideoTrack = m_Pc->addTrack(desc);
+        auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(
+            ssrc, "vaudio", static_cast<uint8_t>(pt), rtc::OpusRtpPacketizer::DefaultClockRate);
+        m_VideoTrack->setMediaHandler(std::make_shared<rtc::OpusRtpPacketizer>(cfg));
+        m_VideoTrack->onOpen([this]() {
+            qInfo() << "[DataChannelRelay] RTP video track open (audio road)";
+            QMetaObject::invokeMethod(
+                this,
+                [this]() {
+                    sendBufferedKeyframe();
+                    std::lock_guard<std::mutex> lk(m_VideoMutex);
+                    if (!m_RtpVideoSentKeyframe) sendIdrRequestThrottled();
+                },
+                Qt::QueuedConnection);
+        });
+    } else if (named.contains(codec)) {
+        auto desc = rtc::Description::Video("video", rtc::Description::Direction::SendOnly);
+        const int pt = 96;
+        if (codec == QLatin1String("av1"))
+            desc.addAV1Codec(pt);
+        else if (codec == QLatin1String("hevc"))
+            desc.addH265Codec(pt);
+        else
+            desc.addH264Codec(pt);
+        const uint32_t ssrc = rd();
+        desc.addSSRC(ssrc, "video"); // before addTrack: else NACK / PLI never route to it
+        m_VideoTrack = m_Pc->addTrack(desc);
+        // The frame's backendTs (ms) as the RTP timestamp, as is: see the header.
+        auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(
+            ssrc, "video", static_cast<uint8_t>(pt), rtc::RtpPacketizer::VideoClockRate);
+        std::shared_ptr<rtc::RtpPacketizer> packetizer;
+        if (codec == QLatin1String("av1"))
+            packetizer = std::make_shared<rtc::AV1RtpPacketizer>(
+                rtc::AV1RtpPacketizer::Packetization::TemporalUnit, cfg);
+        else if (codec == QLatin1String("hevc"))
+            packetizer = std::make_shared<rtc::H265RtpPacketizer>(
+                rtc::NalUnit::Separator::StartSequence, cfg);
+        else
+            packetizer = std::make_shared<rtc::H264RtpPacketizer>(
+                rtc::NalUnit::Separator::StartSequence, cfg);
+        // ~1 s of packets at 100 Mbit/s, for the browser's NACKs.
+        auto nack = std::make_shared<rtc::RtcpNackResponder>(8192);
+        packetizer->addToChain(nack);
+        // Counted, never acted on: the browser's own decoder never gets a
+        // frame (the transform keeps them all), so it asks for a keyframe
+        // over and over. Ours asks on the input channel, as on SCTP.
+        auto pli = std::make_shared<rtc::PliHandler>([this]() {
+            const int n = ++m_RtpPliCount;
+            if (n == 1 || n % 200 == 0)
+                qInfo() << "[DataChannelRelay] RTP video: browser PLIs ignored so far:" << n;
+        });
+        nack->addToChain(pli);
+        m_VideoTrack->setMediaHandler(packetizer);
+        m_VideoTrack->onOpen([this]() {
+            qInfo() << "[DataChannelRelay] RTP video track open";
+            QMetaObject::invokeMethod(
+                this,
+                [this]() {
+                    sendBufferedKeyframe();
+                    std::lock_guard<std::mutex> lk(m_VideoMutex);
+                    if (!m_RtpVideoSentKeyframe) sendIdrRequestThrottled();
+                },
+                Qt::QueuedConnection);
+        });
+    }
+    m_UltraAudioRoad = ultra && named.contains(QStringLiteral("aroad"));
+    if (m_UltraAudioRoad) {
+        auto desc = rtc::Description::Audio("uaudio", rtc::Description::Direction::SendOnly);
+        const int pt = 109;
+        desc.addOpusCodec(pt);
+        const uint32_t ssrc = rd();
+        desc.addSSRC(ssrc, "uaudio");
+        m_UltraTrack = m_Pc->addTrack(desc);
+        auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(
+            ssrc, "uaudio", static_cast<uint8_t>(pt), rtc::OpusRtpPacketizer::DefaultClockRate);
+        m_UltraTrack->setMediaHandler(std::make_shared<rtc::OpusRtpPacketizer>(cfg));
+        m_UltraTrack->onOpen(
+            []() { qInfo() << "[DataChannelRelay] Ultra RTP track open (audio road)"; });
+    } else if (ultra) {
+        auto desc = rtc::Description::Video("ultra", rtc::Description::Direction::SendOnly);
+        const int pt = 97;
+        desc.addVP8Codec(pt);
+        const uint32_t ssrc = rd();
+        desc.addSSRC(ssrc, "ultra");
+        m_UltraTrack = m_Pc->addTrack(desc);
+        auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(
+            ssrc, "ultra", static_cast<uint8_t>(pt), rtc::RtpPacketizer::VideoClockRate);
+        auto packetizer = std::make_shared<rtc::VP8RtpPacketizer>(cfg);
+        packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(16384));
+        m_UltraTrack->setMediaHandler(packetizer);
+        m_UltraTrack->onOpen([]() { qInfo() << "[DataChannelRelay] Ultra RTP track open"; });
+    }
+    // The audio road's pacing (AroadPacer.h), off unless the bench asks
+    // (aroadpace=<x>): on a Mac in Wi-Fi, 3 times its rate over a 50 Mbit/s
+    // floor dropped more in the kernel than a frame in one run (06/10/2026,
+    // W4 « after »), as pacing SCTP did in W2 A: Chrome reads late, the host's
+    // bursts are not the cause. Its resends feed the rate governor either way.
+    // Its window (aroadwin=<KiB>, AroadPacer.h), off unless the bench asks:
+    // at most that much sent past the last chunk the page acknowledged. One
+    // road a session, so one window for either track.
+    if ((m_RtpVideoAudioRoad || m_UltraAudioRoad) && !m_AroadPacer) {
+        const double multiple = m_AroadPace < 0 ? 0.0 : m_AroadPace;
+        const int64_t window = static_cast<int64_t>(m_AroadWindowKb) * 1024;
+        if (multiple > 0 || window > 0) {
+            m_AroadPacer =
+                std::make_unique<AroadPacer>(multiple, 50'000'000 / 8, 16 * 1024, window);
+            qInfo() << "[DataChannelRelay] audio road paced at" << multiple
+                    << "x what it carries, 50 Mbit/s at least (aroadpace=); window"
+                    << m_AroadWindowKb << "KiB (aroadwin=, 0 = none)";
+        }
+    }
+}
+
+void DataChannelRelay::sendAudioRoad(const std::shared_ptr<rtc::Track>& track,
+                                     AudioRoadHistory& history, uint16_t seq, const uint8_t* data,
+                                     size_t size, bool isKeyframe, uint32_t timestamp,
+                                     uint32_t frameId)
+{
+    rtc::FrameInfo info(timestamp);
+    info.isKeyFrame = isKeyframe;
+    // One Opus packet per chunk: 'M', flags (1 = key), frame seq, index,
+    // count (u16, big endian), the wire frame id (u32, big endian), then up
+    // to kChunk bytes of the frame (1100, or the bench's aroadchunk=).
+    const size_t kChunk = m_AroadChunk;
+    constexpr size_t kHead = 12;
+    const size_t count = std::max<size_t>(1, (size + kChunk - 1) / kChunk);
+    AudioRoadHistory::Frame kept;
+    kept.seq = seq;
+    kept.timestamp = timestamp;
+    kept.chunks.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const size_t off = i * kChunk;
+        const size_t len = std::min(kChunk, size - off);
+        std::vector<rtc::byte> chunk(kHead + len);
+        const uint8_t head[kHead] = {'M',
+                                     static_cast<uint8_t>(isKeyframe ? 1 : 0),
+                                     static_cast<uint8_t>(seq >> 8),
+                                     static_cast<uint8_t>(seq),
+                                     static_cast<uint8_t>(i >> 8),
+                                     static_cast<uint8_t>(i),
+                                     static_cast<uint8_t>(count >> 8),
+                                     static_cast<uint8_t>(count),
+                                     static_cast<uint8_t>(frameId >> 24),
+                                     static_cast<uint8_t>(frameId >> 16),
+                                     static_cast<uint8_t>(frameId >> 8),
+                                     static_cast<uint8_t>(frameId)};
+        std::memcpy(chunk.data(), head, kHead);
+        std::memcpy(chunk.data() + kHead, data + off, len);
+        // The bench's loss (MW_AROAD_DROP, per mille): first sends only, so
+        // the page's NACK path is what brings the chunk back.
+        static const int dropPerMille = qEnvironmentVariableIntValue("MW_AROAD_DROP");
+        if (dropPerMille <= 0 ||
+            static_cast<int>(QRandomGenerator::global()->bounded(1000)) >= dropPerMille) {
+            if (m_AroadPacer)
+                m_AroadPacer->send(track, chunk, timestamp, false);
+            else
+                track->sendFrame(chunk.data(), chunk.size(), info);
+        }
+        kept.chunks.push_back(std::move(chunk));
+    }
+    m_AroadSent.fetch_add(static_cast<int64_t>(count), std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> budget(m_AroadBudgetMutex);
+        m_AroadBudget.sent(size + count * kHead, steadyUs());
+    }
+    std::lock_guard<std::mutex> lk(history.mutex);
+    history.frames.push_back(std::move(kept));
+    while (history.frames.size() > history.maxFrames)
+        history.frames.pop_front();
+}
+
+void DataChannelRelay::resendAudioRoad(const QJsonObject& msg)
+{
+    // {"type":"aroadnack","t":"v"|"u","s":seq,"i":[indexes]} from the page's
+    // transform worker: the chunks it saw missing, sent again as they went.
+    // "all":1 names a frame none of whose chunks came (a hole in the seqs: a
+    // small delta is one or two chunks, one loss on the air takes it whole),
+    // so the page knows neither its indexes nor how many: all of them go.
+    const bool ultra = msg["t"].toString() == QLatin1String("u");
+    const std::shared_ptr<rtc::Track> track = ultra ? m_UltraTrack : m_VideoTrack;
+    AudioRoadHistory& history = ultra ? m_UltraRoadHistory : m_VideoRoadHistory;
+    if (!track || !track->isOpen()) return;
+    const uint16_t seq = static_cast<uint16_t>(msg["s"].toInt());
+    const bool all = msg["all"].toInt() != 0;
+    QJsonArray indexes = msg["i"].toArray();
+    std::lock_guard<std::mutex> lk(history.mutex);
+    for (const auto& f : history.frames) {
+        if (f.seq != seq) continue;
+        rtc::FrameInfo info(f.timestamp);
+        if (all) {
+            indexes = QJsonArray();
+            for (size_t i = 0; i < f.chunks.size(); ++i)
+                indexes.append(static_cast<int>(i));
+        }
+        int n = 0;
+        for (const QJsonValue& v : indexes) {
+            const int i = v.toInt(-1);
+            if (i < 0 || i >= static_cast<int>(f.chunks.size())) continue;
+            {
+                std::lock_guard<std::mutex> budget(m_AroadBudgetMutex);
+                if (!m_AroadBudget.mayResend(f.chunks[static_cast<size_t>(i)].size(), steadyUs()))
+                    continue;
+            }
+            try {
+                if (m_AroadPacer)
+                    m_AroadPacer->send(track, f.chunks[static_cast<size_t>(i)], f.timestamp, true);
+                else
+                    track->sendFrame(f.chunks[static_cast<size_t>(i)].data(),
+                                     f.chunks[static_cast<size_t>(i)].size(), info);
+                ++n;
+            } catch (const std::exception& e) {
+                qWarning() << "[DataChannelRelay] audio road resend failed:" << e.what();
+                return;
+            }
+        }
+        history.resent += n;
+        m_AroadResent.fetch_add(n, std::memory_order_relaxed);
+        if (history.resent == n || history.resent / 200 != (history.resent - n) / 200)
+            qInfo() << "[DataChannelRelay] audio road" << (ultra ? "Ultra" : "video")
+                    << "chunks resent so far:" << history.resent
+                    << "| refused by the budget:" << [this]() {
+                           std::lock_guard<std::mutex> budget(m_AroadBudgetMutex);
+                           return m_AroadBudget.refused();
+                       }();
+        return;
+    }
+}
+
+void DataChannelRelay::sendRtpVideo(const QByteArray& frameData, bool isKeyframe,
+                                    int64_t presentationTimeUs, int frameNumber)
+{
+    // The frame's capture on the host's steady clock, as sendFragmented stamps it.
+    uint32_t backendTs = 0;
+    if (m_Shim) {
+        const int64_t firstMs = m_Shim->firstFrameArrivalSteadyMs();
+        const int64_t presUs =
+            presentationTimeUs >= 0 ? presentationTimeUs : m_Shim->framePresentationTimeUs();
+        if (firstMs > 0 && presUs >= 0)
+            backendTs = static_cast<uint32_t>((firstMs + presUs / 1000) & 0xFFFFFFFF);
+    }
+    if (backendTs == 0)
+        backendTs = static_cast<uint32_t>(QDateTime::currentMSecsSinceEpoch() & 0xFFFFFFFF);
+    rtc::FrameInfo info(backendTs);
+    info.isKeyFrame = isKeyframe;
+    // Stamped now: how long after its capture the frame leaves (POC U1.4).
+    const int64_t sendStartUs = steadyUs();
+    int64_t wireId = -1;
+    try {
+        if (m_RtpVideoAudioRoad) {
+            // The DataChannel's frame id, and its map to the engine's frame
+            // number (sendFragmented's): a frame the page gives up on is
+            // named back by id, and a host that heals by invalidation answers
+            // with deltas instead of a keyframe.
+            const uint32_t frameId = m_FrameId++;
+            wireId = frameId;
+            m_FrameNumberById[frameId % kFrameNumberRing].store(
+                frameNumber >= 0
+                    ? (static_cast<int64_t>(frameId) << 32) | static_cast<uint32_t>(frameNumber)
+                    : -1,
+                std::memory_order_release);
+            sendAudioRoad(m_VideoTrack, m_VideoRoadHistory, m_RtpAudioRoadSeq++,
+                          reinterpret_cast<const uint8_t*>(frameData.constData()),
+                          static_cast<size_t>(frameData.size()), isKeyframe, backendTs, frameId);
+        } else {
+            m_VideoTrack->sendFrame(reinterpret_cast<const rtc::byte*>(frameData.constData()),
+                                    static_cast<size_t>(frameData.size()), info);
+        }
+        const int64_t endUs = steadyUs();
+        // The first and the last packet handed to libdatachannel, as the
+        // sender stamps a DataChannel frame: the engine that stamps its frames
+        // closes their timeline on it — queue, send and the host's total.
+        // Without it the stats card under PyroWave, whose frames all ride this
+        // track, had acquire, convert and encode but a HOST TOTAL of "–", and
+        // its LATENCY left the host out: 5.2 ms read beside 8 + 15 + 31 ms of
+        // host stages (19/10/2026). The bench's frame log (relaylog=1) stands
+        // in between, as in sendFragmented.
+        FrameSentSink* sink = (frameNumber >= 0 && m_Shim) ? m_Shim->frameSentSink() : nullptr;
+        if (m_FrameLog && frameNumber >= 0) {
+            if (wireId >= 0) m_FrameLog->sent(frameNumber, static_cast<uint32_t>(wireId));
+            m_FrameLog->setInner(sink);
+            m_FrameLog->frameSent(static_cast<uint32_t>(frameNumber), sendStartUs, endUs);
+        } else if (sink) {
+            sink->frameSent(static_cast<uint32_t>(frameNumber), sendStartUs, endUs);
+        }
+        m_RtpSendUs.push_back(static_cast<int>(endUs - sendStartUs));
+        // backendTs is the steady clock in ms, mod 2^32: the difference wraps alike.
+        const uint32_t nowMs32 = static_cast<uint32_t>((endUs / 1000) & 0xFFFFFFFF);
+        m_RtpLateUs.push_back(static_cast<int>(static_cast<int32_t>(nowMs32 - backendTs)) * 1000);
+        if (m_RtpSendUs.size() >= 600) {
+            std::sort(m_RtpSendUs.begin(), m_RtpSendUs.end());
+            std::sort(m_RtpLateUs.begin(), m_RtpLateUs.end());
+            qInfo() << "[DataChannelRelay] RTP video: sendFrame p50" << m_RtpSendUs[300] << "us p99"
+                    << m_RtpSendUs[594] << "| capture to sent p50" << m_RtpLateUs[300] << "us p99"
+                    << m_RtpLateUs[594];
+            m_RtpSendUs.clear();
+            m_RtpLateUs.clear();
+        }
+        if (isKeyframe) m_RtpVideoSentKeyframe = true;
+        m_AwaitingIdr = false;
+    } catch (const std::exception& e) {
+        qWarning() << "[DataChannelRelay] RTP video send failed:" << e.what();
+    }
+    if (m_DirectVideoSend && (m_UltraSender || m_UltraTrack)) sendUltraSynthetic(backendTs);
 }

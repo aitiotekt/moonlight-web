@@ -165,6 +165,11 @@ describe('app-list memory', () => {
         );
         expect(appsSignature(a)).not.toBe(appsSignature([...a, { id: 3, name: 'C' }]));
         expect(appsSignature(a)).not.toBe(appsSignature([a[1], a[0]]));
+        // A native host's app whose image changed reads as a change too.
+        const device = { os: 'windows', display: 'virtual', model: 'X', key: 'host-app-1' };
+        expect(appsSignature([{ id: 2000, name: 'X', device }])).not.toBe(
+            appsSignature([{ id: 2000, name: 'X', device: { ...device, art: 'ab12' } }]),
+        );
         // Two names that concatenate to the same string must not collide.
         expect(appsSignature([{ id: 1, name: 'A B' }])).not.toBe(
             appsSignature([

@@ -33,8 +33,8 @@
  * rate the pipeline has to sustain. Costing 10ms is fine at 22fps (45ms apart)
  * and fine at 60fps (16.7ms apart); costing 19.5ms at 60fps is not.
  *
- * The ladder only ever goes DOWN from what the user picked (fsr1 → nis → sgsr → off)
- * and climbs back when the pressure is gone. Recovery is deliberately shy: the
+ * The ladder only ever goes DOWN from what the user picked (fsr1 → nis → sgsr →
+ * mwsr → off) and climbs back when the pressure is gone. Recovery is deliberately shy: the
  * cost at the level above cannot be measured from the level below, so a restore
  * is a bet. Each undone bet doubles the wait before the next one, which turns a
  * long call into one failed attempt instead of a flip-flop every 15 seconds.
@@ -48,9 +48,16 @@
 
 /**
  * Descending cost order — the only direction this ladder is walked. The menu
- * calls them Quality (FSR1), Balanced (NIS) and Performance (SGSR1).
+ * calls them Quality (FSR1), Balanced (NIS) and Performance (SGSR1); `mwsr`
+ * is MoonlightWeb's own (docs/design/upscaler-mwsr.md), below SGSR1 because
+ * it costs less on every GPU measured (0.4 to 0.8 × SGSR1, P0 to P3) for
+ * FSR1's sharpness, so a session stepped down keeps a sharp picture one rung
+ * longer. 'auto' takes it since v0.4.1, so an auto session's ceiling is
+ * `mwsr` and its only step down is 'off'. The memory (rememberRung) stores
+ * names and is read under the same ceiling only: a verdict kept under FSR1 or
+ * SGSR1's ceiling is ignored by an MWSR session, nothing to migrate.
  */
-export const ENHANCER_LADDER = ['fsr1', 'nis', 'sgsr', 'off'];
+export const ENHANCER_LADDER = ['fsr1', 'nis', 'sgsr', 'mwsr', 'off'];
 
 /** A renderer's pass as a rung of the ladder: 'gl-sgsr' is 'sgsr'. */
 export function ladderRung(algo) {
@@ -122,6 +129,45 @@ const DEGRADE_RATIO = 0.8;
 const DECODE_QUEUE_DEGRADE = 4;
 /** …and the queue has to be back to about empty before climbing again. */
 const DECODE_QUEUE_RECOVER = 1;
+/**
+ * Share of draws whose GPU work was still running when the next frame came to
+ * be drawn (WebGlRenderer's fences), above which the pass is judged too slow
+ * for this GPU — the third signal, and the one that sees a GPU that keeps UP
+ * but runs BEHIND. Measured 25/09/2026 on a 2-CU Radeon iGPU: FSR1 at 1440p
+ * held 60 fps with the decoder queue empty and the submission at 0.3 ms, while
+ * every picture reached the screen ~29 ms late, two frames queued on the GPU
+ * (click-to-photon 59.6 ms against 30.8 without the enhancer, 32.6 with SGSR).
+ * Throughput hid it; latency is what the player pays.
+ */
+const GPU_BEHIND_DEGRADE = 0.5;
+/** …and about none of them before climbing again. */
+const GPU_BEHIND_RECOVER = 0.1;
+/**
+ * Windows in which the plain copy — the 'off' rung, once stepped down to —
+ * reads late on those fences, after which they are ignored for the session.
+ * A copy is the cheapest draw there is: fences that find it late are not
+ * telling the cost of a pass, and turning the enhancer off cannot clear them.
+ * Measured 28/10/2026, Chrome on a 120 Hz Radeon 780M, 1080p120: the copy, 0.3
+ * ms of GPU work, read over a tenth of its draws late in half the windows and
+ * over half of them in a quarter, so the 15 s in the clear a climb back needs
+ * never came, and the memory carried 'off' into every next session. Four
+ * windows, the 2 s it takes to cut a pass: a hiccup or two is not a verdict.
+ */
+const COPY_LATE_WINDOWS = 4;
+/**
+ * Windows in which that copy fits a frame but costs more than a climb allows
+ * (between RECOVER_RATIO and DEGRADE_RATIO of it), after which the draw time
+ * is read as the presentation's for the session: it no longer holds a climb
+ * back, and cuts a pass only past a whole frame. WebGPU's draw ends at
+ * onSubmittedWorkDone, which also waits for the swap chain (WebGpuRenderer),
+ * and nothing the enhancer does shortens that wait. Measured 28/10/2026,
+ * Chrome WebGPU on a 120 Hz Radeon 780M, 1080p120: the copy took 5.0 to 6.0 ms
+ * of an 8.4 ms frame, over the 3.4 ms a climb needs, so the session left at
+ * 'off' stayed there. A pass that costs more than a frame — MWSR too slow for
+ * the GPU — is still cut; a copy that does not fit is a machine overloaded,
+ * not a presentation, and changes nothing.
+ */
+const COPY_SLOW_WINDOWS = 4;
 /** …and back below this share (with margin, so a restore is not a coin flip). */
 const RECOVER_RATIO = 0.4;
 /** A verdict must hold this long — a single busy window is not a trend. */
@@ -179,6 +225,12 @@ export class EnhancerGovernor {
         this._noRecovery = profile.noRecovery === true;
         /** First observation's timestamp — the warm-up is measured from there. */
         this._firstObsMs = 0;
+        /** Windows the copy read late (COPY_LATE_WINDOWS), and the verdict. */
+        this._copyLateWindows = 0;
+        this._fencesIgnored = false;
+        /** Windows the copy fit but over a climb's margin (COPY_SLOW_WINDOWS). */
+        this._copySlowWindows = 0;
+        this._presentationBound = false;
     }
 
     /** Current algo — what the renderer should be running. */
@@ -201,19 +253,42 @@ export class EnhancerGovernor {
         return this._recoverAfterMs;
     }
 
+    /** True once the fences read the plain copy late (COPY_LATE_WINDOWS):
+     *  gpuBehind counts for nothing from then on. */
+    get fencesIgnored() {
+        return this._fencesIgnored;
+    }
+
+    /** True once the copy alone fit a frame but not a climb's margin
+     *  (COPY_SLOW_WINDOWS): the draw time cuts only past a whole frame. */
+    get presentationBound() {
+        return this._presentationBound;
+    }
+
     /**
      * Feed one observation window.
      * @param {{serviceMs: number, arrivalMs: number, now: number,
-     *           decodeQueue?: number}} obs
+     *           decodeQueue?: number, gpuBehind?: number|null,
+     *           passthrough?: boolean}} obs
      *   serviceMs per-frame cost of the render stage — the draw latency divided
      *             by how many draws overlap (PipelineDiag.renderServiceMs), NOT
      *             the raw wait: with two draws in flight each one waits about
-     *             twice as long while costing the pipeline the same.
+     *             twice as long while costing the pipeline the same. Read as
+     *             the presentation's once the copy waits on it
+     *             (COPY_SLOW_WINDOWS).
      *   arrivalMs average interval between incoming frames = the frame budget
      *   now       performance.now(), passed in so the policy stays pure
      *   decodeQueue average decodeQueueSize (PipelineDiag.decodeQueueAvg) —
      *             the cost a queued GPU pass does not report about itself, see
      *             DECODE_QUEUE_DEGRADE. Absent counts as an empty queue.
+     *   gpuBehind share (0..1) of draws still on the GPU when a later one
+     *             came (see GPU_BEHIND_DEGRADE). Absent or null — a renderer
+     *             that cannot tell — counts as never behind, and so does
+     *             every window once the copy read late (COPY_LATE_WINDOWS).
+     *   passthrough true while the renderer presents the frame at 1:1 without
+     *             running the pass (VideoRenderer.passthrough): the window
+     *             measured a copy, whatever the rung. The ladder holds and its
+     *             timers restart, so no verdict spans a passage through 1:1.
      * @returns {string|null} the new algo when the level changed, else null.
      */
     update(obs) {
@@ -221,9 +296,18 @@ export class EnhancerGovernor {
         const wait = obs && obs.serviceMs;
         const now = (obs && obs.now) || 0;
         const queue = obs && obs.decodeQueue > 0 ? obs.decodeQueue : 0;
+        let behind = obs && obs.gpuBehind > 0 ? obs.gpuBehind : 0;
         // No usable budget (stream idle, no sample yet): hold, and let the
         // sustain timers lapse rather than deciding on nothing.
         if (!(budget >= MIN_BUDGET_MS) || budget > MAX_BUDGET_MS || !(wait >= 0)) {
+            this._degradeSince = 0;
+            this._recoverSince = 0;
+            return null;
+        }
+
+        // Nothing ran: the frame was copied at 1:1. Hold, and let both timers
+        // lapse — the next window at scale starts a verdict afresh.
+        if (obs.passthrough === true) {
             this._degradeSince = 0;
             this._recoverSince = 0;
             return null;
@@ -247,14 +331,43 @@ export class EnhancerGovernor {
             }
         }
 
+        // Stepped down to the copy, and the fences still find it late: they
+        // cannot tell a pass's cost on this device (COPY_LATE_WINDOWS).
+        if (this._fencesIgnored) behind = 0;
+        else if (this.degraded && this.level === 'off' && behind > GPU_BEHIND_RECOVER) {
+            if (++this._copyLateWindows >= COPY_LATE_WINDOWS) {
+                this._fencesIgnored = true;
+                behind = 0;
+            }
+        }
+
         // A flat cap replaces the frame-arrival budget when one was set.
-        const degradeAbove = this._fixedBudgetMs > 0 ? this._fixedBudgetMs : budget * DEGRADE_RATIO;
-        const recoverBelow = this._fixedBudgetMs > 0 ? -1 : budget * RECOVER_RATIO;
+        let degradeAbove = this._fixedBudgetMs > 0 ? this._fixedBudgetMs : budget * DEGRADE_RATIO;
+        let recoverBelow = this._fixedBudgetMs > 0 ? -1 : budget * RECOVER_RATIO;
+
+        // Stepped down to the copy, and the copy alone fits a frame but not a
+        // climb's margin: the draw time waits on presentation (COPY_SLOW_WINDOWS).
+        if (
+            !this._presentationBound &&
+            this._fixedBudgetMs === 0 &&
+            this.degraded &&
+            this.level === 'off' &&
+            wait > recoverBelow &&
+            wait <= degradeAbove &&
+            ++this._copySlowWindows >= COPY_SLOW_WINDOWS
+        ) {
+            this._presentationBound = true;
+        }
+        if (this._presentationBound) {
+            degradeAbove = budget;
+            recoverBelow = budget * DEGRADE_RATIO;
+        }
 
         // Either the draw no longer fits, or it says it does while the decoder
-        // starves behind it. The second is the only signal a queued GPU pass
+        // starves behind it, or while the GPU finishes each picture after the
+        // next one is due. The last two are the only signals a queued GPU pass
         // gives about its real cost.
-        if (wait > degradeAbove || queue > DECODE_QUEUE_DEGRADE) {
+        if (wait > degradeAbove || queue > DECODE_QUEUE_DEGRADE || behind > GPU_BEHIND_DEGRADE) {
             this._recoverSince = 0;
             if (this._degradeSince === 0) this._degradeSince = now;
             if (now - this._degradeSince < DEGRADE_SUSTAIN_MS) return null;
@@ -273,6 +386,7 @@ export class EnhancerGovernor {
             !this._noRecovery &&
             wait < recoverBelow &&
             queue <= DECODE_QUEUE_RECOVER &&
+            behind <= GPU_BEHIND_RECOVER &&
             this._level > this._ceiling
         ) {
             this._degradeSince = 0;

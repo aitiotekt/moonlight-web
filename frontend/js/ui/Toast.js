@@ -46,8 +46,9 @@ export class Toast {
      */
     static _enforceLimit(container) {
         const max = this._maxVisible();
-        // Only count toasts that are not already exiting.
-        const toasts = container.querySelectorAll('.toast:not(.toast-exit)');
+        // Only count toasts that are not already exiting. A sticky one waits
+        // for its click: newer toasts never push it out.
+        const toasts = container.querySelectorAll('.toast:not(.toast-exit):not(.toast-sticky)');
         const excess = toasts.length - (max - 1);
         for (let i = 0; i < excess; i++) {
             const toast = toasts[i];
@@ -63,11 +64,14 @@ export class Toast {
     /**
      * @param {string} message
      * @param {'success'|'error'|'warning'|'info'} type
-     * @param {{durationMs?: number, action?: {label: string, onClick: () => void}}} [options]
+     * @param {{durationMs?: number, sticky?: boolean, action?: {label: string, onClick: () => void}}} [options]
      *   durationMs overrides the 4s auto-fade — advice the user has to read and
-     *   act on needs longer than an acknowledgement does. `action` appends a
-     *   button; clicking it runs the callback and dismisses, and does NOT
-     *   bubble to the dismiss-on-click handler.
+     *   act on needs longer than an acknowledgement does. `sticky` never fades:
+     *   it stays until clicked (an offer the user may only see later), and the
+     *   visible-toast limit leaves it alone. `action` appends a button; clicking
+     *   it runs the callback and dismisses, and does NOT bubble to the
+     *   dismiss-on-click handler.
+     * @returns {{dismiss: () => void}} to take the toast away early
      */
     static show(message, type = 'info', options = {}) {
         const container = this._ensureContainer();
@@ -76,7 +80,7 @@ export class Toast {
         this._enforceLimit(container);
 
         const toast = document.createElement('div');
-        toast.className = `toast toast-${type}`;
+        toast.className = `toast toast-${type}${options.sticky ? ' toast-sticky' : ''}`;
         // textContent, not innerHTML: messages carry interpolated values.
         const text = document.createElement('span');
         text.className = 'toast-text';
@@ -113,23 +117,24 @@ export class Toast {
         // Dismiss on click
         toast.addEventListener('click', remove);
 
-        // Auto-fade (4s unless the caller asked for longer)
-        setTimeout(remove, options.durationMs || 4000);
+        // Auto-fade (4s unless the caller asked for longer, never when sticky)
+        if (!options.sticky) setTimeout(remove, options.durationMs || 4000);
+        return { dismiss: remove };
     }
 
     // The shorthands forward `options`: a caller asking for a longer fade
     // through Toast.warning() used to get the 4s default without a word.
     static success(message, options) {
-        this.show(message, 'success', options);
+        return this.show(message, 'success', options);
     }
     static error(message, options) {
-        this.show(message, 'error', options);
+        return this.show(message, 'error', options);
     }
     static warning(message, options) {
-        this.show(message, 'warning', options);
+        return this.show(message, 'warning', options);
     }
     static info(message, options) {
-        this.show(message, 'info', options);
+        return this.show(message, 'info', options);
     }
 
     /**

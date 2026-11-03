@@ -1,7 +1,11 @@
 # mw-rendezvous — the introduction server: held host lines and signalling relay.
 # Static, dependency-free Go binary on a minimal runtime. Never published to the
 # host: Caddy reverse-proxies it under https://stream.{MW_DOMAIN}/v1/.
-FROM golang:1.22-alpine AS build
+# A supported Go, by its minor tag: each `--build` takes its latest patch. 1.22
+# had been out of support since February 2025, and govulncheck (26/10/2026)
+# found the net/http, HTTP/2 and crypto/x509 fixes of 1.27.2 and 1.27.3
+# reachable from this server.
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 # No third-party modules (stdlib only), so just copy the sources and build.
 # Glob rather than a file list: a new source file must never be silently left
@@ -19,7 +23,7 @@ COPY *.go ./
 RUN CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /mw-rendezvous .
 
-FROM alpine:3.20
+FROM alpine:3.22
 RUN adduser -D -H -u 10002 mwrdv \
     && mkdir -p /data && chown mwrdv /data
 COPY --from=build /mw-rendezvous /usr/local/bin/mw-rendezvous

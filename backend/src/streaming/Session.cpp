@@ -19,13 +19,17 @@
 #include "ClipboardBridge.h"
 #include "ClipboardPolicy.h"
 #include "HostAudioSink.h"
+#include "MicUplink.h"
 #include "DataChannelRelay.h"
 #include "MediaTrackRelay.h"
 #include "SignalingServer.h"
 #include "StreamRelay.h"
 #include "MoonlightShim.h"
 #include "NativeMediaEngine.h"
+#include "NativeBench.h"
 #include "InputMessageCodec.h"
+#include "RxBufSection.h"
+#include "StartChoice.h"
 #include "../backend/NvHTTP.h"
 #include "../backend/NvComputer.h"
 #include "../backend/IdentityManager.h"
@@ -180,13 +184,80 @@ void StreamSession::start()
     // that didn't /quit cleanly), /resume reconnects to OUR own session instead
     // of /launch (which would be rejected with "app already running"). /resume
     // is keyed by uniqueid, so it never touches another client's session.
-    if (m_PreferResume || s_ActiveUniqueIds.contains(effectiveUniqueId())) {
-        qInfo() << "[Session] Resuming (preferResume=" << m_PreferResume << ") on" << m_Host->name
-                << m_Host->activeAddress.address();
-        doResumeApp();
-    } else {
-        doLaunchApp();
-    }
+    //
+    // Where the app outlives the stream, the host itself says what runs: the
+    // uniqueid hints above cannot tell which app a /resume would join, and a
+    // /resume carries no app id — joining app A when the viewer clicked B is
+    // exactly the wrong answer. A standby (preferResume) joins the live app by
+    // definition and skips the question.
+    auto byHint = [this]() {
+        if (m_PreferResume || s_ActiveUniqueIds.contains(effectiveUniqueId())) {
+            qInfo() << "[Session] Resuming (preferResume=" << m_PreferResume << ") on"
+                    << m_Host->name << m_Host->activeAddress.address();
+            doResumeApp();
+        } else {
+            doLaunchApp();
+        }
+    };
+    if (!m_PreferResume && m_Backend->capabilities().resumableApps)
+        chooseByRunningApp(byHint);
+    else
+        byHint();
+}
+
+void StreamSession::chooseByRunningApp(std::function<void()> orElse)
+{
+    QPointer<StreamSession> self(this);
+    // Asked for this device: on MultiSeat the app that matters is the one on
+    // the device's own seat; everywhere else this is the host's running app.
+    m_Backend->runningAppForDevice(
+        m_ClientUniqueId, [self, orElse](bool ok, const BackendError& err, int running) {
+            if (!self) return;
+            if (!ok) {
+                qWarning() << "[Session] Host did not say which app runs (" << err.message
+                           << ") — choosing by hint";
+                orElse();
+                return;
+            }
+            switch (startchoice::decide(running, self->m_AppId, self->m_LaunchAttempted)) {
+            case startchoice::Verb::Launch:
+                qInfo() << "[Session] No app running on" << self->m_Host->name << "— launching"
+                        << self->m_AppId;
+                self->doLaunchApp();
+                break;
+            case startchoice::Verb::Resume:
+                qInfo() << "[Session] App" << running << "already runs on" << self->m_Host->name
+                        << "— resuming it";
+                self->doResumeApp();
+                break;
+            case startchoice::Verb::AppRunning:
+                qInfo() << "[Session] App" << running << "runs on" << self->m_Host->name
+                        << "— not joining it for app" << self->m_AppId;
+                self->respondAppRunning(running);
+                break;
+            case startchoice::Verb::ByHint:
+                // Our /launch was refused, yet nothing runs now: the app ended in
+                // between. The hint path has nothing better to offer.
+                orElse();
+                break;
+            }
+        });
+}
+
+void StreamSession::respondAppRunning(int runningAppId)
+{
+    // Machine-readable: the browser offers to quit the running app and launch
+    // this one, or to resume the running one instead.
+    QJsonObject errObj;
+    errObj["error"] = QString("Another app is already running on \"%1\". Quit it first, or "
+                              "resume it.")
+                          .arg(m_Host->name);
+    errObj["code"] = QStringLiteral("app_running");
+    errObj["status"] = 409;
+    errObj["runningAppId"] = runningAppId;
+    m_Respond(HttpResponse::json(errObj, 409));
+    emit sessionFailed(QStringLiteral("Another app is running"));
+    deleteLater();
 }
 
 QString StreamSession::effectiveUniqueId() const
@@ -205,6 +276,11 @@ LaunchRequest StreamSession::buildLaunchRequest() const
     req.hdrEnabled = m_Config.hdrEnabled;
     req.muteHostAudio = m_Config.muteHostAudio;
     req.rideOutLoss = m_RideOutLoss;
+    req.refInvalidation = m_RefInvalidation;
+    req.cropsToFrame = m_CropsToFrame;
+    req.displayKey = m_DisplayKey;
+    req.hostAppKnown = m_HostAppKnown;
+    req.previousPrimary = m_PreviousPrimary;
     req.rikey = m_Config.rikey;
     req.rikeyid = m_Config.rikeyid;
     // Empty means "the provider's default identity"; effectiveUniqueId() would
@@ -251,9 +327,9 @@ void StreamSession::doResumeApp()
 
 void StreamSession::doLaunchApp()
 {
-    qDebug() << "[Session] Launching app" << m_AppId << "on" << m_Host->name;
-    qDebug() << "[Session]   address:" << m_Host->activeAddress.address()
-             << "port:" << m_Host->activeHttpsPort;
+    // INFO: the address a launch went to is in no other line.
+    qInfo() << "[Session] Launching app" << m_AppId << "on" << m_Host->name << "at"
+            << m_Host->activeAddress.address() << "port" << m_Host->activeHttpsPort;
     qDebug() << "[Session]   stream:" << m_StreamWidth << "x" << m_StreamHeight << "@"
              << m_StreamFps << "fps, bitrate:" << m_StreamBitrateKbps << "kbps,"
              << "hdr:" << m_Config.hdrEnabled;
@@ -370,10 +446,9 @@ void StreamSession::quit()
 
 void StreamSession::onLaunchResult(bool ok, const BackendError& err, const MediaDescriptor& media)
 {
-    // Drop the launch/resume TLS socket now: leaving it pooled ~120s would hold
-    // Sunshine's single-threaded HTTPS server and block new iOS/Qt connections
-    // for the whole stream. Polling is suspended during a stream, so this is safe.
-    m_Http->dropPooledConnections();
+    // The launch/resume TLS socket is already closed (NvHTTP::closeWhenDone):
+    // pooled ~120s it would hold Sunshine's single-threaded HTTPS server and
+    // block new iOS/Qt connections for the whole stream.
 
     if (!ok) {
         qWarning() << "[Session] Launch failed:" << err.message << "kind=" << int(err.kind)
@@ -414,9 +489,27 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         // vanishingly rare, and one extra attempt of the other verb is harmless
         // self-healing rather than a wrong answer.
         if (err.kind == BackendError::Protocol) {
+            // Sunshine refuses /launch while ANY app runs, and a /resume would
+            // join that app whatever it is. Where the host can say which one
+            // runs, only resume the one asked for.
+            if (m_LaunchAttempted && !m_ResumeAttempted &&
+                m_Backend->capabilities().resumableApps) {
+                qWarning() << "[Session] Launch rejected (" << err.message
+                           << ") — asking the host which app runs";
+                m_LaunchRefusal = err;
+                QPointer<StreamSession> self(this);
+                chooseByRunningApp([self, message = err.message]() {
+                    if (!self) return;
+                    qWarning() << "[Session] Launch rejected (" << message
+                               << ") — falling back to /resume for our uniqueid";
+                    self->doResumeApp();
+                });
+                return;
+            }
             if (!m_ResumeAttempted) {
                 qWarning() << "[Session] Launch rejected (" << err.message
                            << ") — falling back to /resume for our uniqueid";
+                m_LaunchRefusal = err;
                 doResumeApp();
                 return;
             }
@@ -429,6 +522,17 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
             }
         }
 
+        // A /resume tried only because /launch was refused speaks of a session
+        // that never existed: "503 No running app to resume", which the mapping
+        // below would read as a video capture failure. The launch's refusal is
+        // what the viewer can act on — Apollo's "Permission denied" for a
+        // device it never allowed to launch apps (Discord report, 09/10/2026).
+        if (m_LaunchRefusal && m_ResumeAttempted) {
+            qWarning() << "[Session] Resume fallback failed too — reporting the launch's refusal ("
+                       << m_LaunchRefusal->message << ")";
+        }
+        const BackendError& refusal = m_LaunchRefusal && m_ResumeAttempted ? *m_LaunchRefusal : err;
+
         // Sunshine 503 = the host could not initialize video capture/encoding.
         // Almost always a display problem on the HOST: no display connected, or
         // the session is locked with the screen asleep — a blanked output stops
@@ -436,7 +540,7 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         // and Sunshine's encoder probe fails. On macOS it can also be a missing
         // Screen Recording permission. Surface a clear, actionable message
         // instead of the opaque "502 Launch error: HTTP 503".
-        if (err.httpStatus == 503 || err.message.contains(QStringLiteral("503"))) {
+        if (refusal.httpStatus == 503 || refusal.message.contains(QStringLiteral("503"))) {
             // Machine-readable `code` lets the frontend show an explicit dialog
             // instead of a plain toast. `local_host` + `local_os` tell it whose
             // machine failed: the repair buttons it offers (open the macOS
@@ -462,8 +566,8 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
             errObj["local_os"] = QStringLiteral("Linux");
 #endif
             m_Respond(HttpResponse::json(errObj, 503));
-        } else if (err.httpStatus == 403 ||
-                   err.message.contains(QStringLiteral("Permission denied"))) {
+        } else if (refusal.httpStatus == 403 ||
+                   refusal.message.contains(QStringLiteral("Permission denied"))) {
             // Apollo — and so every MultiSeat seat — grants full rights only to
             // the first device that pairs with it; everyone after gets "view the
             // list" and nothing else. The refusal is a 403 that says only
@@ -475,16 +579,16 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
                              "needs — a host that hands out limited permissions gives the first "
                              "device that pairs everything, and later ones almost nothing.")
                          .arg(m_Host->name)));
-        } else if (err.kind == BackendError::Protocol) {
-            m_Respond(HttpResponse::error(502, QString("Launch error: %1").arg(err.message)));
+        } else if (refusal.kind == BackendError::Protocol) {
+            m_Respond(HttpResponse::error(502, QString("Launch error: %1").arg(refusal.message)));
         } else {
             m_Respond(HttpResponse::error(502, QString("Launch failed: %1 (target: %2:%3)")
-                                                   .arg(err.message)
+                                                   .arg(refusal.message)
                                                    .arg(m_Host->activeAddress.address())
                                                    .arg(m_Host->activeHttpsPort)));
         }
 
-        emit sessionFailed(err.message);
+        emit sessionFailed(refusal.message);
         deleteLater();
         return;
     }
@@ -570,6 +674,8 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
 
         NativeMediaEngine::StartParams nativeParams;
         nativeParams.displayId = media.nativeHost.displayId;
+        m_VirtualDisplayGpu = media.nativeHost.virtualDisplayGpu;
+        m_PreviousPrimaryGpu = media.nativeHost.previousPrimaryGpu;
         nativeParams.width = m_StreamWidth;
         nativeParams.height = m_StreamHeight;
         nativeParams.fps = m_StreamFps;
@@ -582,10 +688,17 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         // Intra-refresh is only worth its cost when the client will decode
         // through the damage, so the client's word is what turns it on.
         nativeParams.intraRefresh = media.nativeHost.rideOutLoss;
+        // And its decoder's word on the reference repairs.
+        nativeParams.refInvalidation = media.nativeHost.refInvalidation;
+        // And whether it cuts its frames to the size the host says.
+        nativeParams.cropsToFrame = media.nativeHost.cropsToFrame;
+        // And whether it reads MWSR's zones, which the frames then carry.
+        nativeParams.mwsrZones = m_MwsrZones;
         // The client's screen, so the cadence can land on its grid when it
         // paints on vsync — see SessionConfig::clientRefreshMilliHz.
         nativeParams.clientRefreshMilliHz = m_ClientRefreshMilliHz;
         nativeParams.clientVsync = m_ClientVsync;
+        nativeParams.clientTearingReal = m_ClientTearingReal;
         // And the ceiling that alignment may not cross — see setMaxFps.
         nativeParams.maxFps = m_MaxFps;
         nativeParams.followDisplayShape = m_FollowDisplayShape;
@@ -602,6 +715,19 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         // The portal consent this installation already holds. Only a machine
         // that captures through the portal has one at all.
         nativeParams.portalRestoreToken = m_PortalRestoreToken;
+        nativeParams.virtualPrimary = m_VirtualPrimary;
+        nativeParams.gamescopeApp = m_GamescopeApp;
+        nativeParams.gamescopeCommand = m_GamescopeCommand;
+        // The picture chain the admin chose (Advanced). A value this build
+        // does not know leaves Auto in place rather than guessing.
+        mw::native::parseVideoPipeline(m_NativeVideoPipeline.toStdString(),
+                                       nativeParams.videoPipeline);
+        // The bench's knobs from the settings file, when someone added them.
+        nativeParams.tuningSpec = m_NativeTuning;
+        // A guest on the shared feed: the pictures come down its pipe.
+        nativeParams.feedPipe = m_FeedPipe;
+        nativeParams.feedToken = m_FeedToken;
+        nativeParams.feedSlot = m_FeedSlot;
 
         // Forwarded rather than acted on here: whoever owns this session owns
         // the settings file, and in a worker that is another process entirely.
@@ -641,6 +767,27 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
     // the value persists. Normalize it back to 100% at each stream start.
     if (hostIsSelf) {
         HostAudioSink::ensureFullVolume();
+    }
+
+    // The viewer's microphone plays into THIS machine's virtual microphone, so
+    // it is only worth anything when the streamed host is this machine: a
+    // remote Sunshine would never hear it (GameStream carries no microphone),
+    // and the voice would come out on the wrong PC. Same gate as the clipboard
+    // otherwise: the owner's, never an invited player's. Every transport
+    // carries it: the WebRTC ones on the audio track, the WebSocket one as
+    // frames on its socket. The native host is this machine by construction,
+    // and its entry carries no address for isSelfAddress() to recognise.
+    if (m_MicRequested) {
+        const bool micHostHere = media.type == MediaType::NativeHost || hostIsSelf;
+        std::string why = MicUplink::refusal(micHostHere, m_InputPolicy.unrestricted());
+        if (why.empty()) why = MicUplink::unavailable(m_MicDevice.toStdString());
+        if (why.empty()) {
+            auto mic = std::make_shared<MicUplink>(m_MicDevice.toStdString());
+            if (mic->start(why)) m_Mic = std::move(mic);
+        }
+        m_MicWhy = QString::fromStdString(why);
+        qInfo().noquote() << "[Session] Microphone"
+                          << (m_Mic ? QStringLiteral("granted") : "refused: " + m_MicWhy);
     }
 
     // Scroll: hold sub-notch amounts back only for a host that would throw them
@@ -690,6 +837,7 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         streamRelay->setWsPath(m_WsPath);
         streamRelay->setClipboardEnabled(clipboardLocal);
         streamRelay->setInputPolicy(m_InputPolicy);
+        streamRelay->setMicUplink(m_Mic);
 
         connect(m_Engine, &IMediaEngine::connectionStarted, this,
                 &StreamSession::onShimConnectionStarted);
@@ -736,6 +884,7 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         auto* relay = new MediaTrackRelay(m_Engine, nullptr);
         relay->setClipboardEnabled(clipboardLocal);
         relay->setInputPolicy(m_InputPolicy);
+        relay->setMicUplink(m_Mic);
 
         // SignalingServer: WebSocket for SDP/ICE exchange only.
         auto* signaling = new SignalingServer(relay, m_WsPort, m_ServerHost, nullptr);
@@ -743,8 +892,11 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         signaling->setWsPath(m_WsPath);
         signaling->setStunServer(m_StunServer);
         signaling->setEnableIceTcp(m_EnableIceTcp);
+        signaling->setIceTcpPassive(m_IceTcpPassive);
+        signaling->setDebugIceDropUdp(m_DebugIceDropUdp);
         signaling->setAllowWsFallback(!m_AutoMode);
         signaling->setClientKind(m_ClientKind);
+        signaling->setClientSameNetwork(m_ClientSameNetwork);
         signaling->setPairingIdentity(m_MwBindHostId, m_MwBindHostKey, m_MwBindBrowserKey);
         signaling->setMediaPort(m_MediaPort);
         signaling->setPresetMapping(m_UpnpPublicIp, m_UpnpExternalPort);
@@ -803,6 +955,7 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         auto* relay = new DataChannelRelay(m_Engine, nullptr);
         relay->setClipboardEnabled(clipboardLocal);
         relay->setInputPolicy(m_InputPolicy);
+        relay->setMicUplink(m_Mic);
         relay->setStreamBitrateKbps(m_StreamBitrateKbps);
 
         // The client's half of the bargain: it says it will decode through the
@@ -811,6 +964,37 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         // yet at this point and would answer no to anything asked now.
         relay->setRideOutLoss(media.type == MediaType::NativeHost && media.nativeHost.rideOutLoss);
 
+        // The bench's link keys (loss=, sctpcc=, flood= — plan Idées Punktfunk,
+        // A0), read here rather than by the engine: the SCTP settings apply to
+        // the association prepare() is about to make, before the engine starts.
+        // A bad spec is the engine's to report; here it only means none. Said
+        // or not, the native host's link defaults go the same way (usrsctp's
+        // max burst, plan Wi-Fi W2.5): the relay is always told.
+        if (media.type == MediaType::NativeHost) {
+            const QString spec = effectiveTuningSpec(m_NativeTuning);
+            mw::native::EncoderTuning tuning;
+            int gpu = -1;
+            QString error;
+            if (!spec.isEmpty() && !parseEncoderTuningSpec(spec, tuning, gpu, error))
+                tuning = mw::native::EncoderTuning{};
+            relay->setLinkBench(tuning);
+        } else {
+            // A GameStream host's stream has no video channel either, so Chrome
+            // keeps the same 64 KB socket: the silent section too (rxbuf=0
+            // takes it out), and none of the native host's other link keys.
+            relay->setRxBufVideo(
+                mw::rxbuf::offeredFromSpec(effectiveTuningSpec(m_NativeTuning).toStdString()));
+        }
+
+        // Which codecs ride an RTP video track (POC Ultra U1.4): the relay
+        // matches it against the codec the engine negotiated when it builds
+        // the offer. The bench's variable wins over the settings file.
+        {
+            const QByteArray env = qgetenv("MW_RTP_VIDEO");
+            relay->setRtpVideoPolicy(env.isEmpty() ? m_RtpVideo : QString::fromUtf8(env),
+                                     media.type == MediaType::NativeHost);
+        }
+
         // SignalingServer: WebSocket for SDP/ICE exchange only.
         // NonSecure mode: external tunnel or Cloudflare provides TLS termination.
         auto* signaling = new SignalingServer(relay, m_WsPort, m_ServerHost, nullptr);
@@ -818,8 +1002,11 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         signaling->setWsPath(m_WsPath);
         signaling->setStunServer(m_StunServer);
         signaling->setEnableIceTcp(m_EnableIceTcp);
+        signaling->setIceTcpPassive(m_IceTcpPassive);
+        signaling->setDebugIceDropUdp(m_DebugIceDropUdp);
         signaling->setAllowWsFallback(!m_AutoMode);
         signaling->setClientKind(m_ClientKind);
+        signaling->setClientSameNetwork(m_ClientSameNetwork);
         signaling->setPairingIdentity(m_MwBindHostId, m_MwBindHostKey, m_MwBindBrowserKey);
         signaling->setMediaPort(m_MediaPort);
         signaling->setPresetMapping(m_UpnpPublicIp, m_UpnpExternalPort);
@@ -914,7 +1101,7 @@ void StreamSession::applyInputPolicy(const InputMsg::Policy& policy)
     }
 
     qInfo() << "[Session] Input policy changed — gamepad:" << policy.gamepad
-            << "keyboard/mouse:" << policy.keyboardMouse;
+            << "keyboard/mouse:" << policy.keyboardMouse << "hid:" << policy.hid;
 }
 
 // Read the TTL of the host's own packets and, if it settles an OS we could not
@@ -927,10 +1114,11 @@ void StreamSession::applyKeyboardMode(HostOsProbe::HostOs os)
 {
     if (!m_Engine) return;
 
+    // What the host can do, whatever the owner chose: a toolbar chord is
+    // resolved by its character wherever that is possible (InputMsg::
+    // resolveKey), so the mode no longer folds the setting in.
     KeyboardMode mode = KeyboardMode::Positional;
-    if (!AppSettings().keyboardLayoutFidelity()) {
-        mode = KeyboardMode::Positional; // opted out in the settings file
-    } else if (qobject_cast<NativeMediaEngine*>(m_Engine)) {
+    if (qobject_cast<NativeMediaEngine*>(m_Engine)) {
         // Our own host, whatever the OS: it resolves the character in its own
         // layout and presses the key that carries it.
         mode = KeyboardMode::Native;
@@ -944,8 +1132,31 @@ void StreamSession::applyKeyboardMode(HostOsProbe::HostOs os)
         default: mode = KeyboardMode::Positional; break;
         }
     }
+    // And what the owner chose for the physical keyboard: from the server, in
+    // a worker; from the file, in the server's own process.
+    const LayoutFidelity fidelity = InputMsg::parseLayoutFidelity(
+        m_KeyboardLayoutFidelity.isEmpty() ? AppSettings().keyboardLayoutFidelity()
+                                           : m_KeyboardLayoutFidelity);
     m_Engine->setKeyboardMode(mode);
-    qInfo() << "[Session] Keyboard layout fidelity:" << InputMsg::keyboardModeName(mode);
+    m_Engine->setLayoutFidelity(fidelity);
+
+    // The touch keyboard's text on this machine's layout, when the owner asked
+    // for it and the host runs here, the one host whose layout this process can
+    // read (issue #44). Read once: this runs again when the OS is settled late.
+    std::shared_ptr<const mw::native::HostKeyboardLayout> textLayout;
+    const bool hostLayout = m_KeyboardHostLayout.value_or(AppSettings().keyboardHostLayout());
+    if (mode == KeyboardMode::Positional && hostLayout && m_Host->isLocalMachine()) {
+        textLayout = m_Engine->hostTextLayout();
+        if (!textLayout) textLayout = mw::native::HostKeyboardLayout::detect();
+    }
+    m_Engine->setHostTextLayout(textLayout);
+
+    qInfo() << "[Session] Keyboard:" << InputMsg::keyboardModeName(mode)
+            << "| layout fidelity:" << InputMsg::layoutFidelityName(fidelity) << "| text:"
+            << (textLayout ? QStringLiteral("this PC's layout, %1")
+                                 .arg(QString::fromStdString(textLayout->name()))
+                : mode == KeyboardMode::Positional ? QStringLiteral("US keys")
+                                                   : QStringLiteral("as text"));
 }
 
 void StreamSession::sampleHostIpTtl()
@@ -986,7 +1197,7 @@ void StreamSession::sampleHostIpTtl()
 
 void StreamSession::onShimConnectionStarted()
 {
-    qDebug() << "[Session] LiStartConnection succeeded — sending response to browser";
+    qInfo() << "[Session] LiStartConnection succeeded — sending response to browser";
 
     // The host's OS may still be unknown at this point — nothing on the control
     // plane names it. Now that its packets are arriving, the TTL they carry can
@@ -1088,6 +1299,20 @@ void StreamSession::onShimConnectionStarted()
     // less delay, whereas a GameStream host gets them over its own protocol
     // and keeps the browser's frame-coalesced cadence.
     result["native"] = qobject_cast<NativeMediaEngine*>(m_Engine) != nullptr;
+    // Whether the audio section was offered sendrecv for the viewer's
+    // microphone, and if it was asked and not granted, why — the page then
+    // never opens the microphone, and says why once.
+    if (m_MicRequested) {
+        result["mic"] = m_Mic != nullptr;
+        if (!m_Mic) result["mic_why"] = m_MicWhy;
+    }
+    // The virtual display drawn by another GPU than the display it replaced:
+    // apps opened before the stream stay there, and the browser suggests
+    // restarting one that stutters. Absent when the GPUs are the same.
+    if (!m_VirtualDisplayGpu.isEmpty()) {
+        result["vd_gpu_apart"] = QJsonObject{{QStringLiteral("display"), m_VirtualDisplayGpu},
+                                             {QStringLiteral("apps"), m_PreviousPrimaryGpu}};
+    }
     // Whether a lost frame is healed with a delta (NVENC reference
     // invalidation): the browser then keeps decoding through a gap and names
     // the frames it missed instead of discarding deltas until a keyframe.
@@ -1122,6 +1347,11 @@ void StreamSession::onShimConnectionStarted()
             result["hdr"] = info.hdr;
             result["display_hdr"] = info.displayHdr;
             result["hdr_capable"] = info.hdrCapable;
+            // The frames are PyroWave's (the browser's codec for a wired LAN,
+            // /start's ultra_codec), which the browser decodes itself: said
+            // from the encoder that runs, never from what was asked.
+            if (info.videoEncoder12 == mw::native::EncoderTuning::Encoder12::Pyrowave)
+                result["ultra_codec"] = QStringLiteral("pyrowave");
         }
     }
 

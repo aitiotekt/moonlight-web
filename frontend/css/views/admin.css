@@ -251,3 +251,134 @@
         opacity: 1;
     }
 }
+
+/* "Download logs" (Advanced): the button, then the bar while the archive is
+   built and fetched, then what it is doing. The bar is the update banner's. */
+.admin-logs-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+}
+
+/* Apps on this PC: one row each — the card's image at the grid's 3:4, then
+   name, command and actions; then the form, the name narrower than the
+   command, and the image picked from a button. */
+.host-apps .settings-section-desc {
+    margin-bottom: var(--space-4);
+}
+.host-app-list {
+    list-style: none;
+    margin: 0 0 var(--space-3);
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+.host-app-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border-1);
+}
+.host-app-thumb {
+    flex: 0 0 auto;
+    width: 48px;
+    aspect-ratio: 3 / 4;
+    overflow: hidden;
+    background-color: var(--border-1);
+}
+.host-app-thumb img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.host-app-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+.host-app-title {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-2);
+}
+.host-app-name {
+    font-weight: 600;
+}
+.host-app-badge {
+    font-size: 0.8em;
+    opacity: 0.75;
+}
+.host-app-command {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+}
+.host-app-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+.host-app-add {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+}
+.host-app-add .settings-input {
+    width: auto;
+    min-width: 0;
+    flex: 1 1 14rem;
+}
+.host-app-add .host-app-name-input {
+    flex: 0 1 12rem;
+}
+.host-app-file-label {
+    max-width: 14rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.host-app-file-label.is-disabled {
+    opacity: 0.5;
+    pointer-events: none;
+}
+.host-apps-empty {
+    margin: 0 0 var(--space-3);
+}
+.host-apps-hint code {
+    font-family: var(--font-mono);
+}
+.host-apps-detected {
+    margin: var(--space-2) 0 0;
+}
+.admin-logs-progress {
+    position: relative;
+    flex: 0 0 auto;
+    width: 160px;
+    height: 4px;
+    overflow: hidden;
+    background-color: var(--border-1);
+    border-radius: 2px;
+}
+.admin-logs-progress[hidden] {
+    display: none;
+}
+.admin-logs-progress-fill {
+    display: block;
+    width: 0;
+    height: 100%;
+    background-color: var(--accent-1);
+    border-radius: 2px;
+    transition: width 0.15s linear;
+}
+.admin-logs-status:empty {
+    display: none;
+}

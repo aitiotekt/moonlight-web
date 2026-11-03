@@ -41,6 +41,8 @@ services:
     environment:
       MW_DOMAIN: ${MW_DOMAIN}
       MW_PUBLIC_IP: ${MW_PUBLIC_IP}
+      # Optional: every name gets an AAAA too (see .env.sample).
+      MW_PUBLIC_IP6: ${MW_PUBLIC_IP6:-}
       # User-facing key from .env, mapped to the var the official wrapper reads.
       PDNS_AUTH_API_KEY: ${MW_PDNS_API_KEY}
     volumes:
@@ -165,7 +167,12 @@ services:
     network_mode: host
     command:
       - --listening-port=3478
+      # Both families: a browser asks stun:<the page's own name>:3478, so the
+      # day that name has an AAAA, an IPv6 client asks over IPv6 — and a v6
+      # entry nobody answers costs every ICE gathering its full retry budget.
+      # Quoted: a bare trailing ":" makes YAML read the line as a mapping key.
       - --listening-ip=0.0.0.0
+      - "--listening-ip=::"
       - --stun-only
       - --no-tls
       - --no-dtls
@@ -308,12 +315,33 @@ volumes:
   umami_db:
 
 networks:
+  # IPv6 on both networks that carry a published port (dnsdist's :53 on mwnet,
+  # Caddy's :80/:443 on both). Without it Docker still listens on [::] for
+  # those ports, but through its userland proxy, which opens a NEW connection
+  # to the container over IPv4: every IPv6 client then arrives as the bridge
+  # gateway — one address for Caddy's rate_limit, the rendezvous quotas and
+  # dnsdist's per-client QPS cap, all of IPv6 sharing a single bucket. With it,
+  # ip6tables forwards IPv6 the way iptables already forwards IPv4, and the
+  # containers see the real client address. Needs Docker 27+ (ip6tables on by
+  # default) and a kernel with IPv6 enabled; a public IPv6 address is not
+  # needed. The prefixes are unique-local (RFC 4193), never routed outside.
+  #
+  # MTU 1400: eth0 of the production VM is 1400. A bridge left at 1500 lets a
+  # container send full 1500-byte packets that the host must bounce back with
+  # "Packet Too Big" before every new peer — and IPv6 routers never fragment.
+  #
+  # Changing either setting on a running box means recreating the network:
+  # README.md §"IPv6 on the Docker networks".
   mwnet:
     driver: bridge
+    enable_ipv6: true
+    driver_opts:
+      com.docker.network.driver.mtu: "1400"
     # Fixed subnet so pdns can keep a stable IP for dnsdist's backend address.
     ipam:
       config:
         - subnet: 172.28.0.0/24
+        - subnet: fdbd:53a8:a93f:28::/64
   # The one link between production and staging: production's Caddy proxies
   # stream.dev.* across it. Owned (created) here, joined as `external` by
   # docker-compose.dev.yml — so production comes up on its own, and the dev
@@ -321,3 +349,9 @@ networks:
   mw-edge:
     driver: bridge
     name: mw-edge
+    enable_ipv6: true
+    driver_opts:
+      com.docker.network.driver.mtu: "1400"
+    ipam:
+      config:
+        - subnet: fdbd:53a8:a93f:e::/64

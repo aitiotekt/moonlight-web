@@ -17,6 +17,7 @@
 
 #include "backend/VirtualDisplayApply.h"
 
+#include "backend/DriverPackage.h"
 #include "backend/VirtualDisplay.h"
 #include "common/Logger.h"
 
@@ -25,6 +26,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QStringList>
 #include <QThread>
 
 #include <cstdio>
@@ -119,118 +121,8 @@ QString lastErrorText(DWORD err = GetLastError())
     return QStringLiteral("0x%1 %2").arg(err, 8, 16, QLatin1Char('0')).arg(text);
 }
 
-QString fileSha256(const QString& path)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return QString();
-    QCryptographicHash h(QCryptographicHash::Sha256);
-    if (!h.addData(&f)) return QString();
-    return QString::fromLatin1(h.result().toHex());
-}
-
-// ── Trusted Publishers, for the duration of the install ────────────────────
-//
-// A user-mode driver package installs without a prompt only when the
-// catalog's signer is a trusted publisher. The signer is pinned by thumbprint
-// (VirtualDisplay::catalogSignerThumbprint); the certificate itself is taken
-// from inside the catalog we just hashed, never from anywhere else, added to
-// the machine store for the install, and deleted again unless it was already
-// there before us. Nothing signed by anyone else is ever trusted, and the
-// trust does not outlive this process.
-
-struct PublisherTrust
-{
-    HCERTSTORE store = nullptr;
-    PCCERT_CONTEXT added = nullptr; // the copy in the store, when WE added it
-    bool preexisting = false;
-
-    ~PublisherTrust()
-    {
-        if (added) {
-            // CertDeleteCertificateFromStore frees the context either way.
-            if (!CertDeleteCertificateFromStore(added))
-                Logger::warning(
-                    QStringLiteral("[vdisplay-apply] could not untrust the publisher: %1")
-                        .arg(lastErrorText()));
-            else
-                Logger::info(QStringLiteral("[vdisplay-apply] publisher untrusted again"));
-            added = nullptr;
-        }
-        if (store) CertCloseStore(store, 0);
-    }
-};
-
-bool trustCatalogSigner(const QString& catPath, PublisherTrust& trust, QString* error)
-{
-    const QByteArray wanted =
-        QByteArray::fromHex(VirtualDisplay::catalogSignerThumbprint().toLatin1());
-
-    HCERTSTORE catStore = nullptr;
-    HCRYPTMSG msg = nullptr;
-    const std::wstring wpath = QDir::toNativeSeparators(catPath).toStdWString();
-    if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, wpath.c_str(),
-                          CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED | CERT_QUERY_CONTENT_FLAG_CERT,
-                          CERT_QUERY_FORMAT_FLAG_ALL, 0, nullptr, nullptr, nullptr, &catStore, &msg,
-                          nullptr)) {
-        *error = QStringLiteral("cannot read the catalog's signature: %1").arg(lastErrorText());
-        return false;
-    }
-    if (msg) CryptMsgClose(msg);
-
-    PCCERT_CONTEXT match = nullptr;
-    for (PCCERT_CONTEXT c = CertEnumCertificatesInStore(catStore, nullptr); c;
-         c = CertEnumCertificatesInStore(catStore, c)) {
-        BYTE hash[20];
-        DWORD len = sizeof(hash);
-        if (!CertGetCertificateContextProperty(c, CERT_SHA1_HASH_PROP_ID, hash, &len)) continue;
-        if (QByteArray(reinterpret_cast<const char*>(hash), int(len)) == wanted) {
-            match = CertDuplicateCertificateContext(c);
-            CertFreeCertificateContext(c);
-            break;
-        }
-    }
-    CertCloseStore(catStore, 0);
-    if (!match) {
-        *error = QStringLiteral("the catalog is not signed by the pinned publisher");
-        return false;
-    }
-
-    trust.store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
-                                CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG,
-                                L"TrustedPublisher");
-    if (!trust.store)
-        trust.store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0, CERT_SYSTEM_STORE_LOCAL_MACHINE,
-                                    L"TrustedPublisher");
-    if (!trust.store) {
-        CertFreeCertificateContext(match);
-        *error =
-            QStringLiteral("cannot open the Trusted Publishers store: %1").arg(lastErrorText());
-        return false;
-    }
-
-    CRYPT_HASH_BLOB blob{DWORD(wanted.size()),
-                         reinterpret_cast<BYTE*>(const_cast<char*>(wanted.constData()))};
-    if (PCCERT_CONTEXT existing =
-            CertFindCertificateInStore(trust.store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
-                                       CERT_FIND_SHA1_HASH, &blob, nullptr)) {
-        // Already trusted on this machine (the driver's own installer does the
-        // same thing, permanently): not ours to remove afterwards.
-        CertFreeCertificateContext(existing);
-        CertFreeCertificateContext(match);
-        trust.preexisting = true;
-        Logger::info(QStringLiteral("[vdisplay-apply] publisher already trusted"));
-        return true;
-    }
-    const BOOL ok =
-        CertAddCertificateContextToStore(trust.store, match, CERT_STORE_ADD_NEW, &trust.added);
-    CertFreeCertificateContext(match);
-    if (!ok) {
-        *error = QStringLiteral("cannot trust the publisher: %1").arg(lastErrorText());
-        return false;
-    }
-    Logger::info(QStringLiteral("[vdisplay-apply] publisher trusted for this install"));
-    return true;
-}
+// The pinned hashes and the catalog signer's trust: DriverPackage.h, shared
+// with "MoonlightWeb Virtual HID".
 
 // ── Device nodes ────────────────────────────────────────────────────────────
 
@@ -465,18 +357,95 @@ void deletePackage()
     SetupDiDestroyDeviceInfoList(set);
 }
 
+/// The modes the record says this project added to another VDD's file.
+QList<VirtualDisplay::AddedMode> readAddedModes()
+{
+    QFile f(VirtualDisplay::addedModesPath());
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
+    return VirtualDisplay::parseAddedModes(QString::fromUtf8(f.readAll()));
+}
+
+/// The record rewritten, or removed when it holds nothing.
+void writeAddedModes(const QList<VirtualDisplay::AddedMode>& modes)
+{
+    const QString path = VirtualDisplay::addedModesPath();
+    if (modes.isEmpty()) {
+        QFile::remove(path);
+        return;
+    }
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        Logger::warning(QStringLiteral("[vdisplay-apply] cannot write %1").arg(path));
+        return;
+    }
+    f.write(VirtualDisplay::addedModesText(modes).toUtf8());
+}
+
+/// @p xml with every mode the record names taken out; @p removed lists them.
+QString withoutAddedModes(const QString& xml, QStringList* removed)
+{
+    QString out = xml;
+    for (const VirtualDisplay::AddedMode& m : readAddedModes()) {
+        bool changed = false;
+        out =
+            VirtualDisplay::settingsWithoutMode(out, m.width, m.height, m.refreshMilliHz, &changed);
+        if (changed)
+            removed->append(QStringLiteral("%1x%2 at %3 Hz")
+                                .arg(m.width)
+                                .arg(m.height)
+                                .arg(VirtualDisplay::rateText(m.refreshMilliHz)));
+    }
+    return out;
+}
+
+/// The modes this project added to another VDD's file, taken out of it, and
+/// the record cleared: the owner's list as it was before our first stream.
+/// When the display is switched off, and when the package is uninstalled
+/// beside another node. A file of ours needs nothing: it is rewritten whole.
+void forgetAddedModes()
+{
+    const QString path = VirtualDisplay::settingsXmlPath();
+    QFile f(path);
+    QString current;
+    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) current = QString::fromUtf8(f.readAll());
+    f.close();
+    if (!current.isEmpty() && !VirtualDisplay::isOurSettings(current)) {
+        QStringList removed;
+        const QString cleaned = withoutAddedModes(current, &removed);
+        if (!removed.isEmpty()) {
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+                Logger::warning(QStringLiteral("[vdisplay-apply] cannot write %1").arg(path));
+                return; // the record stays, for the next try
+            }
+            f.write(cleaned.toUtf8());
+            f.close();
+            Logger::info(QStringLiteral("[vdisplay-apply] taken out of another VDD's mode list "
+                                        "again: %1")
+                             .arg(removed.join(QStringLiteral(", "))));
+        }
+    }
+    writeAddedModes({});
+}
+
 /// The driver's mode list, holding @p width × @p height ahead of the rest.
 ///
 /// The file is shared by every instance of the driver on the machine: one an
 /// owner's own VDD wrote carries no marker of ours and is left exactly as it
-/// is — the display then comes up at whatever that file lists. Ours is
-/// rewritten whenever the wanted mode changes, and @p changed says so, since
-/// the driver only reads this file when the device starts.
-bool writeSettings(int width, int height, int refresh, bool* changed, QString* error)
+/// is — the display then comes up at whatever that file lists — but for the
+/// client's mode, added ahead of its list and recorded (addedModesPath), so
+/// that the end of the stream, or the next activation, takes it out again.
+/// Ours is rewritten whenever the wanted mode changes, and @p changed says
+/// so, since the driver only reads this file when the device starts.
+/// @p refreshMilliHz is the rate the display is to run at, 0 for the default.
+/// @p gpu is the GPU the owner chose to draw it (Request::gpu): it goes into a
+/// file of ours only — an owner's file keeps the GPU it names, which draws
+/// that owner's own displays too.
+bool writeSettings(int width, int height, int refreshMilliHz, const QString& gpu, bool* changed,
+                   QString* error)
 {
     *changed = false;
     const QString path = VirtualDisplay::settingsXmlPath();
-    const QString wanted = VirtualDisplay::settingsXml(width, height, refresh);
+    const QString wanted = VirtualDisplay::settingsXml(width, height, refreshMilliHz, gpu);
     QFile f(path);
     if (f.exists()) {
         QString current;
@@ -487,10 +456,41 @@ bool writeSettings(int width, int height, int refresh, bool* changed, QString* e
             // Someone else's file — an owner's own VDD, or an install of ours
             // from before the marker. It keeps every one of its modes; the
             // client's is added to the list, and nothing else is touched.
+            //
+            // But first, out with what an earlier stream of ours added and
+            // nobody took out (a server stopped mid-stream, a display that did
+            // not come up): the list must not grow from one client to the
+            // next — two sizes at 240 Hz and the driver brought nothing up.
+            QStringList removed;
+            const QString cleaned = withoutAddedModes(current, &removed);
+            if (!removed.isEmpty())
+                Logger::info(QStringLiteral("[vdisplay-apply] left by an earlier stream, taken "
+                                            "out of another VDD's mode list: %1")
+                                 .arg(removed.join(QStringLiteral(", "))));
+            // No size asked, but a rate the product never asked before
+            // millihertz — a display matched to the client's screen, 239.744
+            // for a 119.872 Hz one (`vddmatch`, plan glissade), or a bench's
+            // MW_VDD_REFRESH: the default size at that rate, which the
+            // owner's list does not hold. Windows applies no rate the driver
+            // does not list. The product's own 240 and the default 120 are
+            // left as they always were: whatever the owner's list says.
+            const int milli = refreshMilliHz;
+            const bool rateOnly = width <= 0 && milli > 0 &&
+                                  milli != VirtualDisplay::kRateMax * VirtualDisplay::kMilliHz &&
+                                  milli != VirtualDisplay::kRefreshHz * VirtualDisplay::kMilliHz;
+            const int addW = rateOnly ? VirtualDisplay::kWidth : width;
+            const int addH = rateOnly ? VirtualDisplay::kHeight : height;
+            // The mode as settingsWithMode() spells it, for the record.
+            VirtualDisplay::AddedMode mode{addW, addH, milli};
+            const bool sized = VirtualDisplay::normaliseMode(mode.width, mode.height);
+            if (!VirtualDisplay::normaliseRate(mode.refreshMilliHz))
+                mode.refreshMilliHz = VirtualDisplay::kRefreshHz * VirtualDisplay::kMilliHz;
             bool added = false;
             const QString grown =
-                VirtualDisplay::settingsWithMode(current, width, height, refresh, &added);
-            if (!added) {
+                VirtualDisplay::settingsWithMode(cleaned, addW, addH, milli, &added);
+            writeAddedModes(added && sized ? QList<VirtualDisplay::AddedMode>{mode}
+                                           : QList<VirtualDisplay::AddedMode>{});
+            if (grown == current) {
                 Logger::info(QStringLiteral("[vdisplay-apply] %1 belongs to another VDD — left as "
                                             "it is")
                                  .arg(path));
@@ -503,12 +503,14 @@ bool writeSettings(int width, int height, int refresh, bool* changed, QString* e
             f.write(grown.toUtf8());
             f.close();
             *changed = true;
-            Logger::info(QStringLiteral("[vdisplay-apply] %1x%2 at %3 Hz added to another VDD's "
-                                        "mode list in %4 — its own modes kept")
-                             .arg(width)
-                             .arg(height)
-                             .arg(refresh > 0 ? refresh : VirtualDisplay::kRefreshHz)
-                             .arg(path));
+            if (added)
+                Logger::info(QStringLiteral("[vdisplay-apply] %1x%2 at %3 Hz added to another "
+                                            "VDD's mode list in %4 — its own modes kept, ours "
+                                            "taken out at the end")
+                                 .arg(mode.width)
+                                 .arg(mode.height)
+                                 .arg(VirtualDisplay::rateText(mode.refreshMilliHz))
+                                 .arg(path));
             return true;
         }
     } else if (!QDir().mkpath(QFileInfo(path).absolutePath())) {
@@ -522,10 +524,13 @@ bool writeSettings(int width, int height, int refresh, bool* changed, QString* e
     f.write(wanted.toUtf8());
     f.close();
     *changed = true;
-    Logger::info(QStringLiteral("[vdisplay-apply] mode list rewritten with %1x%2 at %3 Hz first")
+    Logger::info(QStringLiteral("[vdisplay-apply] mode list rewritten with %1x%2 at %3 Hz first, "
+                                "drawn by %4")
                      .arg(width > 0 ? width : VirtualDisplay::kWidth)
                      .arg(height > 0 ? height : VirtualDisplay::kHeight)
-                     .arg(refresh > 0 ? refresh : VirtualDisplay::kRefreshHz));
+                     .arg(refreshMilliHz > 0 ? VirtualDisplay::rateText(refreshMilliHz)
+                                             : QString::number(VirtualDisplay::kRefreshHz))
+                     .arg(gpu.isEmpty() ? QStringLiteral("the driver's choice of GPU") : gpu));
     return true;
 }
 
@@ -558,7 +563,7 @@ int stageDriver(Context& ctx)
         QString infPath, catPath;
         for (const VirtualDisplay::DriverFile& f : VirtualDisplay::driverFiles()) {
             const QString path = dir + QLatin1Char('/') + QLatin1String(f.name);
-            if (fileSha256(path) != QLatin1String(f.sha256))
+            if (DriverPackage::fileSha256(path) != QLatin1String(f.sha256))
                 return failAt(ctx, stage,
                               QStringLiteral("%1 is missing or does not match its pinned hash")
                                   .arg(QLatin1String(f.name)));
@@ -569,10 +574,12 @@ int stageDriver(Context& ctx)
         // wrote any. An owner's own VDD configured that file, and ours takes
         // the modes it lists.
         bool wrote = false;
-        if (!writeSettings(0, 0, 0, &wrote, &error)) return failAt(ctx, stage, error);
+        if (!writeSettings(0, 0, 0, QString(), &wrote, &error)) return failAt(ctx, stage, error);
 
-        PublisherTrust trust;
-        if (!trustCatalogSigner(catPath, trust, &error)) return failAt(ctx, stage, error);
+        DriverPackage::PublisherTrust trust;
+        if (!DriverPackage::trustCatalogSigner(catPath, VirtualDisplay::catalogSignerThumbprint(),
+                                               false, "[vdisplay-apply]", trust, &error))
+            return failAt(ctx, stage, error);
         SP_DEVINFO_DATA data{};
         if (!createOurNode(nodes.set, data, &error)) return failAt(ctx, stage, error);
         bool reboot = false;
@@ -620,6 +627,7 @@ int stageDriver(Context& ctx)
         } else {
             Logger::info(QStringLiteral(
                 "[vdisplay-apply] another node uses the driver — package and settings kept"));
+            forgetAddedModes();
         }
         ctx.result.ok = true;
         ctx.result.stage = QStringLiteral("done");
@@ -640,8 +648,8 @@ int stageDriver(Context& ctx)
         // on by a stream that just ended — is what a restart is for.
         if (enable) {
             bool listChanged = false;
-            if (!writeSettings(ctx.request.width, ctx.request.height, ctx.request.refresh,
-                               &listChanged, &error)) {
+            if (!writeSettings(ctx.request.width, ctx.request.height, ctx.request.refreshMilliHz,
+                               ctx.request.gpu, &listChanged, &error)) {
                 Logger::warning(
                     QStringLiteral("[vdisplay-apply] %1 — the default mode stands").arg(error));
             } else if (listChanged && nodeIsEnabled(*ours)) {
@@ -661,6 +669,10 @@ int stageDriver(Context& ctx)
         } else if (!setEnabled(nodes.set, *ours, enable, &error)) {
             return failAt(ctx, stage, error);
         }
+        // Off: the client's mode leaves the owner's list with the stream. The
+        // driver read it when the device started; a device stopped reads
+        // nothing until the next activation adds what that client needs.
+        if (!enable) forgetAddedModes();
         ctx.result.ok = true;
         ctx.result.stage = stage;
         return kExitOk; // the caller decides whether a mode stage follows
@@ -931,11 +943,12 @@ bool applyTopology(const Topology& t, QString* error)
     return true;
 }
 
-/// Query the active display configuration, let @p edit change it, apply it.
+/// Query the active display configuration, let @p edit change it, apply it —
+/// and save it to Windows' database when @p save (VirtualDisplay::savesLayout).
 /// The CCD API (what Windows Settings uses), not ChangeDisplaySettingsEx:
 /// on the bench an indirect display just brought up took neither a mode nor
 /// a position through GDI — success returned, nothing changed.
-template <typename Edit> bool applyDisplayConfig(Edit edit, QString* error)
+template <typename Edit> bool applyDisplayConfig(Edit edit, bool save, QString* error)
 {
     UINT32 nPaths = 0, nModes = 0;
     if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPaths, &nModes) != ERROR_SUCCESS) {
@@ -952,9 +965,10 @@ template <typename Edit> bool applyDisplayConfig(Edit edit, QString* error)
     paths.resize(nPaths);
     modes.resize(nModes);
     if (!edit(paths, modes, error)) return false;
-    const LONG rc = SetDisplayConfig(
-        UINT32(paths.size()), paths.data(), UINT32(modes.size()), modes.data(),
-        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    const LONG rc =
+        SetDisplayConfig(UINT32(paths.size()), paths.data(), UINT32(modes.size()), modes.data(),
+                         SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES |
+                             (save ? SDC_SAVE_TO_DATABASE : 0));
     if (rc != ERROR_SUCCESS) {
         *error = QStringLiteral("SetDisplayConfig: %1").arg(lastErrorText(DWORD(rc)));
         return false;
@@ -980,12 +994,16 @@ int pathIndexFor(const std::vector<DISPLAYCONFIG_PATH_INFO>& paths, const QStrin
 }
 
 /// Our mode on the display at @p devicePath: the source (desktop) size, and
-/// the target left to the driver at @p refresh Hz. @p width × @p height is
+/// the target left to the driver at @p refreshMilliHz. @p width × @p height is
 /// the client's size when it asked for one, the default mode otherwise, and
-/// @p refresh its screen's rate or the default — either way the driver's list
-/// holds the pair by now (writeSettings()).
-bool setMode(const QString& devicePath, int width, int height, int refresh, QString* error)
+/// @p refreshMilliHz the stream's choice or the default — either way the
+/// driver's list holds the pair by now (writeSettings()). The rate goes as the
+/// exact fraction the driver lists (rateFraction: 29968/125 for 239.744), the
+/// only one SetDisplayConfig finds.
+bool setMode(const QString& devicePath, int width, int height, int refreshMilliHz, bool save,
+             QString* error)
 {
+    const VirtualDisplay::RateFraction rate = VirtualDisplay::rateFraction(refreshMilliHz);
     return applyDisplayConfig(
         [&](std::vector<DISPLAYCONFIG_PATH_INFO>& paths,
             std::vector<DISPLAYCONFIG_MODE_INFO>& modes, QString* err) {
@@ -1003,13 +1021,13 @@ bool setMode(const QString& devicePath, int width, int height, int refresh, QStr
             modes[src].sourceMode.width = UINT32(width);
             modes[src].sourceMode.height = UINT32(height);
             p.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
-            p.targetInfo.refreshRate.Numerator = UINT32(refresh);
-            p.targetInfo.refreshRate.Denominator = 1;
+            p.targetInfo.refreshRate.Numerator = UINT32(rate.numerator);
+            p.targetInfo.refreshRate.Denominator = UINT32(rate.denominator);
             p.targetInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
             p.targetInfo.scaling = DISPLAYCONFIG_SCALING_IDENTITY;
             return true;
         },
-        error);
+        save, error);
 }
 
 /// Switch on the attached, inactive display @p attached (a QDC_ALL_PATHS
@@ -1017,7 +1035,7 @@ bool setMode(const QString& devicePath, int width, int height, int refresh, QStr
 /// Windows. Needed when Windows' own answer to the monitor is "off" — its
 /// database remembers the last layout for this set of displays, and that is
 /// what a stream's end leaves.
-bool switchOn(const ActivePath& attached, QString* error)
+bool switchOn(const ActivePath& attached, bool save, QString* error)
 {
     return applyDisplayConfig(
         [&](std::vector<DISPLAYCONFIG_PATH_INFO>& paths,
@@ -1043,13 +1061,13 @@ bool switchOn(const ActivePath& attached, QString* error)
             paths.push_back(p);
             return true;
         },
-        error);
+        save, error);
 }
 
 /// Switch off every active display that is neither in @p t nor ours at
 /// @p devicePath — what Windows lit up on its own when ours appeared.
 /// @return how many went off; -1 on failure.
-int pruneToTopology(const Topology& t, const QString& devicePath, QString* error)
+int pruneToTopology(const Topology& t, const QString& devicePath, bool save, QString* error)
 {
     int pruned = 0;
     const bool ok = applyDisplayConfig(
@@ -1070,13 +1088,125 @@ int pruneToTopology(const Topology& t, const QString& devicePath, QString* error
             paths = keep;
             return true;
         },
-        error);
+        save, error);
     return ok ? pruned : -1;
+}
+
+/// The monitor device path of @p p's target, empty when Windows does not say.
+QString targetDevicePath(const DISPLAYCONFIG_PATH_INFO& p)
+{
+    DISPLAYCONFIG_TARGET_DEVICE_NAME tn{};
+    tn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    tn.header.size = sizeof(tn);
+    tn.header.adapterId = p.targetInfo.adapterId;
+    tn.header.id = p.targetInfo.id;
+    if (DisplayConfigGetDeviceInfo(&tn.header) != ERROR_SUCCESS) return QString();
+    return QString::fromWCharArray(tn.monitorDevicePath);
+}
+
+/// @p p appended to @p out, with the modes it names copied from @p modes and
+/// its indices made to point at the copies; @p copied maps an index of
+/// @p modes to its copy's, so a mode two paths share is copied once.
+void addPath(Topology& out, DISPLAYCONFIG_PATH_INFO p,
+             const std::vector<DISPLAYCONFIG_MODE_INFO>& modes, std::vector<UINT32>& copied)
+{
+    copied.resize(modes.size(), DISPLAYCONFIG_PATH_MODE_IDX_INVALID);
+    for (UINT32* idx : {&p.sourceInfo.modeInfoIdx, &p.targetInfo.modeInfoIdx}) {
+        if (*idx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID) continue;
+        if (*idx >= modes.size()) {
+            *idx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            continue;
+        }
+        if (copied[*idx] == DISPLAYCONFIG_PATH_MODE_IDX_INVALID) {
+            copied[*idx] = UINT32(out.modes.size());
+            out.modes.push_back(modes[*idx]);
+        }
+        *idx = copied[*idx];
+    }
+    out.paths.push_back(p);
+}
+
+/// The layout from before ours, @p t, imposed again now that ours at
+/// @p devicePath is up: every other display in the mode and at the place it
+/// had, ours on their right (placeBeside), nothing else on — and saved to
+/// Windows' database as this set of displays' layout. Windows brings a set up
+/// from that database, with the modes each display had the last time it was
+/// on: an owner's own VDD on the same driver came back at 800×600 at 30 Hz,
+/// the first mode of its list, every time ours came on, and every change of
+/// ours saved it again at that (N95, 16/10/2026). Saved this way, the next
+/// activation brings it up as the owner left it. Switches off, as
+/// pruneToTopology() does, whatever Windows lit up beside ours.
+bool imposeTopology(const Topology& t, const QString& devicePath, QString* error)
+{
+    UINT32 nPaths = 0, nModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPaths, &nModes) != ERROR_SUCCESS) {
+        *error = QStringLiteral("GetDisplayConfigBufferSizes failed");
+        return false;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPaths, paths.data(), &nModes, modes.data(),
+                           nullptr) != ERROR_SUCCESS) {
+        *error = QStringLiteral("QueryDisplayConfig failed");
+        return false;
+    }
+    paths.resize(nPaths);
+    modes.resize(nModes);
+    const int i = pathIndexFor(paths, devicePath);
+    if (i < 0) {
+        *error = QStringLiteral("the display is not in the active configuration");
+        return false;
+    }
+    const DISPLAYCONFIG_PATH_INFO& ours = paths[size_t(i)];
+    const UINT32 ourSource = ours.sourceInfo.modeInfoIdx;
+    if (ourSource == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || ourSource >= modes.size() ||
+        modes[ourSource].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+        *error = QStringLiteral("the display has no source mode");
+        return false;
+    }
+
+    Topology out;
+    std::vector<UINT32> copied;
+    QList<VirtualDisplay::DesktopRect> others;
+    for (const DISPLAYCONFIG_PATH_INFO& p : t.paths) {
+        // Ours as an earlier stream left it on: it comes as it is now.
+        if (sameTarget(p, ours) ||
+            targetDevicePath(p).compare(devicePath, Qt::CaseInsensitive) == 0)
+            continue;
+        if (p.sourceInfo.adapterId.LowPart == ours.sourceInfo.adapterId.LowPart &&
+            p.sourceInfo.adapterId.HighPart == ours.sourceInfo.adapterId.HighPart &&
+            p.sourceInfo.id == ours.sourceInfo.id) {
+            *error = QStringLiteral("the display's source drives another display already");
+            return false;
+        }
+        addPath(out, p, t.modes, copied);
+        const UINT32 src = p.sourceInfo.modeInfoIdx;
+        if (src != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && src < t.modes.size() &&
+            t.modes[src].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+            const DISPLAYCONFIG_SOURCE_MODE& m = t.modes[src].sourceMode;
+            others.append({int(m.position.x), int(m.position.y), int(m.width), int(m.height)});
+        }
+    }
+    std::vector<DISPLAYCONFIG_MODE_INFO> ourModes = modes;
+    const QPoint at = VirtualDisplay::placeBeside(others);
+    ourModes[ourSource].sourceMode.position.x = at.x();
+    ourModes[ourSource].sourceMode.position.y = at.y();
+    std::vector<UINT32> ourCopied;
+    addPath(out, ours, ourModes, ourCopied);
+
+    const LONG rc = SetDisplayConfig(
+        UINT32(out.paths.size()), out.paths.data(), UINT32(out.modes.size()), out.modes.data(),
+        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    if (rc != ERROR_SUCCESS) {
+        *error = QStringLiteral("SetDisplayConfig: %1").arg(lastErrorText(DWORD(rc)));
+        return false;
+    }
+    return true;
 }
 
 /// Make the display at @p devicePath the primary one: every desktop origin
 /// shifted so that one lands on (0,0), in one configuration change.
-bool makePrimary(const QString& devicePath, QString* error)
+bool makePrimary(const QString& devicePath, bool save, QString* error)
 {
     return applyDisplayConfig(
         [&](std::vector<DISPLAYCONFIG_PATH_INFO>& paths,
@@ -1100,7 +1230,56 @@ bool makePrimary(const QString& devicePath, QString* error)
             }
             return true;
         },
-        error);
+        save, error);
+}
+
+/// Every display but ours at @p devicePath off (Request::exclusive), never
+/// saved (VirtualDisplay::savesLayout): Windows' database keeps them on, and
+/// replays that the moment ours goes, whoever switches it off.
+/// @return how many went off; -1 on failure.
+int keepOnlyOurs(const QString& devicePath, QString* error)
+{
+    int off = 0;
+    const bool ok = applyDisplayConfig(
+        [&](std::vector<DISPLAYCONFIG_PATH_INFO>& paths,
+            std::vector<DISPLAYCONFIG_MODE_INFO>& modes, QString* err) {
+            Q_UNUSED(modes);
+            const int ours = pathIndexFor(paths, devicePath);
+            if (ours < 0) {
+                *err = QStringLiteral("the display is not in the active configuration");
+                return false;
+            }
+            off = int(paths.size()) - 1;
+            paths = {paths[size_t(ours)]};
+            return true;
+        },
+        VirtualDisplay::savesLayout(VirtualDisplay::LayoutStep::Exclusive, true), error);
+    return ok ? off : -1;
+}
+
+/// The other displays are off for an exclusive stream (keepOnlyOurs): a
+/// marker beside the saved layout, so that the next process — a mode change
+/// mid-stream, the stream's end, a server restarted after a crash — knows
+/// that what is active is no layout to save or to remember.
+QString othersOffPath(const Context& ctx)
+{
+    return ctx.dir + QStringLiteral("/others-off");
+}
+
+bool othersOff(const Context& ctx)
+{
+    return QFile::exists(othersOffPath(ctx));
+}
+
+void setOthersOff(const Context& ctx, bool off)
+{
+    if (!off) {
+        QFile::remove(othersOffPath(ctx));
+        return;
+    }
+    QFile f(othersOffPath(ctx));
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        Logger::warning(QStringLiteral("[vdisplay-apply] cannot write %1").arg(f.fileName()));
 }
 
 // ── Stage "snapshot": the desktop half that runs before the node goes on ──
@@ -1112,6 +1291,18 @@ int stageSnapshot(Context& ctx)
     ctx.result.stage = QStringLiteral("snapshot");
     if (ctx.request.action != Action::Activate) return kExitOk;
     QString error;
+    if (othersOff(ctx)) {
+        // A new mode for an exclusive stream's display: what is active is ours
+        // alone, and the layout to come back to is the one already saved.
+        if (loadTopology(ctx)) {
+            Logger::info(QStringLiteral("[vdisplay-apply] the other displays are off — the "
+                                        "layout from before is kept"));
+        } else {
+            Logger::warning(QStringLiteral("[vdisplay-apply] the other displays are off and no "
+                                           "layout from before is saved"));
+        }
+        return kExitOk;
+    }
     if (saveTopology(ctx, &error)) {
         Logger::info(QStringLiteral("[vdisplay-apply] display layout saved"));
     } else {
@@ -1130,6 +1321,7 @@ int stageMode(Context& ctx)
     if (ctx.request.action == Action::Deactivate) {
         ctx.result.ok = true;
         ctx.result.stage = stage;
+        const bool wereOff = othersOff(ctx);
         // The layout from before ours, applied while ours still exists: that
         // switches ours off, puts every other display back where it was and
         // gives the primary role back, in one change. The node goes next.
@@ -1142,12 +1334,28 @@ int stageMode(Context& ctx)
             } else if (applyTopology(*saved, &error)) {
                 Logger::info(QStringLiteral("[vdisplay-apply] display layout restored"));
                 QFile::remove(topologyPath(ctx));
+                setOthersOff(ctx, false);
                 return kExitOk; // the driver stage (disable) follows
             } else {
                 Logger::warning(
                     QStringLiteral("[vdisplay-apply] display layout not restored: %1").arg(error));
             }
             QFile::remove(topologyPath(ctx));
+        }
+        if (wereOff) {
+            // An exclusive stream's displays, without the layout to put them
+            // back as they were: Windows' own extended layout for the displays
+            // attached, which never saw them off (savesLayout).
+            const LONG rc =
+                SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+            if (rc == ERROR_SUCCESS)
+                Logger::info(QStringLiteral("[vdisplay-apply] the other displays back on, "
+                                            "as Windows extends them"));
+            else
+                Logger::warning(
+                    QStringLiteral("[vdisplay-apply] the other displays not back on: %1")
+                        .arg(lastErrorText(DWORD(rc))));
+            setOthersOff(ctx, false);
         }
         // The previous primary back in its role, while ours still exists —
         // Windows would otherwise pick one itself when ours goes.
@@ -1158,7 +1366,10 @@ int stageMode(Context& ctx)
                     continue;
                 found = true;
                 QString error;
-                if (!p.primary && !makePrimary(p.devicePath, &error))
+                if (!p.primary && !makePrimary(p.devicePath,
+                                               VirtualDisplay::savesLayout(
+                                                   VirtualDisplay::LayoutStep::Primary, false),
+                                               &error))
                     Logger::warning(
                         QStringLiteral("[vdisplay-apply] previous primary not restored: %1")
                             .arg(error));
@@ -1178,6 +1389,10 @@ int stageMode(Context& ctx)
     // The monitor appears a moment after the driver starts; ten seconds is
     // generous for a UMDF driver and a single monitor. Whether Windows then
     // switches it on is its database's call — attached and off, we do it.
+    using VirtualDisplay::LayoutStep;
+    using VirtualDisplay::savesLayout;
+    // An exclusive stream's display taking a new mode: the others are off.
+    bool off = othersOff(ctx);
     std::optional<ActivePath> target;
     QElapsedTimer wait;
     wait.start();
@@ -1187,7 +1402,7 @@ int stageMode(Context& ctx)
         if (!switchedOn) {
             if (const auto attached = findOurTarget(QDC_ALL_PATHS)) {
                 switchedOn = true;
-                if (switchOn(*attached, &error))
+                if (switchOn(*attached, savesLayout(LayoutStep::Mode, off), &error))
                     Logger::info(QStringLiteral(
                         "[vdisplay-apply] the virtual display was attached but off: switched on"));
                 else
@@ -1204,7 +1419,23 @@ int stageMode(Context& ctx)
             ctx.result.stage = QStringLiteral("done");
             return finish(ctx);
         }
-        return failAt(ctx, stage, QStringLiteral("the virtual display did not appear"));
+        // Nothing came of the device the driver stage just switched on: it
+        // goes back off, as it was before this activation. Left on, it stays
+        // enabled with no display behind it until the server's next start
+        // turns it off (seen on the bench, 29/09/2026: a 500 Hz mode the
+        // driver would not bring up, then the next launch refused as well).
+        DisplayNodes nodes;
+        if (auto ours = nodes.valid() ? nodes.ours() : std::nullopt; ours && nodeIsEnabled(*ours)) {
+            QString disableError;
+            if (!setEnabled(nodes.set, *ours, false, &disableError))
+                Logger::warning(
+                    QStringLiteral("[vdisplay-apply] the device stays on: %1").arg(disableError));
+        }
+        // Nor does the mode it was asked for stay in an owner's list.
+        forgetAddedModes();
+        // The server tries again closer to the default mode
+        // (VirtualDisplay::fallbackTowardsDefault).
+        return failAt(ctx, stage, VirtualDisplay::notAppearedError());
     }
     ctx.result.display = target->gdiName;
 
@@ -1213,10 +1444,32 @@ int stageMode(Context& ctx)
         if (p.primary && p.devicePath.compare(target->devicePath, Qt::CaseInsensitive) != 0)
             ctx.result.previousPrimary = p.devicePath;
 
-    // Only what was on before, plus ours: Windows may have switched on a
-    // display the owner keeps disconnected.
-    if (const auto saved = loadTopology(ctx)) {
-        const int pruned = pruneToTopology(*saved, target->devicePath, &error);
+    // Only what was on before, as it was, plus ours: Windows may have switched
+    // on a display the owner keeps disconnected, and brought the others up in
+    // the modes its database remembers for this set (imposeTopology). When
+    // that layout cannot be imposed, the extra displays go off all the same.
+    // An exclusive stream's display taking a new mode keeps the others off:
+    // imposing the layout from before would light them up for a moment.
+    const bool stayExclusive = off && ctx.request.exclusive;
+    bool imposed = false;
+    if (const auto saved = loadTopology(ctx);
+        !stayExclusive && saved && topologyStillAttached(*saved)) {
+        imposed = imposeTopology(*saved, target->devicePath, &error);
+        off = VirtualDisplay::othersOffAfter(LayoutStep::Impose, off, imposed);
+        if (!off) setOthersOff(ctx, false);
+        if (imposed)
+            Logger::info(QStringLiteral("[vdisplay-apply] the other displays as they were, ours "
+                                        "on their right — saved as this set's layout"));
+        else
+            Logger::warning(
+                QStringLiteral("[vdisplay-apply] the layout from before not imposed: %1")
+                    .arg(error));
+        error.clear();
+        if (auto again = findOurTarget()) target = again;
+    }
+    if (const auto saved = loadTopology(ctx); !stayExclusive && saved && !imposed) {
+        const int pruned = pruneToTopology(*saved, target->devicePath,
+                                           savesLayout(LayoutStep::Prune, off), &error);
         if (pruned < 0)
             Logger::warning(
                 QStringLiteral("[vdisplay-apply] extra displays not switched off: %1").arg(error));
@@ -1236,38 +1489,44 @@ int stageMode(Context& ctx)
         wantW = VirtualDisplay::kWidth;
         wantH = VirtualDisplay::kHeight;
     }
-    int wantHz = ctx.request.refresh;
-    if (!VirtualDisplay::normaliseRate(wantHz)) wantHz = VirtualDisplay::kRefreshHz;
-    if (setMode(target->devicePath, wantW, wantH, wantHz, &error)) {
+    int wantMilli = ctx.request.refreshMilliHz;
+    if (!VirtualDisplay::normaliseRate(wantMilli))
+        wantMilli = VirtualDisplay::kRefreshHz * VirtualDisplay::kMilliHz;
+    const bool saveMode = savesLayout(LayoutStep::Mode, off);
+    if (setMode(target->devicePath, wantW, wantH, wantMilli, saveMode, &error)) {
         Logger::info(QStringLiteral("[vdisplay-apply] %1 set to %2x%3@%4")
                          .arg(target->gdiName)
                          .arg(wantW)
                          .arg(wantH)
-                         .arg(wantHz));
+                         .arg(VirtualDisplay::rateText(wantMilli)));
     } else {
         // Not fatal: the display exists and streams at whatever mode it has.
         Logger::warning(QStringLiteral("[vdisplay-apply] mode %1x%2@%3 refused on %4: %5")
                             .arg(wantW)
                             .arg(wantH)
-                            .arg(wantHz)
+                            .arg(VirtualDisplay::rateText(wantMilli))
                             .arg(target->gdiName, error));
         // The size first — a rate the client's screen runs at is worth more
-        // than its shape — then the default mode entirely.
+        // than its shape — then the product's own rate (a rate matched to the
+        // client's screen that the driver did not take), then the default
+        // mode entirely.
         const struct
         {
-            int w, h, hz;
-        } fallbacks[] = {
-            {VirtualDisplay::kWidth, VirtualDisplay::kHeight, wantHz},
-            {VirtualDisplay::kWidth, VirtualDisplay::kHeight, VirtualDisplay::kRefreshHz}};
+            int w, h, milli;
+        } fallbacks[] = {{VirtualDisplay::kWidth, VirtualDisplay::kHeight, wantMilli},
+                         {VirtualDisplay::kWidth, VirtualDisplay::kHeight,
+                          VirtualDisplay::kRateMax * VirtualDisplay::kMilliHz},
+                         {VirtualDisplay::kWidth, VirtualDisplay::kHeight,
+                          VirtualDisplay::kRefreshHz * VirtualDisplay::kMilliHz}};
         for (const auto& f : fallbacks) {
-            if (f.w == wantW && f.h == wantH && f.hz == wantHz) continue;
+            if (f.w == wantW && f.h == wantH && f.milli == wantMilli) continue;
             QString again;
-            if (!setMode(target->devicePath, f.w, f.h, f.hz, &again)) continue;
+            if (!setMode(target->devicePath, f.w, f.h, f.milli, saveMode, &again)) continue;
             Logger::info(QStringLiteral("[vdisplay-apply] %1 fell back to %2x%3@%4")
                              .arg(target->gdiName)
                              .arg(f.w)
                              .arg(f.h)
-                             .arg(f.hz));
+                             .arg(VirtualDisplay::rateText(f.milli)));
             break;
         }
     }
@@ -1286,8 +1545,30 @@ int stageMode(Context& ctx)
         Logger::warning(
             QStringLiteral("[vdisplay-apply] SDR refused: %1").arg(lastErrorText(DWORD(hr))));
 
-    if (!makePrimary(target->devicePath, &error))
+    if (!makePrimary(target->devicePath, savesLayout(LayoutStep::Primary, off), &error))
         Logger::warning(QStringLiteral("[vdisplay-apply] not made primary: %1").arg(error));
+
+    // Last, and never saved: every change above has been, with the other
+    // displays on — the layout Windows replays whatever ends the stream.
+    if (ctx.request.exclusive && !off) {
+        // The marker first: a crash between the two leaves a marker with the
+        // displays on, which only spares a save.
+        setOthersOff(ctx, true);
+        const int n = keepOnlyOurs(target->devicePath, &error);
+        off = VirtualDisplay::othersOffAfter(LayoutStep::Exclusive, off, n >= 0);
+        if (n >= 0)
+            Logger::info(
+                QStringLiteral("[vdisplay-apply] exclusive: %1 other display(s) off").arg(n));
+        else
+            Logger::warning(
+                QStringLiteral("[vdisplay-apply] exclusive: the others stay on: %1").arg(error));
+        if (!off) setOthersOff(ctx, false);
+    } else if (off) {
+        // The layout from before could not be imposed again: the others stay
+        // off until the stream ends, whatever the option says now.
+        Logger::info(QStringLiteral("[vdisplay-apply] the other displays stay off until the "
+                                    "stream ends"));
+    }
 
     ctx.result.ok = true;
     ctx.result.stage = QStringLiteral("done");
@@ -1359,6 +1640,84 @@ int run(const QString& stageArg, const QString& dirArg)
     Q_UNUSED(stage);
     return failAt(ctx, QStringLiteral("request"),
                   QStringLiteral("virtual displays are not supported on this platform"));
+#endif
+}
+
+int guard(const QString& server)
+{
+#ifdef Q_OS_WIN
+    const QStringList parts = server.split(QLatin1Char(':'));
+    bool okPid = false, okTime = false;
+    const DWORD pid = parts.size() == 2 ? parts[0].toULong(&okPid) : 0;
+    const quint64 created = parts.size() == 2 ? parts[1].toULongLong(&okTime) : 0;
+    if (!okPid || !okTime || pid == 0) {
+        Logger::warning(QStringLiteral("[vdisplay-guard] not a server: %1").arg(server));
+        return kExitFailed;
+    }
+    // One guard per edition and session: an exclusive stream that takes a
+    // new mode activates again, and the first guard is still on watch.
+    const std::wstring mutexName =
+        (QStringLiteral("Local\\") + VirtualDisplay::displayName() + QStringLiteral(" guard"))
+            .toStdWString();
+    HANDLE single = CreateMutexW(nullptr, FALSE, mutexName.c_str());
+    if (single && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(single);
+        return kExitOk;
+    }
+    // The handle, not the number, and only when it is the server's: a pid
+    // the server left behind may name another process by now.
+    HANDLE proc = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (proc) {
+        FILETIME c{}, e{}, k{}, u{};
+        const quint64 have = GetProcessTimes(proc, &c, &e, &k, &u)
+                                 ? (quint64(c.dwHighDateTime) << 32) | quint64(c.dwLowDateTime)
+                                 : 0;
+        if (have != created) {
+            CloseHandle(proc);
+            proc = nullptr;
+        }
+    }
+    Context ctx;
+    ctx.dir = VirtualDisplay::stagingDir();
+    // Off means a marker that is there AND can be read: anything less and
+    // nothing is touched.
+    const auto othersOffReadable = [&ctx] {
+        QFile f(othersOffPath(ctx));
+        return f.exists() && f.open(QIODevice::ReadOnly);
+    };
+    Logger::info(QStringLiteral("[vdisplay-guard] watching the server (pid %1)%2")
+                     .arg(pid)
+                     .arg(proc ? QString() : QStringLiteral(" — already gone")));
+    int rc = kExitOk;
+    for (;;) {
+        const bool alive = proc && WaitForSingleObject(proc, 1000) == WAIT_TIMEOUT;
+        const VirtualDisplay::GuardStep step =
+            VirtualDisplay::guardStep(alive, othersOffReadable());
+        if (step == VirtualDisplay::GuardStep::Wait) continue;
+        if (step == VirtualDisplay::GuardStep::Restore) {
+            Logger::warning(QStringLiteral("[vdisplay-guard] the server is gone with the other "
+                                           "displays off — bringing them back"));
+            VirtualDisplay::Request req;
+            req.action = VirtualDisplay::Request::Action::Deactivate;
+            QFile f(VirtualDisplay::requestPath());
+            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                f.write(VirtualDisplay::toJson(req));
+                f.close();
+                rc = run(QStringLiteral("mode"), QString());
+            } else {
+                Logger::warning(
+                    QStringLiteral("[vdisplay-guard] cannot write %1").arg(f.fileName()));
+                rc = kExitFailed;
+            }
+        }
+        break;
+    }
+    if (proc) CloseHandle(proc);
+    if (single) CloseHandle(single);
+    return rc;
+#else
+    Q_UNUSED(server);
+    return kExitOk;
 #endif
 }
 

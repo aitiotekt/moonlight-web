@@ -14,6 +14,7 @@
 
 #include <QDateTime>
 #include <QFile>
+#include <QJsonObject>
 #include <QObject>
 #include <QStandardPaths>
 #include <QString>
@@ -102,10 +103,20 @@ void test_pin_is_required_and_bound_to_the_link()
     CHECK(!ok.cookie.isEmpty());
     CHECK_EQ(mgr->slotForCookie(ok.cookie), kSlot);
 
-    // A cookie is worthless once the owner re-shares.
+    // Who joins: this activation on this device. Another cookie is someone else.
+    const QString joiner = mgr->joinIdentity(kSlot, ok.cookie);
+    CHECK(!joiner.isEmpty());
+    CHECK_EQ(mgr->joinIdentity(kSlot, ok.cookie), joiner);
+    CHECK(mgr->joinIdentity(kSlot, QStringLiteral("another-device")) != joiner);
+    CHECK(mgr->joinIdentity(kSlot, QString()).isEmpty());
+
+    // A cookie is worthless once the owner re-shares, and the new activation
+    // is a new joiner even for the same cookie: the last guest's Sunshine
+    // session is never handed on (startPlayerStream).
     QString token2, pin2;
     mgr->activate(kSlot, kHost, kApp, kTtl, token2, pin2, st);
     CHECK_EQ(mgr->slotForCookie(ok.cookie), -1);
+    CHECK(mgr->joinIdentity(kSlot, ok.cookie) != joiner);
 
     delete mgr;
 }
@@ -188,7 +199,7 @@ void test_permissions_follow_the_board_live()
 
     QVector<QPair<bool, bool>> pushed;
     QObject::connect(mgr, &ShareManager::permissionsChanged,
-                     [&pushed](int, bool gamepad, bool km) { pushed.append({gamepad, km}); });
+                     [&pushed](int, bool gamepad, bool km, bool) { pushed.append({gamepad, km}); });
 
     QString token, pin;
     ShareManager::SlotStatus st;
@@ -249,6 +260,53 @@ void test_permissions_follow_the_board_live()
     CHECK(!st2.permissions.keyboardMouse);
 
     delete mgr;
+}
+
+void test_hid_box_rides_with_the_gamepad()
+{
+    SECTION("share: the HID box travels to the worker, and only with the gamepad");
+
+    // Absent (a file or a page from before the box) is no passthrough, and so
+    // is one without the gamepad: the device would reach the game while the
+    // guest's own controller is refused.
+    CHECK(!ShareManager::Permissions::fromJson(QJsonObject{{"gamepad", true}}).hid);
+    CHECK(!ShareManager::Permissions::fromJson(QJsonObject{{"hid", true}}).hid);
+    const ShareManager::Permissions wheel =
+        ShareManager::Permissions::fromJson(QJsonObject{{"gamepad", true}, {"hid", true}});
+    CHECK(wheel.hid);
+    CHECK(ShareManager::Permissions::fromJson(wheel.toJson()) == wheel);
+    // Not a badge of its own: a gamer with a wheel is still a gamer.
+    CHECK_EQ(wheel.accessLevel(), QStringLiteral("gamer"));
+
+    ShareManager* mgr = freshManager();
+    QVector<bool> pushed;
+    QObject::connect(mgr, &ShareManager::permissionsChanged,
+                     [&pushed](int, bool, bool, bool hid) { pushed.append(hid); });
+
+    QString token, pin;
+    ShareManager::SlotStatus st;
+    mgr->activate(kSlot, kHost, kApp, kTtl, token, pin, st);
+    CHECK(!st.permissions.hid);
+
+    ShareManager::Permissions gamer;
+    gamer.gamepad = true;
+    CHECK(mgr->setPermissions(kSlot, gamer));
+    // The box alone is a change, and the worker hears it: it is what plugs
+    // the guest's wheel in on the host, or pulls it out.
+    CHECK(mgr->setPermissions(kSlot, wheel));
+    CHECK(mgr->setPermissions(kSlot, gamer));
+    CHECK_EQ(pushed.size(), 3);
+    CHECK(!pushed.at(0));
+    CHECK(pushed.at(1));
+    CHECK(!pushed.at(2));
+
+    // Remembered for the next opening and across a restart, like the others.
+    CHECK(mgr->setPermissions(kSlot, wheel));
+    delete mgr;
+    auto* restarted = new ShareManager();
+    CHECK(restarted->permissions(kSlot).hid);
+    restarted->deactivateAll(ShareManager::EndReason::OwnerStop);
+    delete restarted;
 }
 
 void test_one_device_per_invitation()
@@ -594,6 +652,58 @@ void test_share_is_bound_to_its_host()
     delete restarted;
 }
 
+void test_guests_picture_height()
+{
+    SECTION("share: one picture height for every guest, the owner's pick, kept");
+    ShareManager* mgr = freshManager();
+    CHECK_EQ(mgr->feedHeight(), 1080); // the default
+
+    QVector<int> told;
+    QObject::connect(mgr, &ShareManager::feedHeightChanged, [&told](int h) { told.append(h); });
+    // Only the heights the board offers: it arrives from a browser.
+    CHECK(!mgr->setFeedHeight(2160));
+    CHECK(!mgr->setFeedHeight(0));
+    CHECK_EQ(mgr->feedHeight(), 1080);
+    CHECK(mgr->setFeedHeight(1080)); // the same: accepted, nothing to rebuild
+    CHECK(told.isEmpty());
+    CHECK(mgr->setFeedHeight(720));
+    CHECK_EQ(mgr->feedHeight(), 720);
+    CHECK_EQ(told.size(), 1);
+    CHECK_EQ(told.value(0), 720);
+    delete mgr;
+
+    // The owner's pick outlives a restart, like the rows' own labels.
+    auto* restarted = new ShareManager();
+    CHECK_EQ(restarted->feedHeight(), 720);
+    delete restarted;
+}
+
+void test_link_address_is_per_host_and_kept()
+{
+    SECTION("share: each host's link address is the owner's pick, kept");
+    ShareManager* mgr = freshManager();
+    CHECK_EQ(mgr->linkAddress(QStringLiteral("host-A")), QStringLiteral("auto")); // the default
+    // Only the forms the board offers, and only for a named host.
+    CHECK(!mgr->setLinkAddress(QStringLiteral("host-A"), QStringLiteral("192.168.1.66")));
+    CHECK(!mgr->setLinkAddress(QString(), QStringLiteral("lan")));
+    CHECK(mgr->setLinkAddress(QStringLiteral("host-A"), QStringLiteral("tailscale")));
+    CHECK(mgr->setLinkAddress(QStringLiteral("host-B"), QStringLiteral("iface:wg0")));
+    CHECK_EQ(mgr->linkAddress(QStringLiteral("host-A")), QStringLiteral("tailscale"));
+    CHECK_EQ(mgr->linkAddress(QStringLiteral("host-B")), QStringLiteral("iface:wg0"));
+    CHECK_EQ(mgr->linkAddress(QStringLiteral("host-C")), QStringLiteral("auto"));
+    delete mgr;
+
+    // Picks outlive a restart; Automatic forgets the host's entry.
+    auto* restarted = new ShareManager();
+    CHECK_EQ(restarted->linkAddress(QStringLiteral("host-A")), QStringLiteral("tailscale"));
+    CHECK(restarted->setLinkAddress(QStringLiteral("host-B"), QStringLiteral("auto")));
+    delete restarted;
+    auto* again = new ShareManager();
+    CHECK_EQ(again->linkAddress(QStringLiteral("host-B")), QStringLiteral("auto"));
+    CHECK_EQ(again->linkAddress(QStringLiteral("host-A")), QStringLiteral("tailscale"));
+    delete again;
+}
+
 } // namespace
 
 void run_share_manager_tests()
@@ -604,6 +714,7 @@ void run_share_manager_tests()
     test_rate_limit_locks_a_single_caller();
     test_access_level_reads_both_flags();
     test_permissions_follow_the_board_live();
+    test_hid_box_rides_with_the_gamepad();
     test_one_device_per_invitation();
     test_lifetime_is_per_player();
     test_rows_can_be_named();
@@ -613,4 +724,6 @@ void run_share_manager_tests()
     test_persistence_survives_a_restart();
     test_clear_secrets_are_memory_only();
     test_share_is_bound_to_its_host();
+    test_guests_picture_height();
+    test_link_address_is_per_host_and_kept();
 }

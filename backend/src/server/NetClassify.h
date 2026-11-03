@@ -19,7 +19,9 @@
 
 #include <QAbstractSocket>
 #include <QHostAddress>
+#include <QList>
 #include <QString>
+#include <QStringList>
 
 /// Single source of truth for "where did this peer come from".
 ///
@@ -95,6 +97,46 @@ inline bool isPrivateOrLoopback(Kind k)
 inline bool isTrustedPeer(Kind k)
 {
     return k != Kind::Public;
+}
+
+/// True when a Public peer still sits on the host's own network: it arrives
+/// from one of the host's public IPv4 addresses (it went out through our router
+/// and came back), or from a global IPv6 inside one of the host's own /64
+/// prefixes (same link). A browser on the LAN that reached us through a public
+/// link looks like that: its address is the one the rendezvous tunnel settled
+/// on, never a private one.
+///
+/// It may be shown the LAN host candidate, nothing more. Without it, measured
+/// 2026-10-24, a Mac on the same Wi-Fi had only the public candidates to try,
+/// and ICE nominated the router's hairpin (prflx <router LAN address>), where
+/// the video never drained. The peer still plans ICE for the internet: a shared
+/// public IPv4 can be another subscriber's, who sees no more than our LAN
+/// address.
+inline bool sharesHostNetwork(const QString& peer, const QStringList& hostPublicIpv4,
+                              const QList<QHostAddress>& hostAddresses)
+{
+    QString bare = peer;
+    if (bare.startsWith(QLatin1String("::ffff:"), Qt::CaseInsensitive)) bare = bare.mid(7);
+    const QHostAddress addr(bare);
+    if (addr.isNull() || classify(bare) != Kind::Public) return false;
+
+    if (addr.protocol() == QAbstractSocket::IPv4Protocol) {
+        for (const QString& own : hostPublicIpv4)
+            if (!own.isEmpty() && QHostAddress(own) == addr) return true;
+        return false;
+    }
+
+    const Q_IPV6ADDR a = addr.toIPv6Address();
+    for (const QHostAddress& own : hostAddresses) {
+        if (own.protocol() != QAbstractSocket::IPv6Protocol) continue;
+        if (classify(own.toString()) != Kind::Public) continue;
+        const Q_IPV6ADDR o = own.toIPv6Address();
+        bool samePrefix = true;
+        for (int i = 0; i < 8 && samePrefix; ++i)
+            samePrefix = a[i] == o[i];
+        if (samePrefix) return true;
+    }
+    return false;
 }
 
 /// Parse back what toString() produced. Used to carry a classification across

@@ -17,18 +17,30 @@
 
 #include "PortalCapture.h"
 
+#include "../../audio/linux/PipeWireLibrary.h"
 #include "../../core/Log.h"
+#include "MutterScreenCast.h"
+#include "XFixesCursor.h"
 
 #include <drm_fourcc.h>
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
+#include <signal.h>
 #include <spa/utils/result.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
+
+// PipeWire 0.3.40's name, for a header older than that — the value is the
+// protocol's.
+#ifndef SPA_POD_PROP_FLAG_DONT_FIXATE
+#define SPA_POD_PROP_FLAG_DONT_FIXATE (1u << 4)
+#endif
 
 namespace mw::native::capture {
 namespace {
@@ -106,12 +118,57 @@ struct PortalCapture::Impl
     pw_buffer* held = nullptr;
     KmsFrame frame{};
     bool frameFresh = false;
+    /// Buffers handed over since the consumer last took one (click trace).
+    int folded = 0;
     bool isDmabuf = false;
+    /// A buffer has arrived since start(): what dmabuf() says is the
+    /// buffers' own word from then on, not the format's.
+    bool sawBuffer = false;
+    /// Formats settled on before the first buffer (renegotiatingWithoutPicture).
+    int formatsBeforePicture = 0;
+    /// The GPU's modifiers, offered to the compositor before shared memory.
+    PortalCapture::DmabufOffer offer;
+    /// What the formats offered right now include: DMA-BUF before shared
+    /// memory, or shared memory alone (setDmabufWhilePointerHidden moves it).
+    bool offering = false;
+    /// The size and the rates every format carries, kept for a renegotiation.
+    bool virtualMonitorFormats = false;
+    spa_rectangle sizeDefault = SPA_RECTANGLE(1920, 1080);
+    spa_rectangle sizeMin = SPA_RECTANGLE(1, 1);
+    spa_rectangle sizeMax = SPA_RECTANGLE(8192, 8192);
+    spa_fraction rateDefault = SPA_FRACTION(60, 1);
+    spa_fraction rateMin = SPA_FRACTION(0, 1);
+    spa_fraction rateMax = SPA_FRACTION(1000, 1);
+    /// The GPU the session converts and encodes on.
+    std::string renderNode;
 
     CursorState cursor;
     bool cursorFresh = false;
     /// An earlier grant to replay, so start() raises no dialog.
     std::string restore;
+
+    /// A virtual monitor's mode; zero width for a real monitor.
+    int virtualWidth = 0;
+    int virtualHeight = 0;
+    int virtualFps = 60;
+    /// KWin makes the virtual monitor, under this name (setKwinVirtualOutput).
+    std::string kwinName;
+    /// Mutter makes it, or records the monitor named here (setMutter).
+    bool mutter = false;
+    std::string mutterConnector;
+    /// The connector is a real monitor of the desktop, not a virtual one.
+    bool mutterRealMonitor = false;
+    /// One of GNOME's virtual monitors before GNOME 48: its pointer is asked
+    /// painted into every picture (MutterScreenCast::embedsPointer).
+    bool embedCursor = false;
+    /// When acquire() next asks whether Mutter ended the screen cast.
+    int64_t nextEndCheckUs = 0;
+    /// gamescope's node, read on the session's PipeWire with no handshake at
+    /// all (setGamescope); its pointer comes from its Xwayland.
+    uint32_t gamescopeNode = 0;
+    std::string gamescopeDisplay;
+    int gamescopePid = 0;
+    XFixesCursor gamescopeCursor;
 
     int64_t nowUs() const
     {
@@ -125,6 +182,8 @@ struct PortalCapture::Impl
     {
         auto* self = static_cast<Impl*>(data);
         if (state == PW_STREAM_STATE_ERROR) {
+            log::warning(std::string("[native] portal stream: ") +
+                         (error ? error : "failed, no reason given"));
             std::lock_guard<std::mutex> lock(self->mutex);
             self->failed = true;
             self->failure = error ? error : "the stream failed";
@@ -143,62 +202,98 @@ struct PortalCapture::Impl
 
         spa_video_info_raw info{};
         if (spa_format_video_raw_parse(param, &info) < 0) return;
+        // A modifier in the format: the compositor took one of the offer's,
+        // and hands DMA-BUF (offerDmabuf). None: shared memory. Read from the
+        // format itself: spa_video_info_raw::flags and SPA_VIDEO_FLAG_MODIFIER
+        // are not in the PipeWire of Ubuntu 22.04 (0.3.48), which builds the
+        // packages.
+        const bool modifier =
+            spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_modifier) != nullptr;
 
         {
             std::lock_guard<std::mutex> lock(self->mutex);
             self->format = info;
             self->haveFormat = true;
+            if (!self->sawBuffer) {
+                self->isDmabuf = modifier;
+                ++self->formatsBeforePicture;
+            }
         }
         self->ready.notify_all();
+        char modifierText[40] = "shared memory";
+        if (modifier)
+            std::snprintf(modifierText, sizeof(modifierText), "DMA-BUF, modifier 0x%llx",
+                          static_cast<unsigned long long>(info.modifier));
         log::info("[native] portal stream: " + std::to_string(info.size.width) + "x" +
                   std::to_string(info.size.height) + " " + formatName(info.format) + " at " +
                   std::to_string(info.max_framerate.denom > 0
                                      ? info.max_framerate.num / info.max_framerate.denom
                                      : 0) +
-                  " fps max");
+                  " fps max, " + modifierText);
 
         // Ask for the metadata we want alongside the pixels. The cursor one is
         // what keeps the pointer OUT of the picture — the handshake asked for
         // METADATA mode, and this is where the buffer gets somewhere to put it.
+        // Mutter 46 and later want room for a 384×384 cursor: a range that
+        // stops below it agrees on no cursor metadata at all, and the pointer
+        // never travels (bench §8s).
         uint8_t storage[1024];
         spa_pod_builder builder{};
         spa_pod_builder_init(&builder, storage, sizeof(storage));
-        const spa_pod* params[2];
-        params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+        const spa_pod* params[3];
+        uint32_t count = 0;
+        params[count++] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
             &builder, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
             SPA_POD_Id(SPA_META_Header), SPA_PARAM_META_size,
             SPA_POD_Int(static_cast<int>(sizeof(spa_meta_header)))));
-        params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+        params[count++] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
             &builder, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
             SPA_POD_Id(SPA_META_Cursor), SPA_PARAM_META_size,
-            SPA_POD_CHOICE_RANGE_Int(cursorMetaSize(64, 64), cursorMetaSize(1, 1),
-                                     cursorMetaSize(256, 256))));
-        pw_stream_update_params(self->stream, params, 2);
+            SPA_POD_CHOICE_RANGE_Int(cursorMetaSize(384, 384), cursorMetaSize(1, 1),
+                                     cursorMetaSize(512, 512))));
+        // DMA-BUF asked for by name once a modifier is agreed. Shared memory
+        // keeps what it always had — no buffer parameter, the compositor's
+        // own — except on a stream that moves between the two
+        // (setDmabufWhilePointerHidden): PipeWire replaces only the kinds of
+        // parameter it is handed again, and the DMA-BUF one left from before
+        // fails the shared memory's allocation ("error alloc buffers: Invalid
+        // argument", UM790Pro, GNOME 46, 09/10/2026). It is named there too.
+        const bool switches = self->embedCursor && !self->offer.renderNode.empty();
+        if (modifier || switches)
+            params[count++] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_dataType,
+                SPA_POD_Int(modifier ? 1 << SPA_DATA_DmaBuf
+                                     : (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr))));
+        pw_stream_update_params(self->stream, params, count);
     }
 
-    /// Read the cursor metadata a buffer carries, if any.
-    void readCursor(pw_buffer* b)
+    /// Read the cursor metadata a buffer carries, if any. True when the pointer
+    /// moved, appeared, went or changed shape.
+    bool readCursor(pw_buffer* b)
     {
         auto* meta = static_cast<spa_meta_cursor*>(
             spa_buffer_find_meta_data(b->buffer, SPA_META_Cursor, sizeof(spa_meta_cursor)));
-        if (!meta) return;
+        if (!meta) return false;
         const bool visible = spa_meta_cursor_is_valid(meta);
         if (!visible) {
-            if (cursor.visible) {
-                cursor.visible = false;
-                cursorFresh = true;
-            }
-            return;
+            if (!cursor.visible) return false;
+            cursor.visible = false;
+            cursorFresh = true;
+            return true;
         }
+        const bool moved =
+            !cursor.visible || cursor.x != meta->position.x || cursor.y != meta->position.y;
         cursor.visible = true;
         cursor.x = meta->position.x;
         cursor.y = meta->position.y;
+        if (moved) cursorFresh = true;
 
         // The shape only travels when it changes; a zero id means "same as
         // before", which is the common case for thousands of frames.
-        if (meta->bitmap_offset == 0) return;
+        if (meta->bitmap_offset == 0) return moved;
         auto* bitmap = SPA_PTROFF(meta, meta->bitmap_offset, spa_meta_bitmap);
-        if (!bitmap || bitmap->size.width == 0 || bitmap->size.height == 0) return;
+        if (!bitmap || bitmap->size.width == 0 || bitmap->size.height == 0) return moved;
         const auto* pixels = SPA_PTROFF(bitmap, bitmap->offset, uint8_t);
         const int w = static_cast<int>(bitmap->size.width);
         const int h = static_cast<int>(bitmap->size.height);
@@ -221,6 +316,7 @@ struct PortalCapture::Impl
         cursor.inkHeight = inkH;
         ++cursor.shapeVersion;
         cursorFresh = true;
+        return true;
     }
 
     /// PipeWire takes a buffer back — a renegotiation, which GNOME 42 does at
@@ -244,20 +340,30 @@ struct PortalCapture::Impl
         if (!b) return;
 
         std::unique_lock<std::mutex> lock(self->mutex);
+        spa_buffer* buf = b->buffer;
+        if (buf->n_datas < 1 || buf->datas[0].chunk == nullptr || buf->datas[0].chunk->size == 0) {
+            // An empty buffer is how PipeWire says "nothing new" — and how
+            // Mutter sends a pointer that moved over a still screen: its
+            // metadata on a buffer with no pixels (bench §8s.4). Not a frame:
+            // the one held for the consumer stays held, it may be reading it
+            // right now, and this one goes straight back, which is what keeps
+            // the stream fed. The pointer it carries is read first.
+            const bool pointer = self->readCursor(b);
+            pw_stream_queue_buffer(self->stream, b);
+            if (pointer) {
+                lock.unlock();
+                self->ready.notify_all();
+            }
+            return;
+        }
+
         // One frame held at a time: if the consumer has not taken the last one,
         // this newer one replaces it. Never a queue — the whole engine's rule.
         if (self->held) {
             pw_stream_queue_buffer(self->stream, self->held);
             self->held = nullptr;
         }
-
-        spa_buffer* buf = b->buffer;
-        if (buf->n_datas < 1 || buf->datas[0].chunk == nullptr || buf->datas[0].chunk->size == 0) {
-            // An empty buffer is how PipeWire says "nothing new" — it is not a
-            // frame, and queuing it straight back is what keeps the stream fed.
-            pw_stream_queue_buffer(self->stream, b);
-            return;
-        }
+        self->folded = self->frameFresh ? self->folded + 1 : 1;
 
         self->readCursor(b);
 
@@ -276,6 +382,7 @@ struct PortalCapture::Impl
             f.pitches[i] = static_cast<uint32_t>(buf->datas[i].chunk->stride);
         }
         self->isDmabuf = buf->datas[0].type == SPA_DATA_DmaBuf;
+        self->sawBuffer = true;
         if (!self->isDmabuf && buf->datas[0].data) {
             f.mapped =
                 static_cast<const uint8_t*>(buf->datas[0].data) + buf->datas[0].chunk->offset;
@@ -289,11 +396,91 @@ struct PortalCapture::Impl
             spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(spa_meta_header)));
         f.presentUs = header && header->pts > 0 ? header->pts / 1000 : self->nowUs();
         f.capturedUs = self->nowUs();
+        f.presentRawUs = header && header->pts > 0 ? header->pts / 1000 : 0;
+        f.sequence = header ? static_cast<int64_t>(header->seq) : -1;
 
         self->held = b;
         self->frameFresh = true;
         lock.unlock();
         self->ready.notify_all();
+    }
+
+    /// What we accept, into @p params. DMA-BUF first when @p dmabuf, one
+    /// format per entry of the offer with its modifiers marked "do not
+    /// fixate": the compositor picks the one it can allocate with (PipeWire's
+    /// DMA-BUF negotiation). Then shared memory, no modifier named — what a
+    /// compositor that takes none of them settles on, and all this route asked
+    /// for until 29/09/2026: it exists for the machines that may have no GPU
+    /// path at all. The compositor picks; param_changed says what it picked.
+    void buildFormats(spa_pod_builder& builder, std::vector<const spa_pod*>& params, bool dmabuf)
+    {
+        // The size and the rate every entry carries. A virtual monitor's
+        // refresh is the maxFramerate the format settles on (GNOME 42, 46 and
+        // 48 alike): left free, Mutter's own default wins and makes it 60 Hz,
+        // and a 60 Hz monitor streamed at 60 fps at most loses about 40 % of
+        // its frames to Mutter's rate limit (bench §8s). So the virtual
+        // monitor's entries come first with maxFramerate pinned to its rate —
+        // 240 Hz, the Windows model — then again without, for a compositor
+        // that cannot go that high. Pinned to the stream's own rate, the same
+        // limit costs a 60 fps stream 12 % of its frames, a 120 fps one 8 %
+        // (design click-waits §10.1).
+        const spa_fraction pinnedMax = rateMax;
+        auto addSizeAndRate = [&](bool pinMax) {
+            spa_pod_builder_add(&builder, SPA_FORMAT_VIDEO_size,
+                                SPA_POD_CHOICE_RANGE_Rectangle(&sizeDefault, &sizeMin, &sizeMax),
+                                SPA_FORMAT_VIDEO_framerate,
+                                SPA_POD_CHOICE_RANGE_Fraction(&rateDefault, &rateMin, &rateMax), 0);
+            if (pinMax)
+                spa_pod_builder_add(&builder, SPA_FORMAT_VIDEO_maxFramerate,
+                                    SPA_POD_Fraction(&pinnedMax), 0);
+        };
+        auto addFormats = [&](bool pinMax) {
+            if (dmabuf) {
+                static const uint32_t kFormats[] = {SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBx,
+                                                    SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA};
+                for (uint32_t spaFormat : kFormats) {
+                    const std::vector<uint64_t>* modifiers = nullptr;
+                    for (const auto& entry : offer.modifiers)
+                        if (entry.first == drmFourcc(spaFormat) && !entry.second.empty())
+                            modifiers = &entry.second;
+                    if (!modifiers) continue;
+                    spa_pod_frame object{};
+                    spa_pod_frame choice{};
+                    spa_pod_builder_push_object(&builder, &object, SPA_TYPE_OBJECT_Format,
+                                                SPA_PARAM_EnumFormat);
+                    spa_pod_builder_add(&builder, SPA_FORMAT_mediaType,
+                                        SPA_POD_Id(SPA_MEDIA_TYPE_video), SPA_FORMAT_mediaSubtype,
+                                        SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), SPA_FORMAT_VIDEO_format,
+                                        SPA_POD_Id(spaFormat), 0);
+                    spa_pod_builder_prop(&builder, SPA_FORMAT_VIDEO_modifier,
+                                         SPA_POD_PROP_FLAG_MANDATORY |
+                                             SPA_POD_PROP_FLAG_DONT_FIXATE);
+                    spa_pod_builder_push_choice(&builder, &choice, SPA_CHOICE_Enum, 0);
+                    // An enum choice: its default first, then every value it allows.
+                    spa_pod_builder_long(&builder, static_cast<int64_t>(modifiers->front()));
+                    for (uint64_t modifier : *modifiers)
+                        spa_pod_builder_long(&builder, static_cast<int64_t>(modifier));
+                    spa_pod_builder_pop(&builder, &choice);
+                    addSizeAndRate(pinMax);
+                    params.push_back(
+                        static_cast<const spa_pod*>(spa_pod_builder_pop(&builder, &object)));
+                }
+            }
+            spa_pod_frame object{};
+            spa_pod_builder_push_object(&builder, &object, SPA_TYPE_OBJECT_Format,
+                                        SPA_PARAM_EnumFormat);
+            spa_pod_builder_add(
+                &builder, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), SPA_FORMAT_VIDEO_format,
+                SPA_POD_CHOICE_ENUM_Id(5, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx,
+                                       SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_BGRA,
+                                       SPA_VIDEO_FORMAT_RGBA),
+                0);
+            addSizeAndRate(pinMax);
+            params.push_back(static_cast<const spa_pod*>(spa_pod_builder_pop(&builder, &object)));
+        };
+        if (virtualMonitorFormats) addFormats(true);
+        addFormats(false);
     }
 };
 
@@ -311,11 +498,92 @@ void PortalCapture::setRestoreToken(std::string token)
     d->restore = std::move(token);
 }
 
+void PortalCapture::setVirtualMonitor(int width, int height, int fps)
+{
+    d->virtualWidth = width;
+    d->virtualHeight = height;
+    d->virtualFps = fps > 0 ? fps : 60;
+}
+
+void PortalCapture::setKwinVirtualOutput(std::string name)
+{
+    d->kwinName = std::move(name);
+}
+
+void PortalCapture::setMutter(std::string connector, bool realMonitor)
+{
+    d->mutter = true;
+    d->mutterConnector = std::move(connector);
+    d->mutterRealMonitor = realMonitor;
+}
+
+void PortalCapture::setGamescope(uint32_t node, std::string xDisplay, int pid)
+{
+    d->gamescopeNode = node;
+    d->gamescopeDisplay = std::move(xDisplay);
+    d->gamescopePid = pid;
+}
+
+void PortalCapture::offerDmabuf(DmabufOffer offer)
+{
+    d->offer = std::move(offer);
+}
+
+void PortalCapture::setRenderNode(std::string renderNode)
+{
+    d->renderNode = std::move(renderNode);
+}
+
 bool PortalCapture::start(std::string& error)
 {
+    // Before the handshake: without the library the stream the portal grants
+    // could not be read, and the user would have answered its dialog for nothing.
+    if (!audio::pipeWireAvailable()) {
+        error = audio::kPipeWireMissing;
+        return false;
+    }
     ensurePipeWire();
 
-    if (!d->portal.start(d->restore, 0, d->granted, error)) return false;
+    // A monitor recorded as it is has a size of its own: nothing is pinned.
+    // Nor is gamescope's, made at the stream's size already.
+    const bool virtualMonitor = d->virtualWidth > 0 && d->virtualHeight > 0 &&
+                                d->mutterConnector.empty() && d->gamescopeNode == 0;
+    if (d->gamescopeNode != 0) {
+        // Nobody to ask: the node is gamescope's, on the session's PipeWire.
+        d->granted = PortalStream{};
+        d->granted.nodeId = d->gamescopeNode;
+        d->granted.sessionPipeWire = true;
+        std::string why;
+        const bool cursor = d->gamescopeCursor.start(
+            d->gamescopeDisplay,
+            [this](const CursorState& state) {
+                {
+                    std::lock_guard<std::mutex> lock(d->mutex);
+                    d->cursor = state;
+                    d->cursorFresh = true;
+                }
+                d->ready.notify_all();
+            },
+            why);
+        if (!cursor) log::warning("[native] gamescope: no pointer to draw for the viewer — " + why);
+    } else {
+        d->portal.setVirtual(virtualMonitor);
+        if (d->mutter)
+            d->portal.setMutter(d->mutterConnector, d->virtualWidth, d->virtualHeight,
+                                d->virtualFps);
+        else if (virtualMonitor && !d->kwinName.empty())
+            d->portal.setKwinVirtualOutput(d->kwinName, d->virtualWidth, d->virtualHeight);
+        // GNOME's virtual monitors — made by Mutter or its portal, or another
+        // stream's recorded as it is — paint the pointer into their DMA-BUF
+        // frames up to GNOME 47: it is asked painted into every one, or it
+        // blinks. The version is the shell's to say.
+        const bool gnomeVirtual = (virtualMonitor && d->kwinName.empty()) ||
+                                  (!d->mutterConnector.empty() && !d->mutterRealMonitor);
+        d->embedCursor =
+            gnomeVirtual && MutterScreenCast::embedsPointer(MutterScreenCast::shellMajor());
+        d->portal.setEmbedCursor(d->embedCursor);
+        if (!d->portal.start(d->restore, 0, d->granted, error)) return false;
+    }
     if (!d->granted.valid()) {
         error = "the portal granted nothing usable";
         return false;
@@ -338,8 +606,12 @@ bool PortalCapture::start(std::string& error)
 
     pw_thread_loop_lock(d->loop);
     // The fd the portal handed us: PipeWire takes ownership of it here, which
-    // is why start() must not close it afterwards.
-    d->core = pw_context_connect_fd(d->context, d->granted.pipewireFd, nullptr, 0);
+    // is why start() must not close it afterwards. KWin's output and Mutter's
+    // own screen casts stream on the session's own PipeWire, reached the
+    // ordinary way.
+    d->core = d->granted.pipewireFd >= 0
+                  ? pw_context_connect_fd(d->context, d->granted.pipewireFd, nullptr, 0)
+                  : pw_context_connect(d->context, nullptr, 0);
     d->granted.pipewireFd = -1;
     if (!d->core) {
         pw_thread_loop_unlock(d->loop);
@@ -364,34 +636,43 @@ bool PortalCapture::start(std::string& error)
     }
     pw_stream_add_listener(d->stream, &d->listener, &d->events, d.get());
 
-    // What we accept. No modifiers are named: asking for a specific tiling is
-    // how a negotiation fails on a compositor that would happily have given
-    // shared memory, and this route exists for the machines that have no GPU
-    // path anyway. The compositor picks; param_changed says what it picked.
-    uint8_t storage[2048];
+    if (virtualMonitor) {
+        // A virtual monitor has no size of its own: the compositor makes it
+        // the size this format settles on. One size, then — the client's —
+        // and its cadence as the most it will be asked for.
+        const auto w = static_cast<uint32_t>(d->virtualWidth);
+        const auto h = static_cast<uint32_t>(d->virtualHeight);
+        const auto fps = static_cast<uint32_t>(d->virtualFps);
+        d->sizeDefault = d->sizeMin = d->sizeMax = SPA_RECTANGLE(w, h);
+        d->rateDefault = d->rateMax = SPA_FRACTION(fps, 1);
+    }
+    d->virtualMonitorFormats = virtualMonitor;
+    // Except a GNOME virtual monitor before GNOME 48 (embedCursor): into its
+    // DMA-BUF frames Mutter blits the pointer over a recycled buffer, without
+    // repainting what it held, so over a still desktop every place the
+    // pointer went stays painted in — trails, and a stale second pointer
+    // beside the live one (UM790Pro, GNOME 46, Bruno's test). Its shared-
+    // memory frames are painted whole each time, pointer included, and show
+    // neither (probe: 0 trails over 90 moves; a pointer in every picture).
+    // The price is a copy through system memory, on that route, while the
+    // pointer may show (setDmabufWhilePointerHidden).
+    d->offering = !d->offer.renderNode.empty() && (!d->embedCursor || d->offer.evenWithTrails);
+    if (!d->offer.renderNode.empty() && !d->offering)
+        log::info("[native] GNOME's virtual monitor before GNOME 48: shared memory while the "
+                  "pointer shows — its DMA-BUF frames keep trails of it");
+    if (d->embedCursor && d->offer.evenWithTrails && d->offering)
+        log::info("[native] GNOME's virtual monitor before GNOME 48: DMA-BUF all the same, "
+                  "trails of the pointer and all (bench: portaldmabuf=1)");
+    std::vector<uint8_t> storage(16384);
     spa_pod_builder builder{};
-    spa_pod_builder_init(&builder, storage, sizeof(storage));
-    spa_rectangle sizeDefault = SPA_RECTANGLE(1920, 1080);
-    spa_rectangle sizeMin = SPA_RECTANGLE(1, 1);
-    spa_rectangle sizeMax = SPA_RECTANGLE(8192, 8192);
-    spa_fraction rateDefault = SPA_FRACTION(60, 1);
-    spa_fraction rateMin = SPA_FRACTION(0, 1);
-    spa_fraction rateMax = SPA_FRACTION(1000, 1);
-    const spa_pod* params[1];
-    params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-        &builder, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat, SPA_FORMAT_mediaType,
-        SPA_POD_Id(SPA_MEDIA_TYPE_video), SPA_FORMAT_mediaSubtype,
-        SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), SPA_FORMAT_VIDEO_format,
-        SPA_POD_CHOICE_ENUM_Id(5, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx,
-                               SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA),
-        SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&sizeDefault, &sizeMin, &sizeMax),
-        SPA_FORMAT_VIDEO_framerate,
-        SPA_POD_CHOICE_RANGE_Fraction(&rateDefault, &rateMin, &rateMax)));
+    spa_pod_builder_init(&builder, storage.data(), static_cast<uint32_t>(storage.size()));
+    std::vector<const spa_pod*> params;
+    d->buildFormats(builder, params, d->offering);
 
     const int res = pw_stream_connect(
         d->stream, PW_DIRECTION_INPUT, d->granted.nodeId,
         static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
-        params, 1);
+        params.data(), static_cast<uint32_t>(params.size()));
     pw_thread_loop_unlock(d->loop);
     if (res < 0) {
         error = std::string("cannot connect to the portal's node: ") + spa_strerror(res);
@@ -411,6 +692,11 @@ bool PortalCapture::start(std::string& error)
         error = "the portal's stream never negotiated a format";
         return false;
     }
+    // The first buffer says what really comes: the session picks its pair on
+    // dmabuf(), and a pair built for DMA-BUF cannot read shared memory. A
+    // still screen sends one too — the compositor paints the stream's first
+    // picture when it starts. Without one in time, the format's word stands.
+    d->ready.wait_for(lock, std::chrono::seconds(1), [this] { return d->sawBuffer || d->failed; });
     return true;
 }
 
@@ -419,15 +705,54 @@ std::string PortalCapture::restoreToken() const
     return d->granted.restoreToken;
 }
 
+bool PortalCapture::mutterRefused() const
+{
+    return d->portal.routeRefused();
+}
+
 AcquireStatus PortalCapture::acquire(int timeoutMs, KmsFrame& frame)
 {
-    std::unique_lock<std::mutex> lock(d->mutex);
-    if (d->failed) return AcquireStatus::Lost;
-    if (!d->frameFresh) {
-        d->ready.wait_for(lock, std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : 1),
-                          [this] { return d->frameFresh || d->failed; });
+    // Mutter ends a screen cast of its own accord — the monitor it records
+    // went with the stream that made it, the desktop was locked — and the
+    // PipeWire stream need not say so: asked a few times a second.
+    if (d->mutter && d->nowUs() >= d->nextEndCheckUs) {
+        d->nextEndCheckUs = d->nowUs() + 250 * 1000;
+        if (d->portal.ended()) {
+            std::lock_guard<std::mutex> lock(d->mutex);
+            if (!d->failed) {
+                d->failed = true;
+                d->failure = "GNOME ended the screen cast";
+                log::info("[native] GNOME ended the screen cast — the monitor it showed went, or "
+                          "the desktop was locked");
+            }
+        }
     }
-    if (d->failed) return AcquireStatus::Lost;
+    // gamescope's stream only pauses when gamescope goes — its app quit — so
+    // gamescope itself is asked, as often.
+    if (d->gamescopePid > 0 && d->nowUs() >= d->nextEndCheckUs) {
+        d->nextEndCheckUs = d->nowUs() + 250 * 1000;
+        if (::kill(d->gamescopePid, 0) != 0 && errno == ESRCH) {
+            std::lock_guard<std::mutex> lock(d->mutex);
+            if (!d->failed) {
+                d->failed = true;
+                d->failure = "gamescope went";
+                log::info("[native] gamescope went — its app quit, or it was stopped");
+            }
+        }
+    }
+    std::unique_lock<std::mutex> lock(d->mutex);
+    if (d->failed) {
+        log::info("[native] portal stream lost: " + d->failure);
+        return AcquireStatus::Lost;
+    }
+    if (!d->frameFresh && !d->cursorFresh) {
+        d->ready.wait_for(lock, std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : 1),
+                          [this] { return d->frameFresh || d->cursorFresh || d->failed; });
+    }
+    if (d->failed) {
+        log::info("[native] portal stream lost: " + d->failure);
+        return AcquireStatus::Lost;
+    }
     if (!d->frameFresh) {
         // Nothing new. A pointer that moved is still a visible change, on the
         // same reasoning as the KMS path.
@@ -440,6 +765,8 @@ AcquireStatus PortalCapture::acquire(int timeoutMs, KmsFrame& frame)
     d->frameFresh = false;
     d->cursorFresh = false;
     frame = d->frame;
+    frame.accumulated = d->folded;
+    d->folded = 0;
     return AcquireStatus::Ok;
 }
 
@@ -453,6 +780,8 @@ void PortalCapture::release()
 
 void PortalCapture::stop()
 {
+    // Its callback takes the mutex the stream's does: stopped first.
+    d->gamescopeCursor.stop();
     if (d->loop) {
         pw_thread_loop_lock(d->loop);
         if (d->held && d->stream) {
@@ -484,6 +813,8 @@ void PortalCapture::stop()
     }
     d->portal.stop();
     d->haveFormat = false;
+    d->sawBuffer = false;
+    d->formatsBeforePicture = 0;
 }
 
 int PortalCapture::width() const
@@ -513,9 +844,48 @@ bool PortalCapture::dmabuf() const
     return d->isDmabuf;
 }
 
+bool PortalCapture::switchesDmabufWithPointer() const
+{
+    return d->embedCursor && !d->offer.renderNode.empty() && !d->offer.evenWithTrails &&
+           d->stream != nullptr;
+}
+
+bool PortalCapture::setDmabufWhilePointerHidden(bool hidden)
+{
+    if (!switchesDmabufWithPointer() || hidden == d->offering) return false;
+    // The formats offered again on the live stream: the compositor
+    // renegotiates in place — the node, the grant and the monitor stay — and
+    // the buffers of the new kind follow (dmabuf() says so from the first).
+    std::vector<uint8_t> storage(16384);
+    spa_pod_builder builder{};
+    spa_pod_builder_init(&builder, storage.data(), static_cast<uint32_t>(storage.size()));
+    std::vector<const spa_pod*> params;
+    pw_thread_loop_lock(d->loop);
+    d->buildFormats(builder, params, hidden);
+    const int res =
+        pw_stream_update_params(d->stream, params.data(), static_cast<uint32_t>(params.size()));
+    pw_thread_loop_unlock(d->loop);
+    if (res < 0) {
+        log::warning(std::string("[native] the portal's formats could not be offered again: ") +
+                     spa_strerror(res));
+        return false;
+    }
+    d->offering = hidden;
+    log::info(hidden ? "[native] the pointer is hidden — the portal is offered DMA-BUF again"
+                     : "[native] the pointer may show — the portal is asked for shared memory");
+    return true;
+}
+
+bool PortalCapture::renegotiatingWithoutPicture() const
+{
+    std::lock_guard<std::mutex> lock(d->mutex);
+    return !d->sawBuffer && d->formatsBeforePicture >= 3;
+}
+
 std::string PortalCapture::renderNodePath() const
 {
-    return {};
+    if (!d->renderNode.empty()) return d->renderNode;
+    return d->isDmabuf ? d->offer.renderNode : std::string();
 }
 
 DesktopRect PortalCapture::desktopRect() const
@@ -545,6 +915,11 @@ DesktopRect PortalCapture::desktopRect() const
 const CursorState& PortalCapture::cursor() const
 {
     return d->cursor;
+}
+
+bool PortalCapture::cursorInPicture() const
+{
+    return d->embedCursor;
 }
 
 } // namespace mw::native::capture

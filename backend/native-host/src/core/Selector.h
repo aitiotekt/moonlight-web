@@ -144,6 +144,19 @@ FrameSize frameForDisplay(FrameSize display, FrameSize frame, FramePolicy policy
 /// two; anything else, or a frame with no size, comes back unchanged.
 FrameSize alignedToBlocks(FrameSize frame, int block);
 
+/// The same for an encoder whose blocks are not square: the largest frame
+/// whose width is a whole number of @p blockWidth and height of
+/// @p blockHeight, inside @p frame, closest to its shape — exactly it where
+/// the grid allows. The 780M's AV1 encoder codes 64×16 (C13.12): 1920x1080
+/// becomes 1792x1008, the same 16:9; 1280x720, 2560x1440 and 3840x2160 are
+/// whole already. An encoder told a size off its grid codes a larger frame
+/// and says the picture's in AV1's render size — which Chrome ignores: it
+/// shows the whole frame, padding and all (05/10/2026).
+///
+/// Never less than one block on a side; a block below 1, or a frame with no
+/// size, comes back unchanged.
+FrameSize alignedToGrid(FrameSize frame, int blockWidth, int blockHeight);
+
 /// The FramePolicy a session's config asks for.
 inline FramePolicy policyOf(const SessionConfig& config)
 {
@@ -156,5 +169,22 @@ inline FramePolicy policyOf(const SessionConfig& config)
 /// reshapes `width` × `height` against its display (frameForDisplay), as the
 /// Selector would have.
 bool fallBackFromMatch(SessionConfig& config);
+
+/// The size a display the stream makes for itself may be made at: the bounds
+/// the server pins a virtual display's mode to (VirtualDisplay::normaliseMode),
+/// even on both sides.
+constexpr int kMadeDisplayMin = 480;
+constexpr int kMadeDisplayMax = 4096;
+
+/// "Match my screen" on the portal's virtual monitor (Linux). That display has
+/// no mode to change and no size of its own — the stream makes it
+/// (PortalCapture::setVirtualMonitor) — so the request is honoured by making
+/// it at the client's size: the display @p config names takes that size,
+/// pinned to [kMadeDisplayMin, kMadeDisplayMax] and made even, and the config
+/// stops asking for a mode change. select() then shapes nothing and the frame
+/// is the client's screen to the pixel. Returns false, changing nothing, for
+/// any other display or a config that did not ask — the caller falls back
+/// from the match as before.
+bool sizeVirtualMonitorToClient(Capabilities& caps, SessionConfig& config);
 
 } // namespace mw::native

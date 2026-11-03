@@ -592,6 +592,58 @@ void run_capture_tests()
         }
     }
 
+    // ── The desktop handed over again (retake) ──────────────────────────
+    //
+    // What the pointer drawn into the picture leans on when no copy of the
+    // desktop is held (WindowsSession::retakeDesktop): the duplication let go
+    // and asked for again on the same device, the size and format unchanged,
+    // and its first frame flagged — at once, whether the screen moves or not,
+    // which is the whole point. How soon is said, for each GPU this runs on.
+    {
+        ID3D11Device* device = duplication.device();
+        const int width = duplication.width();
+        const int height = duplication.height();
+        const DXGI_FORMAT format = duplication.format();
+        std::string why;
+        const auto asked = std::chrono::steady_clock::now();
+        const bool retaken = duplication.retake(why);
+        const auto opened = std::chrono::steady_clock::now();
+        CHECK(retaken);
+        if (!retaken) std::fprintf(stderr, "  retake refused: %s\n", why.c_str());
+        CHECK(duplication.device() == device);
+        CHECK_EQ(duplication.width(), width);
+        CHECK_EQ(duplication.height(), height);
+        CHECK_EQ(static_cast<int>(duplication.format()), static_cast<int>(format));
+
+        capture::CapturedFrame frame;
+        int acquires = 0;
+        bool got = false;
+        while (retaken && !got && acquires < 5) {
+            ++acquires;
+            got = duplication.acquire(100, frame) == capture::AcquireStatus::Ok;
+        }
+        const auto handed = std::chrono::steady_clock::now();
+        if (got) {
+            CHECK(frame.retaken);
+            CHECK(frame.texture != nullptr);
+            duplication.release();
+            std::fprintf(stderr,
+                         "  retake: opened again in %.1f ms, the desktop %.1f ms later, "
+                         "%d acquire(s)\n",
+                         std::chrono::duration<double, std::milli>(opened - asked).count(),
+                         std::chrono::duration<double, std::milli>(handed - opened).count(),
+                         acquires);
+            // The next one is a present again, if the screen gives one.
+            capture::CapturedFrame next;
+            if (duplication.acquire(50, next) == capture::AcquireStatus::Ok) {
+                CHECK(!next.retaken);
+                duplication.release();
+            }
+        } else if (retaken) {
+            std::fprintf(stderr, "  retake: NO desktop within %d acquires of 100 ms\n", acquires);
+        }
+    }
+
     duplication.stop();
 
     // ── The same walk again, in HDR ─────────────────────────────
@@ -824,6 +876,38 @@ void run_capture_tests()
 
                 wgc.release();
             }
+
+            // The desktop handed over again, as on the duplication above: a
+            // new pool and session on the same device, the first frame flagged.
+            ID3D11Device* wgcDevice = wgc.device();
+            const auto asked = std::chrono::steady_clock::now();
+            const bool retaken = wgc.retake(wgcError);
+            const auto opened = std::chrono::steady_clock::now();
+            CHECK(retaken);
+            if (!retaken) std::fprintf(stderr, "  WGC retake refused: %s\n", wgcError.c_str());
+            CHECK(wgc.device() == wgcDevice);
+            capture::CapturedFrame again;
+            int acquires = 0;
+            bool got = false;
+            while (retaken && !got && acquires < 5) {
+                ++acquires;
+                got = wgc.acquire(100, again) == capture::AcquireStatus::Ok;
+            }
+            const auto handed = std::chrono::steady_clock::now();
+            if (got) {
+                CHECK(again.retaken);
+                wgc.release();
+                std::fprintf(stderr,
+                             "  WGC retake: opened again in %.1f ms, the desktop %.1f ms later, "
+                             "%d acquire(s)\n",
+                             std::chrono::duration<double, std::milli>(opened - asked).count(),
+                             std::chrono::duration<double, std::milli>(handed - opened).count(),
+                             acquires);
+            } else if (retaken) {
+                std::fprintf(stderr, "  WGC retake: NO desktop within %d acquires of 100 ms\n",
+                             acquires);
+            }
+
             wgc.stop();
             // Same teardown contract as above: idempotent, in any order.
             wgc.stop();

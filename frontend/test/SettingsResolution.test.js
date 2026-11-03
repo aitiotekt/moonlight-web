@@ -29,6 +29,7 @@ vi.mock('../js/i18n/i18n.js', () => ({
 }));
 
 import { SettingsView } from '../js/ui/SettingsView.js';
+import { computeAutoBitrate } from '../js/util/AutoBitrate.js';
 
 const STORAGE_KEY = 'mw-streaming-settings';
 
@@ -81,6 +82,18 @@ describe('SettingsView resolution', () => {
         expect(stored().stream_bitrate_auto).toBe(true);
         await pick('2160');
         expect(stored().stream_bitrate).toBe(view._estimateBitrate() * 1000);
+    });
+
+    // The pixel budget leaves a named rung its lines (issue #38): with the
+    // rate on Auto, 2160p at 60 is over the budget, and the estimate is
+    // still the one for the 2160 lines the stream carries.
+    it('recommends the bitrate of a named rung at its full size', async () => {
+        view.render();
+        view.bindEvents();
+        await pick('2160');
+        expect(view._estimateBitrate()).toBe(
+            computeAutoBitrate(2160, 60, '16:9', false, false, false),
+        );
     });
 
     it('hides the ratio from a user, and shows it to a debug build', () => {

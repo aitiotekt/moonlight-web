@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 namespace mw::native {
@@ -134,6 +135,25 @@ inline AlignedCadence alignCadence(int settingFps, int clientMilliHz, int displa
     out.intervalUs = out.intervalNs / 1000;
     out.fps = fps;
     return out;
+}
+
+/// The client's screen as a session keeps it for its loop: seeded from /start,
+/// then rewritten by each `clientrefresh` (NativeHost::setClientRefresh), and
+/// read by the loop when it re-chooses its cadence. Bounded rather than
+/// trusted, since it crosses the network from a page: nothing presents above
+/// 1000 Hz, and below 1 Hz is "unknown". Both values are always stored. A
+/// renderer that turns out to paint at the vsync says so with a rate the host
+/// may not have yet, and a `&&` between the two exchanges once dropped the
+/// vsync whenever the rate moved. Returns true when either one moved, for the
+/// loop to re-choose between two frames.
+inline bool storeClientRefresh(std::atomic<int>& milliHz, std::atomic<bool>& vsync, int newMilliHz,
+                               bool newVsync)
+{
+    if (newMilliHz < 1000) newMilliHz = 0;
+    if (newMilliHz > 1000000) newMilliHz = 1000000;
+    const bool rateMoved = milliHz.exchange(newMilliHz) != newMilliHz;
+    const bool vsyncMoved = vsync.exchange(newVsync) != newVsync;
+    return rateMoved || vsyncMoved;
 }
 
 } // namespace mw::native

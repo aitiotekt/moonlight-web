@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>MoonlightWeb — Your gaming PC, in any browser</title>
-<meta name="description" content="MoonlightWeb streams your PC games to any device with a browser — up to 4K HDR, 240 fps, under 20 ms Wi-Fi latency. Install once on the gaming PC, play from anywhere. Nothing to install on the client, just a URL.">
+<title>MoonlightWeb — Moonlight web client: your gaming PC in any browser</title>
+<meta name="description" content="MoonlightWeb is a Moonlight web client: stream your gaming PC to any device with a browser — up to 4K HDR, 240 fps, under 20 ms over Wi-Fi. Free, open source, nothing to install on the client.">
 <meta name="author" content="Bruno Martin">
 <meta name="robots" content="index, follow, max-image-preview:large">
 <meta name="theme-color" content="#05080d">
 <!-- Open Graph -->
 <meta property="og:site_name" content="MoonlightWeb">
-<meta property="og:title" content="MoonlightWeb — Your gaming PC, in any browser">
+<meta property="og:title" content="MoonlightWeb — Moonlight web client: your gaming PC in any browser">
 <meta property="og:description" content="A 100% web game-streaming client. Up to 4K HDR, 240 fps, <20 ms Wi-Fi latency. Nothing to install on the client, just a URL.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://moonlightweb.top/">
@@ -18,10 +18,17 @@
 <meta property="og:locale" content="en_US">
 <!-- Twitter -->
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="MoonlightWeb — Your gaming PC, in any browser">
+<meta name="twitter:title" content="MoonlightWeb — Moonlight web client: your gaming PC in any browser">
 <meta name="twitter:description" content="A 100% web game-streaming client. Nothing to install on the client, just a URL.">
 <meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
 <link rel="canonical" href="https://moonlightweb.top/">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/">
+<!-- /i18n:alternates -->
 <!-- Favicon shown in Google Search: a square icon that is a multiple of 48px
      (Google's requirement). favicon.ico now carries a 48px layer, and icon-48
      is the exact recommended size. -->
@@ -56,27 +63,30 @@
   "name": "MoonlightWeb",
   "url": "https://moonlightweb.top/",
   "image": "https://moonlightweb.top/assets/desktop.jpg",
-  "description": "A 100% web game-streaming client. Stream your PC games to any device with a browser — up to 4K HDR, 240 fps, under 20 ms Wi-Fi latency. Nothing to install on the client, just a URL.",
+  "description": "A 100% web game-streaming client. Installed on the gaming PC, it captures and encodes that PC itself, with no Sunshine or other streaming server to set up. Stream your PC games to any device with a browser — up to 4K HDR, 240 fps, under 20 ms Wi-Fi latency. Nothing to install on the client, just a URL.",
   "applicationCategory": "GameApplication",
   "operatingSystem": "Windows, macOS, Linux",
-  "softwareRequirements": "MoonlightWeb installed on the gaming PC; any modern browser as client (Chrome, Edge, Safari, Firefox)",
+  "softwareRequirements": "MoonlightWeb installed on the gaming PC (it captures and encodes that PC itself; no Sunshine needed); any modern browser as client (Chrome, Edge, Safari, Firefox)",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
   "license": "https://www.gnu.org/licenses/gpl-3.0.html",
   "downloadUrl": "https://github.com/linckosz/moonlight-web/releases",
   "author": { "@type": "Person", "name": "Bruno Martin" },
   "featureList": [
     "Game streaming in the browser, no client install",
+    "Its own capture and hardware encode engine (NVENC, AMF, Quick Sync, VA-API, VideoToolbox) on Windows, Linux and macOS: no Sunshine needed",
     "Up to 4K HDR at up to 240 fps (H264, HEVC, AV1)",
     "Under 20 ms latency over Wi-Fi (WebRTC UDP)",
-    "GPU Video Enhancement: SGSRv1 and FSR1 upscaling in WebGPU",
+    "GPU Video Enhancement: MoonlightWeb's own upscaler, in WebGL2 or WebGPU",
     "Keyboard, mouse, touch trackpad, Xbox and PlayStation gamepads with rumble",
+    "Racing wheels with force feedback, flight sticks and RC radios (EdgeTX, OpenTX), sent to the game as themselves",
+    "Also pairs with Sunshine, Apollo, Wolf and MultiSeat hosts",
     "mDNS auto-discovery of gaming PCs, PIN pairing",
     "Direct peer-to-peer WebRTC streams; opt-in Internet access",
     "Session sharing: invite up to 3 players into one running game, local co-op from anywhere"
   ]
 }
 </script>
-<!-- Shared header/footer chrome (markup injected by assets/chrome.js) -->
+<!-- Shared header/footer styling -->
 <link rel="stylesheet" href="assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
 <style>
   :root{
@@ -408,6 +418,9 @@
   .dl-card .cmd.ok .ico-ok{display:block}
   .dl-card .cmd-note{margin:.55rem 0 0; font-size:.74rem}
   .dl-card .cmd-note a{color:var(--muted)}
+  .dl-card .dl-guide{margin:.9rem 0 0; font-size:.82rem}
+  .dl-card .dl-guide a{color:var(--cyan); text-decoration:none}
+  .dl-card .dl-guide a:hover{text-decoration:underline}
   .dl-card .cmd-note a:hover{color:var(--cyan)}
   @media(hover:hover){
     .dl-card:hover{border-color:var(--line-glow); transform:translateY(-3px)}
@@ -496,8 +509,8 @@
 </head>
 <body>
 
-<!-- Header markup injected by assets/chrome.js (shared across every page) -->
-<header id="site-header"></header>
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/" data-nav="home" aria-current="page">Home</a><a href="/guides/" data-nav="guides">Guides</a><a href="/faq.html" data-nav="faq">FAQ</a><a href="/contact.html" data-nav="contact">Contact</a><a href="/server-access/" data-nav="connect">Connect</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/" selected>English</option><option value="fr" data-href="/fr/">Français</option><option value="de" data-href="/de/">Deutsch</option><option value="zh" data-href="/zh/" lang="zh">中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
 
 <div id="scroll">
 <main>
@@ -511,7 +524,7 @@
       <strong>Free and open source. Nothing to install on the client. Just a URL.</strong></p>
     <div class="cta cta-hero">
       <a class="btn btn-primary" href="#download" data-i18n="hero.cta1" data-umami-event="download-cta" data-umami-event-loc="hero">Download free</a>
-      <a class="btn btn-yellow" href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-i18n="hero.cta2" data-umami-event="buy-me-a-coffee" data-umami-event-loc="hero">☕ Buy me a coffee</a>
+      <a class="btn btn-yellow" href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="hero"><span data-bmc-full-logo></span><span class="sr-only" data-i18n="hero.cta2">Buy me a coffee</span></a>
     </div>
 
     <div class="flow reveal" aria-label="Your gaming PC streams over the Internet to any browser">
@@ -558,8 +571,8 @@
     <div class="grid">
       <div class="card cyb reveal"><div class="ico">⚡</div><h3 data-i18n="card1.h3">Console‑grade latency</h3><p data-i18n="card1.p">WebRTC UDP transport with adaptive congestion control — under 20 ms over Wi‑Fi. Play twitch shooters, not slideshow demos.</p></div>
       <div class="card cyb reveal"><div class="ico">🎬</div><h3 data-i18n="card2.h3">Up to 4K HDR, 240 fps</h3><p data-i18n="card2.p">H264, HEVC and AV1, hardware‑decoded via WebCodecs. Real HDR on HDR displays.</p></div>
-      <div class="card cyb reveal"><div class="ico">🪄</div><h3 data-i18n="card3.h3">Video Enhancement</h3><p data-i18n-html="card3.p">GPU upscaling &amp; sharpening (SGSRv1 + FSR1) in WebGPU. Stream 720p, see near‑1440p.</p></div>
-      <div class="card cyb reveal"><div class="ico">🔊</div><h3 data-i18n="card4.h3">Surround Opus audio</h3><p data-i18n="card4.p">Decoded in‑browser with an adaptive jitter buffer. Stays in sync even on flaky Wi‑Fi.</p></div>
+      <div class="card cyb reveal"><div class="ico">🪄</div><h3 data-i18n="card3.h3">Video Enhancement</h3><p data-i18n-html="card3.p">GPU upscaling &amp; sharpening (MoonlightWeb's own upscaler) in WebGL2 or WebGPU. Stream 720p, see near‑1440p.</p></div>
+      <div class="card cyb reveal"><div class="ico">🔊</div><h3 data-i18n="card4.h3">Stereo Opus audio</h3><p data-i18n="card4.p">Decoded in‑browser with an adaptive jitter buffer. Stays in sync even on flaky Wi‑Fi.</p></div>
       <div class="card cyb reveal">
         <svg class="pad-art" viewBox="0 0 260 150" role="img" aria-label="Xbox controller">
           <path d="M65 25 C85 15 175 15 195 25 C220 33 236 62 240 92 C243 117 231 132 216 129 C200 126 194 106 184 97 C174 88 86 88 76 97 C66 106 60 126 44 129 C29 132 17 117 20 92 C24 62 40 33 65 25 Z"
@@ -585,11 +598,11 @@
           <circle cx="152" cy="84" r="14" fill="#0f1a28" stroke="#19d3ff" stroke-width="1.6" stroke-opacity=".7"/>
           <circle cx="152" cy="84" r="8.4" fill="#101c2b" stroke="#19d3ff" stroke-width="1.4"/>
         </svg>
-        <h3 data-i18n="card5.h3">Full input, full rumble</h3><p data-i18n="card5.p">Keyboard, pointer‑lock mouse, touch trackpad, virtual keyboard — and Xbox &amp; PlayStation controllers with rumble.</p>
+        <h3 data-i18n="card5.h3">Full input, full rumble</h3><p data-i18n-html="card5.p">Keyboard, pointer‑lock mouse, touch trackpad, virtual keyboard, Xbox &amp; PlayStation controllers with rumble — and <a href="/controllers.html">racing wheels, flight sticks and RC radios</a>.</p>
       </div>
       <div class="card cyb reveal"><div class="ico">🔎</div><h3 data-i18n="card6.h3">Zero‑config discovery</h3><p data-i18n="card6.p">Your gaming PCs appear automatically via mDNS. PIN pairing, multi‑host, persistent sessions.</p></div>
       <div class="card cyb reveal"><div class="ico">🌍</div><h3 data-i18n="card7.h3">Peer‑to‑peer by design</h3><p data-i18n="card7.p">Streams go straight from your PC to your browser — no cloud in the middle. A remote entry link reaches your PC from anywhere without exposing a single web port.</p></div>
-      <div class="card cyb reveal"><div class="ico">🛟</div><h3 data-i18n="card8.h3">Never drops you</h3><p data-i18n="card8.p">Transport auto‑fallback (UDP → TCP) rides through hostile networks and strict firewalls.</p></div>
+      <div class="card cyb reveal"><div class="ico">🛟</div><h3 data-i18n="card8.h3">Never drops you</h3><p data-i18n="card8.p">Transport auto‑fallback (UDP → TCP) rides through hostile networks, still direct, never through a relay.</p></div>
       <div class="card cyb reveal"><div class="ico">👥</div><h3 data-i18n="card9.h3">Up to 4‑player co‑op</h3><p data-i18n="card9.p">Invite up to three friends into the game already running on your PC — four players in one session. One save, one screen each: they play from their own device, with their own gamepad, as if they were sitting next to you.</p></div>
     </div>
   </div>
@@ -628,7 +641,7 @@
       <div class="txt reveal">
         <span class="kicker" data-i18n="s2.kicker">02 · Go mobile</span>
         <h3 data-i18n-html="s2.h3">A gaming handheld,<br>hiding in your pocket.</h3>
-        <p data-i18n="s2.p">Your phone becomes a full client: multi‑touch trackpad, native virtual keyboard with modifier keys, gamepad support — up to 240 fps with &lt;20 ms Wi‑Fi latency.</p>
+        <p data-i18n="s2.p">Your phone becomes a full client: multi‑touch trackpad, native virtual keyboard with modifier keys, gamepad support — up to 120 fps with &lt;20 ms Wi‑Fi latency.</p>
         <ul>
           <li data-i18n-html="s2.li1"><strong>Touch trackpad</strong> — 1 finger aims, 2 scroll &amp; pinch, taps click</li>
           <li data-i18n-html="s2.li2"><strong>Real keyboard input</strong> — Win, Esc, Ctrl, arrows… all there</li>
@@ -647,7 +660,7 @@
       <div class="txt reveal">
         <span class="kicker yellow" data-i18n="s3.kicker">03 · Enhance</span>
         <h3 data-i18n-html="s3.h3">Stream light.<br>Display sharp.</h3>
-        <p data-i18n="s3.p">Video Enhancement upscales and sharpens the stream on your device's GPU — WebGPU running SGSRv1 and FSR1 shaders. Stream at 720p over 4G, watch it crisp on a 1440p panel.</p>
+        <p data-i18n-html="s3.p">Video Enhancement upscales and sharpens the stream on your device's GPU — WebGL2 or WebGPU running <a href="/mwsr/">MWSR (MoonlightWeb Super Resolution)</a>, MoonlightWeb's own upscaler. Stream at 720p over 4G, watch it crisp on a 1440p panel.</p>
         <ul>
           <li data-i18n-html="s3.li1"><strong>Less bandwidth, more detail</strong> — great on cellular and hotel Wi‑Fi</li>
           <li data-i18n-html="s3.li2"><strong>Runs client‑side</strong> — zero extra load on the gaming PC</li>
@@ -721,15 +734,16 @@
       <p data-i18n="how.p">Three steps, one installer, zero networking homework.</p>
     </div>
     <div class="steps">
-      <div class="step cyb reveal"><h3 data-i18n="step1.h3">Install</h3><p data-i18n="step1.p">One installer on the gaming PC. The wizard sets everything up — including Internet access — and leaves a tray icon behind. Nothing to install on the devices you play from.</p></div>
+      <div class="step cyb reveal"><h3 data-i18n="step1.h3">Install</h3><p data-i18n="step1.p">One installer on the gaming PC: it captures and encodes that PC itself, no Sunshine or second streaming server needed. The wizard sets everything up — including Internet access — and leaves a tray icon behind. Nothing to install on the devices you play from.</p></div>
       <div class="step cyb reveal"><h3 data-i18n="step2.h3">Pair</h3><p data-i18n="step2.p">Open the page on any device: your PC is already listed. Type the PIN it shows, once. That device is now trusted for good.</p></div>
       <div class="step cyb reveal"><h3 data-i18n="step3.h3">Play remotely!</h3><p data-i18n="step3.p">Your private link works from anywhere — hotel Wi‑Fi, a friend's couch, 4G. Pick a game or the whole desktop, gamepad in hand, go.</p></div>
     </div>
 
     <p class="muted reveal" style="text-align:center; max-width:760px; margin:3rem auto 0" data-i18n-html="how.under">
-      Under the hood: a C++/Qt backend embeds <code style="font-family:var(--mono); color:var(--cyan)">moonlight‑common‑c</code>,
-      speaks GameStream (RTSP/RTP/ENet) to the host, and relays video, audio and input to the browser over WebRTC —
-      with automatic UDP-to-TCP fallback. Decoding happens in WebCodecs, rendering in WebGPU, audio in an AudioWorklet.
+      Under the hood: a C++/Qt server captures the gaming PC itself and hands each frame straight to its GPU encoder
+      (NVENC, AMF, Quick Sync, VA‑API, VideoToolbox), then to the browser over WebRTC — with automatic UDP-to-TCP fallback.
+      Already running Sunshine, Apollo or Wolf? It embeds <code style="font-family:var(--mono); color:var(--cyan)">moonlight‑common‑c</code>
+      to pair with those hosts too. Decoding happens in WebCodecs, rendering in WebGL2 or WebGPU, audio in the browser's own WebRTC player.
     </p>
     <div class="chips reveal">
       <span class="chip">C++17 · Qt 6</span><span class="chip">WebRTC</span><span class="chip">WebCodecs</span>
@@ -762,6 +776,7 @@
           <a data-asset="win-x64" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="win-x64">x64 .exe</a>
           <a data-asset="win-arm64" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="win-arm64">arm64 .exe</a>
         </div>
+        <p class="dl-guide"><a href="guides/windows.html" data-i18n="dl.windows.guide" data-umami-event="guide" data-umami-event-loc="dl-windows">Step-by-step install guide →</a></p>
       </div>
       <div class="dl-card cyb reveal">
         <svg class="os" viewBox="0 0 24 24" role="img" aria-label="Apple logo"><path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/></svg>
@@ -770,6 +785,7 @@
         <div class="fmt">
           <a data-asset="mac" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="mac">arm64 .pkg</a>
         </div>
+        <p class="dl-guide"><a href="guides/macos.html" data-i18n="dl.macos.guide" data-umami-event="guide" data-umami-event-loc="dl-macos">Step-by-step install guide →</a></p>
         <!-- Unnotarized .pkg: a browser download trips Gatekeeper, and both of
              these install the very same file without the prompt. Homebrew comes
              first — it is the one that also brings `brew upgrade` along. -->
@@ -783,12 +799,13 @@
       <div class="dl-card cyb reveal">
         <svg class="os" viewBox="0 0 24 24" role="img" aria-label="Linux Tux logo"><path d="M12.504 0c-.155 0-.315.008-.48.021-4.226.333-3.105 4.807-3.17 6.298-.076 1.092-.3 1.953-1.05 3.02-.885 1.051-2.127 2.75-2.716 4.521-.278.832-.41 1.684-.287 2.489a.424.424 0 00-.11.135c-.26.268-.45.6-.663.839-.199.199-.485.267-.797.4-.313.136-.658.269-.864.68-.09.189-.136.394-.132.602 0 .199.027.4.055.536.058.399.116.728.04.97-.249.68-.28 1.145-.106 1.484.174.334.535.47.94.601.81.2 1.91.135 2.774.6.926.466 1.866.67 2.616.47.526-.116.97-.464 1.208-.946.587-.003 1.23-.269 2.26-.334.699-.058 1.574.267 2.577.2.025.134.063.198.114.333l.003.003c.391.778 1.113 1.132 1.884 1.071.771-.06 1.592-.536 2.257-1.306.631-.765 1.683-1.084 2.378-1.503.348-.199.629-.469.649-.853.023-.4-.2-.811-.714-1.376v-.097l-.003-.003c-.17-.2-.25-.535-.338-.926-.085-.401-.182-.786-.492-1.046h-.003c-.059-.054-.123-.067-.188-.135a.357.357 0 00-.19-.064c.431-1.278.264-2.55-.173-3.694-.533-1.41-1.465-2.638-2.175-3.483-.796-1.005-1.576-1.957-1.56-3.368.026-2.152.236-6.133-3.544-6.139zm.529 3.405h.013c.213 0 .396.062.584.198.19.135.33.332.438.533.105.259.158.459.166.724 0-.02.006-.04.006-.06v.105a.086.086 0 01-.004-.021l-.004-.024a1.807 1.807 0 01-.15.706.953.953 0 01-.213.335.71.71 0 00-.088-.042c-.104-.045-.198-.064-.284-.133a1.312 1.312 0 00-.22-.066c.05-.06.146-.133.183-.198.053-.128.082-.264.088-.402v-.02a1.21 1.21 0 00-.061-.4c-.045-.134-.101-.2-.183-.333-.084-.066-.167-.132-.267-.132h-.016c-.093 0-.176.03-.262.132a.8.8 0 00-.205.334 1.18 1.18 0 00-.09.4v.019c.002.089.008.179.02.267-.193-.067-.438-.135-.607-.202a1.635 1.635 0 01-.018-.2v-.02a1.772 1.772 0 01.15-.768c.082-.22.232-.406.43-.533a.985.985 0 01.594-.2zm-2.962.059h.036c.142 0 .27.048.399.135.146.129.264.288.344.465.09.199.14.4.153.667v.004c.007.134.006.2-.002.266v.08c-.03.007-.056.018-.083.024-.152.055-.274.135-.393.2.012-.09.013-.18.003-.267v-.015c-.012-.133-.04-.2-.082-.333a.613.613 0 00-.166-.267.248.248 0 00-.183-.064h-.021c-.071.006-.13.04-.186.132a.552.552 0 00-.12.27.944.944 0 00-.023.33v.015c.012.135.037.2.08.334.046.134.098.2.166.268.01.009.02.018.034.024-.07.057-.117.07-.176.136a.304.304 0 01-.131.068 2.62 2.62 0 01-.275-.402 1.772 1.772 0 01-.155-.667 1.759 1.759 0 01.08-.668 1.43 1.43 0 01.283-.535c.128-.133.26-.2.418-.2zm1.37 1.706c.332 0 .733.065 1.216.399.293.2.523.269 1.052.468h.003c.255.136.405.266.478.399v-.131a.571.571 0 01.016.47c-.123.31-.516.643-1.063.842v.002c-.268.135-.501.333-.775.465-.276.135-.588.292-1.012.267a1.139 1.139 0 01-.448-.067 3.566 3.566 0 01-.322-.198c-.195-.135-.363-.332-.612-.465v-.005h-.005c-.4-.246-.616-.512-.686-.71-.07-.268-.005-.47.193-.6.224-.135.38-.271.483-.336.104-.074.143-.102.176-.131h.002v-.003c.169-.202.436-.47.839-.601.139-.036.294-.065.466-.065zm2.8 2.142c.358 1.417 1.196 3.475 1.735 4.473.286.534.855 1.659 1.102 3.024.156-.005.33.018.513.064.646-1.671-.546-3.467-1.089-3.966-.22-.2-.232-.335-.123-.335.59.534 1.365 1.572 1.646 2.757.13.535.16 1.104.021 1.67.067.028.135.06.205.067 1.032.534 1.413.938 1.23 1.537v-.043c-.06-.003-.12 0-.18 0h-.016c.151-.467-.182-.825-1.065-1.224-.915-.4-1.646-.336-1.77.465-.008.043-.013.066-.018.135-.068.023-.139.053-.209.064-.43.268-.662.669-.793 1.187-.13.533-.17 1.156-.205 1.869v.003c-.02.334-.17.838-.319 1.35-1.5 1.072-3.58 1.538-5.348.334a2.645 2.645 0 00-.402-.533 1.45 1.45 0 00-.275-.333c.182 0 .338-.03.465-.067a.615.615 0 00.314-.334c.108-.267 0-.697-.345-1.163-.345-.467-.931-.995-1.788-1.521-.63-.4-.986-.87-1.15-1.396-.165-.534-.143-1.085-.015-1.645.245-1.07.873-2.11 1.274-2.763.107-.065.037.135-.408.974-.396.751-1.14 2.497-.122 3.854a8.123 8.123 0 01.647-2.876c.564-1.278 1.743-3.504 1.836-5.268.048.036.217.135.289.202.218.133.38.333.59.465.21.201.477.335.876.335.039.003.075.006.11.006.412 0 .73-.134.997-.268.29-.134.52-.334.74-.4h.005c.467-.135.835-.402 1.044-.7zm2.185 8.958c.037.6.343 1.245.882 1.377.588.134 1.434-.333 1.791-.765l.211-.01c.315-.007.577.01.847.268l.003.003c.208.199.305.53.391.876.085.4.154.78.409 1.066.486.527.645.906.636 1.14l.003-.007v.018l-.003-.012c-.015.262-.185.396-.498.595-.63.401-1.746.712-2.457 1.57-.618.737-1.37 1.14-2.036 1.191-.664.053-1.237-.2-1.574-.898l-.005-.003c-.21-.4-.12-1.025.056-1.69.176-.668.428-1.344.463-1.897.037-.714.076-1.335.195-1.814.12-.465.308-.797.641-.984l.045-.022zm-10.814.049h.01c.053 0 .105.005.157.014.376.055.706.333 1.023.752l.91 1.664.003.003c.243.533.754 1.064 1.189 1.637.434.598.77 1.131.729 1.57v.006c-.057.744-.48 1.148-1.125 1.294-.645.135-1.52.002-2.395-.464-.968-.536-2.118-.469-2.857-.602-.369-.066-.61-.2-.723-.4-.11-.2-.113-.602.123-1.23v-.004l.002-.003c.117-.334.03-.752-.027-1.118-.055-.401-.083-.71.043-.94.16-.334.396-.4.69-.533.294-.135.64-.202.915-.47h.002v-.002c.256-.268.445-.601.668-.838.19-.201.38-.336.663-.336zm7.159-9.074c-.435.201-.945.535-1.488.535-.542 0-.97-.267-1.28-.466-.154-.134-.28-.268-.373-.335-.164-.134-.144-.333-.074-.333.109.016.129.134.199.2.096.066.215.2.36.333.292.2.68.467 1.167.467.485 0 1.053-.267 1.398-.466.195-.135.445-.334.648-.467.156-.136.149-.267.279-.267.128.016.034.134-.147.332a8.097 8.097 0 01-.69.468zm-1.082-1.583V5.64c-.006-.02.013-.042.029-.05.074-.043.18-.027.26.004.063 0 .16.067.15.135-.006.049-.085.066-.135.066-.055 0-.092-.043-.141-.068-.052-.018-.146-.008-.163-.065zm-.551 0c-.02.058-.113.049-.166.066-.047.025-.086.068-.14.068-.05 0-.13-.02-.136-.068-.01-.066.088-.133.15-.133.08-.031.184-.047.259-.005.019.009.036.03.03.05v.02h.003z"/></svg>
         <h3>Linux</h3>
-        <p data-i18n="dl.linux">.deb for Debian &amp; Ubuntu, .rpm for Fedora &amp; openSUSE, AppImage for Arch, SteamOS &amp; the rest.</p>
+        <p data-i18n="dl.linux">.deb for Debian &amp; Ubuntu, .rpm for Fedora &amp; openSUSE, the AUR for Arch, AppImage for SteamOS &amp; the rest.</p>
         <div class="fmt">
           <a data-asset="linux-deb" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="linux-deb">.deb</a>
           <a data-asset="linux-rpm" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="linux-rpm">.rpm</a>
           <a data-asset="linux-appimage" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="linux-appimage">.AppImage</a>
         </div>
+        <p class="dl-guide"><a href="guides/linux.html" data-i18n="dl.linux.guide" data-umami-event="guide" data-umami-event-loc="dl-linux">Step-by-step install guide →</a></p>
         <!-- A downloaded package never updates itself. The signed apt/dnf
              repositories do, and put the app in the software centre. One recipe
              covers all of them — install.sh detects apt, dnf, zypper and yum,
@@ -810,7 +827,7 @@
       </div>
     </div>
     <p class="muted reveal" style="text-align:center; font-size:.88rem; margin-top:1.6rem" data-i18n-html="dl.foot">
-      Playing from a phone, tablet or TV? Nothing to download — the client is your browser.
+      Playing from a <a href="play/iphone-ipad.html">phone or tablet</a>, a <a href="play/chromebook.html">Chromebook</a> or a <a href="play/tv.html">TV</a>? Nothing to download — the client is your browser.
       <a href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-loc="all-releases">All releases →</a>
     </p>
   </div>
@@ -826,20 +843,18 @@
         Moonlight ecosystem. An optional tip — the price of a coffee — helps keep the shared DNS domain online. ☕</p>
       <div class="cta">
         <a class="btn btn-primary" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-i18n="cta.btn1" data-umami-event="github" data-umami-event-loc="cta">⭐ Star on GitHub</a>
-        <a class="btn btn-yellow" href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-i18n="cta.btn2" data-umami-event="buy-me-a-coffee" data-umami-event-loc="cta">☕ Buy me a coffee</a>
+        <a class="btn btn-yellow" href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="cta"><span data-bmc-full-logo></span><span class="sr-only" data-i18n="cta.btn2">Buy me a coffee</span></a>
       </div>
     </div>
   </div>
 </section>
 </main>
 
-<!-- Footer markup injected by assets/chrome.js (shared across every page) -->
-<footer id="site-footer"></footer>
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/">Home</a> · <a href="/guides/">Guides</a> · <a href="/faq.html">FAQ</a> · <a href="/contact.html">Contact</a> · <a href="/server-access/">Connect</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>Coffee</span></a></span><span class="foot-play">Play from: <a href="/play/chromebook.html">Chromebook</a> · <a href="/play/iphone-ipad.html">iPhone &amp; iPad</a> · <a href="/play/tv.html">TV</a> · <a href="/sunshine-web-client.html">Sunshine web client</a> · <a href="/browser-game-streaming.html">Why a browser client</a></span></div></footer>
 </div><!-- /#scroll -->
 
 <div id="lb"><img alt=""></div>
-<!-- Inject the shared header/footer BEFORE the i18n block below snapshots
-     [data-i18n] and wires up #lang-select. -->
 <script src="assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
 <script>
   // Lightbox for screenshots.
@@ -866,7 +881,7 @@
   }
 
   // Download section — resolve the latest GitHub release asset for this platform.
-  // Button + meta text are language-aware (re-rendered on 'langchange'). Any failure
+  // Button + meta text follow the page language (<html lang>). Any failure
   // (offline, rate-limit, no release yet) keeps the /releases fallback links.
   (async () => {
     const REPO = 'linckosz/moonlight-web';
@@ -919,6 +934,18 @@
           appimage: 'Portable — faites d’abord chmod +x. Debian/Ubuntu : préférez le .deb ci‑dessous',
         },
       },
+      de: {
+        base: '⬇ MoonlightWeb herunterladen',
+        os: {win:'⬇ Für Windows herunterladen', mac:'⬇ Für macOS herunterladen', linux:'⬇ Für Linux herunterladen'},
+        latest: 'Neueste Version auf GitHub',
+        mobile: 'Auf diesem Gerät öffnest du einfach die URL deines Servers — der Download gehört auf den Gaming-PC.',
+        all: t => `${t} — alle Downloads auf GitHub`,
+        hint: {
+          deb: 'Debian · Ubuntu · Mint · Pop!_OS — andere Distros: .rpm oder .AppImage unten',
+          rpm: 'Fedora · RHEL · openSUSE — andere Distros: .deb oder .AppImage unten',
+          appimage: 'Portabel — zuerst chmod +x ausführen. Debian/Ubuntu: lieber die .deb unten',
+        },
+      },
       zh: {
         base: '⬇ 下载 MoonlightWeb',
         os: {win:'⬇ 下载 Windows 版', mac:'⬇ 下载 macOS 版', linux:'⬇ 下载 Linux 版'},
@@ -943,7 +970,6 @@
       hint.textContent = os === 'linux' ? L.hint[pkg] : '';
       hint.hidden = !hint.textContent;                 // no empty flex row elsewhere
     };
-    document.addEventListener('langchange', render);
     render();
 
     try {
@@ -954,7 +980,7 @@
       // Asset names produced by .github/workflows/release.yml (version-stamped,
       // matched here by their platform/arch/extension suffix):
       //   MoonlightWeb-installer-<ver>-win-{x64,arm64}.exe
-      //   moonlightweb-<ver>-linux-x64.{deb,rpm,AppImage}
+      //   moonlightweb-<ver>-linux-x64.{deb,rpm}, moonlightweb-<ver>-x86_64.AppImage
       //   moonlightweb-<ver>-macos-arm64.pkg
       const assets = {
         'win-x64': find(/win-x64\.exe$/i),
@@ -985,6 +1011,7 @@
     const L10N = {
       en: {copy:'Copy this command', ok:'Copied'},
       fr: {copy:'Copier cette commande', ok:'Copié'},
+      de: {copy:'Diesen Befehl kopieren', ok:'Kopiert'},
       zh: {copy:'复制此命令', ok:'已复制'},
     };
     const btns = document.querySelectorAll('.cmd[data-copy]');
@@ -993,7 +1020,6 @@
       btns.forEach(b => b.setAttribute('aria-label',
         `${b.classList.contains('ok') ? L.ok : L.copy}: ${b.dataset.copy}`));
     };
-    document.addEventListener('langchange', label);
     label();
     btns.forEach(b => b.addEventListener('click', async () => {
       try {
@@ -1020,225 +1046,6 @@
   } else {
     document.querySelectorAll('.reveal').forEach(el=>el.classList.add('in'));
   }
-
-  // ─── i18n ─────────────────────────────────────────────────────────────────
-  // English is the source of truth (the HTML itself, captured on load); the
-  // other languages come from the dictionaries below. The choice is persisted;
-  // EN is the default. Add a language: drop a dictionary here, register it in
-  // DICTS, add a data-i18n-lang button, and a T.<code> block above.
-  const FR = {
-    'nav.home':'Accueil', 'nav.guides':'Guides', 'nav.faq':'FAQ', 'nav.support':'☕ Un café', 'nav.contact':'Contact',
-    'nav.features':'Fonctionnalités', 'nav.showcase':'En images',
-    'nav.how':'Comment ça marche', 'nav.download':'Télécharger',
-
-    'hero.kicker':'100% web · open source · auto‑hébergé',
-    'hero.h1':'Votre PC gamer.<br><span class="grad">Streamé dans le navigateur.</span>',
-    'hero.lead':'MoonlightWeb streame votre PC gamer vers n’importe quel appareil doté d’un navigateur<br>téléphone, tablette, ordinateur, TV. <strong>Gratuit et open source. Rien à installer côté client. Juste une URL.</strong>',
-    'hero.cta1':'Télécharger gratuitement', 'hero.cta2':'☕ Offrez‑moi un café',
-    'hud.k1':'Latence Wi‑Fi', 'hud.k2':'Résolution', 'hud.k3':'Fréquence',
-    'hud.k4':'Codecs', 'hud.k5':'Install. client', 'hud.v3':'jusqu’à 240fps',
-    'flow.pc':'<span>MoonlightWeb</span>',
-    'flow.laptop':'<span>Navigateur seul</span>',
-
-    'feat.kicker':'Fonctionnalités',
-    'feat.h2':'Conçu comme un client natif.<br>Livré comme une page web.',
-    'feat.p':'Tout ce qu’on attend d’un vrai client de game streaming, entièrement dans le navigateur.',
-    'card1.h3':'Latence de console',
-    'card1.p':'Transport WebRTC UDP avec contrôle de congestion adaptatif : moins de 20 ms en Wi‑Fi. Jouez à des FPS nerveux, pas à des diaporamas.',
-    'card2.h3':'Jusqu’à 4K HDR, 240 fps',
-    'card2.p':'H264, HEVC et AV1, décodés matériellement via WebCodecs. Vrai HDR sur écrans HDR.',
-    'card3.h3':'Amélioration vidéo',
-    'card3.p':'Upscaling et netteté GPU (SGSRv1 + FSR1) en WebGPU. Streamez en 720p, voyez du quasi‑1440p.',
-    'card4.h3':'Audio surround Opus',
-    'card4.p':'Décodé dans le navigateur avec un buffer de gigue adaptatif. Reste synchro même sur un Wi‑Fi capricieux.',
-    'card5.h3':'Toutes les commandes, vibrations comprises',
-    'card5.p':'Clavier, souris en pointer‑lock, trackpad tactile, clavier virtuel, et manettes Xbox & PlayStation avec vibrations.',
-    'card6.h3':'Découverte sans configuration',
-    'card6.p':'Vos PC gamer apparaissent automatiquement via mDNS. Appairage par PIN, multi‑hôtes, sessions persistantes.',
-    'card7.h3':'Pair‑à‑pair par conception',
-    'card7.p':'Le flux va droit de votre PC à votre navigateur — aucun cloud au milieu. Un lien d’accès distant rejoint votre PC de n’importe où, sans exposer le moindre port web.',
-    'card8.h3':'Ne vous lâche jamais',
-    'card8.p':'Bascule de transport automatique (UDP → TCP) qui traverse les réseaux hostiles et les pare‑feux stricts.',
-    'card9.h3':'Le multi jusqu’à 4 joueurs',
-    'card9.p':'Invitez jusqu’à trois amis dans le jeu qui tourne déjà sur votre PC — quatre joueurs dans une seule session. Une seule sauvegarde, un écran chacun : ils jouent depuis leur appareil, avec leur manette, comme s’ils étaient assis à côté de vous.',
-
-    'show.kicker':'En images', 'show.h2':'Voyez‑le en action',
-    'show.p':'Même PC, mêmes jeux, sur tous les écrans de la maison (et au‑delà).',
-    's1.kicker':'01 · Découvrir', 's1.h3':'Tous vos PC.<br>Une seule URL.',
-    's1.p':'Ouvrez la page : vos machines de jeu sont déjà là, découvertes sur le réseau local, triées, mémorisées.',
-    's1.li1':'<strong>Découverte mDNS</strong> — plus de chasse aux IP, les hôtes apparaissent seuls',
-    's1.li2':'<strong>Appairage par PIN</strong> — connexion sécurisée en quelques secondes',
-    's1.li3':'<strong>Multi‑hôtes</strong> — PC de bureau, PC du salon, serveur maison',
-    's1.cap':'BIBLIOTHÈQUE — hôtes trouvés via mDNS, à un clic de l’appairage',
-    's2.kicker':'02 · En mobilité', 's2.h3':'Une console portable,<br>cachée dans votre poche.',
-    's2.p':'Votre téléphone devient un client complet : trackpad multitouch, clavier virtuel natif avec touches de modification, support des manettes — jusqu’à 240 fps avec moins de 20 ms de latence Wi‑Fi.',
-    's2.li1':'<strong>Trackpad tactile</strong> — 1 doigt vise, 2 défilent et zooment, tapotez pour cliquer',
-    's2.li2':'<strong>Vraies entrées clavier</strong> — Win, Échap, Ctrl, flèches… tout y est',
-    's2.li3':'<strong>Rien depuis l’App Store</strong> — Safari ou Chrome suffit',
-    's3.kicker':'03 · Améliorer', 's3.h3':'Streamez léger.<br>Affichez net.',
-    's3.p':'L’amélioration vidéo upscale et affine le flux sur le GPU de votre appareil — WebGPU exécutant les shaders SGSRv1 et FSR1. Streamez en 720p en 4G, profitez d’une image nette sur une dalle 1440p.',
-    's3.li1':'<strong>Moins de bande passante, plus de détail</strong> — parfait en 4G et sur le Wi‑Fi d’hôtel',
-    's3.li2':'<strong>Exécuté côté client</strong> — aucune charge supplémentaire sur le PC gamer',
-    's3.li3':'<strong>Faites glisser le curseur</strong> — flux 720p vs. sortie améliorée →',
-    's3.tagl':'FLUX 720p', 's3.tagr':'AMÉLIORÉ ▸ 1440p',
-    's3.cap':'Prince of Persia — streamé en 720p, affiché en 1440p',
-    's4.kicker':'04 · Ajuster', 's4.h3':'Réglez et oubliez.<br>Ou ajustez tout.',
-    's4.p':'Des réglages par défaut sensés avec bitrate auto d’emblée — et un panneau pro complet quand vous voulez le contrôle, sur ordinateur comme sur mobile.',
-    's4.li1':'<strong>Résolution, FPS, bitrate</strong> — auto‑réglés, toujours modifiables',
-    's4.li2':'<strong>HDR &amp; chroma 4:4:4</strong> — pour les puristes du pixel',
-    's4.li3':'<strong>Choix du codec</strong> — les options que votre navigateur ne peut pas décoder sont simplement grisées',
-    's4.cap':'Réglages de streaming & options avancées',
-    's5.kicker':'05 · Passer en ligne', 's5.h3':'LAN party aujourd’hui.<br>Chambre d’hôtel demain.',
-    's5.p':'Jouez loin de chez vous sans confier votre PC à un cloud : le flux est une connexion WebRTC directe, pair‑à‑pair, entre votre navigateur et votre machine. Un lien d’accès distant — sans sous‑domaine public, sans port web exposé — la rejoint de n’importe où.',
-    's5.li1':'<strong>Pair‑à‑pair direct</strong> — votre navigateur se connecte droit à votre PC',
-    's5.li2':'<strong>Rien de publié</strong> — aucun enregistrement DNS public, ports web fermés',
-    's5.li3':'<strong>Auto‑hébergé</strong> — vos jeux ne touchent jamais le cloud de qui que ce soit',
-    's5.cap':'ADMIN — accès Internet activé en un clic',
-
-    'how.kicker':'Pour démarrer', 'how.h2':'Jouer à distance, c’est enfin simple',
-    'how.p':'Trois étapes, un seul installeur, aucun devoir de réseau à faire.',
-    'step1.h3':'Installez',
-    'step1.p':'Un installeur sur le PC gamer. L’assistant configure tout — accès Internet compris — et laisse une icône dans la zone de notification. Rien à installer sur les appareils depuis lesquels vous jouez.',
-    'step2.h3':'Appairez',
-    'step2.p':'Ouvrez la page depuis n’importe quel appareil : votre PC est déjà listé. Saisissez le PIN affiché, une seule fois. Cet appareil est approuvé pour de bon.',
-    'step3.h3':'Jouez à distance !',
-    'step3.p':'Votre lien privé fonctionne de partout — Wi‑Fi d’hôtel, canapé d’un ami, 4G. Choisissez un jeu ou le bureau complet, manette en main, c’est parti.',
-    'how.under':'Sous le capot : un backend C++/Qt embarque <code style="font-family:var(--mono); color:var(--cyan)">moonlight‑common‑c</code>, dialogue en GameStream (RTSP/RTP/ENet) avec l’hôte, et relaie vidéo, audio et entrées vers le navigateur via WebRTC — avec bascule UDP vers TCP automatique. Le décodage se fait en WebCodecs, le rendu en WebGPU, l’audio dans un AudioWorklet.',
-
-    'dl.kicker':'Télécharger', 'dl.h2':'Récupérez le serveur. Amenez les jeux.',
-    'dl.p':'Un seul téléchargement, sur le PC gamer uniquement. Tous les autres appareils ouvrent juste un navigateur.',
-    'dl.win':'Installeur guidé — tout est configuré dans l’assistant, accès Internet compris.',
-    'dl.mac':'Installeur Apple Silicon avec un assistant de configuration guidé.',
-    'dl.mac.brew':'Homebrew', 'dl.mac.curl':'Terminal',
-    'dl.linux':'.deb pour Debian et Ubuntu, .rpm pour Fedora et openSUSE, AppImage pour Arch, SteamOS et le reste.',
-    'dl.linux.repo':'Debian · Ubuntu · Fedora · openSUSE', 'dl.linux.aur':'Arch · Manjaro (AUR)', 'dl.linux.docker':'Docker',
-    'dl.linux.manual':'Plutôt apt/dnf à la main ? →',
-    'dl.foot':'Vous jouez depuis un téléphone, une tablette ou une TV ? Rien à télécharger — le client, c’est votre navigateur. <a href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener">Toutes les versions →</a>',
-
-    'cta.kicker':'Gratuit & open source', 'cta.h2':'Appuyez sur play sur votre propre cloud.',
-    'cta.p':'GPL‑3.0, auto‑hébergé, sans compte, sans abonnement. Développé par un contributeur de longue date de l’écosystème Moonlight. Un pourboire facultatif — le prix d’un café — aide à garder le domaine DNS partagé en ligne. ☕',
-    'cta.btn1':'⭐ Star sur GitHub', 'cta.btn2':'☕ Offrez‑moi un café',
-  };
-
-  const ZH = {
-    'nav.home':'首页', 'nav.guides':'指南', 'nav.faq':'常见问题', 'nav.support':'☕ 咖啡', 'nav.contact':'联系',
-    'nav.features':'功能', 'nav.showcase':'实拍',
-    'nav.how':'工作原理', 'nav.download':'下载',
-
-    'hero.kicker':'100% 网页 · 开源 · 自托管',
-    'hero.h1':'你的游戏 PC。<br><span class="grad">串流到任意浏览器。</span>',
-    'hero.lead':'MoonlightWeb 将你的游戏主机串流到任何带浏览器的设备<br>手机、平板、笔记本、电视。<strong>免费开源。客户端无需安装。只需一个网址。</strong>',
-    'hero.cta1':'免费下载', 'hero.cta2':'☕ 请我喝杯咖啡',
-    'hud.k1':'Wi‑Fi 延迟', 'hud.k2':'分辨率', 'hud.k3':'帧率',
-    'hud.k4':'编解码器', 'hud.k5':'客户端安装', 'hud.v3':'最高 240fps',
-    'flow.pc':'<span>MoonlightWeb</span>',
-    'flow.laptop':'<span>仅需浏览器</span>',
-
-    'feat.kicker':'功能特性',
-    'feat.h2':'像原生客户端一样打造。<br>像网页一样交付。',
-    'feat.p':'一款严肃的游戏串流客户端所应具备的一切——全部在浏览器中运行。',
-    'card1.h3':'主机级延迟',
-    'card1.p':'采用自适应拥塞控制的 WebRTC UDP 传输——Wi‑Fi 下低于 20 毫秒。畅玩快节奏射击，而非幻灯片演示。',
-    'card2.h3':'最高 4K HDR、240 fps',
-    'card2.p':'H264、HEVC 和 AV1，通过 WebCodecs 硬件解码。在 HDR 显示器上呈现真正的 HDR。',
-    'card3.h3':'视频增强',
-    'card3.p':'在 WebGPU 中进行 GPU 放大与锐化（SGSRv1 + FSR1）。串流 720p，看到接近 1440p 的画面。',
-    'card4.h3':'Opus 环绕声',
-    'card4.p':'在浏览器中解码，配备自适应抖动缓冲。即使 Wi‑Fi 不稳定也能保持同步。',
-    'card5.h3':'完整输入，完整震动',
-    'card5.p':'键盘、指针锁定鼠标、触摸触控板、虚拟键盘，以及带震动的 Xbox 和 PlayStation 手柄。',
-    'card6.h3':'零配置发现',
-    'card6.p':'你的游戏 PC 通过 mDNS 自动出现。PIN 码配对、多主机、持久会话。',
-    'card7.h3':'天生点对点',
-    'card7.p':'串流从你的 PC 直达浏览器——中间没有任何云。远程接入链接让你从任何地方连到自己的 PC，无需暴露任何 Web 端口。',
-    'card8.h3':'从不掉线',
-    'card8.p':'传输自动回退（UDP → TCP），穿越恶劣网络和严格防火墙。',
-    'card9.h3':'最多 4 人同乐',
-    'card9.p':'邀请最多三位好友加入你电脑上正在运行的游戏 —— 一局游戏，四名玩家。同一个存档，各自一块屏幕：他们用自己的设备和手柄游玩，就像就坐在你身边。',
-
-    'show.kicker':'实拍', 'show.h2':'亲眼见证',
-    'show.p':'同一台主机，同样的游戏——覆盖家中每块屏幕（乃至更远）。',
-    's1.kicker':'01 · 发现', 's1.h3':'你所有的主机。<br>一个网址。',
-    's1.p':'打开页面，你的游戏机器就已在此——在局域网中被发现、排序、记住。',
-    's1.li1':'<strong>mDNS 自动发现</strong> — 无需查找 IP，主机自动出现',
-    's1.li2':'<strong>PIN 码配对</strong> — 数秒内完成安全握手',
-    's1.li3':'<strong>多主机</strong> — 台式机、客厅 PC、家庭服务器',
-    's1.cap':'应用库 — 通过 mDNS 找到的主机，一键即可配对',
-    's2.kicker':'02 · 移动畅玩', 's2.h3':'一台掌上游戏机，<br>藏在你的口袋里。',
-    's2.p':'你的手机化身完整客户端：多点触控触控板、带修饰键的原生虚拟键盘、手柄支持——最高 240 fps，Wi‑Fi 延迟低于 20 毫秒。',
-    's2.li1':'<strong>触摸触控板</strong> — 1 指瞄准，2 指滚动与缩放，轻点点击',
-    's2.li2':'<strong>真实键盘输入</strong> — Win、Esc、Ctrl、方向键……应有尽有',
-    's2.li3':'<strong>无需从应用商店下载</strong> — Safari 或 Chrome 即可',
-    's3.kicker':'03 · 增强', 's3.h3':'串流轻量。<br>显示锐利。',
-    's3.p':'视频增强在你设备的 GPU 上对画面进行放大与锐化——WebGPU 运行 SGSRv1 和 FSR1 着色器。用 4G 网络串流 720p，在 1440p 屏幕上看到清晰画面。',
-    's3.li1':'<strong>更少带宽，更多细节</strong> — 在蜂窝网络和酒店 Wi‑Fi 上表现出色',
-    's3.li2':'<strong>在客户端运行</strong> — 游戏 PC 无需额外负载',
-    's3.li3':'<strong>拖动滑块</strong> — 720p 串流 vs. 增强输出 →',
-    's3.tagl':'720p 串流', 's3.tagr':'增强 ▸ 1440p',
-    's3.cap':'波斯王子 — 以 720p 串流，以 1440p 显示',
-    's4.kicker':'04 · 精调', 's4.h3':'设好即忘。<br>或随心调整。',
-    's4.p':'开箱即用的合理默认值与自动码率——需要掌控时还有完整的专业面板，桌面和移动端皆可。',
-    's4.li1':'<strong>分辨率、FPS、码率</strong> — 自动调优，随时可改',
-    's4.li2':'<strong>HDR 与 4:4:4 色度</strong> — 为像素纯粹主义者而生',
-    's4.li3':'<strong>编解码器选择</strong> — 浏览器无法解码的选项会自动灰显',
-    's4.cap':'串流设置与高级选项',
-    's5.kicker':'05 · 走向全球', 's5.h3':'今天局域网联机。<br>明天酒店房间。',
-    's5.p':'远离家门也能畅玩，而无需把 PC 交给云端：串流是浏览器与主机之间点对点的 WebRTC 直连。远程接入链接——没有公开子域名、不暴露 Web 端口——让你从任何地方连上它。',
-    's5.li1':'<strong>点对点直连</strong> — 浏览器直接连接你的 PC',
-    's5.li2':'<strong>不公开任何信息</strong> — 无公开 DNS 记录，Web 端口保持关闭',
-    's5.li3':'<strong>自托管</strong> — 你的游戏从不经过任何人的云',
-    's5.cap':'管理页 — 一键启用互联网访问',
-
-    'how.kicker':'开始使用', 'how.h2':'远程畅玩，从此变得简单',
-    'how.p':'三个步骤，一个安装程序，无需任何网络配置功课。',
-    'step1.h3':'安装',
-    'step1.p':'在游戏 PC 上运行一个安装程序。向导会配置好一切——包括互联网访问——并在托盘留下一个图标。你用来游玩的设备无需安装任何东西。',
-    'step2.h3':'配对',
-    'step2.p':'在任意设备上打开页面：你的 PC 已经列在那里。输入它显示的 PIN 码，仅需一次。该设备从此获得信任。',
-    'step3.h3':'远程开玩！',
-    'step3.p':'你的专属链接在任何地方都能用——酒店 Wi‑Fi、朋友家的沙发、4G。选择一款游戏或完整桌面，手柄在手，开玩。',
-    'how.under':'底层原理：一个 C++/Qt 后端内嵌 <code style="font-family:var(--mono); color:var(--cyan)">moonlight‑common‑c</code>，用 GameStream（RTSP/RTP/ENet）与主机通信，并通过 WebRTC 将视频、音频和输入转发到浏览器——并在 UDP 不可用时自动回退到 TCP。解码在 WebCodecs 中完成，渲染在 WebGPU 中，音频在 AudioWorklet 中。',
-
-    'dl.kicker':'下载', 'dl.h2':'装好服务器，带上你的游戏。',
-    'dl.p':'仅在游戏 PC 上下载一次。其他所有设备只需打开浏览器。',
-    'dl.win':'向导式安装程序——一切都在向导中配置好，包括互联网访问。',
-    'dl.mac':'Apple Silicon 安装程序，附带向导式配置。',
-    'dl.mac.brew':'Homebrew', 'dl.mac.curl':'终端',
-    'dl.linux':'Debian/Ubuntu 用 .deb，Fedora/openSUSE 用 .rpm，Arch、SteamOS 及其他用 AppImage。',
-    'dl.linux.repo':'Debian · Ubuntu · Fedora · openSUSE', 'dl.linux.aur':'Arch · Manjaro（AUR）', 'dl.linux.docker':'Docker',
-    'dl.linux.manual':'想手动用 apt/dnf？→',
-    'dl.foot':'用手机、平板或电视畅玩？无需下载——你的浏览器就是客户端。<a href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener">全部版本 →</a>',
-
-    'cta.kicker':'免费 & 开源', 'cta.h2':'在你自己的云上按下开始。',
-    'cta.p':'GPL‑3.0、自托管、无需账户、无需订阅。由 Moonlight 生态的长期贡献者打造。一笔自愿打赏——一杯咖啡的价钱——有助于维持共享 DNS 域名的在线运行。☕',
-    'cta.btn1':'⭐ 在 GitHub 上加星', 'cta.btn2':'☕ 请我喝杯咖啡',
-  };
-
-  // Registered translation catalogs (EN = source HTML, so no entry needed).
-  const DICTS = { fr: FR, zh: ZH };
-
-  const _orig = new Map();
-  document.querySelectorAll('[data-i18n]').forEach(el => _orig.set(el, el.textContent));
-  document.querySelectorAll('[data-i18n-html]').forEach(el => _orig.set(el, el.innerHTML));
-  function applyLang(lang){
-    if (!DICTS[lang]) lang = 'en';
-    const dict = DICTS[lang];                 // undefined for EN → restore original markup
-    document.documentElement.lang = lang;
-    document.querySelectorAll('[data-i18n]').forEach(el => {
-      el.textContent = dict ? (dict[el.dataset.i18n] ?? _orig.get(el)) : _orig.get(el);
-    });
-    document.querySelectorAll('[data-i18n-html]').forEach(el => {
-      el.innerHTML = dict ? (dict[el.dataset.i18nHtml] ?? _orig.get(el)) : _orig.get(el);
-    });
-    if (langSelect) langSelect.value = lang;
-    try { localStorage.setItem('mw_lang', lang); } catch {}
-    document.dispatchEvent(new CustomEvent('langchange', {detail: lang}));
-  }
-  const langSelect = document.getElementById('lang-select');
-  if (langSelect) langSelect.addEventListener('change', () => applyLang(langSelect.value));
-  let _saved = 'en';
-  try { _saved = localStorage.getItem('mw_lang') || 'en'; } catch {}
-  applyLang(_saved);
 </script>
 </body>
 </html>

@@ -130,6 +130,12 @@ public:
     /// Does its work on a thread of its own: the caller is a viewer's control
     /// message, not something to block on the shell.
     virtual bool releaseBlock() { return false; }
+
+    /// Whether a pointing device of the sink's own is what makes the OS show
+    /// its pointer (Windows: the host's own mouse, Win32Input), so nothing
+    /// else need make it show one (PointerPresence). Serialised against
+    /// inject() like the setters; cheap enough for every capture wake-up.
+    virtual bool showsPointer() { return false; }
 };
 
 } // namespace mw::native::input

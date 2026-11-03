@@ -24,8 +24,29 @@
 #include <QVector>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+
+#include "mw/native/HostKeyboardLayout.h"
 
 class FrameSentSink;
+
+/// What a keystroke says about itself beside its character
+/// (IMediaEngine::sendKeyChar). Outside the engine on purpose: a nested class
+/// with member initializers is not complete enough for a default argument
+/// (`= {}`) inside its enclosing class, which GCC and Clang reject.
+struct CharKeyHints
+{
+    /// A chord of the touch keyboard's bar (Ctrl latched, then z): the host
+    /// key carrying the character, under whatever modifiers are held, none
+    /// added and none lifted.
+    bool chord = false;
+    /// The key's US position, for a host whose layout has no key for the
+    /// character — a chord on a Cyrillic layout keeps its shortcut.
+    short positionVk = 0;
+    /// AltGr, or a Mac's Option, chose the character on the client: the Ctrl
+    /// and Alt the viewer holds are a level for the host, not a shortcut.
+    bool altGraph = false;
+};
 
 /**
  * How this host can be made to type the character the client's keyboard layout
@@ -35,6 +56,11 @@ class FrameSentSink;
  * does: it is a property of the host that the session establishes once and the
  * input path then reads. What each value means, and why the host's source code
  * says so, is documented on the enum in InputMessageCodec.h.
+ *
+ * What the host CAN do, whatever the owner chose: the choice is
+ * LayoutFidelity, beside it. A toolbar chord (Ctrl+z from the touch keyboard's
+ * bar) is resolved by its character on every host that can, whatever that
+ * choice says — it names a shortcut, not a position.
  */
 enum class KeyboardMode
 {
@@ -43,6 +69,22 @@ enum class KeyboardMode
     SunshineWindows,
     // No SunshineMacos: a Sunshine host on macOS stays Positional, on purpose.
     // InputMessageCodec.h says why.
+};
+
+/**
+ * When the characters of the client's layout win over key positions — the
+ * owner's choice, keyboard_layout_fidelity in settings.json.
+ */
+enum class LayoutFidelity
+{
+    /// The desktop types the client's characters; gaming mode plays by key
+    /// positions, as a keyboard plugged into the host would.
+    Auto,
+    /// The client's characters, gaming mode included.
+    Always,
+    /// Key positions everywhere, the host's layout decides — as every
+    /// Moonlight client does.
+    Never,
 };
 
 /**
@@ -164,7 +206,10 @@ public:
     /// same encoding as sendKeyEvent's. The character path used to drop it,
     /// which left the macOS backend with no way to notice that its own idea
     /// of the modifiers had drifted.
-    virtual void sendKeyChar(const QString& ch, bool down, char modifiers = 0) = 0;
+    /// `hints` is what else the keystroke says about itself (CharKeyHints).
+    using CharKeyHints = ::CharKeyHints;
+    virtual void sendKeyChar(const QString& ch, bool down, char modifiers = 0,
+                             const CharKeyHints& hints = {}) = 0;
 
     /// Ctrl+Alt+Suppr on the host.
     ///
@@ -260,6 +305,11 @@ public:
     /// not measure them. Read-and-reset: one consumer only.
     virtual QJsonObject takeStageStats() { return {}; }
 
+    /// Whether the capture held its display over the session (the native
+    /// engine's CaptureHold, for the server's `vddmatch`), once
+    /// stopConnection() returned: an empty object when nothing was judged.
+    virtual QJsonObject captureHoldReport() const { return {}; }
+
     // ── GameStream-only, with truthful defaults ─────────────────────────────
 
     /// One-way latency to the host, in ms. Zero when the host is this process:
@@ -286,6 +336,40 @@ public:
     }
     KeyboardMode keyboardMode() const { return m_KeyboardMode.load(std::memory_order_relaxed); }
 
+    /// When the client's characters win over key positions on this session —
+    /// the owner's choice, set once per session beside the mode. Defaults to
+    /// Never, the positions, for the same reason.
+    void setLayoutFidelity(LayoutFidelity fidelity)
+    {
+        m_LayoutFidelity.store(fidelity, std::memory_order_relaxed);
+    }
+    LayoutFidelity layoutFidelity() const
+    {
+        return m_LayoutFidelity.load(std::memory_order_relaxed);
+    }
+
+    /// The layout of this machine, for a positional host that runs on it, when
+    /// the owner asked for it (keyboard_host_layout): the touch keyboard's text
+    /// is then typed on the keys this layout puts each character on. Null — the
+    /// default — keeps the US keys and the text of InputMsg::planText.
+    void setHostTextLayout(std::shared_ptr<const mw::native::HostKeyboardLayout> layout)
+    {
+        std::atomic_store(&m_HostTextLayout, std::move(layout));
+    }
+    std::shared_ptr<const mw::native::HostKeyboardLayout> hostTextLayout() const
+    {
+        return std::atomic_load(&m_HostTextLayout);
+    }
+
+    /// Whether the client's key presses come from its gaming mouse mode, as
+    /// their `gaming` flag says. True when that changed: the session logs one
+    /// line per change, since under "auto" it decides positions or characters.
+    bool noteGamingKeys(bool gaming)
+    {
+        const int now = gaming ? 1 : 0;
+        return m_GamingKeys.exchange(now, std::memory_order_relaxed) != now;
+    }
+
     /// Snapshot the host's real lock-key state. Only possible when the streamed
     /// host IS this machine — which is always true for a native engine and
     /// conditional for GameStream, hence the parameter.
@@ -304,6 +388,53 @@ public:
     /// accepted the request — which is why it is a live question rather than a
     /// flag set at construction.
     virtual bool intraRefreshActive() const { return false; }
+
+    /// The HID passthrough (docs/design/hid-passthrough-study.md, plan P2): a
+    /// device the page reads through WebHID, recreated on the host. Only the
+    /// native engine can; a GameStream host has no way to, and says so.
+    virtual QString hidUnavailableReason() const
+    {
+        return QStringLiteral("the HID passthrough needs MoonlightWeb's native host");
+    }
+    /// The page's hidattach. Empty on success, otherwise why the device was
+    /// refused (for the page and the log).
+    virtual QString hidAttach(int slot, const QJsonObject& message)
+    {
+        Q_UNUSED(slot);
+        Q_UNUSED(message);
+        return hidUnavailableReason();
+    }
+    /// The relay sent the page its hidattached {ok: true}. A wheel kept from
+    /// the last stream answers with what rebuilds its force feedback, which
+    /// the page can only play once it knows the device is there.
+    virtual void hidAttached(int slot) { Q_UNUSED(slot); }
+    /// One message of the 'hid' channel: [slot][report id][seq u16 LE][report].
+    /// Called on the channel's own thread; never blocks.
+    virtual void hidInput(const uint8_t* frame, size_t size)
+    {
+        Q_UNUSED(frame);
+        Q_UNUSED(size);
+    }
+    virtual void hidDetach(int slot) { Q_UNUSED(slot); }
+    /// The page's hidreply: the real device's answer to an hidrequest, to
+    /// inject once into the recreated one.
+    virtual void hidReply(int slot, int reportId, const QByteArray& data)
+    {
+        Q_UNUSED(slot);
+        Q_UNUSED(reportId);
+        Q_UNUSED(data);
+    }
+    /// Whether the page should relay the host OS's Logitech HID++ requests to
+    /// the real wheel (filtered there) and answer with hidreply. Linux only:
+    /// hid-logitech-hidpp binds to the recreated wheel by its VID/PID and
+    /// waits on those answers at probe (unanswered, input stalled ~15 s).
+    /// Its force feedback refuses a non-USB device, so none comes this way.
+    /// Announced in hidcaps as `hidpp`.
+    virtual bool hidRelaysHidpp() const { return false; }
+    /// Whether a recreated device can carry force feedback back to the page
+    /// (a PID block pid.dll drives on Windows, a uinput device whose effects
+    /// the host services on Linux). Announced in hidcaps.
+    virtual bool hidForceFeedback() const { return false; }
 
 signals:
     /// presentationTimeUs travels WITH the frame through the queued connection:
@@ -325,6 +456,15 @@ signals:
 
     /// The host asked to rumble a controller (forwarded to the browser).
     void rumble(int controllerNumber, int lowFreqMotor, int highFreqMotor);
+
+    /// The host's OS asked something of a recreated HID device (an output
+    /// report, a feature): forwarded to the page, on the engine's thread.
+    /// kind: 0 output, 1 get feature, 2 set feature.
+    void hidRequest(int slot, int kind, int reportId, QByteArray data);
+
+    /// A force-feedback operation a game asked of a recreated device, as the
+    /// page's hidffb message (mw::native::HidFfb): op, effect, kind, fields.
+    void hidFfb(QJsonObject message);
 
     /// The mouse pointer's SHAPE changed, and the browser is the one drawing it.
     ///
@@ -375,8 +515,20 @@ signals:
     void displayFormatChanged(int displayWidth, int displayHeight, int frameWidth, int frameHeight,
                               bool displayHdr, bool hdr, bool hdrCapable);
 
+    /// The guests' shared feed goes to @p codec for everyone ("h264": a guest
+    /// whose browser decodes no HEVC joined it), and the feed this session
+    /// carries ends in a moment. Native host, guests on the shared feed only.
+    /// Forwarded to the browser, which comes back in that codec the way its
+    /// own codec fallback does.
+    void sharedFeedCodecChanged(QString codec);
+
 protected:
     /// Written once by the session thread at stream start, read on every
     /// keystroke by whichever thread owns the input channel — hence atomic.
     std::atomic<KeyboardMode> m_KeyboardMode{KeyboardMode::Positional};
+    std::atomic<LayoutFidelity> m_LayoutFidelity{LayoutFidelity::Never};
+    /// Same: set by the session thread, read by the input thread, through
+    /// std::atomic_load / atomic_store.
+    std::shared_ptr<const mw::native::HostKeyboardLayout> m_HostTextLayout;
+    std::atomic<int> m_GamingKeys{-1};
 };

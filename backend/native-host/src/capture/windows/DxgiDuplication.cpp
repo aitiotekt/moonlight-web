@@ -18,6 +18,7 @@
 #include "DxgiDuplication.h"
 
 #include "../../core/Log.h"
+#include "../../core/PresentLattice.h"
 #include "CursorShape.h"
 
 #include <chrono>
@@ -106,10 +107,13 @@ bool DxgiDuplication::openAdapterAndOutput(ComPtr<IDXGIAdapter1>& adapter,
 bool DxgiDuplication::start(std::string& error)
 {
     stop();
+    // A refusal is taken to pass unless it is one of those that stay.
+    m_RefusalMayPass = true;
 
     LARGE_INTEGER frequency = {};
     if (!::QueryPerformanceFrequency(&frequency) || frequency.QuadPart == 0) {
         error = "no high-resolution timer on this machine";
+        m_RefusalMayPass = false;
         return false;
     }
     m_QpcFrequency = frequency.QuadPart;
@@ -118,8 +122,7 @@ bool DxgiDuplication::start(std::string& error)
     m_PaintedPointer = PaintedPointer();
 
     ComPtr<IDXGIAdapter1> adapter;
-    ComPtr<IDXGIOutput> output;
-    if (!openAdapterAndOutput(adapter, output, error)) return false;
+    if (!openAdapterAndOutput(adapter, m_Output, error)) return false;
 
     // D3D_DRIVER_TYPE_UNKNOWN is required when an adapter is supplied — asking
     // for HARDWARE here would silently ignore the adapter and pick the default,
@@ -140,49 +143,17 @@ bool DxgiDuplication::start(std::string& error)
         return false;
     }
 
-    // DuplicateOutput1 lets the formats be named, and the list decides what an
-    // HDR desktop becomes. Listing the float format ahead of the 8-bit one
-    // keeps the desktop as it is: FP16 scRGB when it is HDR, BGRA8 when it is
-    // not. Naming 8-bit alone would make DXGI hand an HDR desktop over "tone-
-    // mapped" — clipped at 80 nits, in fact, which is what an SDR stream of a
-    // desktop with the SDR brightness slider up looked like until 16/09/2026:
-    // blown out. The converter takes scRGB on both kinds of session now (an
-    // SDR one tone-maps it, see ColorConvert::init), so this list is the only
-    // one there is. Machines and drivers without Output5 fall back to the
-    // plain path.
-    ComPtr<IDXGIOutput5> output5;
-    if (SUCCEEDED(output.As(&output5))) {
-        const DXGI_FORMAT formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM};
-        hr = output5->DuplicateOutput1(m_Device.Get(), 0, static_cast<UINT>(std::size(formats)),
-                                       formats, m_Duplication.ReleaseAndGetAddressOf());
-    } else {
-        hr = E_NOINTERFACE;
-    }
-
-    if (FAILED(hr)) {
-        ComPtr<IDXGIOutput1> output1;
-        if (FAILED(output.As(&output1))) {
-            error = "this display does not support Desktop Duplication";
-            return false;
-        }
-        hr = output1->DuplicateOutput(m_Device.Get(), m_Duplication.ReleaseAndGetAddressOf());
-    }
-
-    if (FAILED(hr)) {
-        // DXGI_ERROR_UNSUPPORTED is the one worth naming: it is what a hybrid
-        // laptop returns when the display is driven through the other GPU, and
-        // it is exactly the case Windows.Graphics.Capture exists to cover.
-        if (hr == DXGI_ERROR_UNSUPPORTED)
-            error = "Desktop Duplication is not supported for this display";
-        else
-            error = "could not start Desktop Duplication (" + hresultToString(hr) + ")";
-        return false;
-    }
+    if (!duplicate(error)) return false;
 
     DXGI_OUTDUPL_DESC duplDesc = {};
     m_Duplication->GetDesc(&duplDesc);
     m_Width = static_cast<int>(duplDesc.ModeDesc.Width);
     m_Height = static_cast<int>(duplDesc.ModeDesc.Height);
+    // The mode's refresh as a rational, for the lattice the stream's gate
+    // locks on: 239.757 Hz where the session's own figure, after "Match my
+    // screen", says 239.
+    const DXGI_RATIONAL rate = duplDesc.ModeDesc.RefreshRate;
+    m_RefreshPeriodNs = PresentLattice::periodNsFromRational(rate.Numerator, rate.Denominator);
 
     // ⚠️ ModeDesc.Format is the DISPLAY MODE's format, not the duplication's
     // output format. The two agree only because the list above never makes
@@ -199,7 +170,7 @@ bool DxgiDuplication::start(std::string& error)
     // Kept exactly as DXGI reports it — see DesktopRect on why the DPI
     // virtualization is wanted here and nowhere else.
     DXGI_OUTPUT_DESC outputDesc = {};
-    if (SUCCEEDED(output->GetDesc(&outputDesc))) {
+    if (SUCCEEDED(m_Output->GetDesc(&outputDesc))) {
         m_DesktopRect.left = static_cast<int>(outputDesc.DesktopCoordinates.left);
         m_DesktopRect.top = static_cast<int>(outputDesc.DesktopCoordinates.top);
         m_DesktopRect.right = static_cast<int>(outputDesc.DesktopCoordinates.right);
@@ -213,12 +184,90 @@ bool DxgiDuplication::start(std::string& error)
     m_QpcOrigin = qpcNow.QuadPart;
     m_SteadyOriginUs = steadyNowUs();
 
+    char hz[48] = "";
+    if (m_RefreshPeriodNs > 0)
+        std::snprintf(hz, sizeof(hz), ", mode at %.3f Hz",
+                      1e9 / static_cast<double>(m_RefreshPeriodNs));
     log::info("[native] duplication started: " + std::to_string(m_Width) + "x" +
               std::to_string(m_Height) +
               (m_Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? " (HDR, FP16)"
                : m_Format == DXGI_FORMAT_B8G8R8A8_UNORM
                    ? " (SDR, BGRA8)"
-                   : " (format " + std::to_string(static_cast<int>(m_Format)) + ")"));
+                   : " (format " + std::to_string(static_cast<int>(m_Format)) + ")") +
+              hz);
+    return true;
+}
+
+bool DxgiDuplication::duplicate(std::string& error)
+{
+    // DuplicateOutput1 lets the formats be named, and the list decides what an
+    // HDR desktop becomes. Listing the float format ahead of the 8-bit one
+    // keeps the desktop as it is: FP16 scRGB when it is HDR, BGRA8 when it is
+    // not. Naming 8-bit alone would make DXGI hand an HDR desktop over "tone-
+    // mapped" — clipped at 80 nits, in fact, which is what an SDR stream of a
+    // desktop with the SDR brightness slider up looked like until 16/09/2026:
+    // blown out. The converter takes scRGB on both kinds of session now (an
+    // SDR one tone-maps it, see ColorConvert::init), so this list is the only
+    // one there is. Machines and drivers without Output5 fall back to the
+    // plain path.
+    HRESULT hr = E_NOINTERFACE;
+    ComPtr<IDXGIOutput5> output5;
+    if (SUCCEEDED(m_Output.As(&output5))) {
+        const DXGI_FORMAT formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM};
+        hr = output5->DuplicateOutput1(m_Device.Get(), 0, static_cast<UINT>(std::size(formats)),
+                                       formats, m_Duplication.ReleaseAndGetAddressOf());
+    }
+
+    if (FAILED(hr)) {
+        ComPtr<IDXGIOutput1> output1;
+        if (FAILED(m_Output.As(&output1))) {
+            error = "this display does not support Desktop Duplication";
+            m_RefusalMayPass = false;
+            return false;
+        }
+        hr = output1->DuplicateOutput(m_Device.Get(), m_Duplication.ReleaseAndGetAddressOf());
+    }
+
+    if (FAILED(hr)) {
+        // DXGI_ERROR_UNSUPPORTED is the one worth naming: it is what a hybrid
+        // laptop returns when the display is driven through the other GPU, and
+        // it is exactly the case Windows.Graphics.Capture exists to cover.
+        if (hr == DXGI_ERROR_UNSUPPORTED)
+            error = "Desktop Duplication is not supported for this display";
+        else
+            error = "could not start Desktop Duplication (" + hresultToString(hr) + ")";
+        m_RefusalMayPass = hr != DXGI_ERROR_UNSUPPORTED;
+        return false;
+    }
+    m_RefusalMayPass = false;
+    return true;
+}
+
+bool DxgiDuplication::retake(std::string& error)
+{
+    if (!m_Duplication || !m_Output) {
+        error = "the duplication is not open";
+        return false;
+    }
+    // Let go of the old one before asking for the new: DXGI refuses a second
+    // duplication of an output this process already duplicates. The pointer,
+    // the hidden-pointer override and PaintedPointer's verdict stay — the
+    // display and its driver are the ones they were learned on.
+    release();
+    m_Duplication.Reset();
+    if (!duplicate(error)) {
+        m_RetakeLost = true;
+        return false;
+    }
+    DXGI_OUTDUPL_DESC desc = {};
+    m_Duplication->GetDesc(&desc);
+    if (static_cast<int>(desc.ModeDesc.Width) != m_Width ||
+        static_cast<int>(desc.ModeDesc.Height) != m_Height || desc.ModeDesc.Format != m_Format) {
+        error = "the display changed mode meanwhile";
+        m_RetakeLost = true;
+        return false;
+    }
+    m_Retaking = true;
     return true;
 }
 
@@ -307,11 +356,15 @@ bool DxgiDuplication::updateCursor(const DXGI_OUTDUPL_FRAME_INFO& info)
         const int oldX = m_Cursor.x;
         const int oldY = m_Cursor.y;
 
+        // Where the pointer's image goes. Desktop Duplication gives its top-left
+        // corner already, not the hotspot: subtracting the hotspot again put
+        // every pointer that is not an arrow above and left of its place in the
+        // picture, by its own hotspot — the text I-beam, the resize arrows
+        // (N95, 19/10/2026, game mode). Microsoft's DesktopDuplication sample
+        // draws the shape at this position as it is.
         bool visible = news && info.PointerPosition.Visible != FALSE;
-        int px = news ? static_cast<int>(info.PointerPosition.Position.x)
-                      : m_Cursor.x + m_CursorHotspotX;
-        int py = news ? static_cast<int>(info.PointerPosition.Position.y)
-                      : m_Cursor.y + m_CursorHotspotY;
+        int px = news ? static_cast<int>(info.PointerPosition.Position.x) : m_Cursor.x;
+        int py = news ? static_cast<int>(info.PointerPosition.Position.y) : m_Cursor.y;
 
         // Desktop Duplication reports the pointer HIDDEN, at (0, 0), for a
         // pointer Windows is still showing: seen on Windows 11 for the whole
@@ -340,14 +393,17 @@ bool DxgiDuplication::updateCursor(const DXGI_OUTDUPL_FRAME_INFO& info)
                 const int rh = m_DesktopRect.height();
                 const double sx = rw > 0 && m_Width > 0 ? static_cast<double>(m_Width) / rw : 1.0;
                 const double sy = rh > 0 && m_Height > 0 ? static_cast<double>(m_Height) / rh : 1.0;
-                px = static_cast<int>((ci.ptScreenPos.x - m_DesktopRect.left) * sx);
-                py = static_cast<int>((ci.ptScreenPos.y - m_DesktopRect.top) * sy);
+                // Windows gives the hotspot, as for WGC (Win32Cursor).
+                const int hx = static_cast<int>((ci.ptScreenPos.x - m_DesktopRect.left) * sx);
+                const int hy = static_cast<int>((ci.ptScreenPos.y - m_DesktopRect.top) * sy);
+                px = hx - m_CursorHotspotX;
+                py = hy - m_CursorHotspotY;
                 visible = true;
                 if (!m_HiddenOverridden && !m_HiddenOverrideLogged) {
                     m_HiddenOverrideLogged = true;
                     log::info("[native] cursor: Desktop Duplication reports the pointer hidden "
                               "while Windows shows it at " +
-                              std::to_string(px) + "," + std::to_string(py) +
+                              std::to_string(hx) + "," + std::to_string(hy) +
                               " — Windows' word kept (once per session)");
                 }
             }
@@ -358,11 +414,8 @@ bool DxgiDuplication::updateCursor(const DXGI_OUTDUPL_FRAME_INFO& info)
 
         m_Cursor.visible = visible;
         m_Cursor.inImage = m_HiddenOverridden;
-        // Position is given for the hotspot; the image starts above and left of
-        // it. Drawing at the hotspot would offset every cursor by its own
-        // shape — an arrow would look right and a crosshair would not.
-        m_Cursor.x = px - m_CursorHotspotX;
-        m_Cursor.y = py - m_CursorHotspotY;
+        m_Cursor.x = px;
+        m_Cursor.y = py;
 
         changed = changed || m_Cursor.visible != wasVisible || m_Cursor.inImage != wasInImage ||
                   (m_Cursor.visible && (m_Cursor.x != oldX || m_Cursor.y != oldY));
@@ -373,6 +426,8 @@ bool DxgiDuplication::updateCursor(const DXGI_OUTDUPL_FRAME_INFO& info)
 
 AcquireStatus DxgiDuplication::acquire(int timeoutMs, CapturedFrame& frame)
 {
+    // Said by the caller already, with the reason retake() gave.
+    if (m_RetakeLost) return AcquireStatus::Lost;
     if (!m_Duplication) return AcquireStatus::Failed;
 
     // Holding two frames at once is not allowed by DXGI, and forgetting to
@@ -442,6 +497,13 @@ AcquireStatus DxgiDuplication::acquire(int timeoutMs, CapturedFrame& frame)
     frame.texture = m_AcquiredTexture.Get();
     frame.presentUs = qpcToMicroseconds(info.LastPresentTime.QuadPart);
     frame.capturedUs = steadyNowUs();
+    frame.presentRawUs = frame.presentUs;
+    frame.mouseUs = info.LastMouseUpdateTime.QuadPart != 0
+                        ? qpcToMicroseconds(info.LastMouseUpdateTime.QuadPart)
+                        : 0;
+    frame.accumulated = static_cast<int>(info.AccumulatedFrames);
+    frame.retaken = m_Retaking;
+    m_Retaking = false;
     return AcquireStatus::Ok;
 }
 
@@ -457,11 +519,15 @@ void DxgiDuplication::stop()
 {
     release();
     m_Duplication.Reset();
+    m_Output.Reset();
+    m_Retaking = false;
+    m_RetakeLost = false;
     m_Delivered = false;
     m_Context.Reset();
     m_Device.Reset();
     m_Width = 0;
     m_Height = 0;
+    m_RefreshPeriodNs = 0;
 }
 
 } // namespace mw::native::capture

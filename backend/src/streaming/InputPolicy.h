@@ -36,6 +36,11 @@ struct Policy
 {
     bool gamepad = true;
     bool keyboardMouse = true;
+    /// The HID passthrough (hidattach, hiddetach and the 'hid' channel): a
+    /// device recreated on the host is more than a gamepad, so it has a switch
+    /// of its own. The owner has it; an invited player only when the sharing
+    /// board's box says so (absent reads as false in the worker).
+    bool hid = true;
 
     bool unrestricted() const { return gamepad && keyboardMouse; }
 };
@@ -53,11 +58,14 @@ struct Policy
 inline bool allowed(const QString& type, const Policy& p)
 {
     if (type.startsWith(QLatin1String("gamepad"))) return p.gamepad;
+    if (type.startsWith(QLatin1String("hid"))) return p.hid;
     if (type == QLatin1String("ping") || type == QLatin1String("requestidr") ||
         type == QLatin1String("request_idr") || type == QLatin1String("clientstats") ||
         type == QLatin1String("linkstats") || type == QLatin1String("invalidateref") ||
         type == QLatin1String("framefloor") || type == QLatin1String("clientrefresh") ||
-        type == QLatin1String("clientbitrate") || type == QLatin1String("clientfpscap"))
+        type == QLatin1String("clientbitrate") || type == QLatin1String("clientfpscap") ||
+        type == QLatin1String("decodequeue") || type == QLatin1String("vsyncgrid") ||
+        type == QLatin1String("fpsstep"))
         return true;
     if (type == QLatin1String("inputstate")) return true;
     return p.keyboardMouse; // key*, mouse*, wheel, textinput, locksync, clipboard

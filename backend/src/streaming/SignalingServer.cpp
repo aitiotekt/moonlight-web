@@ -24,10 +24,13 @@ extern "C" {
 #include "Limelight.h"
 }
 #include "IMediaEngine.h"
+#include "IceUdpDrop.h"
 #include "InputMessageCodec.h"
 #include "SdpFingerprint.h"
+#include "SignalingWait.h"
 #include "common/Edition.h"
 #include "common/PairingCrypto.h"
+#include "network/RouterPortPools.h"
 #include "server/NetClassify.h"
 
 #include <rtc/rtc.hpp>
@@ -56,6 +59,29 @@ static bool udpPortFree(uint16_t port)
     const bool ok = probe.bind(QHostAddress::AnyIPv4, port, QAbstractSocket::DontShareAddress);
     probe.close();
     return ok;
+}
+
+// The media block, as the packages' firewall rule and the log name it.
+static const QString kMediaBlock =
+    QStringLiteral("%1-%2/udp")
+        .arg(mw::routerports::kMediaBasePort)
+        .arg(mw::routerports::kMediaBasePort + mw::routerports::kMediaPortCount - 1);
+
+// The port this slot's media socket pins: its own when free, else another of
+// the block — still open in the firewall, where a random one would not be.
+// Something else on the machine can hold one: a second instance streaming on
+// the same slot (production next to --dev), or on Linux a program that got it
+// as an ephemeral port where the packages could not reserve it. The walk runs
+// from the top of the block down, away from the low slots that are always in
+// use. 0 when the whole block is held.
+static uint16_t freeMediaPort(uint16_t own)
+{
+    if (udpPortFree(own)) return own;
+    for (int i = mw::routerports::kMediaPortCount - 1; i >= 0; --i) {
+        const auto port = static_cast<uint16_t>(mw::routerports::kMediaBasePort + i);
+        if (port != own && udpPortFree(port)) return port;
+    }
+    return 0;
 }
 
 // The Linux firewall front-end that is filtering, if any: "ufw" or "firewalld".
@@ -143,6 +169,11 @@ bool SignalingServer::start()
             &SignalingServer::onLocalIceCandidate);
     // Track when DataChannels/Tracks are fully open
     connect(m_Relay, &RelayBase::dataChannelsOpen, this, &SignalingServer::onDataChannelsOpen);
+    // Every way signalling gives up ends the session through the relay, which
+    // owns the teardown (Session::quit, the worker's exit). Until 20/10 this
+    // signal went nowhere: a browser gone mid-handshake or refused by MW-BIND
+    // left the session encoding for nobody until the next /start.
+    connect(this, &SignalingServer::sessionEnded, m_Relay, &RelayBase::endFromSignaling);
 
     // ICE timeout → WebSocket fallback (when UDP is blocked)
     if (auto* dcRelay = qobject_cast<DataChannelRelay*>(m_Relay)) {
@@ -154,6 +185,17 @@ bool SignalingServer::start()
 
     qInfo() << "[SignalingServer] Listening OK";
     m_Running = true;
+
+    // A browser that never opens this socket ends the session as well.
+    mw::signaling::armClientWait(
+        this, mw::signaling::kClientWaitMs,
+        [this]() { return m_ClientArrived || m_Stopping.load(); },
+        [this]() {
+            qWarning() << "[SignalingServer] No browser opened the signalling socket within"
+                       << mw::signaling::kClientWaitMs / 1000
+                       << "s — ending the session (the page was closed or lost after /start)";
+            emit sessionEnded();
+        });
 
     // The router hole, if any, was claimed by the parent before this process
     // existed (RouterPortAllocator); nothing to discover here.
@@ -287,6 +329,12 @@ void SignalingServer::onNewWsConnection()
         qWarning() << "[SignalingServer] nextPendingConnection returned null";
         return;
     }
+    // Bounded: Qt takes a message of up to 2 GB by default, and buffers all of
+    // it before anyone sees a byte. 16 MiB is far past anything this socket
+    // legitimately carries.
+    m_WsClient->setMaxAllowedIncomingMessageSize(16 * 1024 * 1024);
+    m_WsClient->setMaxAllowedIncomingFrameSize(16 * 1024 * 1024);
+    m_ClientArrived = true;
 
     // MW-BIND-v1 state is per connection: nonces are single-use, and a
     // reconnect must not be able to reuse the previous exchange's material.
@@ -310,10 +358,10 @@ void SignalingServer::onNewWsConnection()
     // question, answered by clientIsLocal below.
     const QString peerAddrStr = m_WsClient->peerAddress().toString();
     const bool isInternet = !NetClassify::isPrivateOrLoopback(m_ClientKind);
-    const bool clientIsLocal = NetClassify::isTrustedPeer(m_ClientKind);
+    const bool clientIsLocal = NetClassify::isTrustedPeer(m_ClientKind) || m_ClientSameNetwork;
     qInfo() << "[SignalingServer] Client connected via" << peerAddrStr
             << "— client kind=" << NetClassify::toString(m_ClientKind)
-            << "(isInternet=" << isInternet << ")";
+            << "(isInternet=" << isInternet << ", same network=" << m_ClientSameNetwork << ")";
 
     connect(m_WsClient, &QWebSocket::textMessageReceived, this, &SignalingServer::onWsTextMessage);
     connect(m_WsClient, &QWebSocket::disconnected, this, &SignalingServer::onWsDisconnected);
@@ -346,8 +394,12 @@ void SignalingServer::onNewWsConnection()
     // m_ForceIceTcp controls whether ICE-TCP candidates are generated
     // (true = UDP + TCP, false = UDP only).
     const bool mapped = !m_UpnpPublicIP.isEmpty() && m_UpnpExternalPort > 0;
-    rtc::Configuration config = buildIceConfig(
-        isInternet, mapped, m_MediaPort, lanOnly ? QString() : m_StunServerUrl, m_ForceIceTcp);
+    rtc::Configuration config =
+        buildIceConfig(isInternet, mapped, m_MediaPort, lanOnly ? QString() : m_StunServerUrl,
+                       m_ForceIceTcp, m_IceTcpPassive);
+    if (m_DebugIceDropUdp)
+        qWarning() << "[SignalingServer] DEBUG debug_ice_drop_udp is ON: every UDP candidate is"
+                   << "dropped, ours and the browser's — only passive ICE-TCP can connect";
 
     // With a router hole, tell the relay to rewrite host candidates with the
     // public IP and EXTERNAL port so the browser sees a "host" candidate at
@@ -475,7 +527,9 @@ void SignalingServer::onWsTextMessage(const QString& message)
         }
 
         // Feed the answer into libdatachannel PeerConnection
-        if (!m_Relay->setRemoteDescription(sdp.toStdString())) {
+        const std::string answer =
+            m_DebugIceDropUdp ? mw::ice::stripUdpCandidates(sdp.toStdString()) : sdp.toStdString();
+        if (!m_Relay->setRemoteDescription(answer)) {
             qWarning() << "[SignalingServer] Failed to set remote SDP description";
         } else {
             m_SignalingComplete = true;
@@ -491,6 +545,10 @@ void SignalingServer::onWsTextMessage(const QString& message)
         // that the host's own candidate list never can.
         qInfo() << "[SignalingServer] Received ICE candidate, mid=" << mid << ":"
                 << candidate.left(120);
+        if (m_DebugIceDropUdp && mw::ice::isUdpCandidate(candidate.toStdString())) {
+            qInfo() << "[SignalingServer] DEBUG remote UDP candidate dropped";
+            return;
+        }
 
         m_Relay->addRemoteCandidate(candidate.toStdString(), mid.toStdString());
     } else if (type == "fallback-ws-request") {
@@ -550,7 +608,9 @@ void SignalingServer::onWsDisconnected()
     // Emitting sessionEnded in that case would terminate the streaming
     // session prematurely.
     bool dcReady = wasComplete || m_DataChannelsOpen;
-    if (!dcReady) {
+    if (m_Stopping.load()) {
+        qInfo() << "[SignalingServer::onWsDisconnected] Stopping — the session is already ending";
+    } else if (!dcReady) {
         qInfo() << "[SignalingServer::onWsDisconnected] Signaling NOT complete & DCs NOT open — "
                    "emitting sessionEnded";
         emit sessionEnded();
@@ -578,9 +638,9 @@ void SignalingServer::onRelayIceTimedOut()
     const QString firewall = hostFirewallName();
     if (!firewall.isEmpty())
         qWarning().noquote() << "[SignalingServer]" << firewall
-                             << "is active on this host: it must let UDP" << m_MediaPort
-                             << "through (the packages open 48010-48033/udp), or no stream "
-                                "reaches this machine over UDP";
+                             << "is active on this host: it must let" << kMediaBlock
+                             << "through (the packages open it), or no stream reaches this "
+                                "machine over UDP";
 
     if (!m_AllowWsFallback) {
         // Auto mode: WS fallback is disabled so the auto fallback chain
@@ -864,13 +924,7 @@ void SignalingServer::handleWsFallbackInput(const QString& message)
         // The shared codec, like the other three transports: this copy used to
         // reimplement the international-key rules by hand and would have missed
         // the client's keyboard layout entirely.
-        const InputMsg::KeyPlan plan = InputMsg::resolveKey(msg, m_Shim->keyboardMode());
-        InputMsg::logKey(msg, m_Shim->keyboardMode(), plan, down);
-        if (plan.isText()) {
-            m_Shim->sendKeyChar(plan.text, down, InputMsg::modifierMask(msg));
-        } else {
-            m_Shim->sendKeyEvent(plan.keyCode, down, InputMsg::modifierMask(msg), plan.flags);
-        }
+        InputMsg::sendKey(*m_Shim, msg, down, /*withHold=*/false);
     } else if (type == "mousemove") {
         short dx = static_cast<short>(msg["dx"].toInt(0));
         short dy = static_cast<short>(msg["dy"].toInt(0));
@@ -989,7 +1043,7 @@ void SignalingServer::sendSignedOffer()
 
 void SignalingServer::onLocalSdp(const std::string& sdp)
 {
-    m_PendingOffer = sdp;
+    m_PendingOffer = m_DebugIceDropUdp ? mw::ice::stripUdpCandidates(sdp) : sdp;
 
     // Extract our own fingerprint from the offer we are about to make. Both
     // signatures cover it, so an SDP we cannot read a single sha-256 fingerprint
@@ -1025,6 +1079,11 @@ void SignalingServer::onLocalSdp(const std::string& sdp)
 void SignalingServer::onLocalIceCandidate(const std::string& candidate, const std::string& mid)
 {
     if (!m_WsClient || !m_WsClient->isValid()) return;
+    if (m_DebugIceDropUdp && mw::ice::isUdpCandidate(candidate)) {
+        qInfo() << "[SignalingServer] DEBUG local UDP candidate dropped:"
+                << QString::fromStdString(candidate);
+        return;
+    }
 
     // Logged like the browser's: when ICE fails, the port on each side is what
     // tells a host firewall from an unreachable address.
@@ -1076,7 +1135,8 @@ void SignalingServer::onDataChannelsOpen()
 // ── UPnP NAT traversal ─────────────────────────────────────────────────────────
 
 rtc::Configuration SignalingServer::buildIceConfig(bool isInternet, bool mapped, uint16_t mediaPort,
-                                                   const QString& stunServerUrl, bool forceIceTcp)
+                                                   const QString& stunServerUrl, bool forceIceTcp,
+                                                   bool iceTcpPassive)
 {
     // What the log lines below name: the port the socket binds, which is the
     // one the router forwards to when there is a mapping.
@@ -1104,22 +1164,26 @@ rtc::Configuration SignalingServer::buildIceConfig(bool isInternet, bool mapped,
     if (mapped) {
         config.portRangeBegin = mediaPort;
         config.portRangeEnd = mediaPort;
-    } else if (udpPortFree(mediaPort)) {
-        // Without a router hole too, pin this slot's fixed media port (base +
-        // slot, so concurrent streams never collide). An ephemeral port cannot
-        // be allowed through a port-based firewall: ufw and firewalld on Linux
-        // — which the packages open the media block in — and the port rules of
-        // --dev test builds on Windows (scripts/dev-firewall-allow.ps1). The
-        // installed Windows and macOS rules are program-scoped and take either.
-        config.portRangeBegin = mediaPort;
-        config.portRangeEnd = mediaPort;
-        qInfo() << "[SignalingServer] Pinned UDP media port" << mediaPort;
+    } else if (const uint16_t pinned = freeMediaPort(mediaPort)) {
+        // Without a router hole too, pin a port of the media block. An
+        // ephemeral port cannot be allowed through a port-based firewall: ufw
+        // and firewalld on Linux — which the packages open the block in — and
+        // the port rules of --dev test builds on Windows
+        // (scripts/dev-firewall-allow.ps1). The installed Windows and macOS
+        // rules are program-scoped and take either.
+        config.portRangeBegin = pinned;
+        config.portRangeEnd = pinned;
+        if (pinned == mediaPort)
+            qInfo() << "[SignalingServer] Pinned UDP media port" << pinned;
+        else
+            qWarning() << "[SignalingServer] UDP media port" << mediaPort << "is taken — pinned"
+                       << pinned << "from the same block instead";
     } else {
-        // Someone else holds it: a second instance on this machine (production
-        // next to --dev) streaming on the same slot. An ephemeral port still
-        // works wherever the firewall is program-scoped or off.
-        qWarning() << "[SignalingServer] UDP media port" << mediaPort
-                   << "is taken — using an ephemeral port, which a port-based firewall will block";
+        // The whole block is held: an ephemeral port still works wherever the
+        // firewall is program-scoped or off.
+        qWarning().noquote() << "[SignalingServer] UDP media ports" << kMediaBlock
+                             << "are all taken — using an ephemeral port, which a "
+                                "port-based firewall will block";
     }
 
     if (forceIceTcp) {
@@ -1127,9 +1191,15 @@ rtc::Configuration SignalingServer::buildIceConfig(bool isInternet, bool mapped,
         // fallback path if UDP is blocked by a restrictive firewall.
         // STUN is included to discover srflx addresses as well.
         config.enableIceTcp = true;
+        // Our ICE-TCP only dials, and a browser only dials too: without a
+        // listener the two never pair, and UDP-blocked means no path at all.
+        // The listener shares the media port, whose TCP side the router hole
+        // already forwards; the relay rewrites its candidate like the UDP one.
+        config.enableIceTcpPassive = iceTcpPassive;
         if (!stunServerUrl.isEmpty()) config.iceServers.emplace_back(stunServerUrl.toStdString());
 
         qInfo() << "[SignalingServer] ICE config: TCP mode"
+                << (iceTcpPassive ? "(listening)" : "(dialling only)")
                 << (upnpMappedPort > 0 ? "+ UPnP port=" + QString::number(upnpMappedPort) : "")
                 << stunServerUrl;
     } else if (isInternet) {

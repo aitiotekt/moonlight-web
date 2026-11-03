@@ -32,13 +32,14 @@
  * codec handling. Render quirks (green tint, stride) are preserved and must be
  * re-validated per browser/codec when this path is enabled.
  *
- * Messages in:  init | frame | frameloss | stop
+ * Messages in:  init | frame | frameloss | framesize | stop
  * Messages out: requestidr | codecfallback | firstframe | status | counters | fatal
  */
 import {
     NalParser,
     buildDescription,
     getCodecString,
+    getPictureSize,
     toAvcc,
     H264_FALLBACK_CODEC_STRINGS,
     HEVC_FALLBACK_CODEC_STRINGS,
@@ -54,11 +55,13 @@ import {
     CODEC_AV1,
 } from '../util/Av1Utils.js';
 import { createVideoRenderer } from './renderers/createRenderer.js';
+import { SliceQpReader } from '../util/SliceQp.js';
 import { PipelineDiag } from './PipelineDiag.js';
 import { shouldFlushAtKeyframe } from './DecodeQueuePolicy.js';
 import { EnhancerGovernor, ladderRung, rendererAlgo } from './EnhancerGovernor.js';
 import { drawCapFor } from './RenderPacing.js';
 import { FramePacer } from './FramePacer.js';
+import { cropToAnnounced } from './FrameCrop.js';
 
 // ── Worker-local pipeline state (mirrors the StreamView fields) ──────────────
 const S = {
@@ -69,11 +72,15 @@ const S = {
     videoCodec: 'h264',
     isChromeWindowsHevc: false,
     transport: 'webrtc',
+    /** @type {{width: number, height: number} | null} */
+    frameSize: null,
 
     decoder: null,
     decoderConfigured: false,
     decoderConfiguring: false,
     nalParser: null,
+    /** mwsr 3's QP reader (SliceQp.js), made on its first frame: null otherwise. */
+    sliceQp: null,
 
     pendingFrames: [],
     frameQueue: [],
@@ -271,6 +278,8 @@ function postCounters(force) {
             render: stageStats(S._renderSamples),
         },
         resolution: S._lastResolution || '',
+        // The renderer copied the last frame at 1:1, its pass idle (overlay).
+        passthrough: !!(S.renderer && S.renderer.passthrough),
         pacer: S.pacer ? S.pacer.stats : null,
         diag,
     });
@@ -283,12 +292,30 @@ function postCounters(force) {
 // what is running.
 function applyEnhancerGovernor(diag, now) {
     if (!S.governor || !S.renderer) return;
+    const fencesIgnored = S.governor.fencesIgnored;
+    const presentationBound = S.governor.presentationBound;
     const algo = S.governor.update({
         serviceMs: diag.renderServiceMs,
         arrivalMs: diag.arrivalAvgMs,
         decodeQueue: diag.decodeQueueAvg,
+        // The GPU fences (WebGlRenderer.takeGpuBehind): a pass the GPU keeps
+        // up with, frames late.
+        gpuBehind:
+            typeof S.renderer.takeGpuBehind === 'function' ? S.renderer.takeGpuBehind() : null,
+        // A frame copied at 1:1 ran no pass: the window is not a measurement.
+        passthrough: S.renderer.passthrough === true,
         now,
     });
+    if (!fencesIgnored && S.governor.fencesIgnored) {
+        console.log(
+            '[VideoWorker] Enhancer: the GPU fences read the plain copy late — ignored for this session',
+        );
+    }
+    if (!presentationBound && S.governor.presentationBound) {
+        console.log(
+            '[VideoWorker] Enhancer: the plain copy waits on presentation — the draw time cuts only past a whole frame, for this session',
+        );
+    }
     if (!algo) return;
     const pass = rendererAlgo(algo, S.renderer.kind);
     if (!S.renderer.setAlgo(pass)) return;
@@ -326,6 +353,8 @@ function setupDecoder() {
                         (frame.format || 'null'),
                 );
             }
+            // AV1 padded past the picture: cut to the host's size (FrameCrop.js).
+            if (S.videoCodec === CODEC_AV1) frame = cropToAnnounced(frame, S.frameSize);
             onDecodedFrame(frame);
         },
         error: (err) => {
@@ -499,7 +528,13 @@ function configureDecoder() {
     // 4:4:4 is RExt too and is SDR), AV1 10-bit.
     const isHdr = isHevcHdrProfile(codec, S.nalParser.sps) || isAv1HdrProfile(codec);
 
-    const shared = { codedWidth: 1920, codedHeight: 1080, optimizeForLatency: true };
+    // The size the host really encodes, from the SPS (StreamView.configureDecoder
+    // has why: issue #23); 1080p only when the SPS cannot be read.
+    const pic = getPictureSize(S.nalParser);
+    const codedSize = pic
+        ? { codedWidth: pic.width, codedHeight: pic.height }
+        : { codedWidth: 1920, codedHeight: 1080 };
+    const shared = { ...codedSize, optimizeForLatency: true };
     // Decoder color space: HDR (BT.2020 + PQ) or SDR (BT.709).
     /** @type {{ colorSpace: HdrVideoColorSpaceInit }} */
     const vColor = isHdr
@@ -551,26 +586,23 @@ function configureDecoder() {
         configsToTry.push({
             codec: fbCodec,
             description: desc.buffer,
-            codedWidth: 1920,
-            codedHeight: 1080,
+            ...codedSize,
             optimizeForLatency: true,
             ...vColor,
         });
         configsToTry.push({
             codec: fbCodec,
             description: desc.buffer,
-            codedWidth: 1920,
-            codedHeight: 1080,
+            ...codedSize,
             optimizeForLatency: true,
         });
     }
-    configsToTry.push({ codec, description: desc.buffer, codedWidth: 1920, codedHeight: 1080 });
+    configsToTry.push({ codec, description: desc.buffer, ...codedSize });
     configsToTry.push({ codec, description: desc.buffer });
     configsToTry.push({
         codec,
         description: desc,
-        codedWidth: 1920,
-        codedHeight: 1080,
+        ...codedSize,
         optimizeForLatency: true,
     });
     configsToTry.push({ codec, optimizeForLatency: true });
@@ -600,7 +632,12 @@ function tryHevcAvccConfigs(codec, desc, fallbacks, shared, vColor) {
     }
     cfgs.push({ codec, description: desc, ...shared });
     cfgs.push({ codec, description: desc.buffer, optimizeForLatency: true });
-    cfgs.push({ codec, description: desc.buffer, codedWidth: 1920, codedHeight: 1080 });
+    cfgs.push({
+        codec,
+        description: desc.buffer,
+        codedWidth: shared.codedWidth,
+        codedHeight: shared.codedHeight,
+    });
     cfgs.push({ codec, description: desc.buffer });
     cfgs.push({ codec, ...shared });
     cfgs.push({ codec, optimizeForLatency: true });
@@ -652,7 +689,7 @@ function flushPendingFrames() {
     }
     while (S.pendingFrames.length > 0) {
         const entry = S.pendingFrames.shift();
-        decodeFrame(entry.data, entry.isKeyframe, entry.backendTs, entry.arrivalAbs);
+        decodeFrame(entry.data, entry.isKeyframe, entry.backendTs, entry.arrivalAbs, entry.zones);
     }
 }
 
@@ -678,10 +715,10 @@ function flushDecodeQueue() {
     return true;
 }
 
-function decodeFrame(data, isKeyframe, backendTs, arrivalAbs) {
+function decodeFrame(data, isKeyframe, backendTs, arrivalAbs, zones = null) {
     if (!S.decoderConfigured) {
         if (S.pendingFrames.length < 120)
-            S.pendingFrames.push({ data, isKeyframe, backendTs, arrivalAbs });
+            S.pendingFrames.push({ data, isKeyframe, backendTs, arrivalAbs, zones });
         return;
     }
     if (!S.decoder) return;
@@ -744,6 +781,13 @@ function decodeFrame(data, isKeyframe, backendTs, arrivalAbs) {
 
     try {
         const chunk = new EncodedVideoChunk({ type, timestamp, duration: 16667, data: avccData });
+        // The frame's size: the picture's motion, for the gaze zone of mwsr.
+        if (S.renderer) S.renderer.noteEncodedFrame(avccData.length, isKeyframe);
+        // mwsr 3: the frame's QP, from its first slice header (nothing read otherwise).
+        if (S.renderer && S.renderer.wantsFrameQp) S.renderer.noteFrameQp(timestamp, frameQp(data));
+        // mwsr's zones from the native host, kept by the chunk's timestamp.
+        if (zones && S.renderer && S.renderer.wantsFrameZones)
+            S.renderer.noteFrameZones(timestamp, zones);
         trackChunkSubmit(timestamp, backendTs);
         if (arrivalAbs > 0) addStageSample(S._arriveSamples, nowAbs() - arrivalAbs);
         S.decoder.decode(chunk);
@@ -759,9 +803,16 @@ function decodeFrame(data, isKeyframe, backendTs, arrivalAbs) {
     }
 }
 
+/** The QP of a frame for mwsr 3 (SliceQp.js); the reader made on first use, per codec. */
+function frameQp(annexB) {
+    const codec = S.nalParser.codec;
+    if (!S.sliceQp || S.sliceQp.codec !== codec) S.sliceQp = new SliceQpReader(codec);
+    return S.sliceQp.read(annexB);
+}
+
 // ── AV1 pipeline ─────────────────────────────────────────────────────────────
 
-function handleAv1Frame(data, isKeyframe, arrivalAbs) {
+function handleAv1Frame(data, isKeyframe, arrivalAbs, zones = null) {
     if (!S.decoderConfigured && !S.decoderConfiguring) {
         if (isKeyframe) {
             if (S.pendingFrames.length > 0) S.pendingFrames = [];
@@ -770,14 +821,14 @@ function handleAv1Frame(data, isKeyframe, arrivalAbs) {
             configureAv1Decoder(seqHeader || undefined);
         } else {
             if (S.pendingFrames.length < 120)
-                S.pendingFrames.push({ data, isKeyframe, arrivalAbs });
+                S.pendingFrames.push({ data, isKeyframe, arrivalAbs, zones });
             if (S.pendingFrames.length > 30 && S.pendingFrames.length % 30 === 0) {
                 requestIdr('AV1 no keyframe while buffering');
             }
             return;
         }
     }
-    decodeAv1Frame(data, isKeyframe, arrivalAbs);
+    decodeAv1Frame(data, isKeyframe, arrivalAbs, zones);
 }
 
 function configureAv1Decoder(seqHeaderObu) {
@@ -806,7 +857,7 @@ function configureAv1Decoder(seqHeaderObu) {
                         }
                         while (S.pendingFrames.length > 0) {
                             const entry = S.pendingFrames.shift();
-                            decodeAv1Frame(entry.data, entry.isKeyframe);
+                            decodeAv1Frame(entry.data, entry.isKeyframe, 0, entry.zones);
                         }
                     } catch (e) {
                         tryCodecs(index + 1);
@@ -820,9 +871,10 @@ function configureAv1Decoder(seqHeaderObu) {
     tryCodecs(0);
 }
 
-function decodeAv1Frame(data, isKeyframe, arrivalAbs) {
+function decodeAv1Frame(data, isKeyframe, arrivalAbs, zones = null) {
     if (!S.decoderConfigured) {
-        if (S.pendingFrames.length < 120) S.pendingFrames.push({ data, isKeyframe, arrivalAbs });
+        if (S.pendingFrames.length < 120)
+            S.pendingFrames.push({ data, isKeyframe, arrivalAbs, zones });
         return;
     }
     if (!S.decoder) return;
@@ -836,6 +888,9 @@ function decodeAv1Frame(data, isKeyframe, arrivalAbs) {
         // AV1 has no backendTs here (synthetic chunk timestamps), so the pacer
         // sees 0 and leaves this path on the present-on-decode behavior.
         const chunk = new EncodedVideoChunk({ type, timestamp, duration: 16667, data: obuData });
+        if (S.renderer) S.renderer.noteEncodedFrame(obuData.length, isKeyframe);
+        if (zones && S.renderer && S.renderer.wantsFrameZones)
+            S.renderer.noteFrameZones(timestamp, zones);
         trackChunkSubmit(timestamp, 0);
         if (arrivalAbs > 0) addStageSample(S._arriveSamples, nowAbs() - arrivalAbs);
         S.decoder.decode(chunk);
@@ -984,7 +1039,7 @@ async function drawFrame(frame) {
 
 // Core frame entry (mirrors StreamView._processVideoFrame from the AV1 dispatch
 // onward; stale/gap/stats/overlay stay on the main thread before this point).
-function processFrame(data, isKeyframe, backendTs, arrivalAbs) {
+function processFrame(data, isKeyframe, backendTs, arrivalAbs, zones = null) {
     if (S.stopped || S._fatalDecodeError) return;
 
     // Arrival cadence + encoded size at the pipeline entry: distinguishes "the
@@ -993,7 +1048,7 @@ function processFrame(data, isKeyframe, backendTs, arrivalAbs) {
     S.diag.noteArrival(data.length);
 
     if (S.videoCodec === CODEC_AV1) {
-        handleAv1Frame(data, isKeyframe, arrivalAbs);
+        handleAv1Frame(data, isKeyframe, arrivalAbs, zones);
         return;
     }
 
@@ -1027,7 +1082,7 @@ function processFrame(data, isKeyframe, backendTs, arrivalAbs) {
     }
     if (!S.decoderConfigured && S.nalParser.isReady()) configureDecoder();
 
-    decodeFrame(data, isKeyframe, backendTs, arrivalAbs);
+    decodeFrame(data, isKeyframe, backendTs, arrivalAbs, zones);
 }
 
 self.onmessage = (e) => {
@@ -1038,6 +1093,8 @@ self.onmessage = (e) => {
             S.videoCodec = m.videoCodec;
             S.isChromeWindowsHevc = !!m.isChromeWindowsHevc;
             S.transport = m.transport || 'webrtc';
+            // The native host's frame size, null elsewhere (StreamView._frameSize).
+            S.frameSize = m.frameSize || null;
             // Adaptive presentation reserve (mw_pacing, resolved on main — the
             // worker has no localStorage). Null keeps present-on-decode.
             S.pacer = m.pacing ? new FramePacer() : null;
@@ -1055,7 +1112,14 @@ self.onmessage = (e) => {
                 webgpu: !!m.webgpu,
                 algo: m.algo,
                 ceiling: m.ceiling,
+                yuv444: !!m.yuv444,
                 hdr: !!m.hdr,
+                // The mwsr kernel's gaze zone (BrowserDetect.mwsrGazeWanted, on main).
+                gazeZone: !!m.gazeZone,
+                // mwsr's zones from the native host (BrowserDetect.mwsrMapWanted, on main).
+                zoneMap: !!m.zoneMap,
+                // mwsr 2 / 3's deblocking (the debug menu's), null otherwise.
+                deblock: m.deblock || null,
             }).then((r) => {
                 S.renderer = r;
                 // The setting is the ceiling: the governor only steps below
@@ -1084,11 +1148,15 @@ self.onmessage = (e) => {
             break;
         case 'frame': {
             const data = new Uint8Array(m.data);
-            processFrame(data, m.isKeyframe, m.backendTs, m.arrivalAbs || 0);
+            processFrame(data, m.isKeyframe, m.backendTs, m.arrivalAbs || 0, m.zones || null);
             break;
         }
         case 'frameloss':
             S._referenceValid = false;
+            break;
+        case 'framesize':
+            // The host's display changed size (`displayformat`).
+            S.frameSize = m.frameSize || null;
             break;
         case 'resync':
             // The tab is back from the background: the burst of frames that

@@ -228,6 +228,19 @@ describe('which machine a page talks to', () => {
             at(`/${A}`, `#p=/${'x'.repeat(33)}`);
             expect(tunnelModule.landingPathFromLocation()).toBeNull();
         });
+
+        // A reload of the application, which the service worker now sends
+        // through this page so the cache is checked first: it lands back where
+        // it was, never on a path that is an identifier or has two segments.
+        it('keeps the page a reload of the application was on', () => {
+            at('/admin', `#${A}`);
+            expect(tunnelModule.landingPathFromLocation()).toBe('/admin');
+            expect(tunnelModule.hostIdFromLocation()).toBe(A);
+            at('/', `#${A}`);
+            expect(tunnelModule.landingPathFromLocation()).toBeNull();
+            at('/admin/x', `#${A}`);
+            expect(tunnelModule.landingPathFromLocation()).toBeNull();
+        });
     });
 
     // And a fourth: the invitation an owner shared. It never appears in a URL

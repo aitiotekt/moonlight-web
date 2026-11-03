@@ -55,12 +55,15 @@ export class InstanceMenu {
      *
      * @param {string} currentId  this install's key in the register
      * @param {string} name       what this install calls itself
+     * @param {Array<{id: string, name: string, url: string}>} [entries]
+     *        the rows to offer, instead of the register as it stands — the PIN
+     *        screen passes its own, where this machine goes by a neutral label
      */
-    render(currentId, name) {
+    render(currentId, name, entries) {
         if (!this.mount || !name) return;
         this.currentId = currentId;
 
-        const instances = listInstances();
+        const instances = entries ?? listInstances();
         // The register is written before this runs, so the current machine is
         // always in it — but a browser that refused storage gives an empty list,
         // and the header must still show the name it was handed.

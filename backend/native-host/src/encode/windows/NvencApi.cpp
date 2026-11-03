@@ -57,7 +57,10 @@ NvencApi::NvencApi()
     // Never linked: the DLL belongs to the display driver, and its absence is
     // the normal state of every machine without an NVIDIA GPU.
     HMODULE dll = ::GetModuleHandleW(L"nvEncodeAPI64.dll");
-    if (!dll) dll = ::LoadLibraryW(L"nvEncodeAPI64.dll");
+    // From System32 only, where the driver puts it: absent (any machine without
+    // that vendor's GPU), a bare name would go on down the search order to
+    // PATH, which the user writes, in a worker that may run elevated.
+    if (!dll) dll = ::LoadLibraryExW(L"nvEncodeAPI64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!dll) {
         m_Reason = "no NVIDIA encoder runtime on this machine";
         return;

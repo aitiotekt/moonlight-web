@@ -102,15 +102,23 @@ if(WIN32)
         set(_mw_ssl_arch x64)
     endif()
     set(_mw_ssl "${CMAKE_CURRENT_SOURCE_DIR}/libs/windows")
-    # Use the committed prebuilt only if present for this arch (x64). Otherwise
-    # (e.g. ARM64) fall back to find_package — supply OpenSSL via a vcpkg
-    # toolchain or OPENSSL_ROOT_DIR on the command line.
+    # Use the committed prebuilt when present for this arch (x64 and ARM64, made
+    # by scripts/build-openssl-windows.ps1). Otherwise fall back to find_package
+    # — supply OpenSSL via a vcpkg toolchain or OPENSSL_ROOT_DIR.
     if(EXISTS "${_mw_ssl}/lib/${_mw_ssl_arch}/libssl.lib")
         set(_mw_ssl_prebuilt ON)
         set(OPENSSL_ROOT_DIR     "${_mw_ssl}")
         set(OPENSSL_INCLUDE_DIR  "${_mw_ssl}/include/${_mw_ssl_arch}" CACHE PATH "" FORCE)
         set(OPENSSL_SSL_LIBRARY    "${_mw_ssl}/lib/${_mw_ssl_arch}/libssl.lib"    CACHE FILEPATH "" FORCE)
         set(OPENSSL_CRYPTO_LIBRARY "${_mw_ssl}/lib/${_mw_ssl_arch}/libcrypto.lib" CACHE FILEPATH "" FORCE)
+        # Under MSVC, FindOpenSSL searches OPENSSL_ROOT_DIR/lib for its own
+        # names (libcrypto64MD...) and then overwrites the two variables above
+        # with what it found — the x64 import library, whatever the target.
+        # Its search results are cache entries: pinning them pins the answer.
+        foreach(_cfg RELEASE DEBUG)
+            set(LIB_EAY_${_cfg} "${OPENSSL_CRYPTO_LIBRARY}" CACHE FILEPATH "" FORCE)
+            set(SSL_EAY_${_cfg} "${OPENSSL_SSL_LIBRARY}" CACHE FILEPATH "" FORCE)
+        endforeach()
     else()
         message(STATUS "No committed OpenSSL for ${_mw_ssl_arch} — relying on find_package")
     endif()
@@ -156,6 +164,72 @@ add_subdirectory(native-host)
 # moonlight-common-c (+ bundled ENet, nanors FEC). Its CMakeLists picks the
 # right ENet platform sources (win32.c vs unix.c) and links OpenSSL crypto.
 add_subdirectory(third_party/moonlight-common-c)
+
+# Our patches on submodules, kept as files in third_party/patches rather than a
+# fork: each is applied to the submodule's working tree at configure time, once
+# (a patch that already reverses cleanly is left alone).
+find_package(Git REQUIRED)
+function(mw_apply_patch dir patch)
+    set(p "${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/${patch}")
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${dir}" apply --reverse --check "${p}"
+                    RESULT_VARIABLE applied OUTPUT_QUIET ERROR_QUIET)
+    if(applied EQUAL 0)
+        return()
+    endif()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${dir}" apply "${p}"
+                    RESULT_VARIABLE failed ERROR_VARIABLE why)
+    if(NOT failed EQUAL 0)
+        message(FATAL_ERROR "${patch} does not apply to ${dir}: ${why}"
+                            "(the submodule moved: refresh the patch)")
+    endif()
+    message(STATUS "applied ${patch}")
+endfunction()
+
+# libdatachannel: the DSCP of outgoing packets settable (rtc::SetDscpSettings),
+# where upstream writes EF / AF42 / AF11 in. The server puts it all in AF41
+# (plan « le son et la priorité des paquets », D5).
+mw_apply_patch("${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdatachannel"
+               libdatachannel-dscp-settings.patch)
+# DtlsSrtpTransport copies every RTP packet with make_message(size, orig), which
+# dropped the DSCP the track had set: the sound left in the video's class, never
+# its own (bench of 21/10). A patch of its own, so a tree with the one above
+# already applied takes it too.
+mw_apply_patch("${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdatachannel"
+               libdatachannel-srtp-dscp.patch)
+# libjuice gives up marking on Windows without trying; on Windows 11 an
+# unelevated setsockopt(IP_TOS) does mark, under the service too. Chosen over a
+# QoS policy laid by the installer, which Windows leaves out of force after a
+# reboot on a PC outside a domain (bench of 12/10, even with "Do not use NLA").
+option(MW_LIBJUICE_WINDOWS_DSCP "Let libjuice set the DSCP on Windows" ON)
+set(MW_LIBJUICE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdatachannel/deps/libjuice")
+if(WIN32 AND MW_LIBJUICE_WINDOWS_DSCP)
+    mw_apply_patch("${MW_LIBJUICE_DIR}" libjuice-windows-diffserv.patch)
+else()
+    # Switched back off: the patch comes out again.
+    set(p "${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/libjuice-windows-diffserv.patch")
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${MW_LIBJUICE_DIR}" apply --reverse --check "${p}"
+                    RESULT_VARIABLE applied OUTPUT_QUIET ERROR_QUIET)
+    if(applied EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${MW_LIBJUICE_DIR}" apply --reverse "${p}")
+        message(STATUS "took libjuice-windows-diffserv.patch out")
+    endif()
+endif()
+# macOS refuses IP_TOS on libjuice's dual-stack socket and IPV6_TCLASS marks
+# IPv6 only: a stream to an IPv4 peer left unmarked (bench of 16/10). Each such
+# packet carries the class itself instead.
+if(APPLE)
+    mw_apply_patch("${MW_LIBJUICE_DIR}" libjuice-macos-diffserv.patch)
+endif()
+# libjuice's ICE-TCP only dials, and a browser only dials too (it never even
+# signals its TCP candidates): where UDP is blocked, no pair could form (bench of
+# 23/10). This one listens as well, on the TCP side of the agent's UDP port and
+# only while the checks run, behind a gate that reads nothing past an
+# authenticated Binding request. A connection asks for it through
+# rtc::Configuration::enableIceTcpPassive, the second patch; the server does
+# when the owner sets ice_tcp_passive. docs/design/ice-tcp-passive.md
+mw_apply_patch("${MW_LIBJUICE_DIR}" libjuice-ice-tcp-passive.patch)
+mw_apply_patch("${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdatachannel"
+               libdatachannel-ice-tcp-passive.patch)
 
 # libdatachannel (WebRTC DataChannel + media). Match the previous .bat flags.
 set(NO_WEBSOCKET ON  CACHE BOOL "" FORCE)
@@ -222,16 +296,28 @@ add_executable(mw-server
     src/server/SessionPool.cpp
     src/server/routes/AuthRoutes.cpp
     src/server/routes/HostRoutes.cpp
+    src/server/routes/HostAppRoutes.cpp
+    src/server/HostAppImage.cpp
+    src/server/HostAppLauncher.cpp
+    src/server/LauncherDetect.cpp
     src/server/routes/ShareRoutes.cpp
     src/server/routes/SystemRoutes.cpp
+    src/server/routes/LogRoutes.cpp
+    src/server/LogArchive.cpp
+    src/server/LogScrubber.cpp
     src/common/Logger.cpp
+    src/common/RunFlags.cpp
+    src/common/ZipWriter.cpp
     src/common/CrashHandler.cpp
     src/common/DesktopSession.cpp
     src/common/Edition.cpp
     src/common/LinuxCapabilities.cpp
     src/common/RendezvousId.cpp
+    src/common/InheritedEnvironment.cpp
     src/network/RendezvousClient.cpp
+    src/network/AddressRace.cpp
     src/network/UPNPClient.cpp
+    src/network/LinkAddresses.cpp
     src/network/RouterPortCore.cpp
     src/network/RouterPortAllocator.cpp
     src/network/StunClient.cpp
@@ -240,10 +326,14 @@ add_executable(mw-server
     src/network/SessionMetrics.cpp
     src/network/UpdateChecker.cpp
     src/network/SelfUpdater.cpp
+    src/network/UpdateApply.cpp
+    src/network/UpdateApplyRules.cpp
+    src/network/MdnsAdvertiser.cpp
     src/TrayManager.cpp
     src/Autostart.cpp
     src/DisplaySleep.cpp
     src/LatencyFlag.cpp
+    src/LatencyBeep.cpp
     src/backend/NvHTTP.cpp
     src/backend/NvComputer.cpp
     src/backend/ComputerManager.cpp
@@ -269,6 +359,8 @@ add_executable(mw-server
     src/backend/VirtualDisplayRules.cpp
     src/backend/VirtualDisplayJob.cpp
     src/backend/VirtualDisplayApply.cpp
+    src/backend/DriverPackage.cpp
+    src/backend/VirtualHidApply.cpp
     # Listed as a source although it is a header: it declares a Q_OBJECT with no
     # .cpp of its own (it is the pure media-engine interface), and AUTOMOC only
     # moc's a header it can see in the target.
@@ -279,12 +371,30 @@ add_executable(mw-server
     src/streaming/InputWatchdog.cpp
     src/streaming/MoonlightShim.cpp
     src/streaming/NativeMediaEngine.cpp
+    # The HID passthrough's hidattach: the page's WebHID collections, read.
+    src/streaming/HidCollectionsJson.cpp
+    # Its wheels kept between two streams, from one worker to the next.
+    src/streaming/HidParkedJson.cpp
+    src/streaming/HidParkingTransfer.cpp
+    src/streaming/FeedInfo.cpp
+    src/streaming/FeedPublisher.cpp
+    src/streaming/FeedSubscriber.cpp
+    src/streaming/SharedFeed.cpp
     src/streaming/NativeBench.cpp
     src/streaming/ClipboardBridge.cpp
     src/streaming/HostAudioSink.cpp
+    # The viewer's microphone, played into this machine's virtual one; its OS
+    # backend (MicOutput*.cpp) is chosen below.
+    src/streaming/MicUplink.cpp
     src/streaming/StreamRelay.cpp
     src/streaming/DataChannelRelay.cpp
+    src/streaming/PacketMarking.cpp
+    src/streaming/SctpCounters.cpp
+    src/streaming/HostUplinkReader.cpp
+    src/streaming/HostUploadCap.cpp
+    src/streaming/SctpFlood.cpp
     src/streaming/FrameSender.cpp
+    src/streaming/AroadPacer.cpp
     src/streaming/MediaTrackRelay.cpp
     src/streaming/SignalingServer.cpp
     src/streaming/StreamWorkerHost.cpp
@@ -320,6 +430,11 @@ set_target_properties(mw-server PROPERTIES OUTPUT_NAME ${MW_APP_NAME})
 # App Nap suppression during streaming (Objective-C++, macOS only).
 if(APPLE)
     target_sources(mw-server PRIVATE src/common/MacActivity.mm)
+    # The icon of a launcher found on this Mac, for its card (HostAppImage).
+    target_sources(mw-server PRIVATE src/server/HostAppImageMac.mm)
+    # A card's new windows onto the virtual display (HostAppLauncher).
+    target_sources(mw-server PRIVATE src/server/HostAppLauncherMac.mm)
+    target_link_libraries(mw-server PRIVATE "-framework AppKit" "-framework ApplicationServices")
 endif()
 
 # ── Click-to-photon flag: the per-platform backends ────────────────────────
@@ -329,8 +444,10 @@ endif()
 if(APPLE)
     target_sources(mw-server PRIVATE src/LatencyFlagMac.mm)
     target_compile_definitions(mw-server PRIVATE MW_LATENCY_FLAG_MAC)
-    # CGEventTap + NSWindow. Foundation/Security are already linked below.
-    target_link_libraries(mw-server PRIVATE "-framework AppKit" "-framework ApplicationServices")
+    # CGEventTap + NSWindow, and CATransaction to hand the flag to the window
+    # server at once. Foundation/Security are already linked below.
+    target_link_libraries(mw-server PRIVATE "-framework AppKit" "-framework ApplicationServices"
+                                            "-framework QuartzCore")
 elseif(UNIX)
     # Optional, like the native host's own Linux dependencies: without the X11
     # headers CMake still builds — the stub, whose unsupportedReason() names the
@@ -362,6 +479,48 @@ elseif(UNIX)
     endif()
 endif()
 
+# ── The viewer's microphone (src/streaming/MicOutput.h) ────────────────────
+# Windows plays it into a virtual cable through WASAPI (no dependency); Linux
+# into a PipeWire virtual source, libpipewire opened with dlopen — headers only
+# here, as for the native host, so a machine without it still starts. Without
+# the headers the build carries the stub, which says why.
+if(WIN32)
+    target_sources(mw-server PRIVATE src/streaming/MicOutputWindows.cpp)
+elseif(UNIX AND NOT APPLE)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(MW_MIC_PIPEWIRE QUIET libpipewire-0.3)
+    endif()
+    if(MW_MIC_PIPEWIRE_FOUND)
+        message(STATUS "Microphone: PipeWire ${MW_MIC_PIPEWIRE_VERSION} ON")
+        target_sources(mw-server PRIVATE src/streaming/MicOutputPipeWire.cpp)
+        target_include_directories(mw-server SYSTEM PRIVATE ${MW_MIC_PIPEWIRE_INCLUDE_DIRS})
+        target_compile_options(mw-server PRIVATE ${MW_MIC_PIPEWIRE_CFLAGS_OTHER})
+    else()
+        message(WARNING "Microphone OFF — install libpipewire-0.3-dev to build it")
+        target_sources(mw-server PRIVATE src/streaming/MicOutputNone.cpp)
+    endif()
+else()
+    target_sources(mw-server PRIVATE src/streaming/MicOutputNone.cpp)
+endif()
+
+# libopus decodes it. The native host builds the same submodule when it has a
+# sound to encode; a build where it does not (no PipeWire headers, the
+# container's relay-only image) gets it from here.
+if(NOT TARGET opus)
+    set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+    set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+    set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+    add_subdirectory(native-host/third_party/opus ${CMAKE_CURRENT_BINARY_DIR}/opus-mic
+                     EXCLUDE_FROM_ALL)
+    set_target_properties(opus PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+endif()
+target_link_libraries(mw-server PRIVATE Opus::opus)
+target_include_directories(mw-server SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/native-host/third_party/opus/include)
+
 # Windows release builds run windowless (no console): logs go to a file next to
 # the exe (see main.cpp). Debug keeps the console for development. WIN32_EXECUTABLE
 # switches to /SUBSYSTEM:WINDOWS, so Qt6::EntryPoint must provide WinMain->main.
@@ -391,6 +550,9 @@ target_include_directories(mw-server PRIVATE
     third_party/qmdnsengine
     third_party/moonlight-common-c/src
     third_party/moonlight-common-c/enet/include
+    # usrsctp (built inside libdatachannel): DataChannelRelay reads its
+    # retransmission counters.
+    third_party/libdatachannel/deps/usrsctp/usrsctplib
     ${CMAKE_CURRENT_BINARY_DIR}/miniupnpc_include
 )
 
@@ -458,13 +620,15 @@ if(WIN32)
     # from the service (ConsoleSession.cpp).
     # taskschd + ole32 + oleaut32: the logon Scheduled Task toggled from the
     # tray and the admin page (Autostart.cpp).
-    # setupapi + newdev + cfgmgr32: the virtual display driver's device node,
-    # created and removed by the --vdisplay-apply helper (VirtualDisplayApply.cpp).
+    # setupapi + newdev + cfgmgr32: the virtual display's and the virtual HID's
+    # device nodes, created and removed by the --vdisplay-apply and --vhid-apply
+    # helpers (VirtualDisplayApply.cpp, VirtualHidApply.cpp).
     # advapi32 + shell32: the LocalSystem launcher service — the SCM, the pipe
     # DACLs and the console user's AppData (WorkerService.cpp).
+    # wintrust: the update installer's Authenticode check (UpdateApply.cpp).
     target_link_libraries(mw-server PRIVATE ws2_32 winmm Bcrypt Crypt32 iphlpapi Dbghelp avrt
                                             wtsapi32 userenv taskschd ole32 oleaut32
-                                            setupapi newdev cfgmgr32 advapi32 shell32)
+                                            setupapi newdev cfgmgr32 advapi32 shell32 wintrust)
     # OpenSSL is linked dynamically (import libs) — ship the DLLs next to the exe.
     file(GLOB _mw_ssl_dlls "${_mw_ssl}/lib/${_mw_ssl_arch}/*-3-${_mw_ssl_arch}.dll")
     foreach(_dll ${_mw_ssl_dlls})
@@ -552,6 +716,17 @@ if(MW_BUILD_TESTS)
         # settings it writes. Pure Qt Core, verified here on every platform.
         tests/test_virtual_display.cpp
         src/backend/VirtualDisplayRules.cpp
+        # The pinned-hash gate in front of SetupAPI, and the HID driver's pins.
+        tests/test_driver_package.cpp
+        src/backend/DriverPackage.cpp
+        # What the elevated update helper accepts to run, and the environment
+        # variables every elevated helper drops before Qt reads them.
+        tests/test_update_apply.cpp
+        src/network/UpdateApplyRules.cpp
+        src/network/UpdateChecker.cpp
+        # UpdateChecker asks for the address race on its request (AddressRace).
+        src/network/AddressRace.cpp
+        src/common/InheritedEnvironment.cpp
         src/common/Edition.cpp
         src/server/ConnectionGuard.cpp
         src/server/HttpParser.cpp
@@ -571,7 +746,14 @@ if(MW_BUILD_TESTS)
     )
     set_target_properties(mw-security-tests PROPERTIES AUTOMOC ON)
     target_include_directories(mw-security-tests PRIVATE src tests)
+    # The driver packages the installer bundles, re-hashed against their pins.
+    target_compile_definitions(mw-security-tests PRIVATE
+        MW_INSTALLER_DRIVERS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers")
     target_link_libraries(mw-security-tests PRIVATE Qt6::Core Qt6::Network OpenSSL::Crypto)
+    if(WIN32)
+        # DriverPackage.cpp's catalog signer check (CryptQueryObject).
+        target_link_libraries(mw-security-tests PRIVATE Crypt32)
+    endif()
     add_test(NAME security-tnr COMMAND mw-security-tests)
 endif()
 
@@ -585,11 +767,17 @@ endif()
 # files (HttpServer falls back to <exedir>/frontend at runtime), and the OpenSSL
 # DLLs on Windows. Qt runtime is added per-platform by the deploy tool
 # (windeployqt / macdeployqt / linuxdeploy) in the release workflow.
-install(TARGETS mw-server RUNTIME DESTINATION . BUNDLE DESTINATION .)
+# Every rule here is in the "app" component, and the release workflow installs
+# that component alone: the vendored submodules (libdatachannel, miniupnpc,
+# ENet) bring install rules of their own, whose headers, static libraries and
+# CMake package files would otherwise land in the Windows installer.
+install(TARGETS mw-server RUNTIME DESTINATION . COMPONENT app BUNDLE DESTINATION . COMPONENT app)
 # Ship only the served assets: dev tooling (node_modules, tests, lint/TS configs,
 # internal .claude notes) must never reach user machines — and trips codesign on
 # macOS. Top-level dirs are excluded by REGEX so e.g. js/ subtrees stay intact.
-install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../frontend" DESTINATION .
+# isDevOnly() in StaticFileHandler.cpp holds the same list for a run from the
+# source tree: change both together.
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../frontend" DESTINATION . COMPONENT app
     REGEX "/frontend/(\\.claude|node_modules|test|scripts|build|coverage)$" EXCLUDE
     PATTERN ".prettierignore" EXCLUDE
     PATTERN ".prettierrc.json" EXCLUDE
@@ -602,7 +790,7 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../frontend" DESTINATION .
     PATTERN "vitest.config.js" EXCLUDE
 )
 if(WIN32 AND _mw_ssl_prebuilt)
-    install(FILES ${_mw_ssl_dlls} DESTINATION .)
+    install(FILES ${_mw_ssl_dlls} DESTINATION . COMPONENT app)
 endif()
 if(WIN32)
     # "MoonlightWeb Virtual Display": the bundled IddCx driver package (MIT,
@@ -610,19 +798,35 @@ if(WIN32)
     # the installer's elevated helper installs from {app}\drivers\vdd.
     # The helper refuses any file it cannot match against its pinned hash, so an
     # incomplete package has to stop the build here rather than ship an
-    # installer whose driver stage fails on the user's machine.
-    foreach(_mw_vdd_file IN ITEMS MttVDD.inf mttvdd.cat MttVDD.dll)
-        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vdd/${_mw_vdd_file}")
-            message(FATAL_ERROR "Virtual display driver payload incomplete: "
-                                "installer/drivers/vdd/${_mw_vdd_file} is missing")
-        endif()
-    endforeach()
-    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vdd" DESTINATION drivers)
+    # installer whose driver stage fails on the user's machine. x64 only: the
+    # package is x64, and Windows on ARM takes a driver package only signed by
+    # Microsoft (0x800b0109, 20/10/2026), so ARM64 bundles none and its
+    # installer asks nothing about it.
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
+        foreach(_mw_vdd_file IN ITEMS MttVDD.inf mttvdd.cat MttVDD.dll)
+            if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vdd/${_mw_vdd_file}")
+                message(FATAL_ERROR "Virtual display driver payload incomplete: "
+                                    "installer/drivers/vdd/${_mw_vdd_file} is missing")
+            endif()
+        endforeach()
+        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vdd" DESTINATION drivers COMPONENT app)
+    endif()
+    # "MoonlightWeb Virtual HID": the HID passthrough's driver, and the host's
+    # own mouse on a host with none, built and signed apart
+    # (native-host/drivers/vhid/build.ps1 -Sign Own, our own certificate) and
+    # pinned file by file in VirtualHidApply.h. x64 only: Windows on ARM takes
+    # a driver package only signed by Microsoft (0x800b0109, 20/10/2026), so
+    # there the installer has nothing to set up and the passthrough reports
+    # itself unavailable, as on a machine without the driver.
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vhid/MoonlightWebVHid.inf")
+        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vhid" DESTINATION drivers COMPONENT app)
+    endif()
 endif()
 
 set(CPACK_PACKAGE_NAME "moonlightweb")
 set(CPACK_PACKAGE_VENDOR "moonlightweb")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Sunshine streaming client for the browser")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Stream your gaming PC to any device with a browser")
 # rpm forbids '-' in a version field, and the untagged fallback is the only
 # string that can carry one. Same treatment as the git-describe branch above:
 # dashes become dots.

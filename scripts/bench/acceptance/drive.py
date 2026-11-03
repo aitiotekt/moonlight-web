@@ -145,8 +145,17 @@ class Driver:
             set(document.getElementById('login-pin-input'), %s);
             const k = document.getElementById('login-remember');
             if (k && !k.checked) k.click();
-            const b = [...document.querySelectorAll('button')].find(e => e.textContent.trim() === 'Unlock');
+            // The PIN form's own submit button, whatever the page's language:
+            // a client in French shows "Déverrouiller", and matching "Unlock"
+            // left every pass after the session expired on the PIN page
+            // (04/10/2026, the N95 against the Mac).
+            const input = document.getElementById('login-pin-input');
+            const form = input && input.closest('form');
+            const b = (form && form.querySelector('button[type=submit], button:not([type])')) ||
+                [...document.querySelectorAll('button')].find(e =>
+                    /^(unlock|déverrouiller)$/i.test(e.textContent.trim()));
             if (b) b.click();
+            else if (form) form.requestSubmit();
             return 'submitted';
         })()""" % (json.dumps(machine_name), json.dumps(pin)))
         time.sleep(8)
@@ -216,7 +225,7 @@ class Driver:
         except PassFailed:
             return {}
 
-    def pick_tile(self, target, tries=5):
+    def pick_tile(self, target, tries=5, index=None):
         """Turn a matrix `target` into the tile to click, or say why there is none.
 
         Patient on purpose. A host card appears before its app list does — the
@@ -227,13 +236,13 @@ class Driver:
         last = None
         for attempt in range(tries):
             try:
-                return self._pick_tile_once(target)
+                return self._pick_tile_once(target, index)
             except PassFailed as e:
                 last = e
                 time.sleep(3)
         raise last
 
-    def _pick_tile_once(self, target):
+    def _pick_tile_once(self, target, index=None):
         inv = self.inventory()
         cards = inv.get("cards", [])
         if not cards:
@@ -268,8 +277,10 @@ class Driver:
         if target == "display":
             # MW_BENCH_DISPLAY picks another physical display than the first,
             # counted in app-id order: the way to stream a screen driven by a
-            # different GPU (DualRTX: 1 is the AMD iGPU's).
-            index = int(os.environ.get("MW_BENCH_DISPLAY", "0") or 0)
+            # different GPU (DualRTX: 1 is the AMD iGPU's). A pass that names
+            # its encoder GPU (`displayGpu`) hands the index in instead.
+            if index is None:
+                index = int(os.environ.get("MW_BENCH_DISPLAY", "0") or 0)
             for c in native:
                 phys = [a for a in c["apps"] if a["appId"].isdigit() and a["appId"] != "1000"]
                 if len(phys) > index:
@@ -319,11 +330,23 @@ class Driver:
             self.call("Input.dispatchMouseEvent", type=kind, x=pos["x"], y=pos["y"],
                         button="left", clickCount=1)
             time.sleep(0.05)
-        time.sleep(1.5)
         # Streaming your own PC puts a confirmation in the way and leaves the
-        # tile stuck on "Launching…" until it is answered.
-        self.eval("(() => { const g = document.querySelector('.self-stream-go');"
-                  " if (g) { g.click(); return 'confirmed'; } return 'no overlay'; })()")
+        # tile stuck on "Launching…" until it is answered. The dialog only
+        # appears once the app has read the internet status, and right after
+        # the instance starts that takes several seconds: one look at 1.5 s
+        # missed it, and the first pass after every restart sat on
+        # "Launching…" until "no picture after 60s" (23/09/2026).
+        end = time.time() + 20
+        while time.time() < end:
+            time.sleep(0.5)
+            got = self.eval("(() => { const g = document.querySelector('.self-stream-go');"
+                            " if (g) { g.click(); return 'confirmed'; }"
+                            " return document.querySelector('canvas') ? 'streaming' : 'waiting'; })()")
+            if "waiting" not in got:
+                return
+            if "true" in self.eval(
+                    "JSON.stringify(!!document.querySelector('.app-card--launch-failed'))"):
+                return
 
     def wait_picture(self, timeout=45):
         """True once a canvas is on screen — the first frame has been drawn."""
@@ -372,12 +395,20 @@ class Driver:
                 return out;
             };
             const c = document.querySelector('canvas');
+            // A canvas whose control went to an OffscreenCanvas throws on
+            // getContext (POC Ultra B2.1, mw_ultra_present=offscreen).
+            const kind = () => {
+                try {
+                    return c.getContext('webgl2') ? 'webgl2' : 'canvas2d';
+                } catch (e) {
+                    return 'offscreen';
+                }
+            };
             return JSON.stringify({
                 rows: grab('.stats-row'),
                 legs: grab('.stats-leg-row'),
                 latencyText: document.querySelector('.stats-value.stats-latency')?.textContent.trim() || null,
-                canvas: c ? { w: c.width, h: c.height,
-                              renderer: c.getContext('webgl2') ? 'webgl2' : 'canvas2d' } : null,
+                canvas: c ? { w: c.width, h: c.height, renderer: kind() } : null,
                 fullscreen: !!document.fullscreenElement,
                 visibility: document.visibilityState
             });

@@ -48,4 +48,6 @@ export type StreamTransport = (WebRtcDataChannel | WebRtcMedia) & {
      * transport. `WebRtcMedia` deliberately ignores it (no in-session fallback).
      */
     _chainFallback?: boolean;
+    /** A share-link guest, never paired with the host: no MW-BIND hello. */
+    _unpairedGuest?: boolean;
 };

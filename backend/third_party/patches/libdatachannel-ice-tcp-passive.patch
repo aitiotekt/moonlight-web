@@ -1,0 +1,30 @@
+diff --git a/include/rtc/configuration.hpp b/include/rtc/configuration.hpp
+index d02fa7e..dc003fb 100644
+--- a/include/rtc/configuration.hpp
++++ b/include/rtc/configuration.hpp
+@@ -73,6 +73,9 @@ struct RTC_CPP_EXPORT Configuration {
+ 	CertificateType certificateType = CertificateType::Default;
+ 	TransportPolicy iceTransportPolicy = TransportPolicy::All;
+ 	bool enableIceTcp = false;
++	// MoonlightWeb patch, libjuice only: with enableIceTcp, also listen on the TCP port of the ICE
++	// socket while the checks run, for a peer that only dials (a browser on a network without UDP)
++	bool enableIceTcpPassive = false;
+ 	bool enableIceUdpMux = false; // libjuice only
+ 	bool disableAutoNegotiation = false;
+ 	bool disableAutoGathering = false;
+diff --git a/src/impl/icetransport.cpp b/src/impl/icetransport.cpp
+index 4d37e70..e5e8c11 100644
+--- a/src/impl/icetransport.cpp
++++ b/src/impl/icetransport.cpp
+@@ -131,8 +131,9 @@ IceTransport::IceTransport(const Configuration &config, candidate_callback candi
+ 		throw std::runtime_error("Failed to create the ICE agent");
+ 
+ 	// ICE-TCP
+-	juice_set_ice_tcp_mode(mAgent.get(), config.enableIceTcp ? JUICE_ICE_TCP_MODE_ACTIVE
+-	                                                         : JUICE_ICE_TCP_MODE_NONE);
++	juice_set_ice_tcp_mode(mAgent.get(), !config.enableIceTcp      ? JUICE_ICE_TCP_MODE_NONE
++	                                     : config.enableIceTcpPassive ? JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE
++	                                                                  : JUICE_ICE_TCP_MODE_ACTIVE);
+ 
+ 	// Add TURN servers
+ 	for (const auto &server : servers)

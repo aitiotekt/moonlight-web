@@ -1,10 +1,15 @@
 # Set-DisplayHdr.ps1 -- list or switch Windows HDR ("advanced color") per display.
 #   .\Set-DisplayHdr.ps1 -List
 #   .\Set-DisplayHdr.ps1 -Name M27Q -Enable
-#   .\Set-DisplayHdr.ps1 -Name M27Q -Disable
+#   .\Set-DisplayHdr.ps1 -Device \\.\DISPLAY5 -Disable
+#
+# -Device names the screen by its GDI name, which is unique; -Name matches the
+# monitor's model name, which is not when a desk has several of one model (the
+# three M27Q of DualRTX) - it then takes the first, and that may be the wrong one.
 param(
     [switch]$List,
     [string]$Name,
+    [string]$Device,
     [switch]$Enable,
     [switch]$Disable
 )
@@ -32,16 +37,48 @@ public static class DispHdr
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string monitorFriendlyDeviceName;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monitorDevicePath;
     }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SOURCE_NAME { public HEADER header; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string viewGdiDeviceName; }
     [StructLayout(LayoutKind.Sequential)] public struct GET_ADVANCED_COLOR { public HEADER header; public uint value; public uint colorEncoding; public uint bitsPerColorChannel; }
     [StructLayout(LayoutKind.Sequential)] public struct SET_ADVANCED_COLOR { public HEADER header; public uint value; }
 
     [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPath, out uint numMode);
     [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint numPath, [Out] PATH_INFO[] paths, ref uint numMode, [Out] MODE_INFO[] modes, IntPtr topology);
     [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref TARGET_NAME p);
+    [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref SOURCE_NAME p);
     [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref GET_ADVANCED_COLOR p);
     [DllImport("user32.dll")] static extern int DisplayConfigSetDeviceInfo(ref SET_ADVANCED_COLOR p);
 
-    public class Target { public string Name; public LUID Adapter; public uint Id; public bool Supported; public bool Enabled; public uint Bits; }
+    public class Target { public string Name; public string Gdi; public LUID Adapter; public LUID Render; public uint Id; public bool Supported; public bool Enabled; public uint Bits; }
+
+    // The GPU that renders each screen, by GDI name. For a physical screen it
+    // is the adapter of its path; for an indirect (virtual) display the path
+    // names the virtual adapter, and only DXGI - which lists the output under
+    // the GPU that composes it - says which GPU a client on it decodes with.
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct DXGI_ADAPTER_DESC { [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Description; public uint VendorId, DeviceId, SubSysId, Revision; public UIntPtr Dedicated, DedicatedSystem, SharedSystem; public LUID Luid; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct DXGI_OUTPUT_DESC { [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName; public int Left, Top, Right, Bottom; public int Attached; public int Rotation; public IntPtr Monitor; }
+    [ComImport, Guid("ae02eedb-c735-4690-8d52-5a8dc20213aa"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IDXGIOutput { void SetPrivateData(); void SetPrivateDataInterface(); void GetPrivateData(); void GetParent(); [PreserveSig] int GetDesc(out DXGI_OUTPUT_DESC d); }
+    [ComImport, Guid("2411e7e1-12ac-4ccf-bd14-9798e8534dc0"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IDXGIAdapter { void SetPrivateData(); void SetPrivateDataInterface(); void GetPrivateData(); void GetParent(); [PreserveSig] int EnumOutputs(uint i, out IDXGIOutput o); [PreserveSig] int GetDesc(out DXGI_ADAPTER_DESC d); }
+    [ComImport, Guid("770aae78-f26f-4dba-a829-253c83d1b387"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IDXGIFactory1 { void SetPrivateData(); void SetPrivateDataInterface(); void GetPrivateData(); void GetParent(); [PreserveSig] int EnumAdapters(uint i, out IDXGIAdapter a); }
+    [DllImport("dxgi.dll")] static extern int CreateDXGIFactory1(ref Guid riid, out IDXGIFactory1 f);
+
+    public static Dictionary<string, LUID> RenderAdapters()
+    {
+        var map = new Dictionary<string, LUID>(StringComparer.OrdinalIgnoreCase);
+        var iid = typeof(IDXGIFactory1).GUID; IDXGIFactory1 f;
+        if (CreateDXGIFactory1(ref iid, out f) != 0) return map;
+        IDXGIAdapter a;
+        for (uint i = 0; f.EnumAdapters(i, out a) == 0; i++)
+        {
+            DXGI_ADAPTER_DESC ad; a.GetDesc(out ad);
+            IDXGIOutput o;
+            for (uint j = 0; a.EnumOutputs(j, out o) == 0; j++) { DXGI_OUTPUT_DESC od; o.GetDesc(out od); map[od.DeviceName] = ad.Luid; }
+        }
+        return map;
+    }
 
     public static List<Target> List()
     {
@@ -52,6 +89,7 @@ public static class DispHdr
         rc = QueryDisplayConfig(2, ref np, paths, ref nm, modes, IntPtr.Zero);
         if (rc != 0) throw new Exception("QueryDisplayConfig " + rc);
         var list = new List<Target>();
+        var render = RenderAdapters();
         for (int i = 0; i < np; i++)
         {
             var t = paths[i].targetInfo;
@@ -61,7 +99,13 @@ public static class DispHdr
             var ac = new GET_ADVANCED_COLOR();
             ac.header.type = 9; ac.header.size = (uint)Marshal.SizeOf(typeof(GET_ADVANCED_COLOR)); ac.header.adapterId = t.adapterId; ac.header.id = t.id;
             DisplayConfigGetDeviceInfo(ref ac);
-            list.Add(new Target { Name = tn.monitorFriendlyDeviceName, Adapter = t.adapterId, Id = t.id, Supported = (ac.value & 1) != 0, Enabled = (ac.value & 2) != 0, Bits = ac.bitsPerColorChannel });
+            var s = paths[i].sourceInfo;
+            var sn = new SOURCE_NAME();
+            sn.header.type = 1; sn.header.size = (uint)Marshal.SizeOf(typeof(SOURCE_NAME)); sn.header.adapterId = s.adapterId; sn.header.id = s.id;
+            DisplayConfigGetDeviceInfo(ref sn);
+            LUID r;
+            if (!render.TryGetValue(sn.viewGdiDeviceName ?? "", out r)) r = t.adapterId;
+            list.Add(new Target { Name = tn.monitorFriendlyDeviceName, Gdi = sn.viewGdiDeviceName, Adapter = t.adapterId, Render = r, Id = t.id, Supported = (ac.value & 1) != 0, Enabled = (ac.value & 2) != 0, Bits = ac.bitsPerColorChannel });
         }
         return list;
     }
@@ -78,15 +122,19 @@ public static class DispHdr
 if (-not ([System.Management.Automation.PSTypeName]'DispHdr').Type) { Add-Type -TypeDefinition $src }
 
 $targets = [DispHdr]::List()
-if ($List -or -not $Name) {
-    $targets | ForEach-Object { "{0,-28} supported={1,-5} enabled={2,-5} bpc={3}" -f $_.Name, $_.Supported, $_.Enabled, $_.Bits }
-    if (-not $Name) { exit 0 }
+if ($List -or (-not $Name -and -not $Device)) {
+    # adapter= addresses the screen (it is what -Enable/-Disable act on);
+    # render= is the GPU that draws it - the one to pin a client on.
+    $targets | ForEach-Object { "{0,-14} {1,-28} supported={2,-5} enabled={3,-5} bpc={4} adapter={5},{6} render={7},{8}" -f $_.Gdi, $_.Name, $_.Supported, $_.Enabled, $_.Bits, $_.Adapter.HighPart, $_.Adapter.LowPart, $_.Render.HighPart, $_.Render.LowPart }
+    if (-not $Name -and -not $Device) { exit 0 }
 }
-$t = $targets | Where-Object { $_.Name -like "*$Name*" } | Select-Object -First 1
-if (-not $t) { Write-Error "no display matching '$Name'"; exit 1 }
+$t = if ($Device) { $targets | Where-Object { $_.Gdi -eq $Device } | Select-Object -First 1 }
+     else { $targets | Where-Object { $_.Name -like "*$Name*" } | Select-Object -First 1 }
+if (-not $t) { Write-Error "no display matching '$Device$Name'"; exit 1 }
 if ($Enable -or $Disable) {
     $rc = [DispHdr]::Set($t, [bool]$Enable)
-    "set {0} HDR={1} rc={2}" -f $t.Name, [bool]$Enable, $rc
+    "set {0} ({1}) HDR={2} rc={3}" -f $t.Gdi, $t.Name, [bool]$Enable, $rc
     Start-Sleep -Milliseconds 800
-    [DispHdr]::List() | Where-Object { $_.Name -eq $t.Name } | ForEach-Object { "{0} now enabled={1} bpc={2}" -f $_.Name, $_.Enabled, $_.Bits }
+    [DispHdr]::List() | Where-Object { $_.Gdi -eq $t.Gdi } | ForEach-Object { "{0} ({1}) now enabled={2} bpc={3}" -f $_.Gdi, $_.Name, $_.Enabled, $_.Bits }
+    if ($rc -ne 0) { exit 1 }
 }

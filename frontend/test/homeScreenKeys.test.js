@@ -12,7 +12,6 @@ import {
     packHandoffKeys,
     unpackHandoffKeys,
     isHomeScreenHandoff,
-    startUrlWithSideKeys,
     isHandoffKeySpent,
     markHandoffKeySpent,
 } from '../js/util/homeScreenKeys.js';
@@ -67,31 +66,6 @@ describe('packHandoffKeys / unpackHandoffKeys', () => {
         expect(isHomeScreenHandoff(parsed)).toBe(false);
         expect(unpackHandoffKeys(null)).toEqual({ own: '', others: [] });
         expect(isHomeScreenHandoff(unpackHandoffKeys(''))).toBe(false);
-    });
-});
-
-describe('startUrlWithSideKeys', () => {
-    it('writes the others beside the key the manifest already carries', () => {
-        const url = startUrlWithSideKeys(`/${idC}#k=${A}`, [{ id: idB, key: B }]);
-        expect(url).toBe(`/${idC}#k=${encodeURIComponent(`${A},${idB}:${B}`)}`);
-        expect(unpackHandoffKeys(decodeURIComponent(url.split('#k=')[1]))).toEqual({
-            own: A,
-            others: [{ id: idB, key: B }],
-        });
-    });
-
-    it('adds a #k= when the manifest had none, and keeps the other parts', () => {
-        expect(startUrlWithSideKeys(`/${idC}`, [{ id: idB, key: B }])).toBe(
-            `/${idC}#k=${encodeURIComponent(`,${idB}:${B}`)}`,
-        );
-        expect(startUrlWithSideKeys(`/${idC}#p=%2Fadmin&k=${A}`, [{ id: idB, key: B }])).toBe(
-            `/${idC}#p=%2Fadmin&k=${encodeURIComponent(`${A},${idB}:${B}`)}`,
-        );
-    });
-
-    it('changes nothing when there is nothing to add', () => {
-        expect(startUrlWithSideKeys(`/${idC}#k=${A}`, [])).toBe(`/${idC}#k=${A}`);
-        expect(startUrlWithSideKeys(undefined, [{ id: idB, key: B }])).toBeUndefined();
     });
 });
 

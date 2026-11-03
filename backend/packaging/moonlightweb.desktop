@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=MoonlightWeb
-Comment=Sunshine streaming client for the browser
+Comment=Stream your gaming PC to any browser
 Exec=MoonlightWeb
 Icon=MoonlightWeb
 Categories=Network;Game;

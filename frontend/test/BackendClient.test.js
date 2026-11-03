@@ -44,6 +44,20 @@ describe('BackendClient', () => {
         expect(fetchMock).toHaveBeenCalledWith('/api/hosts');
     });
 
+    // A proxy page, a restarting server or the app shell can answer 200 with
+    // HTML: the browser's "Unexpected token '<'" must not reach the user.
+    it('says the answer was unreadable when an OK answer is not JSON', async () => {
+        const html = {
+            ok: true,
+            status: 200,
+            json: async () => JSON.parse('<!doctype html>'),
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(html));
+        const err = await BackendClient.getHosts().catch((e) => e);
+        expect(err.message).toBe('appError.serverUnreadable');
+        expect(err.statusCode).toBe(200);
+    });
+
     it('POST sends a JSON body with the right headers', async () => {
         const fetchMock = mockFetch(jsonResponse({ ok: true }));
         await BackendClient.addManualHost('10.0.0.9');
@@ -189,6 +203,36 @@ describe('BackendClient', () => {
         expect(body.client_uniqueid).toMatch(/^[0-9A-F]{16}$/);
     });
 
+    // The native host drops a delta without a keyframe only for a browser that
+    // asked for it — and a Mac's VideoToolbox fails on that delta (28/09/2026).
+    it('launchApp asks to ride out a gap, except from an Apple platform', async () => {
+        const fetchMock = mockFetch(jsonResponse({ started: true }));
+        await BackendClient.launchApp('host1', 42, {});
+        expect(JSON.parse(fetchMock.apiCalls()[0][1].body).ride_out_loss).toBe(true);
+
+        const ua = vi
+            .spyOn(navigator, 'userAgent', 'get')
+            .mockReturnValue(
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            );
+        await BackendClient.launchApp('host1', 42, {});
+        expect(JSON.parse(fetchMock.apiCalls()[1][1].body).ride_out_loss).toBe(false);
+        ua.mockRestore();
+    });
+
+    // Every client takes the host's reference repairs, except a device whose
+    // decoder fell silent under them (Freebox Player POP, 01/10/2026).
+    it('launchApp refuses the reference repairs only on a device that kept that verdict', async () => {
+        localStorage.removeItem('mw_ref_repairs');
+        const fetchMock = mockFetch(jsonResponse({ started: true }));
+        await BackendClient.launchApp('host1', 42, {});
+        expect(JSON.parse(fetchMock.apiCalls()[0][1].body).ref_invalidation).toBe(true);
+        localStorage.setItem('mw_ref_repairs', 'off');
+        await BackendClient.launchApp('host1', 42, {});
+        expect(JSON.parse(fetchMock.apiCalls()[1][1].body).ref_invalidation).toBe(false);
+        localStorage.removeItem('mw_ref_repairs');
+    });
+
     it('downloadCertificate returns raw text', async () => {
         vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse('CERT-TOKEN')));
         await expect(BackendClient.downloadCertificate()).resolves.toBe('CERT-TOKEN');
@@ -249,7 +293,8 @@ const POST_ROUTES = [
         '/api/hosts/h1/seats',
         { user: 'ada' },
     ],
-    ['stopHostSession', () => BackendClient.stopHostSession('h1'), '/api/hosts/h1/stop-session', {}],
+    // The device rides along: on a MultiSeat host, Quit is this device's seat's.
+    ['stopHostSession', () => BackendClient.stopHostSession('h1'), '/api/hosts/h1/stop-session', { client_uniqueid: expect.stringMatching(/^[0-9A-F]{16}$/) }],
     [
         'shareActivate',
         () => BackendClient.shareActivate(2, { host_uuid: 'u1', app_id: 7 }),
@@ -475,7 +520,11 @@ describe('BackendClient request shaping', () => {
     it('playerJoin only sends an aspect when it was overridden', async () => {
         const plain = mockFetch(jsonResponse({ ok: true }));
         await BackendClient.playerJoin('tok', 1080);
-        expect(JSON.parse(plain.apiCalls()[0][1].body)).toEqual({ token: 'tok', height: 1080 });
+        expect(JSON.parse(plain.apiCalls()[0][1].body)).toEqual({
+            token: 'tok',
+            height: 1080,
+            ride_out_loss: true,
+        });
 
         const forced = mockFetch(jsonResponse({ ok: true }));
         await BackendClient.playerJoin('tok', 1080, '16:9');
@@ -483,7 +532,25 @@ describe('BackendClient request shaping', () => {
             token: 'tok',
             height: 1080,
             aspect: '16:9',
+            ride_out_loss: true,
         });
+    });
+
+    // A guest of a Linux host encodes on its own: without the wish, its stream
+    // had no refresh wave and every lost frame cost a keyframe (01/10/2026).
+    it('playerJoin asks to ride out a gap, except from an Apple platform', async () => {
+        const fetchMock = mockFetch(jsonResponse({ ok: true }));
+        await BackendClient.playerJoin('tok', 1080);
+        expect(JSON.parse(fetchMock.apiCalls()[0][1].body).ride_out_loss).toBe(true);
+
+        const ua = vi
+            .spyOn(navigator, 'userAgent', 'get')
+            .mockReturnValue(
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+            );
+        await BackendClient.playerJoin('tok', 1080);
+        expect(JSON.parse(fetchMock.apiCalls()[1][1].body).ride_out_loss).toBe(false);
+        ua.mockRestore();
     });
 
     it('quitApp scopes to one slot when the caller names it', async () => {
@@ -494,6 +561,15 @@ describe('BackendClient request shaping', () => {
         // The slot's own uniqueid wins over the browser's — quitting the twin
         // session instead of the one asked for is what kills a live stream.
         expect(JSON.parse(init.body)).toEqual({ session_slot: 1, client_uniqueid: 'AAAA' });
+    });
+
+    // Issue #24: asked before a launch on a host whose app outlives the stream.
+    it('getRunningApp asks the host route and returns its answer', async () => {
+        const fetchMock = mockFetch(jsonResponse({ currentGameId: 7 }));
+        const answer = await BackendClient.getRunningApp('h1');
+        expect(answer).toEqual({ currentGameId: 7 });
+        // For this device: on MultiSeat, the app on its own seat.
+        expect(fetchMock.apiCalls()[0][0]).toBe(`/api/hosts/h1/running-app?client_uniqueid=${BackendClient.clientUniqueId()}`);
     });
 
     it('quitApp defaults to this browser when no slot is named', async () => {

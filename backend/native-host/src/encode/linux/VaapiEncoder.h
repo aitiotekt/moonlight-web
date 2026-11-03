@@ -52,9 +52,8 @@
 // generate them from the sequence and picture parameters, and re-emit the
 // parameter sets on every IDR — which is what a browser that joins late or
 // loses the first keyframe needs. Packed headers supplied by the application
-// are supported by both and used by FFmpeg; they are NOT sent here until a
-// measurement shows the driver's own are missing something (the VUI's
-// bitstream_restriction, say — the B8 lesson from NVENC).
+// are supported by both and used by FFmpeg; here they are sent only to a
+// driver that has shown it needs them.
 //
 // ⚠️ And on one machine they were missing EVERYTHING. Measured 16/09/2026 on a
 // Radeon 610M (radeonsi "raphael_mendocino", Mesa 25.2.8): every IDR came out as
@@ -64,12 +63,20 @@
 // headless one, and gives up 15 seconds later with "decoder_unsupported": a
 // stream that never starts and says nothing useful about why.
 //
-// Writing the parameter sets here instead is a bitstream writer that has to
-// agree, bit for bit, with slice headers the driver still writes — new risk for
-// every GPU that works today, to rescue one that does not. So the encoder does
-// the cheap, certain thing: init() encodes ONE throwaway IDR and looks. A driver
-// that writes its parameter sets is used as before; one that does not is refused
-// by name, and the session falls back to the CPU pair, which always works.
+// It was not the GPU but the Mesa: from 25.x its VA-API frontend (radeonsi, and
+// anything else behind it) writes the parameter sets only when the application
+// hands them in as packed headers — and reads frame_num and the reference
+// picture set from the application's packed slice header, leaving them at zero
+// without one. Every AMD host on a current distribution, not one laptop.
+//
+// So init() encodes ONE throwaway IDR and looks. A driver that writes its
+// parameter sets is used exactly as before — no GPU that works today changes
+// path. One that does not, and says it takes packed headers, is opened again
+// with every header written here (ParameterSets.h): sequence and picture sets
+// with each IDR, a slice header with every picture. Mesa parses them and
+// re-writes them itself, so they must say exactly what the parameter buffers
+// say. A driver that still writes none is refused by name, and the session
+// falls back to the CPU pair, which always works.
 
 namespace mw::native::encode {
 
@@ -86,6 +93,11 @@ namespace mw::native::encode {
 /// Out here rather than inside the encoder because it is the one piece of this
 /// file that can be tested without a GPU.
 bool carriesParameterSets(const std::vector<uint8_t>& bitstream, Codec codec);
+
+/// Whether @p bitstream carries its sequence parameters more than once — a
+/// driver that writes its own on top of the ones we handed it as packed
+/// headers. Same walk as carriesParameterSets().
+bool doublesParameterSets(const std::vector<uint8_t>& bitstream, Codec codec);
 
 class VaapiEncoder
 {
@@ -118,9 +130,15 @@ public:
     ///                    the receiver will use if it never gets it.
     bool encode(bool forceKeyframe, uint32_t frameNumber, EncoderOutput& out, std::string& error);
 
-    /// Whether invalidateReference() does anything here. True on every VA-API
-    /// encoder: the reference list is ours to write, picture by picture.
-    bool supportsReferenceInvalidation() const { return true; }
+    /// Whether invalidateReference() does anything here. True wherever the
+    /// reference list is ours to write, picture by picture — which HEVC is only
+    /// when the slice headers are ours too: a driver that writes them (Mesa 23)
+    /// keeps the lost picture in its reference set, and the decoder then looks
+    /// for a picture it never had (18 wrong frames out of 41 on the 780M).
+    bool supportsReferenceInvalidation() const
+    {
+        return m_Codec != Codec::Hevc || m_PackedHeadersUsed;
+    }
 
     /// The frame numbered @p frameNumber never reached the receiver: encode the
     /// next pictures against older ones only, so the stream heals with an
@@ -139,7 +157,14 @@ public:
     /// Whether the stream really refreshes by intra-refresh: what the driver
     /// DOES, never what was asked.
     bool intraRefreshEnabled() const { return m_IntraRefresh; }
-    int intraRefreshFrames() const { return m_IntraRefreshPeriod; }
+    /// The horizon the receiver waits for: the gap plus a sweep, as Vulkan
+    /// Video announces it; a sweep alone when they run back to back.
+    int intraRefreshFrames() const
+    {
+        return m_IntraRefreshDistance > m_IntraRefreshPeriod
+                   ? m_IntraRefreshDistance + m_IntraRefreshPeriod
+                   : m_IntraRefreshPeriod;
+    }
 
     void stop();
 
@@ -147,11 +172,15 @@ private:
     struct Impl;
     std::unique_ptr<Impl> d;
 
+    /// Everything init() does once the parameters are known — twice when the
+    /// driver's first keyframe comes out bare (see above).
+    bool open(const std::string& renderNode, bool packedHeaders, std::string& error);
     bool openDisplay(const std::string& renderNode, std::string& error);
     bool chooseProfile(Codec codec, std::string& error);
     bool createSurfaces(std::string& error);
     bool exportInput(std::string& error);
     bool renderRateControl(std::string& error);
+    bool refreshesThisFrame();
     bool renderH264(bool idr, std::string& error);
     bool renderHevc(bool idr, std::string& error);
     bool renderAv1(bool key, std::string& error);
@@ -166,11 +195,21 @@ private:
 
     convert::Nv12Target m_Input;
 
+    bool m_WantIntraRefresh = false;
+    /// The driver said it takes every header from us — kept across open()s.
+    bool m_PackedHeadersOffered = false;
+    /// The encoder open now writes every header itself (ParameterSets.h).
+    bool m_PackedHeadersUsed = false;
+
     bool m_IntraRefresh = false;
     int m_IntraRefreshPeriod = 0;
     /// Which column band the rolling refresh is at, in macroblocks (H.264) or
     /// CTBs (HEVC). Advances every encoded frame.
     int m_RefreshPosition = 0;
+    /// Frames from one sweep's start to the next (encode::
+    /// intraRefreshDistanceFrames), and how far into that the wave is.
+    int m_IntraRefreshDistance = 0;
+    int m_RefreshClock = 0;
 
     uint32_t m_FrameNum = 0;
     uint32_t m_IdrPicId = 0;

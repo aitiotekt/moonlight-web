@@ -15,6 +15,25 @@
 # then `import stream_site` inside the site block. The site block itself — the
 # name, the `tls` line — stays in the template, since that is what differs.
 
+# What a rate limit charges: the client's address, or for IPv6 its /64. A
+# subscriber is handed a whole /64 at the least, so the full address would give
+# one household 2^64 budgets, and a limiter in memory for each it walks through
+# (mw-rendezvous's quotaKey makes the same call). Sets {mw_subscriber}; import
+# it before the rate_limit that keys on it.
+#
+# By its text, since Caddy has no prefix placeholder. The first four groups
+# written out ARE the /64. A "::" among them is a run of zeros the address
+# compressed: what comes before it is kept, which only the few ways one /64 can
+# be written tell apart — a handful of budgets, never 2^64. An IPv4 address has
+# no colon and is charged as it is.
+(subscriber_key) {
+	map {client_ip} {mw_subscriber} {
+		~^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+): "${1}::/64"
+		~^([0-9a-f]+(?::[0-9a-f]+)*):: "${1}::/64"
+		default {client_ip}
+	}
+}
+
 # Response headers for everything that is a document or a script of the entry
 # page. Shared by the two file-serving handles below.
 (bootstrap_headers) {
@@ -99,10 +118,12 @@
 			#
 			# {client_ip}, not {remote_host}: identical in production, where no
 			# proxy is trusted; on staging it is the address the front proxy
-			# forwarded, which is the only one worth budgeting.
+			# forwarded, which is the only one worth budgeting. Narrowed to its
+			# /64 for IPv6 (subscriber_key).
+			import subscriber_key
 			rate_limit {
 				zone mw_rendezvous {
-					key {client_ip}
+					key {mw_subscriber}
 					events 120
 					window 1m
 				}

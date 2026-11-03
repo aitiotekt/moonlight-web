@@ -58,4 +58,17 @@ namespace VirtualDisplayApply {
 /// @return process exit code: 0 ok, 1 failed, 3010 ok but reboot required
 int run(const QString& stage, const QString& dir);
 
+/// The `--vdisplay-guard` mode (Windows): left behind by a server whose
+/// stream turned the other displays off (Request::exclusive), it waits on
+/// that server's process. When the server dies with them still off, it plays
+/// the desktop half of a deactivation — the layout from before, or Windows'
+/// extended one — without elevation; the node goes off at the server's next
+/// start (resetAtStartup). It leaves as soon as they are back on, by the
+/// stream's end or anything else (VirtualDisplay::guardStep).
+/// @param server "<pid>:<creation time>" of the server process, the time as
+///               the 100 ns ticks GetProcessTimes gives: a pid reused by
+///               another process is not mistaken for the server.
+/// @return process exit code: 0 nothing to do or restored, 1 failed
+int guard(const QString& server);
+
 } // namespace VirtualDisplayApply

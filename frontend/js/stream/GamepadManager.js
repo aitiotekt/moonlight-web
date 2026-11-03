@@ -20,11 +20,23 @@
  *
  * The Gamepad API exposes "standard mapping" controllers (Xbox, PlayStation,
  * most modern pads) with a fixed layout that maps 1:1 to Limelight's button
- * flags and axes. We poll the live state every frame and send a snapshot over
- * the input transport only when it changes (anti-spam).
+ * flags and axes. A pad is never an event — not even its buttons, unlike a key
+ * or a click: it is seen when it is read. The frame loop finds the pads; once
+ * one is forwarded it is also read every POLL_MS, the rate Chrome samples pads
+ * at. A snapshot goes over the input transport only when it changes
+ * (anti-spam).
  *
- * Non-standard controllers (racing wheels, HOTAS) are ignored on purpose:
- * they need a per-device remap that does not exist yet (phase 2).
+ * A controller the browser reports without a standard layout is read through
+ * a mapping (gamepadMapping.resolveMapping): the user's own, a built-in
+ * profile (EdgeTX / OpenTX radios), Chrome Android's pre-sorted layout, or
+ * SDL_GameControllerDB. One that nothing maps is not
+ * forwarded — every button could be somewhere else — and the caller is told
+ * so it can offer the remap wizard.
+ *
+ * `single` mode (share-link guests) forwards ONE pad, always as controller 0:
+ * the host shifts a guest's pads past the owner's and the other guests'
+ * (gamepadOffset), so a guest pad at browser index 1 would land on the next
+ * guest's virtual controller.
  *
  * Protocol (browser → backend):
  *   {type:"gamepadconnect", index, mask, ctype, rumble}
@@ -32,6 +44,16 @@
  *   {type:"gamepaddisconnect", index, mask}
  * Backend → browser: {type:"rumble", index, low, high}
  */
+
+import {
+    resolveMapping,
+    readVirtualPad,
+    loadGamepadDb,
+    detectPlatform,
+    isAutoMapped,
+    isTvRemoteId,
+} from './gamepadMapping.js';
+import { getMapping, CHANGED_EVENT } from '../util/gamepadMappingsStore.js';
 
 // Limelight button flags (must match Limelight.h).
 const BTN = {
@@ -114,6 +136,40 @@ function axisToShort(v) {
 const REEMIT_MS = 500;
 
 /**
+ * A TV remote seen as a pad (gamepadMapping.isTvRemoteId): StreamView gets its
+ * direction pad as arrow keys instead (onRemoteKey), like any remote of the
+ * keyboard kind, and the host is never told a pad is there.
+ * @param {{id?: string}} gp
+ */
+export function isTvRemotePad(gp) {
+    return isTvRemoteId(gp && gp.id);
+}
+
+/** Standard-mapping direction pad buttons, as the arrows they stand for. */
+const REMOTE_DIRS = { 12: 'up', 13: 'down', 14: 'left', 15: 'right' };
+/**
+ * A remote's arrow held this long repeats, then this often — the typematic a
+ * keyboard's controller would make: a key injected on the host presses once
+ * however long it is held (see StreamView.handleKeyDown).
+ */
+const REMOTE_REPEAT_DELAY_MS = 420;
+const REMOTE_REPEAT_MS = 40;
+/** The menu chord on a real pad: Select + Start + LB + RB (moonlight-qt's quit chord). */
+const MENU_CHORD = [8, 9, 4, 5];
+
+/**
+ * How often a forwarded pad is read between two frames. Chrome samples pads
+ * at 250 Hz; read once a frame, a stick or a button waited for the next frame
+ * — 8 ms on average at 60 Hz, sticks and buttons alike. Read every 4 ms, it
+ * waits 2. Not a setting: latency comes first, and a pad that does not move
+ * still sends nothing (see REEMIT_MS for the one exception).
+ *
+ * Armed only while a pad is forwarded, the page is visible and the stream not
+ * paused (_armPoll); the frame loop alone keeps looking for pads otherwise.
+ */
+const POLL_MS = 4;
+
+/**
  * Whether a snapshot is away from rest (button, trigger or stick). The
  * threshold matches the backend's (InputWatchdog::padAtRest): deliberately
  * loose, since a barely-drifted stick counted as active costs a message and
@@ -135,31 +191,78 @@ function isActive(s) {
 export class GamepadManager {
     /**
      * @param {(msg:object)=>void} sendFn — sends a JSON input message.
-     * @param {{ profile?: 'auto'|'x360'|'ds4', onIgnored?: (gp: Gamepad) => void }} [options]
+     * @param {{ profile?: 'auto'|'x360'|'ds4',
+     *           onIgnored?: (gp: Gamepad) => void,
+     *           onMapped?: (gp: Gamepad, res: object) => void,
+     *           single?: boolean, preferredKey?: string|null,
+     *           probe?: {notePadRead: (gapMs: number) => void, notePadSend: () => void}|null,
+     *           platform?: string, db?: object|null, user?: (key: string) => object|null }} [options]
      *   `profile` forces the pad the host presents instead of following what we
      *   detect. It is offered in debug builds only (see SettingsView): in
      *   production the right behaviour is to guess correctly, and a visible
      *   switch would turn a detection bug into a question the user cannot
      *   answer. In debug it is what separates "the detection was wrong" from
      *   "the profile is wrong".
-     *   `onIgnored` is told, once per pad, about a controller this manager will
-     *   not forward (no standard mapping) — the caller decides how to say it.
+     *   `onIgnored` is told, once per pad, about a controller nothing maps —
+     *   the caller decides how to say it (and offers the wizard).
+     *   `onMapped` is told, once per pad, about one laid out without the user
+     *   (a built-in profile, Chrome Android, SDL database), so they can check it.
+     *   `single` forwards one pad only, as controller 0 (share-link guests);
+     *   `preferredKey` is the pad (gamepadMapping.padKey) to take when present.
+     *   `probe` (diagnostics only, PipelineDiag's MainThreadProbe) is told how
+     *   far apart the reads of a forwarded pad are, and of every state sent.
+     *   `platform`, `db` and `user` replace the live sources (tests).
+     *   `onRemoteKey(dir, down, repeat)` is told the arrows of a TV remote seen
+     *   as a pad (isTvRemotePad), which is then never forwarded as a pad.
+     *   `onMenuChord()` is told when a forwarded pad presses Select + Start +
+     *   LB + RB together (StreamView opens the remote's menu with it on a TV).
      */
     constructor(sendFn, options = {}) {
         this._send = sendFn;
+        this._onRemoteKey = typeof options.onRemoteKey === 'function' ? options.onRemoteKey : null;
+        this._onMenuChord = typeof options.onMenuChord === 'function' ? options.onMenuChord : null;
+        // Browser index → { buttonIndex → {since, lastAt} } for a remote's held arrows.
+        this._remotes = new Map();
+        // Pads whose menu chord is down, so it fires once per press.
+        this._chordDown = new Set();
         this._profile = options.profile || 'auto';
         this._onIgnored = typeof options.onIgnored === 'function' ? options.onIgnored : null;
-        // Indexes already reported as ignored; a pad is announced once, not
-        // once per frame of the poll that keeps seeing it.
+        this._onMapped = typeof options.onMapped === 'function' ? options.onMapped : null;
+        this._single = options.single === true;
+        this._preferredKey = options.preferredKey || null;
+        this._platform = options.platform || detectPlatform();
+        // undefined = SDL database not loaded yet; null = unavailable.
+        this._db = 'db' in options ? options.db : undefined;
+        this._dbLoading = false;
+        this._user = typeof options.user === 'function' ? options.user : getMapping;
+        // Indexes already reported as ignored / guessed; a pad is announced
+        // once, not once per frame of the poll that keeps seeing it.
         this._ignored = new Set();
+        this._announced = new Set();
+        // Browser index → { id, res } — how each pad is read, until it is
+        // replugged or a mapping changes.
+        this._resolved = new Map();
+        this._paused = false;
         this._running = false;
         this._rafId = null;
-        // index → { last: {buttons,lt,rt,lx,ly,rx,ry}, sentAt, hasRumble:boolean }
+        // The POLL_MS reader, while armed (_armPoll).
+        this._pollTimer = null;
+        this._probe = options.probe || null;
+        // When the previous read of a forwarded pad happened (diagnostics).
+        this._lastReadAt = 0;
+        // Browser index → { last: {buttons,lt,rt,lx,ly,rx,ry}, sentAt,
+        //   hasRumble, bindings, hostIndex, key }
         this._pads = new Map();
-        // index → { strong, weak, since, timer } for a vibration being held.
+        // Keys (`usb:vid:pid`) of pads the HID passthrough sends as themselves.
+        this._excluded = new Set();
+        // Browser index → { strong, weak, since, timer } for a vibration being held.
         this._rumble = new Map();
         this._onConnect = (e) => this._handleConnect(e.gamepad);
         this._onDisconnect = (e) => this._handleDisconnect(e.gamepad);
+        this._onMappingsChanged = () => this.refreshMappings();
+        // A hidden page stops the frame loop and the reads with it, as it
+        // always did; StreamView repeats every pad on the way back (resendAll).
+        this._onVisibility = () => this._armPoll();
     }
 
     start() {
@@ -167,6 +270,8 @@ export class GamepadManager {
         this._running = true;
         window.addEventListener('gamepadconnected', this._onConnect);
         window.addEventListener('gamepaddisconnected', this._onDisconnect);
+        window.addEventListener(CHANGED_EVENT, this._onMappingsChanged);
+        document.addEventListener('visibilitychange', this._onVisibility);
         // Pads connected before start() won't fire an event — pick them up on
         // the first poll.
         this._loop();
@@ -177,17 +282,81 @@ export class GamepadManager {
         this._running = false;
         window.removeEventListener('gamepadconnected', this._onConnect);
         window.removeEventListener('gamepaddisconnected', this._onDisconnect);
+        window.removeEventListener(CHANGED_EVENT, this._onMappingsChanged);
+        document.removeEventListener('visibilitychange', this._onVisibility);
         if (this._rafId !== null) cancelAnimationFrame(this._rafId);
         this._rafId = null;
+        this._armPoll();
+        this._releaseRemotes();
+        this._chordDown.clear();
         // Motors first: a pad still shaking after the stream closed would be
         // shaking for nobody.
         for (const index of Array.from(this._rumble.keys())) this._stopRumble(index);
         // Tell the host every controller is gone.
-        for (const index of this._pads.keys()) {
-            this._send({ type: 'gamepaddisconnect', index, mask: 0 });
+        for (const entry of this._pads.values()) {
+            this._send({ type: 'gamepaddisconnect', index: entry.hostIndex, mask: 0 });
         }
         this._pads.clear();
         this._ignored.clear();
+        this._announced.clear();
+        this._resolved.clear();
+    }
+
+    /**
+     * Forget how every pad is read, so the next poll resolves them again —
+     * after the user saved or reset a mapping. A pad that became unmapped is
+     * released on the host; one that became mapped is announced.
+     */
+    refreshMappings() {
+        this._resolved.clear();
+        this._ignored.clear();
+    }
+
+    /**
+     * Stop forwarding while the remap wizard listens to the pad: every pad is
+     * put back at rest on the host once, then nothing is sent until resumed.
+     * Pressing A to map "A" must not press A in the game.
+     */
+    setPaused(paused) {
+        paused = !!paused;
+        if (paused === this._paused) return;
+        this._paused = paused;
+        this._armPoll();
+        if (paused) {
+            this._releaseRemotes();
+            const rest = { buttons: 0, lt: 0, rt: 0, lx: 0, ly: 0, rx: 0, ry: 0 };
+            for (const entry of this._pads.values()) {
+                entry.last = rest;
+                entry.sentAt = performance.now();
+                this._send({
+                    type: 'gamepad',
+                    index: entry.hostIndex,
+                    mask: this._mask(),
+                    ...rest,
+                });
+            }
+        } else {
+            this.resendAll();
+        }
+    }
+
+    /**
+     * Single mode: the pad to forward from now on. The current one is
+     * released on the host and the chosen one takes controller 0 on the next
+     * poll (if it is connected and mapped).
+     */
+    setPreferredPad(key) {
+        this._preferredKey = key || null;
+        if (!this._single) return;
+        for (const [index, entry] of this._pads) {
+            if (entry.key !== this._preferredKey) this._release(index);
+        }
+    }
+
+    /** The pad forwarded in single mode (its key), or null. */
+    forwardedKey() {
+        for (const entry of this._pads.values()) return entry.key;
+        return null;
     }
 
     /**
@@ -204,20 +373,40 @@ export class GamepadManager {
         return detectType(gp.id);
     }
 
-    /** Active controllers as a bitmask (one bit per index). */
+    /**
+     * Arm the POLL_MS reader while a pad is forwarded, the page is visible and
+     * the stream is not paused — disarm it as soon as one of the three fails.
+     * Called wherever one of them changes. With nothing to forward, the frame
+     * loop alone keeps watching for pads.
+     */
+    _armPoll() {
+        const wanted =
+            this._running &&
+            this._pads.size > 0 &&
+            !this._paused &&
+            document.visibilityState !== 'hidden';
+        // Diagnostics: a stretch without reads is not a gap between two.
+        if (!wanted) this._lastReadAt = 0;
+        if (wanted && this._pollTimer === null) {
+            this._pollTimer = setInterval(() => this._poll(), POLL_MS);
+        } else if (!wanted && this._pollTimer !== null) {
+            clearInterval(this._pollTimer);
+            this._pollTimer = null;
+        }
+    }
+
+    /** Active controllers as a bitmask (one bit per host index). */
     _mask() {
         let m = 0;
-        for (const index of this._pads.keys()) m |= 1 << index;
+        for (const entry of this._pads.values()) m |= 1 << entry.hostIndex;
         return m;
     }
 
     /**
-     * A pad the browser reports without a standard mapping: it does not know
-     * which button is which, and neither do we. Forwarding it anyway would give
-     * a pad whose every button may be somewhere else — harder to diagnose than
-     * a pad that is not there. Decided out of scope on 2026-09-02 (design §7):
-     * on PC a controller offering DirectInput almost always offers XInput too,
-     * so the fix is a switch on the pad, and the user has to be told that.
+     * A pad nothing maps: the browser does not know which button is which,
+     * and neither do we. Forwarding it anyway would give a pad whose every
+     * button may be somewhere else — harder to diagnose than a pad that is not
+     * there. The caller is told once, and offers the remap wizard.
      */
     _noteIgnored(gp) {
         if (this._ignored.has(gp.index)) return;
@@ -225,22 +414,173 @@ export class GamepadManager {
         if (this._onIgnored) this._onIgnored(gp);
     }
 
-    _handleConnect(gp) {
-        if (!gp) return;
-        if (gp.mapping !== 'standard') {
-            this._noteIgnored(gp);
-            return;
+    /** How this pad is read (cached per browser index and id). */
+    _resolve(gp) {
+        const cached = this._resolved.get(gp.index);
+        if (cached && cached.id === gp.id) return cached.res;
+        const res = resolveMapping(gp, {
+            user: this._user,
+            db: this._db,
+            platform: this._platform,
+        });
+        if (res.source === 'pending') {
+            this._loadDb();
+            return res; // not cached: asked again once the database is in
         }
-        if (this._pads.has(gp.index)) return;
+        this._resolved.set(gp.index, { id: gp.id, res });
+        return res;
+    }
+
+    _loadDb() {
+        if (this._dbLoading || this._db !== undefined) return;
+        this._dbLoading = true;
+        loadGamepadDb().then((db) => {
+            this._db = db;
+            this._dbLoading = false;
+            this._resolved.clear();
+        });
+    }
+
+    /**
+     * Resolve `gp` and, if it is mapped and has a place, announce it to the
+     * host. Returns the pad's entry when it is forwarded, else null.
+     */
+    _consider(gp) {
+        const res = this._resolve(gp);
+        if (res.source === 'pending') return null;
+        let entry = this._pads.get(gp.index);
+        if (this._excluded.has(res.key)) {
+            if (entry) this._release(gp.index);
+            return null;
+        }
+        if (!res.source) {
+            if (entry) this._release(gp.index);
+            this._noteIgnored(gp);
+            return null;
+        }
+        this._ignored.delete(gp.index);
+        if (entry) {
+            entry.bindings = res.bindings;
+            return entry;
+        }
+        if (this._single) {
+            // One pad only. The preferred one takes the place from any other;
+            // otherwise first come, first served.
+            const holder = Array.from(this._pads.keys())[0];
+            if (holder !== undefined) {
+                const preferred = this._preferredKey && res.key === this._preferredKey;
+                const holderPreferred = this._pads.get(holder).key === this._preferredKey;
+                if (!preferred || holderPreferred) return null;
+                this._release(holder);
+            }
+        }
         const hasRumble = !!gp.vibrationActuator;
-        this._pads.set(gp.index, { last: null, sentAt: 0, hasRumble });
+        const hostIndex = this._single ? 0 : gp.index;
+        entry = {
+            last: null,
+            sentAt: 0,
+            hasRumble,
+            bindings: res.bindings,
+            hostIndex,
+            key: res.key,
+        };
+        this._pads.set(gp.index, entry);
+        this._armPoll();
         this._send({
             type: 'gamepadconnect',
-            index: gp.index,
+            index: hostIndex,
             mask: this._mask(),
             ctype: this._controllerType(gp),
             rumble: hasRumble,
         });
+        if (isAutoMapped(res.source) && !this._announced.has(gp.index)) {
+            this._announced.add(gp.index);
+            if (this._onMapped) this._onMapped(gp, res);
+        }
+        return entry;
+    }
+
+    /**
+     * Pads the HID passthrough sends to the host as themselves, by key
+     * (`usb:vid:pid`): never forwarded as a mapped pad as well, or the game
+     * would see the device twice. One already forwarded is taken off at once;
+     * one let go again comes back at the next poll.
+     */
+    setExcluded(keys) {
+        this._excluded = new Set(keys || []);
+        for (const [index, entry] of Array.from(this._pads)) {
+            if (this._excluded.has(entry.key)) this._release(index);
+        }
+    }
+
+    /** Take a forwarded pad off the host. */
+    _release(index) {
+        const entry = this._pads.get(index);
+        if (!entry) return;
+        this._stopRumble(index);
+        this._pads.delete(index);
+        this._armPoll();
+        this._send({ type: 'gamepaddisconnect', index: entry.hostIndex, mask: this._mask() });
+    }
+
+    _handleConnect(gp) {
+        if (!gp || isTvRemotePad(gp)) return;
+        this._consider(gp);
+    }
+
+    /**
+     * A TV remote's arrows, out of a pad read: each press and release, and
+     * the repeats of one held, to onRemoteKey. Nothing else of it is read.
+     */
+    _readRemote(gp) {
+        let held = this._remotes.get(gp.index);
+        if (!held) {
+            held = new Map();
+            this._remotes.set(gp.index, held);
+        }
+        const now = performance.now();
+        for (const b of Object.keys(REMOTE_DIRS)) {
+            const i = Number(b);
+            const down = !!(gp.buttons[i] && gp.buttons[i].pressed);
+            const was = held.get(i);
+            if (down && !was) {
+                held.set(i, { since: now, lastAt: now });
+                if (this._onRemoteKey) this._onRemoteKey(REMOTE_DIRS[b], true, false);
+            } else if (down && was) {
+                if (
+                    now - was.since >= REMOTE_REPEAT_DELAY_MS &&
+                    now - was.lastAt >= REMOTE_REPEAT_MS
+                ) {
+                    was.lastAt = now;
+                    if (this._onRemoteKey) this._onRemoteKey(REMOTE_DIRS[b], true, true);
+                }
+            } else if (!down && was) {
+                held.delete(i);
+                if (this._onRemoteKey) this._onRemoteKey(REMOTE_DIRS[b], false, false);
+            }
+        }
+    }
+
+    /** Let go of every arrow a remote holds (pause, stop): the host must not keep one down. */
+    _releaseRemotes() {
+        for (const held of this._remotes.values()) {
+            for (const i of held.keys()) {
+                if (this._onRemoteKey) this._onRemoteKey(REMOTE_DIRS[i], false, false);
+            }
+            held.clear();
+        }
+    }
+
+    /** Select + Start + LB + RB on a forwarded pad: tell once per press. */
+    _checkChord(gp) {
+        if (!this._onMenuChord) return;
+        const all = MENU_CHORD.every((i) => gp.buttons[i] && gp.buttons[i].pressed);
+        if (all && !this._chordDown.has(gp.index)) {
+            this._chordDown.add(gp.index);
+            this._onMenuChord();
+        } else if (!all) {
+            this._chordDown.delete(gp.index);
+        }
     }
 
     _handleDisconnect(gp) {
@@ -248,10 +588,9 @@ export class GamepadManager {
         // Unplugged and plugged back in still the wrong mode deserves the
         // message again; the same index may also be a different pad by then.
         this._ignored.delete(gp.index);
-        if (!this._pads.has(gp.index)) return;
-        this._stopRumble(gp.index);
-        this._pads.delete(gp.index);
-        this._send({ type: 'gamepaddisconnect', index: gp.index, mask: this._mask() });
+        this._announced.delete(gp.index);
+        this._resolved.delete(gp.index);
+        this._release(gp.index);
     }
 
     _loop() {
@@ -260,33 +599,37 @@ export class GamepadManager {
         this._rafId = requestAnimationFrame(() => this._loop());
     }
 
+    /**
+     * One read of every pad — from the frame loop, and every POLL_MS while a
+     * pad is forwarded. The two interleave; neither sends what has not changed.
+     */
     _poll() {
         const pads = navigator.getGamepads ? navigator.getGamepads() : [];
         for (const gp of pads) {
             if (!gp) continue;
-            if (gp.mapping !== 'standard') {
-                // Also seen here, not only on the connect event: a pad plugged
-                // in before start() never fires one.
-                this._noteIgnored(gp);
+            // A TV remote: its arrows as keys, and never a pad on the host.
+            if (isTvRemotePad(gp)) {
+                if (!this._paused) this._readRemote(gp);
                 continue;
             }
-            // Late-arriving pad (no connect event yet).
-            if (!this._pads.has(gp.index)) this._handleConnect(gp);
+            // Also seen here, not only on the connect event: a pad plugged in
+            // before start() never fires one, and a mapping may have changed.
+            const entry = this._consider(gp);
+            if (!entry || this._paused) continue;
+            this._checkChord(gp);
 
-            const entry = this._pads.get(gp.index);
-            if (!entry) continue;
-
+            const src = entry.bindings ? readVirtualPad(gp, entry.bindings) : gp;
             let buttons = 0;
             for (const i in BUTTON_MAP) {
-                if (gp.buttons[i] && gp.buttons[i].pressed) buttons |= BUTTON_MAP[i];
+                if (src.buttons[i] && src.buttons[i].pressed) buttons |= BUTTON_MAP[i];
             }
-            const lt = gp.buttons[6] ? Math.round(gp.buttons[6].value * 255) : 0;
-            const rt = gp.buttons[7] ? Math.round(gp.buttons[7].value * 255) : 0;
+            const lt = src.buttons[6] ? Math.round(src.buttons[6].value * 255) : 0;
+            const rt = src.buttons[7] ? Math.round(src.buttons[7].value * 255) : 0;
             // Y axes inverted: Limelight expects up = positive.
-            const lx = axisToShort(gp.axes[0] || 0);
-            const ly = axisToShort(-(gp.axes[1] || 0));
-            const rx = axisToShort(gp.axes[2] || 0);
-            const ry = axisToShort(-(gp.axes[3] || 0));
+            const lx = axisToShort(src.axes[0] || 0);
+            const ly = axisToShort(-(src.axes[1] || 0));
+            const rx = axisToShort(src.axes[2] || 0);
+            const ry = axisToShort(-(src.axes[3] || 0));
 
             const cur = { buttons, lt, rt, lx, ly, rx, ry };
             const now = performance.now();
@@ -311,8 +654,25 @@ export class GamepadManager {
             }
             entry.last = cur;
             entry.sentAt = now;
-            this._send({ type: 'gamepad', index: gp.index, mask: this._mask(), ...cur });
+            this._send({ type: 'gamepad', index: entry.hostIndex, mask: this._mask(), ...cur });
+            if (this._probe) this._probe.notePadSend();
         }
+        if (this._probe) this._noteRead();
+    }
+
+    /**
+     * Diagnostics: the gap since the previous read, counted only while it
+     * matters — a pad forwarded and not paused. Any other read starts over, so
+     * a quiet stretch never reads as one long gap.
+     */
+    _noteRead() {
+        if (this._pads.size === 0 || this._paused) {
+            this._lastReadAt = 0;
+            return;
+        }
+        const now = performance.now();
+        if (this._lastReadAt) this._probe.notePadRead(now - this._lastReadAt);
+        this._lastReadAt = now;
     }
 
     /**
@@ -353,7 +713,13 @@ export class GamepadManager {
      * Zero on both motors is the "off" the host sends when the game releases
      * the pad; anything else replaces whatever was being held.
      */
-    rumble(index, low, high) {
+    rumble(hostIndex, low, high) {
+        // The host speaks of its controller numbers; a single-mode pad is
+        // controller 0 whatever its browser index.
+        let index = hostIndex;
+        for (const [browserIndex, entry] of this._pads) {
+            if (entry.hostIndex === hostIndex) index = browserIndex;
+        }
         // Limelight motors are 16-bit; the Web API wants 0..1 magnitudes.
         const strong = Math.min(1, (low || 0) / 65535);
         const weak = Math.min(1, (high || 0) / 65535);

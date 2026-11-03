@@ -74,8 +74,16 @@ mkdir -p "$SCRIPTS"
 sed -e "s/@MW_APP_NAME@/$APP_NAME/g" -e "s/@MW_AGENT_LABEL@/$AGENT_LABEL/g" \
     "$HERE/scripts/postinstall" > "$SCRIPTS/postinstall"
 chmod +x "$SCRIPTS/postinstall"
+# Bundles are relocatable by default: Installer finds an app with the same
+# identifier anywhere on the disk and upgrades it there. On a Mac whose app
+# lived in ~/Applications, the new bundle went there, still root-owned, while
+# postinstall pointed the LaunchAgent at /Applications, where nothing was:
+# the app no longer started at login (12/10/2026). Always /Applications.
+pkgbuild --analyze --root "$STAGE" "$WORK/component.plist"
+/usr/bin/plutil -replace 0.BundleIsRelocatable -bool NO "$WORK/component.plist"
 pkgbuild \
     --root "$STAGE" \
+    --component-plist "$WORK/component.plist" \
     --identifier "$IDENT" \
     --version "$VERSION" \
     --scripts "$SCRIPTS" \

@@ -51,17 +51,22 @@ public:
     OpusEncoder(const OpusEncoder&) = delete;
     OpusEncoder& operator=(const OpusEncoder&) = delete;
 
-    bool open(std::string& error);
+    /// `frameSamples`: 240 (5 ms, the product), or 480 / 960 (10 / 20 ms,
+    /// the bench key `audioframe=`); anything else is refused.
+    bool open(std::string& error, int frameSamples = kFrameSamples);
 
-    /// Encode exactly one frame (kFrameSamples per channel, interleaved
+    /// Encode exactly one frame (frameSamples() per channel, interleaved
     /// floats). Returns the packet size, 0 on error (logged once).
     size_t encode(const float* interleaved, std::vector<uint8_t>& out);
+
+    int frameSamples() const { return m_FrameSamples; }
 
     /// What libopus reports as its own version, for the session log.
     static const char* libraryVersion();
 
 private:
     ::OpusEncoder* m_Encoder = nullptr;
+    int m_FrameSamples = kFrameSamples;
     bool m_LoggedError = false;
 };
 

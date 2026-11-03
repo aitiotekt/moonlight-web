@@ -96,6 +96,11 @@ public:
     ID3D11Texture2D* transfer(ID3D11Device* sourceDevice, ID3D11DeviceContext* sourceContext,
                               ID3D11Texture2D* source, std::string& error);
 
+    /// Let go of the captured surfaces opened for the copy engine, before the
+    /// capture hands its surfaces over anew (IWindowsCapture::retake). Each
+    /// transfer() waits for its own copy, so nothing reads them by then.
+    void forgetSources() { m_DmaSources.clear(); }
+
     /// How many transfers happened, and how long they took on average and at
     /// most, in microseconds — for the end-of-session log.
     int64_t transfers() const { return m_Transfers; }

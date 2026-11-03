@@ -35,11 +35,12 @@ That is the whole picture on a LAN. From outside, the browser has no way to *rea
 2. The two exchange WebRTC signalling through the introduction server, which copies opaque payloads and is bound out of the middle by MW-BIND-v1 ([Security §6.6](06-Security.md#66-the-entry-identifier-and-mw-bind-v1)).
 3. Everything after the first byte — the interface, the REST API, the streaming signalling — travels over the direct connection. The introduction server is not in that path, and no media ever crosses it.
 
-The MoonlightWeb server plays three roles at once:
+The MoonlightWeb server plays four roles at once:
 
 1. **Web server** — serves the frontend (static files) and a REST API over HTTPS.
 2. **GameStream client** — embeds `moonlight-common-c` and speaks NvHTTP/RTSP/RTP/ENet to Sunshine, exactly like moonlight-qt would.
 3. **Streaming bridge** — re-encapsulates the decoded-protocol media (H.264/HEVC/AV1 frames, Opus packets) and input into browser-reachable transports: WebRTC DataChannels, WebRTC RTP media tracks, or a WSS relay. Each session actually runs in a **child process** (`--stream-worker`), which is what lets two of them coexist despite the `moonlight-common-c` singleton.
+4. **Native host** — captures and encodes the machine it runs on (`backend/native-host/`), without `moonlight-common-c`, and hands each frame to the same bridge. It is the default card.
 
 The **infrastructure stack is decoupled** and stays out of the data path: it introduces peers, serves the entry page, answers STUN, and hosts the site, the release relay and the censuses. It never sees a stream, an input event or a credential ([Infrastructure Stack](10-Infrastructure-Stack.md)). An instance that is never opened to the internet talks to none of it.
 
@@ -54,7 +55,7 @@ The **infrastructure stack is decoupled** and stays out of the data path: it int
 | **WebRTC PeerConnection** | The stream itself: video over a DataChannel or an RTP track (per transport family), audio always an RTP Opus track, input always a DataChannel (see [Streaming & Transports](05-Streaming-and-Transports.md)). |
 | **WSS `/ws/stream`** | Last-resort full-stream relay (video+audio+input over one WebSocket) when WebRTC cannot connect. |
 | **WSS `/ws1`, `/ws1/stream`** | The same two surfaces for the **second stream slot** (internal 48011/48012) — the standby leg of seamless quality switching. |
-| **WSS `/ws2`…`/ws4` (+ `/stream`)** | One pair per **invited player** (internal 48021/48022, 48031/48032, 48041/48042). Ports follow the slot: signaling = 48001 + 10 × slot, relay = that + 1. These are the only WebSocket surfaces that do *not* accept a session cookie: they require the `mw_player` cookie bound to that slot's live share activation (see [Security](06-Security.md)). |
+| **WSS `/ws2`…`/ws4` (+ `/stream`)** | One pair per **invited player** (internal 48013/48014, 48015/48016, 48017/48018). Slot 0 keeps 48001/48002; every other slot takes two consecutive ports, signaling then relay, from a second base placed clear of the media block and of the streaming servers' ports (48011 by default, 48574 under `--dev`). These are the only WebSocket surfaces that do *not* accept a session cookie: they require the `mw_player` cookie bound to that slot's live share activation (see [Security](06-Security.md)). |
 | **WSS `/ws/control`** | Tiny control channel every open tab keeps: used for single-tab dedup (a second app launch redirects an existing tab to `/admin` instead of opening a duplicate). |
 
 All WebSocket surfaces share the single HTTPS port: the HTTP server detects the `Upgrade` header and proxies the socket to the right internal WS server. One public port (443 by default) carries everything.
@@ -70,7 +71,7 @@ A browser arriving through the remote entry link speaks the **same** surfaces, t
 | **RTP** (UDP 47998/47999/48000) | Video/audio payload from Sunshine's GPU encoder. |
 | **ENet control** (:47999) | Encrypted input channel (AES-128-GCM) + control messages (IDR requests, connection status). |
 | **mDNS :5353** | LAN discovery. The server never binds 5353 permanently (it would conflict with Sunshine's own mDNS on the same machine); scans are ephemeral. |
-| **Sunshine REST API** (:47990) | Used only by the setup wizard/installer to create credentials and send the pairing PIN (`/api/pin`). |
+| **Sunshine REST API** (:47990) | Used by the setup wizard to create credentials and send the pairing PIN (`/api/pin`), by the MultiSeat backend for each seat's PIN, and probed without credentials to tell the backend apart. |
 
 ### End-to-end launch sequence
 
@@ -94,7 +95,7 @@ Browser                        MoonlightWeb                        Sunshine
 
 Key invariants (hard-won, do not regress):
 
-- **One session per process, two slots per server.** `moonlight-common-c` is a process-global singleton and the signaling port is fixed, so each session runs in its own `--stream-worker` child process (`stream_worker_enabled`, default on) — slot 0 is the live stream, slot 1 the standby used for seamless quality switching. A second *browser* launching still does a **take-over**: the live client is notified (`{"type":"takeover"}`), its relay is torn down *without* cancelling the Sunshine session, and the newcomer `/resume`s it. Only a `standby:true` launch is allowed to add a session instead of replacing one.
+- **One session per process, a pool of slots per server.** `moonlight-common-c` is a process-global singleton and the signaling port is fixed, so each session runs in its own `--stream-worker` child process (`stream_worker_enabled`, default on) — slot 0 is the owner's live stream, slot 1 its standby for seamless quality switching, slots 2 to 4 the invited players, and further slots devices streaming a different host. A second *browser* launching still does a **take-over**: the live client is notified (`{"type":"takeover"}`), its relay is torn down *without* cancelling the Sunshine session, and the newcomer `/resume`s it. A launch adds a session instead of replacing one when it is `standby:true` or streams a different host.
 - **The response to `/start` is sent before ICE connects.** Connection failures are only observable client-side, so the **browser drives the transport fallback chain** by relaunching with `transport_index + 1`.
 - **Teardown is serialized.** A new session's `start()` is deferred until the previous relay graph is fully destroyed (`QObject::destroyed`), because the signaling port and the moonlight singleton are only freed then.
 - Sessions are keyed per-browser by a `client_uniqueid` (hex, from `mw_client_uniqueid` in localStorage) so one browser's quit/relaunch never cancels another client's Sunshine session, and a page reload `/resume`s its own session.
@@ -106,11 +107,11 @@ Key invariants (hard-won, do not regress):
 | **C++17 + Qt 6.11** (backend) | `moonlight-common-c` is C; Qt provides the cross-platform event loop, networking (QSslSocket), JSON, tray icon, and mature TLS handling on all three OSes with a single codebase. Qt 6.11 is the tested baseline; the **OpenSSL TLS backend is forced** on Windows (Schannel cannot import PEM keys). |
 | **`moonlight-common-c`** (submodule) | The canonical, battle-tested GameStream protocol core used by every Moonlight client. Reimplementing RTSP/RTP/ENet/FEC would be folly. |
 | **`libdatachannel`** (submodule) | Lightweight C++ WebRTC implementation (DataChannels *and* RTP media tracks) without pulling the enormous libwebrtc. Built statically via CMake `add_subdirectory`. |
-| **`qmdnsengine`**, **`miniupnpc`** (submodules) | mDNS discovery and UPnP port mapping, both small and embeddable. Every router hole — the tunnel's and each stream slot's — is claimed by one `RouterPortAllocator` in the main process, which walks shared candidate lists so several MoonlightWeb hosts on one LAN never take each other's entries — tunnel `3478-3481`, `5349-5352` then `46000-46031`; stream `48010 + slot` then `46100-46199` on the router side only (`backend/src/network/RouterPortPools.h`). |
+| **`qmdnsengine`**, **`miniupnpc`** (submodules) | mDNS discovery and UPnP port mapping, both small and embeddable. Every router hole — the tunnel's and each stream slot's — is claimed by one `RouterPortAllocator` in the main process, which walks shared candidate lists so several MoonlightWeb hosts on one LAN never take each other's entries — tunnel `3478-3481`, `5349-5352` then `46000-46031`; stream `48550 + slot` then `46100-46199` on the router side only (`backend/src/network/RouterPortPools.h`). |
 | **OpenSSL 3** | Pairing crypto (AES/RSA per GameStream), input encryption (AES-128-GCM), certificate handling. Bundled on Windows (`backend/libs/windows/`). |
 | **Vanilla JS, no framework, no build step** (frontend) | The app is served by an embedded C++ web server: zero build tooling means the server ships plain files and contributors need only a browser. ES6 modules give structure; Prettier+ESLint+Vitest+tsc(advisory) give quality without a bundler. |
-| **WebCodecs + WebGPU/Canvas** (video) | WebCodecs exposes the browser's hardware H.264/HEVC/AV1 decoders with frame-level control (latency!); rendering to canvas allows the WebGPU enhancement pipeline. A `<video>`-sink alternative exists for HDR (see [Transports](05-Streaming-and-Transports.md)). |
-| **AudioWorklet + WebCodecs AudioDecoder** (audio) | Opus decode on the native decoder, playback on the real-time audio thread with an adaptive jitter buffer and WSOLA time-stretch. |
+| **WebCodecs + WebGPU/Canvas** (video) | WebCodecs exposes the browser's hardware H.264/HEVC/AV1 decoders with frame-level control (latency!); rendering to canvas allows the WebGL2/WebGPU enhancement pipeline. A `<video>`-sink alternative exists for HDR (see [Transports](05-Streaming-and-Transports.md)). |
+| **Native WebRTC Opus track** (audio; AudioWorklet + WebCodecs AudioDecoder on WSS) | On WebRTC the browser's own RTP stack decodes and plays the Opus track (jitter buffer, FEC, PLC). On WSS, Opus is decoded by the native decoder and played on the real-time audio thread with an adaptive jitter buffer and WSOLA time-stretch. |
 | **CMake** (single build system) | qmake was removed 2026-06-28. One `CMakeLists.txt` covers Windows x64/ARM64 (MSVC/Ninja), Linux, macOS, plus tests, coverage and `compile_commands.json`. |
 | **Go, stdlib only** (introduction server, gateway) | `mw-rendezvous` and `mw-proxy` are the two pieces of this project exposed to the whole internet with no user in front of them. A poisoned dependency is a realistic way in, and neither has anything worth importing one for. See [Infrastructure Stack](10-Infrastructure-Stack.md). |
 | **A held WebSocket, not a published record** (reachability) | The address a browser needs is the reflexive candidate — a port that exists only while a connection is being made. There is nothing an instance could usefully announce in advance, so the line *is* the reachability. It also means opting in publishes no DNS record and takes no certificate, and therefore puts nothing in Certificate Transparency. |
@@ -157,7 +158,7 @@ moonlight-web/
 - **Event-driven, no nested event loops** — HTTP dispatch uses sync or **async routes with a `ResponseCallback`**; pairing and NvHTTP are fully asynchronous. A nested `QEventLoop` in the HTTP dispatch path historically caused a use-after-free crash and is banned.
 - **Relay threading** — each relay runs its stream pumping off the main thread (dedicated relay thread); teardown ownership lives in `qApp`-context lambdas in `main.cpp` (a relay whose teardown lived elsewhere was never destroyed, producing 504s).
 - **Frontend: one main view + overlays** — `hosts` is the single history-backed view; `admin`, `settings` and `streaming` are overlays with guard `pushState` (see `frontend/js/app.js` header comment).
-- **Transports are pluggable** — a shared relay contract (`RelayBase.h`) and a frontend renderer abstraction (`VideoRenderer` + `createRenderer`) keep the 5 transport modes and the 3 render sinks orthogonal.
+- **Transports are pluggable** — a shared relay contract (`RelayBase.h`) and a frontend renderer abstraction (`VideoRenderer` + `createRenderer`) keep the 5 transport modes and the 4 render sinks (Canvas2D, WebGL2, WebGPU, `<video>`) orthogonal.
 
 ---
 

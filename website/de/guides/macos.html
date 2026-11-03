@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<!-- Generated from /guides/macos.html and _i18n/de/guides/macos.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoonlightWeb unter macOS installieren — dein Mac in jedem Browser</title>
+<meta name="description" content="Schritt für Schritt: Installiere den MoonlightWeb-Server auf deinem Mac mit Apple Silicon und streame deine Spiele auf jedes Gerät mit Browser — iPhone, iPad, Laptop, TV.">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#05080d">
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="MoonlightWeb unter macOS installieren — dein Mac in jedem Browser">
+<meta property="og:description" content="Schritt für Schritt: Installiere den MoonlightWeb-Server auf deinem Mac mit Apple Silicon und streame deine Spiele auf jedes Gerät mit Browser — iPhone, iPad, Laptop, TV.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://moonlightweb.top/de/guides/macos.html">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="MoonlightWeb unter macOS installieren — dein Mac in jedem Browser">
+<meta name="twitter:description" content="Schritt für Schritt: Installiere den MoonlightWeb-Server auf deinem Mac mit Apple Silicon und streame deine Spiele auf jedes Gerät mit Browser — iPhone, iPad, Laptop, TV.">
+<meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/de/guides/macos.html">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/macos.html">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/macos.html">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/macos.html">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/macos.html">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/macos.html">
+<!-- /i18n:alternates -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<link rel="stylesheet" href="/assets/pages.css?v={{(fileStat `/assets/pages.css`).ModTime.Unix}}">
+<!-- Shared header/footer styling -->
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://moonlightweb.top/de/"},
+        {"@type": "ListItem", "position": 2, "name": "Guides", "item": "https://moonlightweb.top/de/guides/"},
+        {"@type": "ListItem", "position": 3, "name": "Install on macOS", "item": "https://moonlightweb.top/de/guides/macos.html"}
+      ]
+    },
+    {
+      "@type": "HowTo",
+      "name": "Install MoonlightWeb on macOS and stream your Mac to any browser",
+      "description": "Install the MoonlightWeb server on an Apple Silicon Mac — it captures and encodes that Mac itself — and play from any device with a browser.",
+      "totalTime": "PT5M",
+      "estimatedCost": {"@type": "MonetaryAmount", "currency": "USD", "value": "0"},
+      "supply": [{"@type": "HowToSupply", "name": "Apple Silicon Mac (M1 or newer)"}],
+      "tool": [{"@type": "HowToTool", "name": "A modern browser on any client device (Chrome, Edge, Safari, Firefox)"}],
+      "step": [
+        {"@type": "HowToStep", "name": "Download the installer", "text": "Download the Apple Silicon .pkg from the MoonlightWeb releases page.", "url": "https://moonlightweb.top/de/guides/macos.html#step-download"},
+        {"@type": "HowToStep", "name": "Run the guided installer", "text": "Run the .pkg on the Mac that runs your games. The setup wizard walks you through the configuration, including one-click Internet access.", "url": "https://moonlightweb.top/de/guides/macos.html#step-install"},
+        {"@type": "HowToStep", "name": "Grant the two macOS permissions", "text": "At its first launch MoonlightWeb asks for both macOS permissions at once: Screen Recording, so this Mac can stream its own screen, and Accessibility, so your clicks and keystrokes reach it. Tick both in System Settings, Privacy & Security, then quit and reopen MoonlightWeb.", "url": "https://moonlightweb.top/de/guides/macos.html#permissions"},
+        {"@type": "HowToStep", "name": "Open a browser on any device", "text": "Go to https://localhost on the Mac itself, or your LAN IP from another device on your network.", "url": "https://moonlightweb.top/de/guides/macos.html#step-open"},
+        {"@type": "HowToStep", "name": "Your Mac is already there", "text": "The Mac is listed straight away, with one card per screen — no pairing, no PIN. Other hosts on the network (Sunshine, Wolf, MultiSeat) are discovered too and pair with a PIN.", "url": "https://moonlightweb.top/de/guides/macos.html#step-pair"},
+        {"@type": "HowToStep", "name": "Press play", "text": "Pick a game or the full desktop and play from any browser in the house — or anywhere.", "url": "https://moonlightweb.top/de/guides/macos.html#step-play"}
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/de/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/de/" data-nav="home">Start</a><a href="/de/guides/" data-nav="guides" aria-current="page">Anleitungen</a><a href="/de/faq.html" data-nav="faq">FAQ</a><a href="/de/contact.html" data-nav="contact">Kontakt</a><a href="/de/server-access/" data-nav="connect">Verbinden</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/guides/macos.html">English</option><option value="fr" data-href="/fr/guides/macos.html">Français</option><option value="de" data-href="/de/guides/macos.html" selected>Deutsch</option><option value="zh" data-href="/zh/guides/macos.html" lang="zh">中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<main>
+<div class="wrap">
+  <nav class="crumbs" aria-label="Breadcrumb" data-i18n-html="crumbs"><a href="/de/">Startseite</a> / <a href="/de/guides/">Anleitungen</a> / macOS</nav>
+  <span class="kicker" data-i18n="kicker">Installationsanleitung · macOS</span>
+  <h1 data-i18n="h1">Streame deinen Mac in jeden Browser</h1>
+  <p class="lead" data-i18n-html="lead">MoonlightWeb ist ein kostenloser Open-Source-Server (GPL-3.0), der deinen Mac auf jedes Gerät mit Browser streamt. <strong>Ein Download auf dem Mac, auf dem die Spiele laufen. Alle anderen Geräte öffnen einfach eine URL.</strong></p>
+
+  <h2 data-i18n="need.h">Was du brauchst</h2>
+  <ul>
+    <li data-i18n-html="need.1">Einen <strong>Mac mit Apple Silicon</strong> (M1 oder neuer) — den Rechner, auf dem deine Spiele laufen.</li>
+    <li data-i18n-html="need.2"><strong>Sonst nichts.</strong> MoonlightWeb erfasst und encodiert diesen Mac selbst (ScreenCaptureKit → VideoToolbox) — kein zweiter Streaming-Server nötig. Du hast schon irgendwo Sunshine, Wolf oder MultiSeat laufen? Diese Rechner koppelst du auf derselben Seite.</li>
+    <li data-i18n="need.3">Als Client jedes Gerät mit einem modernen Browser: Safari, Chrome, Edge oder Firefox. Keine App, kein Konto.</li>
+  </ul>
+
+  <h2 data-i18n="steps.h">Installation Schritt für Schritt</h2>
+  <div class="gsteps">
+    <div class="gstep cyb" id="step-download">
+      <h3 data-i18n="step1.h">Lade den Installer herunter</h3>
+      <p data-i18n-html="step1.p">Hol dir das <code>arm64 .pkg</code> von der <a href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener">Releases-Seite</a>.</p>
+    </div>
+    <div class="gstep cyb" id="step-install">
+      <h3 data-i18n="step2.h">Starte den geführten Installer — auf dem Mac, auf dem deine Spiele laufen</h3>
+      <p data-i18n="step2.p">Der Einrichtungsassistent führt dich durch die Konfiguration, inklusive der optionalen Internet-Verbindung (Remote-Streaming-Sessions, standardmäßig aus). Danach läuft der Server.</p>
+      <p data-i18n-html="step2.p2">Anschließend bittet macOS dich, MoonlightWeb die <strong>Bildschirmaufnahme</strong> zu erlauben — ohne sie kann dieser Mac seinen eigenen Bildschirm nicht streamen. Das ist die erste von <a href="#permissions">zwei Berechtigungen, die nur du erteilen kannst</a>; der Assistent öffnet dir den richtigen Einstellungsbereich.</p>
+    </div>
+    <div class="gstep cyb" id="step-open">
+      <h3 data-i18n="step3.h">Öffne einen Browser auf einem beliebigen Gerät</h3>
+      <p data-i18n-html="step3.p">Auf dem Mac selbst: <code>https://localhost</code>. Von einem anderen Gerät in deinem Netzwerk: deine LAN-IP. Spielen von außerhalb deines Netzwerks: Schalte den Internetzugriff ein, und die App gibt dir einen Remote-Link, der direkt zu diesem Rechner führt. Du kannst auch deine eigene Domain und dein eigenes Zertifikat verwenden.</p>
+    </div>
+    <div class="gstep cyb" id="step-pair">
+      <h3 data-i18n="step4.h">Dein Mac ist schon da</h3>
+      <p data-i18n="step4.p">Dieser Mac steht sofort in der Liste, mit einer Karte pro Bildschirm — nichts zu koppeln, keine PIN. Andere Hosts in deinem Netzwerk (Sunshine, Wolf, MultiSeat) werden daneben per mDNS gefunden: Die koppelst du einmal — bei Sunshine, indem du die PIN, die MoonlightWeb anzeigt, auf der Weboberfläche von Sunshine eingibst — und die Kopplung bleibt für immer gespeichert.</p>
+    </div>
+    <div class="gstep cyb" id="step-play">
+      <h3 data-i18n="step5.h">Drück auf Play</h3>
+      <p data-i18n="step5.p">Wähle einen Bildschirm, ein Spiel oder den ganzen Desktop. iPhone, iPad, ein anderer Laptop, ein Fernseher — alles mit Browser wird zum Client.</p>
+    </div>
+  </div>
+
+  <p style="text-align:center"><a class="btn btn-primary" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-loc="guide-macos" data-i18n="dl.btn">⬇ Für macOS herunterladen</a></p>
+
+  <h2 id="permissions" data-i18n="perm.h">Was du unter macOS erlauben musst</h2>
+  <p data-i18n-html="perm.p">Apple lässt keinen Installer diese Berechtigungen für dich erteilen — jeder Streaming-Server unter macOS fragt nach denselben. Es sind <strong>zwei</strong>, und MoonlightWeb fragt beim ersten Start nach beiden — direkt nach der Installation, während du noch vor dem Mac sitzt:</p>
+  <ul>
+    <li data-i18n-html="perm.1"><strong>Bildschirmaufnahme</strong>, beim ersten Start. Aktiviere <em>MoonlightWeb</em> unter <strong>Systemeinstellungen → Datenschutz &amp; Sicherheit → Bildschirmaufnahme</strong> (ab macOS 15 heißt das <em>Bildschirm- &amp; Systemaudioaufnahme</em>), dann <strong>beende MoonlightWeb und öffne es erneut</strong> — macOS wendet diese Berechtigung nur auf ein Programm an, das nach der Erteilung gestartet wurde. Bis dahin zeigt die Host-Seite diesen Mac als nicht verfügbar an und sagt genau das.</li>
+    <li data-i18n-html="perm.2"><strong>Bedienungshilfen</strong>, gleich im Anschluss abgefragt. Damit erreichen deine Klicks und Tastenanschläge den Mac. Aktiviere <em>MoonlightWeb</em> unter <strong>Systemeinstellungen → Datenschutz &amp; Sicherheit → Bedienungshilfen</strong>. Ohne diese Berechtigung kommt das Bild an, aber nichts reagiert — und macOS warnt nicht von sich aus; deshalb sagt es dir die Einrichtungsseite und bietet an, den Bereich für dich zu öffnen.</li>
+  </ul>
+  <p data-i18n-html="perm.rest">Unterwegs fragt der Installer außerdem nach deinem <strong>Administratorpasswort</strong> (die App landet in <code>/Applications</code>) und auf seiner ersten Seite nach einem <strong>Erlauben</strong> für „Dieses Paket führt ein Programm aus, um festzustellen, ob die Software installiert werden kann“ — dieses Programm ist die Seite zum Internetzugang im Installer selbst. Sonst nichts: Der Installer lässt MoonlightWeb bereits durch die macOS-Firewall, daher erscheint keine Abfrage für eingehende Verbindungen, und es wird kein zweiter Streaming-Server installiert.</p>
+  <div class="note" data-i18n-html="perm.note"><strong>Einmal erteilt, dauerhaft behalten.</strong> Releases sind mit einem stabilen Zertifikat signiert, daher fragt ein Update von MoonlightWeb nicht erneut nach diesen Berechtigungen.</div>
+
+  <h2 id="one-line-install" data-i18n="cli.h">Stattdessen ein Befehl — und keine Warnung</h2>
+  <p data-i18n-html="cli.p">MoonlightWeb ist kostenlos und Open Source, und das heißt auch: Es ist nicht mit einer kostenpflichtigen Apple Developer ID signiert. Deshalb begrüßt macOS ein <em>heruntergeladenes</em> <code>.pkg</code> mit <strong>„kann nicht geöffnet werden, da es von einem nicht verifizierten Entwickler stammt“</strong>. Diese Prüfung gilt nur für Dateien, die ein Browser heruntergeladen hat — jeder dieser beiden Befehle installiert also genau dasselbe Paket, ganz ohne Wegklicken:</p>
+  <pre><code>brew install --cask linckosz/tap/moonlightweb</code></pre>
+  <pre><code>curl -fsSL https://moonlightweb.top/install.sh | bash</code></pre>
+  <p data-i18n="cli.note">Beide fragen nach deinem Administratorpasswort, installieren nach /Applications und öffnen den Einrichtungsassistenten — derselbe Installer, dasselbe Ergebnis, ein Schritt weniger.</p>
+
+  <h2 data-i18n="tr.h">Fehlerbehebung</h2>
+  <h3 data-i18n="tr0.h">macOS verweigert das Öffnen des Installers: „nicht verifizierter Entwickler“</h3>
+  <p data-i18n-html="tr0.p">Erwartet und harmlos: Um diesen Dialog loszuwerden, braucht es eine kostenpflichtige Apple Developer ID. Nutze einen der beiden Befehle oben, dann erscheint er nie. Willst du lieber die bereits heruntergeladene Datei verwenden: Unter <strong>macOS 15 Sequoia und neuer</strong> doppelklickst du sie einmal, lässt sie abweisen, öffnest dann <strong>Systemeinstellungen → Datenschutz &amp; Sicherheit</strong>, scrollst ganz nach unten und klickst auf <strong>Dennoch öffnen</strong> — der alte Trick mit Control-Klick → Öffnen funktioniert nicht mehr. Das Gegenstück im Terminal ist <code>xattr -dr com.apple.quarantine ~/Downloads/moonlightweb-*.pkg</code>.</p>
+  <h3 data-i18n="tr4.h">Das Bild ist da, aber Maus und Tastatur tun nichts</h3>
+  <p data-i18n-html="tr4.p">Das ist die Berechtigung <strong>Bedienungshilfen</strong>: Fehlt sie, verwirft macOS eingespeiste Klicks und Tastenanschläge völlig stillschweigend. Aktiviere <em>MoonlightWeb</em> unter <strong>Systemeinstellungen → Datenschutz &amp; Sicherheit → Bedienungshilfen</strong>, dann beende die App und öffne sie erneut.</p>
+  <h3 data-i18n="tr5.h">Der Schalter ist schon aktiviert, und es geht trotzdem nicht</h3>
+  <p data-i18n-html="tr5.p">macOS knüpft eine Berechtigung an die <em>Signatur</em> einer App, nicht an ihren Namen — ein übrig gebliebener Eintrag einer älteren oder anders gebauten Kopie bleibt also aktiviert, während die laufende App abgewiesen wird. Lösch ihn im Terminal und lass die App erneut fragen:</p>
+  <pre><code>tccutil reset ScreenCapture com.moonlightweb.server
+tccutil reset Accessibility com.moonlightweb.server</code></pre>
+  <p data-i18n-html="tr5.p2">Öffne MoonlightWeb erneut und aktiviere es in beiden Bereichen, sobald es dort wieder auftaucht. Bei einem Pre-Release-Build lautet die Kennung <code>com.moonlightweb.server.dev</code>.</p>
+  <h3 data-i18n="tr1.h">Der Host erscheint nicht im Browser</h3>
+  <p data-i18n="tr1.p">Stell sicher, dass das Client-Gerät im selben Netzwerk ist wie der Mac. Der Installer lässt MoonlightWeb selbst durch die macOS-Firewall, eine Firewall eines Drittanbieters oder ein Gast-WLAN, das seine Clients voneinander isoliert, tut das aber nicht. Du kannst einen Host auch manuell per IP hinzufügen.</p>
+  <h3 data-i18n="tr2.h">Spielen auf iPhone oder iPad</h3>
+  <p data-i18n="tr2.p">Öffne dieselbe URL in Safari — kein Download aus dem App Store nötig. Du bekommst ein Multitouch-Trackpad und eine native virtuelle Tastatur mit Sondertasten; ein Mac als Host empfängt keinen Controller (macOS erlaubt keinen virtuellen Controller).</p>
+  <h3 data-i18n="tr3.h">Der Stream ruckelt bei schwacher Verbindung</h3>
+  <p data-i18n-html="tr3.p">Senk die Stream-Auflösung und aktiviere <strong>Video Enhancement</strong>: Der Stream wird auf der GPU des Clients hochskaliert und nachgeschärft (WebGL2 oder WebGPU mit MoonlightWebs eigenem Upscaler), sodass ein 720p-Stream fast wie 1440p aussieht.</p>
+
+  <div class="note" data-i18n-html="note"><strong>Restriktives Netzwerk?</strong> MoonlightWeb weicht von selbst auf TCP aus, wenn UDP blockiert ist, weiterhin direkt, und funktioniert so auch hinter den meisten strengen Firewalls und in feindseligem Hotel-WLAN.</div>
+
+  <h2 data-i18n="read.h">Weiterlesen</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/de/faq.html"><strong data-i18n="x.faq.t">FAQ</strong><span data-i18n="x.faq.d">Latenz, Codecs, Sicherheit, Spielen übers Internet — alle häufigen Fragen.</span></a>
+    <a class="cyb" href="/de/guides/windows.html"><strong data-i18n="x.win.t">Unter Windows installieren</strong><span data-i18n="x.win.d">Geführter Installer — ein Assistent, sonst nichts einzurichten.</span></a>
+    <a class="cyb" href="/de/guides/linux.html"><strong data-i18n="x.lin.t">Unter Linux installieren</strong><span data-i18n="x.lin.d">.deb, .rpm oder portables AppImage.</span></a>
+  </div>
+</div>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/de/">Start</a> · <a href="/de/guides/">Anleitungen</a> · <a href="/de/faq.html">FAQ</a> · <a href="/de/contact.html">Kontakt</a> · <a href="/de/server-access/">Verbinden</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>Kaffee</span></a></span><span class="foot-play">Spielen auf: <a href="/de/play/chromebook.html">Chromebook</a> · <a href="/de/play/iphone-ipad.html">iPhone und iPad</a> · <a href="/de/play/tv.html">TV</a> · <a href="/de/sunshine-web-client.html">Web-Client für Sunshine</a> · <a href="/de/browser-game-streaming.html">Warum ein Browser-Client</a></span></div></footer>
+
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+</body>
+</html>

@@ -23,3 +23,7 @@ frontend/node_modules
 frontend/coverage
 frontend/build
 **/.DS_Store
+# A submodule's .git is a file pointing into the repository's own .git, which is
+# not in the context: left in, `git -C <submodule> apply` fails on it, where
+# outside any repository it patches the files the way `patch` would.
+**/.git

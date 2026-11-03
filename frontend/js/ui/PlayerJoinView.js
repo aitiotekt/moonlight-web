@@ -26,9 +26,16 @@
 import { BackendClient } from '../api/BackendClient.js';
 import { t } from '../i18n/i18n.js';
 import { escapeHtml } from '../util/escapeHtml.js';
-import { IS_MOBILE_OR_TABLET, IS_TOUCH_DEVICE } from '../util/BrowserDetect.js';
+import { IS_MOBILE_OR_TABLET, IS_TOUCH_DEVICE, hevcClientDecodes } from '../util/BrowserDetect.js';
 import { PlayerArt } from './PlayerArt.js';
 import { noticeHtml } from './PrivacyNotice.js';
+import {
+    GamepadRemapDialog,
+    connectedPads,
+    resolvePad,
+    sourceBadge,
+} from './GamepadRemapDialog.js';
+import { padKey, padName, isAutoMapped } from '../stream/gamepadMapping.js';
 
 const HEIGHTS = [720, 1080, 1440];
 
@@ -49,9 +56,12 @@ function loadPrefs() {
             // it so a returning guest keeps the choice they already made.
             gaming: raw.gaming === true || raw.immersive === true,
             touchScreen: raw.touchScreen === true,
+            // The controller picked last time (gamepadMapping.padKey), taken
+            // again when it is plugged in.
+            padKey: typeof raw.padKey === 'string' ? raw.padKey : null,
         };
     } catch (_) {
-        return { gaming: false, touchScreen: false };
+        return { gaming: false, touchScreen: false, padKey: null };
     }
 }
 
@@ -67,7 +77,7 @@ export class PlayerJoinView {
     /**
      * @param {HTMLElement} container
      * @param {string} token the share token from the URL
-     * @param {(info: {height: number, gaming: boolean, touchScreen: boolean}) => Promise<void>} onJoin
+     * @param {(info: {height: number, gaming: boolean, touchScreen: boolean, padKey: string|null}, transportIndex?: number, codec?: string) => Promise<void>} onJoin
      */
     constructor(container, token, onJoin) {
         this.container = container;
@@ -76,6 +86,9 @@ export class PlayerJoinView {
         this.info = null;
         this._height = 1080;
         this._prefs = loadPrefs();
+        this._padWatch = null;
+        this._padSig = '';
+        this._joinLabel = '';
     }
 
     async start() {
@@ -87,6 +100,12 @@ export class PlayerJoinView {
         try {
             this.info = await BackendClient.playerInfo(this.token);
         } catch (err) {
+            // A live link whose PIN another browser already spent: most often
+            // this same guest in a private tab, so say where the invitation is.
+            if (err?.responseBody?.error === 'bound_elsewhere') {
+                this._renderBoundElsewhere();
+                return;
+            }
             // 404 = the link is dead or was never real. Anything else (offline,
             // 500) is shown the same way: from here they are equally unusable,
             // and the page is not the place to debug a server.
@@ -103,6 +122,7 @@ export class PlayerJoinView {
     // ── Screens ─────────────────────────────────────────────────────────────
 
     _shell(inner, artKey) {
+        this._stopPadWatch();
         this.container.innerHTML = `
             <div class="player-page">
                 ${artKey ? `<div class="player-art">${PlayerArt[artKey]}</div>` : ''}
@@ -176,6 +196,18 @@ export class PlayerJoinView {
         );
     }
 
+    /** The invitation is alive, but tied to the browser that entered its PIN. */
+    _renderBoundElsewhere() {
+        this._shell(
+            `
+            <h1>${escapeHtml(t('player.boundTitle'))}</h1>
+            <p>${escapeHtml(t('player.boundBody'))}</p>
+            <p class="player-muted">${escapeHtml(t('player.boundHint'))}</p>
+        `,
+            'void',
+        );
+    }
+
     /** The owner stopped the session mid-stream (or before we could join). */
     renderEnded() {
         this._shell(
@@ -211,6 +243,11 @@ export class PlayerJoinView {
 
         input.addEventListener('input', () => {
             input.value = input.value.replace(/\D/g, '').slice(0, 6);
+            // All six typed on a phone: put the keyboard away, so the button
+            // is in plain sight instead of under it.
+            if (input.value.length === 6 && window.matchMedia?.('(pointer: coarse)').matches) {
+                input.blur();
+            }
         });
 
         form.addEventListener('submit', async (e) => {
@@ -335,6 +372,12 @@ export class PlayerJoinView {
         // because pressing Join then wakes a machine nobody is sitting at.
         const app = this.info.app_name || '';
         const willLaunch = this.info.cold_start === true;
+        // A native host's guests watch one picture, at the height its owner
+        // picked: nothing to choose here, only to know.
+        const fixedHeight = [720, 1080, 1440].includes(Number(this.info.feed_height))
+            ? Number(this.info.feed_height)
+            : 0;
+        if (fixedHeight) this._height = fixedHeight;
 
         this._shell(`
             <h1>${escapeHtml(t('player.joinTitle', { machine }))}</h1>
@@ -351,6 +394,12 @@ export class PlayerJoinView {
                           )}</p>`
                         : ''
                 }
+                ${
+                    fixedHeight
+                        ? `<p class="player-hint player-quality-fixed">${escapeHtml(
+                              t('player.qualityFixed', { height: fixedHeight }),
+                          )}</p>`
+                        : `
                 <div class="player-quality">
                     <span class="player-field-label" id="player-quality-label"
                           >${escapeHtml(t('player.quality'))}</span>
@@ -363,8 +412,10 @@ export class PlayerJoinView {
                         `,
                         ).join('')}
                     </div>
-                </div>
+                </div>`
+                }
                 ${this._inputToggles()}
+                ${this._gamepadAllowed() ? '<div class="player-gamepad"></div>' : ''}
                 <button class="btn btn-open player-join-btn" type="button">
                     ${escapeHtml(willLaunch ? t('player.launchButton') : t('player.joinButton'))}
                 </button>
@@ -398,22 +449,45 @@ export class PlayerJoinView {
 
         const joinBtn = this.container.querySelector('.player-join-btn');
         if (!joinBtn) return;
+        this._joinLabel = willLaunch ? t('player.launchButton') : t('player.joinButton');
+        this._startPadWatch();
         joinBtn.addEventListener('click', async () => {
+            // An unknown controller is mapped first: the guest would otherwise
+            // walk in with a pad the game never hears.
+            if (this._padNeedsMap()) {
+                this._openPadDialog(true);
+                return;
+            }
             const err = /** @type {HTMLElement} */ (
                 this.container.querySelector('.player-join-error')
             );
+            this._stopPadWatch();
             /** @type {HTMLButtonElement} */ (joinBtn).disabled = true;
             joinBtn.textContent = t('player.joining');
             err.hidden = true;
             try {
-                await this.onJoin({
-                    height: this._height,
-                    // No aspect: a guest cannot know the host's format, and its
-                    // own monitor is irrelevant — the backend hands it the ratio
-                    // the owner's session already settled on for that host.
-                    gaming: this._prefs.gaming,
-                    touchScreen: this._prefs.touchScreen,
-                });
+                // The stream the guests share is HEVC unless one of them cannot
+                // decode it. A browser that cannot says so now: the stream goes
+                // H.264 for everyone once, instead of this guest failing its
+                // first picture and coming back.
+                const codec =
+                    this.info.shared_feed === true && !(await hevcClientDecodes())
+                        ? 'h264'
+                        : undefined;
+                await this.onJoin(
+                    {
+                        height: this._height,
+                        // No aspect: a guest cannot know the host's format, and
+                        // its own monitor is irrelevant — the backend hands it the
+                        // ratio the owner's session already settled on for that
+                        // host.
+                        gaming: this._prefs.gaming,
+                        touchScreen: this._prefs.touchScreen,
+                        padKey: this._gamepadAllowed() ? this._selectedPadKey() : null,
+                    },
+                    0,
+                    codec,
+                );
             } catch (ex) {
                 const code = ex && ex.responseBody && ex.responseBody.error;
                 if (code === 'session_ended') {
@@ -433,7 +507,138 @@ export class PlayerJoinView {
                 err.hidden = false;
                 /** @type {HTMLButtonElement} */ (joinBtn).disabled = false;
                 joinBtn.textContent = t('player.joinButton');
+                this._startPadWatch();
             }
         });
+    }
+
+    // ── Controller (invitations that allow a gamepad) ─────────────────────
+    //
+    // One controller per invitation: the guest picks it here when several are
+    // plugged in, and only that one reaches the host. A controller nothing
+    // maps must be mapped before joining — the mapping is kept in this browser
+    // for every later visit, so this is asked once per controller.
+
+    _gamepadAllowed() {
+        return !!(this.info && this.info.permissions && this.info.permissions.gamepad === true);
+    }
+
+    /** The pad to use: the one picked (if plugged in), else the first. */
+    _selectedPadKey() {
+        const keys = connectedPads().map((gp) => padKey(gp));
+        if (this._prefs.padKey && keys.includes(this._prefs.padKey)) return this._prefs.padKey;
+        return keys[0] || null;
+    }
+
+    _selectedPad() {
+        const key = this._selectedPadKey();
+        return connectedPads().find((gp) => padKey(gp) === key) || null;
+    }
+
+    _padNeedsMap() {
+        if (!this._gamepadAllowed()) return false;
+        const gp = this._selectedPad();
+        return !!gp && resolvePad(gp).source === null;
+    }
+
+    /**
+     * Keep the field in step with what is plugged in. Chrome only reveals a
+     * pad after a button press, so this polls rather than waiting for events.
+     */
+    _startPadWatch() {
+        if (!this._gamepadAllowed() || this._padWatch) return;
+        this._padSig = '';
+        const tick = () => this._renderPadField();
+        this._padWatch = { timer: setInterval(tick, 400), tick };
+        window.addEventListener('gamepadconnected', tick);
+        window.addEventListener('gamepaddisconnected', tick);
+        tick();
+    }
+
+    _stopPadWatch() {
+        if (!this._padWatch) return;
+        clearInterval(this._padWatch.timer);
+        window.removeEventListener('gamepadconnected', this._padWatch.tick);
+        window.removeEventListener('gamepaddisconnected', this._padWatch.tick);
+        this._padWatch = null;
+    }
+
+    _renderPadField() {
+        const field = /** @type {HTMLElement} */ (this.container.querySelector('.player-gamepad'));
+        const joinBtn = /** @type {HTMLButtonElement} */ (
+            this.container.querySelector('.player-join-btn')
+        );
+        if (!field) return;
+        const pads = connectedPads();
+        const key = this._selectedPadKey();
+        const gp = this._selectedPad();
+        const res = gp ? resolvePad(gp) : null;
+        const sig = pads.map((p) => p.id).join('|') + '#' + key + '#' + (res ? res.source : '');
+        if (sig === this._padSig) return;
+        this._padSig = sig;
+
+        let body;
+        if (!pads.length) {
+            body = `<p class="player-gamepad-empty">${escapeHtml(t('player.gamepadNone'))}</p>`;
+        } else {
+            const control =
+                pads.length > 1
+                    ? `<select class="gamepad-remap-select player-gamepad-select" aria-labelledby="player-gamepad-label">
+                        ${pads
+                            .map((p) => {
+                                const k = padKey(p);
+                                return `<option value="${escapeHtml(k)}" ${k === key ? 'selected' : ''}>${escapeHtml(padName(p))}</option>`;
+                            })
+                            .join('')}
+                       </select>`
+                    : `<span class="gamepad-remap-name">${escapeHtml(padName(pads[0]))}</span>`;
+            const guessed = res && isAutoMapped(res.source);
+            body = `
+                <div class="player-gamepad-row">${control}${res ? sourceBadge(res.source) : ''}</div>
+                ${res && res.source === null ? `<p class="player-hint">${escapeHtml(t('player.gamepadNeedsMap'))}</p>` : ''}
+                ${
+                    res && res.source
+                        ? `<button type="button" class="player-gamepad-check">${escapeHtml(
+                              t(guessed ? 'player.gamepadCheck' : 'gamepad.remap.remap'),
+                          )}</button>`
+                        : ''
+                }`;
+        }
+        field.innerHTML = `
+            <span class="player-field-label" id="player-gamepad-label">${escapeHtml(t('player.gamepad'))}</span>
+            ${body}`;
+
+        const select = /** @type {HTMLSelectElement} */ (field.querySelector('select'));
+        if (select) {
+            select.addEventListener('change', () => {
+                this._prefs.padKey = select.value;
+                savePrefs(this._prefs);
+                this._renderPadField();
+            });
+        }
+        const check = field.querySelector('.player-gamepad-check');
+        if (check) check.addEventListener('click', () => this._openPadDialog(false));
+
+        if (joinBtn && !joinBtn.disabled) {
+            joinBtn.textContent =
+                res && res.source === null ? t('player.gamepadConfigure') : this._joinLabel;
+        }
+    }
+
+    _openPadDialog(required) {
+        const dialog = new GamepadRemapDialog({
+            padKey: this._selectedPadKey(),
+            mode: 'auto',
+            required,
+            onPadChange: (k) => {
+                this._prefs.padKey = k;
+                savePrefs(this._prefs);
+            },
+            onClose: () => {
+                this._padSig = '';
+                this._renderPadField();
+            },
+        });
+        dialog.open();
     }
 }

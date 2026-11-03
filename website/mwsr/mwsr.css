@@ -1,0 +1,126 @@
+/* The MWSR comparison (website/mwsr/), on the site's tokens (assets/pages.css). */
+[hidden]{display:none !important}
+main.cmp{padding:40px 0 64px}
+.wrap.wide{max-width:1160px}
+.lede{color:var(--txt); max-width:72ch}
+.privacy{color:var(--muted); font-size:.92rem; max-width:72ch;
+  border-left:3px solid var(--cyan); padding:.2em 0 .2em .9em; background:rgba(25,211,255,.04)}
+.small{font-size:.85rem; color:var(--muted)}
+small{color:var(--muted); font-size:.78em}
+
+/* settings */
+.controls{display:flex; flex-wrap:wrap; gap:14px 22px; margin:28px 0 10px}
+.controls fieldset, .file-bar fieldset{border:0; margin:0; padding:0; min-width:0}
+.controls legend, .file-bar legend{font:700 .72rem/1 var(--mono); letter-spacing:.16em; text-transform:uppercase; color:var(--muted); margin-bottom:8px; padding:0}
+.seg{display:flex; flex-wrap:wrap; gap:6px}
+.seg label{position:relative; display:inline-flex; align-items:baseline; gap:.4em; cursor:pointer;
+  padding:.38rem .75rem; border:1px solid var(--line); border-radius:8px; background:var(--panel);
+  font-size:.9rem; line-height:1.3; user-select:none; transition:border-color .15s, background .15s}
+.seg label:hover{border-color:var(--line-glow)}
+.seg input{position:absolute; opacity:0; pointer-events:none}
+.seg label:has(input:checked){border-color:var(--cyan); background:rgba(25,211,255,.12); color:#fff}
+.seg label:has(input:focus-visible){outline:2px solid var(--cyan); outline-offset:2px}
+.seg label:has(input:disabled){opacity:.85}
+.seg label.file{border-style:dashed; align-items:center}
+/* the same width whatever the name: a longer one would move the panes */
+.seg label.file .name{display:inline-block; width:8em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.check{display:flex; align-items:center; gap:.5em; margin-top:8px; font-size:.88rem; color:var(--muted); cursor:pointer}
+.check input{accent-color:var(--cyan); width:16px; height:16px}
+.check:has(input:disabled){opacity:.45; cursor:default}
+/* a one-line tip: on hover, or on a tap (focus), over the page, never in its
+   flow; as wide as its row, so that it never leaves a phone's screen */
+.check-row{position:relative; display:flex; align-items:center; gap:.45em}
+.check-row .check{margin-top:8px}
+.tip{flex:none; display:inline-grid; place-items:center; width:18px; height:18px; margin-top:8px;
+  border:1px solid var(--line); border-radius:50%; font:700 .7rem/1 var(--mono); color:var(--muted); cursor:help}
+.tip:hover, .tip:focus{color:var(--cyan); border-color:var(--cyan); outline:none}
+.tip::after{content:attr(data-tip); display:none; position:absolute; z-index:5; left:0; right:0; top:calc(100% + 6px);
+  padding:.45rem .6rem; border:1px solid var(--line-glow); border-radius:8px; background:var(--panel-2);
+  color:var(--txt); font:400 .8rem/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; letter-spacing:0;
+  box-shadow:0 6px 24px rgba(0,0,0,.45); pointer-events:none}
+.tip:hover::after, .tip:focus::after{display:block}
+.ab{display:flex; gap:6px; margin-top:8px; align-items:center}
+.ab select, .ab button{font:inherit; font-size:.88rem; color:var(--txt); background:var(--panel-2);
+  border:1px solid var(--line); border-radius:8px; padding:.3rem .5rem}
+.ab button{cursor:pointer; min-width:2.2rem}
+.ab :disabled{opacity:.45; cursor:default}
+.spots{display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:0 0 8px}
+.spots .lbl{font:700 .68rem/1 var(--mono); letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin-right:2px}
+#spots{display:contents}
+.spots button{font:inherit; font-size:.8rem; color:var(--muted); background:none; border:1px solid var(--line);
+  border-radius:999px; padding:.15rem .6rem; cursor:pointer}
+.spots button:hover{color:var(--cyan); border-color:var(--line-glow)}
+
+/* messages */
+.msg{margin:10px 0; font-size:.9rem; color:var(--muted); min-height:1.4em}
+.msg:empty{min-height:0; margin:0}
+.msg.bad{color:#ff8fb8}
+.msg.warn{color:var(--yellow)}
+/* the status line keeps its height, empty or not, so that no setting moves the
+   panes; a failure, the end of the page's work, may take more lines */
+#status{height:1.5em; line-height:1.5; margin:0 0 8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+#status.bad{height:auto; min-height:1.5em; white-space:normal}
+#hdr-note{margin:10px 0 0}
+.file-bar{display:flex; flex-wrap:wrap; align-items:flex-end; gap:8px 18px; margin-top:12px}
+.file-bar #file-note{margin:0 0 .4rem}
+
+/* panes */
+.viewer{position:relative}
+.panes{display:grid; gap:10px; grid-template-columns:repeat(3, minmax(0, 1fr))}
+.panes.two{grid-template-columns:repeat(2, minmax(0, 1fr))}
+.panes.one{grid-template-columns:1fr}
+.pane{margin:0; position:relative; border:1px solid var(--line); border-radius:10px; overflow:hidden; background:#04070b}
+.pane canvas{display:block; width:100%; aspect-ratio:4 / 3; touch-action:none; cursor:grab}
+.panes.two .pane canvas{aspect-ratio:1 / 1}
+.panes.one .pane canvas{aspect-ratio:16 / 9}
+.pane canvas:active{cursor:grabbing}
+.pane figcaption{display:flex; flex-wrap:wrap; gap:.2em .7em; align-items:baseline; padding:.3rem .6rem;
+  font-size:.8rem; line-height:1.35; border-top:1px solid var(--line); background:var(--panel)}
+.pane figcaption b{font:700 .82rem var(--mono); letter-spacing:.06em; color:#fff}
+.pane figcaption .m{color:var(--muted); font-variant-numeric:tabular-nums}
+.pane .side{position:absolute; top:.5rem; font:700 .75rem var(--mono); color:#fff; background:rgba(4,7,11,.75);
+  padding:.1rem .45rem; border-radius:6px; pointer-events:none}
+.pane figcaption .next{margin-left:auto}
+.pane canvas:focus-visible{outline:2px solid var(--cyan); outline-offset:-2px}
+.pane .side.l{left:.5rem}
+.pane .side.r{right:.5rem}
+.drop{position:absolute; inset:0; display:grid; place-items:center; border:2px dashed var(--cyan); border-radius:12px;
+  background:rgba(5,8,13,.85); font-weight:700; color:var(--cyan)}
+.under{display:flex; flex-wrap:wrap; gap:12px 18px; align-items:flex-start; margin-top:12px}
+#overview{width:240px; height:auto; aspect-ratio:16 / 9; border:1px solid var(--line); border-radius:8px; cursor:crosshair; background:#04070b}
+.under .nav{flex:1 1 280px; min-width:0}
+.hint{margin:0; font-size:.85rem; color:var(--muted)}
+.wipe-slider{display:flex; align-items:center; gap:.6em; font-size:.85rem; color:var(--muted); flex-basis:100%}
+.wipe-slider input{flex:1; accent-color:var(--cyan)}
+
+/* scores */
+.results h2, .about h2, .notes h2{margin-top:1.8em}
+.table-wrap{overflow-x:auto}
+.table-wrap table{border-collapse:collapse; width:100%; min-width:560px; font-size:.92rem}
+.table-wrap th, .table-wrap td{padding:.5rem .7rem; border-bottom:1px solid var(--line); text-align:left; vertical-align:baseline}
+.table-wrap th{font-weight:700; color:var(--txt)}
+#table th small{display:block; font-weight:400}
+.table-wrap td{font-variant-numeric:tabular-nums}
+.table-wrap caption{text-align:left; font-weight:700; color:var(--txt); padding:.9rem 0 .2rem}
+.about td{white-space:nowrap}
+#table td.num{white-space:nowrap}
+#table tr.best td.num.fid{color:#fff; font-weight:700}
+.bar{display:inline-block; height:6px; border-radius:3px; background:var(--cyan); opacity:.7; margin-left:.5em; vertical-align:middle}
+.tag{font:600 .72rem var(--mono); color:var(--muted); margin-left:.35em}
+.timing{display:flex; flex-wrap:wrap; align-items:center; gap:10px 18px; margin-top:14px}
+.timing .check{margin-top:0}
+.timing .btn[disabled]{opacity:.5; cursor:default}
+#tprogress{font-size:.88rem; color:var(--muted); font-variant-numeric:tabular-nums}
+.foot-logo{border-radius:4px; vertical-align:-3px; margin-right:6px}
+
+@media (max-width:900px){
+  .panes{grid-template-columns:repeat(2, minmax(0, 1fr))}
+}
+@media (max-width:560px){
+  main.cmp{padding-top:24px}
+  .panes{gap:6px}
+  .pane canvas, .panes.two .pane canvas{aspect-ratio:1 / 1}
+  .panes.one .pane canvas{aspect-ratio:4 / 3}
+  .pane figcaption{font-size:.72rem; padding:.25rem .4rem}
+  #overview{width:100%}
+}

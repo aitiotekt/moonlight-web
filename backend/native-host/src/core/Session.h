@@ -22,6 +22,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace mw::native {
 
@@ -62,8 +63,15 @@ struct ResolvedTarget
 {
     int displayId = -1;
     /// The output's index WITHIN its own adapter, which is what DXGI wants and
-    /// is not the global display id on a multi-GPU machine.
+    /// is not the global display id on a multi-GPU machine. As the probe saw
+    /// it: Windows moves it when another display becomes primary, so the
+    /// Windows session looks it up again by displayKey at each capture open.
     unsigned outputIndex = 0;
+    /// The display itself, which outputIndex is only the place of:
+    /// DisplayInfo::key (the monitor device path on Windows) and
+    /// DisplayInfo::osName (the GDI name, the stand-in where there is no path).
+    std::string displayKey;
+    std::string displayOsName;
 
     /// How the picture will be obtained — the probe's answer, carried rather
     /// than re-derived. It matters on Linux, where a machine that may not read
@@ -72,6 +80,17 @@ struct ResolvedTarget
     /// was the usable one.
     CaptureApi capture = CaptureApi::None;
 
+    /// Linux: the display is the portal's VIRTUAL source — created by the
+    /// session at the stream's size and cadence, gone when it ends.
+    bool portalVirtual = false;
+    /// Linux: the display is Steam's Big Picture in its own gamescope
+    /// (GamescopeSession.h) — started or found by the session, at the stream's
+    /// size and cadence, kept ten minutes after the last stream.
+    bool gamescopeSteam = false;
+    /// Linux: one of the user's apps in its own gamescope, the same way
+    /// (SessionConfig::gamescopeApp names it).
+    bool gamescopeApp = false;
+
     /// The adapter that scans the display out — where capture must happen.
     uint64_t captureAdapterHandle = 0;
     /// The adapter that will encode. Equal to the capture adapter in the normal
@@ -79,8 +98,17 @@ struct ResolvedTarget
     uint64_t encodeAdapterHandle = 0;
 
     std::string encodeGpuName;
+    /// The encoding GPU's maker and driver (GpuInfo::vendorId, driverVersion):
+    /// what the D3D12 route's list of excluded drivers is read against.
+    uint32_t encodeVendorId = 0;
+    uint64_t encodeDriverVersion = 0;
     EncoderApi encoder = EncoderApi::None;
     Codec codec = Codec::H264;
+    /// Linux: the encoding GPU's codecs without the ones the session's own
+    /// settings offered (platform::offerSessionCodecs, AV1 through Vulkan
+    /// Video). Where an offered codec cannot run after all, the session
+    /// takes the client's next codec among these; empty when none was offered.
+    std::vector<Codec> codecsWithoutOffer;
 
     /// True when the two adapters differ, so the frame has to cross between
     /// them. Costly, rare, and always worth a log line.

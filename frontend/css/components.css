@@ -685,6 +685,32 @@ body.ios .settings-checkbox-label input[type='checkbox']:checked::before {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+   Line notice (ui/LineNotice.js)
+
+   The line to the machine away under a running stream: a small grey pill at
+   the top centre, over the picture and over the CSS-fallback fullscreen
+   (z-index 9999). Nothing to click, so it lets every click through.
+   ════════════════════════════════════════════════════════════════════════ */
+.line-notice {
+    position: fixed;
+    top: calc(env(safe-area-inset-top, 0px) + var(--space-3));
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10000;
+    max-width: calc(100vw - 2 * var(--space-3));
+    padding: 5px 14px;
+    border-radius: 999px;
+    background: rgba(24, 24, 28, 0.72);
+    color: rgba(255, 255, 255, 0.85);
+    font-size: var(--fs-xs);
+    line-height: 1.4;
+    text-align: center;
+    pointer-events: none;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
    Statistics disclosure
 
    What the census covers, folded shut. There is no consent bar to style: the
@@ -797,6 +823,23 @@ body.ios .settings-checkbox-label input[type='checkbox']:checked::before {
     font-size: var(--fs-sm);
     color: var(--text-2);
     line-height: 1.5;
+}
+/* A Mac that lost Accessibility: it still streams, so the grid stays, with
+   the missing switch said above it. */
+.host-perm-warn {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    align-items: flex-start;
+    margin: 0 var(--space-4) var(--space-3);
+    padding: var(--space-3);
+    border-left: 3px solid var(--warning);
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+    line-height: 1.5;
+}
+.host-perm-warn p {
+    margin: 0;
 }
 .status-badge.nodisplay,
 .status-icon.nodisplay {
@@ -1014,6 +1057,23 @@ body.ios .settings-checkbox-label input[type='checkbox']:checked::before {
     font-weight: 600;
     word-break: break-all;
     user-select: all;
+}
+/* "Don't show this again": quiet, just above the buttons it qualifies. Same
+   checkbox as the login's "Keep me signed in". */
+.self-stream-mute {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+    cursor: pointer;
+}
+.self-stream-mute input {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent-1);
+    cursor: pointer;
 }
 .pairing-status-text {
     font-size: var(--fs-sm);

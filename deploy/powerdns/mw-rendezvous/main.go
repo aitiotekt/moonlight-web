@@ -51,15 +51,24 @@ import (
 // ── Configuration (env-driven) ──────────────────────────────────────────────
 
 type config struct {
-	listen      string        // MW_RDV_LISTEN             (default ":8090")
-	storePath   string        // MW_RDV_STORE              (default "/data/rendezvous.json")
-	secret      []byte        // MW_RDV_OWNER_SECRET       (HMAC key for the claim store)
-	maxNewPerHr int           // MW_RDV_MAX_NEW_PER_HOUR   (default 20; 0 = unlimited)
+	listen      string // MW_RDV_LISTEN             (default ":8090")
+	storePath   string // MW_RDV_STORE              (default "/data/rendezvous.json")
+	secret      []byte // MW_RDV_OWNER_SECRET       (HMAC key for the claim store)
+	maxNewPerHr int    // MW_RDV_MAX_NEW_PER_HOUR   (default 20; 0 = unlimited)
+	// The same new claims, charged to the /48 and to the whole server: a free
+	// /48 is 65 536 per-/64 budgets, and the server's own is what bounds a flood
+	// from many of them. Ids already held are never charged (handleClaim).
+	maxNewPer48 int           // MW_RDV_MAX_NEW_PER_48_PER_HOUR (default 60; 0 = unlimited)
+	maxNewAll   int           // MW_RDV_MAX_NEW_GLOBAL_PER_HOUR (default 1000; 0 = unlimited)
+	maxClaims   int           // MW_RDV_MAX_CLAIMS         (default 100000; 0 = unlimited)
+	unusedTTL   time.Duration // MW_RDV_UNUSED_CLAIM_DAYS  (default 7; 0 = never)
+	flushDelay  time.Duration // MW_RDV_FLUSH_DELAY_MS     (default 2000; 0 = every write at once)
 	maxPeerPerM int           // MW_RDV_MAX_PEER_PER_MIN   (default 30; 0 = unlimited)
 	maxSessions int           // MW_RDV_MAX_SESSIONS       (default 4, per host)
 	maxMessage  int           // MW_RDV_MAX_MESSAGE_BYTES  (default 64 KiB)
 	pingEvery   time.Duration // MW_RDV_PING_SECONDS       (default 45s)
 	minProto    int           // MW_RDV_MIN_PROTO          (default 1; see protoCurrent)
+	closeDelay  time.Duration // MW_RDV_CLOSE_DELAY_MS     (default 3s; see closeLater)
 }
 
 func mustEnv(name string) string {
@@ -97,6 +106,11 @@ func loadConfig() config {
 		secret:    []byte(mustEnv("MW_RDV_OWNER_SECRET")),
 		// 0 is meaningful (unlimited), so the floor is 0 rather than 1.
 		maxNewPerHr: envInt("MW_RDV_MAX_NEW_PER_HOUR", 20, 0, 100000),
+		maxNewPer48: envInt("MW_RDV_MAX_NEW_PER_48_PER_HOUR", 60, 0, 100000),
+		maxNewAll:   envInt("MW_RDV_MAX_NEW_GLOBAL_PER_HOUR", 1000, 0, 1000000),
+		maxClaims:   envInt("MW_RDV_MAX_CLAIMS", 100000, 0, 10000000),
+		unusedTTL:   time.Duration(envInt("MW_RDV_UNUSED_CLAIM_DAYS", 7, 0, 3650)) * 24 * time.Hour,
+		flushDelay:  time.Duration(envInt("MW_RDV_FLUSH_DELAY_MS", 2000, 0, 60000)) * time.Millisecond,
 		maxPeerPerM: envInt("MW_RDV_MAX_PEER_PER_MIN", 30, 0, 100000),
 		maxSessions: envInt("MW_RDV_MAX_SESSIONS", 4, 1, 64),
 		maxMessage:  envInt("MW_RDV_MAX_MESSAGE_BYTES", 64*1024, 1024, 1024*1024),
@@ -104,7 +118,8 @@ func loadConfig() config {
 		// Raising this is how clients too old to keep serving are retired: they
 		// get a code that says so, instead of a failure that looks like the
 		// network. Decide it on the version census, never on a hunch.
-		minProto: envInt("MW_RDV_MIN_PROTO", 1, 1, protoCurrent),
+		minProto:   envInt("MW_RDV_MIN_PROTO", 1, 1, protoCurrent),
+		closeDelay: time.Duration(envInt("MW_RDV_CLOSE_DELAY_MS", 3000, 0, 30000)) * time.Millisecond,
 	}
 }
 
@@ -121,20 +136,27 @@ func (c config) readIdle() time.Duration { return 2*c.pingEvery + 15*time.Second
 // ── Server ──────────────────────────────────────────────────────────────────
 
 type server struct {
-	cfg        config
-	store      *claimStore
-	hub        *hub
-	claimQuota *quota
-	peerQuota  *quota
+	cfg           config
+	store         *claimStore
+	hub           *hub
+	claimQuota    *quota
+	claimQuota48  *quota
+	claimQuotaAll *quota
+	peerQuota     *quota
 }
 
 func newServer(cfg config, store *claimStore) *server {
+	store.maxClaims = cfg.maxClaims
+	store.unusedTTL = cfg.unusedTTL
+	store.delay = cfg.flushDelay
 	return &server{
-		cfg:        cfg,
-		store:      store,
-		hub:        newHub(cfg.maxSessions),
-		claimQuota: newQuota(cfg.maxNewPerHr, time.Hour),
-		peerQuota:  newQuota(cfg.maxPeerPerM, time.Minute),
+		cfg:           cfg,
+		store:         store,
+		hub:           newHub(cfg.maxSessions),
+		claimQuota:    newQuota(cfg.maxNewPerHr, time.Hour),
+		claimQuota48:  newQuotaBits(cfg.maxNewPer48, time.Hour, 48),
+		claimQuotaAll: newQuota(cfg.maxNewAll, time.Hour),
+		peerQuota:     newQuota(cfg.maxPeerPerM, time.Minute),
 	}
 }
 
@@ -183,9 +205,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// clientIP returns the address the budgets are keyed on. Caddy terminates TLS
-// in front, so the socket peer is always the proxy — X-Forwarded-For is the only
-// place the real address appears. Nothing but rate limiting is decided from it.
+// clientIP returns the address the budgets are charged to (quotaKey narrows an
+// IPv6 one to its /64). Caddy terminates TLS in front, so the socket peer is
+// always the proxy — X-Forwarded-For is the only place the real address
+// appears. Nothing but rate limiting is decided from it.
 func clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		if i := strings.IndexByte(xff, ','); i >= 0 {
@@ -267,9 +290,20 @@ func (s *server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	// Budget only NEW claims. Re-presenting an id already held is what a host
 	// does on every restart, and charging for that would lock out a machine that
 	// reboots often — or a household behind one address.
-	if !s.store.owns(id, token) && !s.claimQuota.allow(clientIP(r)) {
-		writeErr(w, http.StatusTooManyRequests, "too many new claims from this address, retry later")
-		return
+	// Narrowest first, so an address over its own budget does not spend the
+	// /48's or the server's for everybody else.
+	if !s.store.owns(id, token) {
+		ip := clientIP(r)
+		if !s.claimQuota.allow(ip) || !s.claimQuota48.allow(ip) {
+			writeErr(w, http.StatusTooManyRequests, "too many new claims from this address, retry later")
+			return
+		}
+		if !s.claimQuotaAll.allow("all") {
+			log.Printf("[mw-rendezvous] WARN new claims over the server's budget (%d/h) — refused until it frees up",
+				s.cfg.maxNewAll)
+			writeErr(w, http.StatusTooManyRequests, "too many new claims right now, retry later")
+			return
+		}
 	}
 
 	switch s.store.claim(id, token) {
@@ -285,6 +319,9 @@ func (s *server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	case claimHasOther:
 		writeErrCode(w, http.StatusConflict,
 			"this owner already holds an id — release it first", errOwnerHasOther)
+	case claimFull:
+		log.Printf("[mw-rendezvous] WARN claim store full (%d ids) — new claims refused", s.cfg.maxClaims)
+		writeErr(w, http.StatusTooManyRequests, "too many new claims right now, retry later")
 	}
 }
 
@@ -319,6 +356,8 @@ func (s *server) handleHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A line held: the id is in use, and never let go of as unused.
+	s.store.touch(id)
 	line := &hostLine{id: id, conn: conn, proto: proto, sessions: map[string]*session{}}
 	if displaced := s.hub.register(line); displaced != nil {
 		go hangUpLine(displaced, "replaced by a newer connection from the same owner")
@@ -451,7 +490,7 @@ func (s *server) handlePeer(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		close(done)
 		if line.dropSession(sess.id) {
-			_ = sendHost(line.conn, hostFrame{T: msgClose, S: sess.id})
+			s.closeLater(line, sess.id)
 		}
 		_ = conn.Close()
 	}()
@@ -482,6 +521,33 @@ func (s *server) handlePeer(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// closeLater tells the host that a browser's socket ended — closeDelay from
+// now, and only if the host's own line is still the one that was up.
+//
+// A host takes that word as the browser leaving and takes its tunnel down. But a
+// socket also ends when whatever stands in front of this server restarts: the
+// proxy closes every socket it holds, one by one, and a browser's that goes
+// before its host's line used to be reported at once, down a line that was
+// about to go too. The host then ended a tunnel that was still perfectly good —
+// a stream on its own LAN included — for a departure that never happened. Held
+// back a moment, the word goes nowhere when the host's line falls in the
+// meantime: that line is marked gone, and nothing is sent down it.
+//
+// The session itself is released at once (the caller dropped it): its slot is
+// free for the next browser, and nothing more can be relayed to it.
+func (s *server) closeLater(line *hostLine, sessionID string) {
+	send := func() {
+		if line.alive() {
+			_ = sendHost(line.conn, hostFrame{T: msgClose, S: sessionID})
+		}
+	}
+	if s.cfg.closeDelay <= 0 {
+		send()
+		return
+	}
+	time.AfterFunc(s.cfg.closeDelay, send)
+}
+
 // ── Wiring ──────────────────────────────────────────────────────────────────
 
 func (s *server) routes() *http.ServeMux {
@@ -490,10 +556,13 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("/v1/host", s.handleHost)
 	mux.HandleFunc("/v1/peer", s.handlePeer)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		// sessions: browsers on the line right now. Read before touching the
+		// proxy in front of this server, it says who a restart would cut off.
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":     true,
-			"online": s.hub.onlineCount(),
-			"claims": s.store.count(),
+			"ok":       true,
+			"online":   s.hub.onlineCount(),
+			"sessions": s.hub.sessionCount(),
+			"claims":   s.store.count(),
 		})
 	})
 	return mux
@@ -517,7 +586,7 @@ func main() {
 		// the one thing this service must not do.
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("[mw-rendezvous] listening on %s — %d claims on file, ping %s, %d sessions/host, %d KiB max message",
-		cfg.listen, store.count(), cfg.pingEvery, cfg.maxSessions, cfg.maxMessage/1024)
+	log.Printf("[mw-rendezvous] listening on %s — %d claims on file, ping %s, %d sessions/host, %d KiB max message, close after %s",
+		cfg.listen, store.count(), cfg.pingEvery, cfg.maxSessions, cfg.maxMessage/1024, cfg.closeDelay)
 	log.Fatal(srv.ListenAndServe())
 }

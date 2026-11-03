@@ -28,6 +28,7 @@
 #include "../SunshineRestClient.h"
 #include "GameStreamBackend.h"
 
+#include <QNetworkReply>
 #include <QSettings>
 
 #include <memory>
@@ -114,6 +115,42 @@ NvComputer* MultiSeatBackend::seatHost(const MultiSeatSeat& seat, const QString&
         host->serverCertPem.isEmpty() ? NvComputer::PS_NOT_PAIRED : NvComputer::PS_PAIRED;
 
     return host;
+}
+
+void MultiSeatBackend::fillSeatVersion(const MultiSeatSeat& seat, const QString& address,
+                                       std::function<void()> done)
+{
+    // The synthetic host carries no version of its own, and the stream
+    // session hands it to moonlight-common-c, which refuses a connection whose
+    // appversion it cannot parse: LiStartConnection then failed at once with
+    // "error -1 (socket=6)", before any RTSP (MultiSeat bench, 05/10/2026).
+    // Read once per process; a failure leaves it as it was.
+    NvComputer* synthetic = &m_SeatHosts[seat.id];
+    if (!synthetic->appVersion.isEmpty()) {
+        done();
+        return;
+    }
+    QNetworkReply* reply = m_SeatHttp->getServerInfoAsync(NvAddress(address, seat.gfeHttpPort()),
+                                                          IdentityManager::get()->getUniqueId());
+    const QString id = seat.id;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, id, done]() {
+        reply->deleteLater();
+        auto it = m_SeatHosts.find(id);
+        if (reply->error() == QNetworkReply::NoError && it != m_SeatHosts.end()) {
+            const QString xml = QString::fromUtf8(reply->readAll());
+            it->appVersion = NvHTTP::getXmlString(xml, QStringLiteral("appversion"));
+            it->gfeVersion = NvHTTP::getXmlString(xml, QStringLiteral("GfeVersion"));
+            const QString codecs =
+                NvHTTP::getXmlString(xml, QStringLiteral("ServerCodecModeSupport"));
+            it->serverCodecModeSupport = codecs.isEmpty() ? 1 : codecs.toInt();
+            const QString hevc = NvHTTP::getXmlString(xml, QStringLiteral("MaxLumaPixelsHEVC"));
+            it->maxLumaPixelsHEVC = hevc.isEmpty() ? 0 : hevc.toInt();
+        } else {
+            Logger::warning(QStringLiteral("MultiSeat: seat %1 did not say its version: %2")
+                                .arg(id, reply->errorString()));
+        }
+        done();
+    });
 }
 
 void MultiSeatBackend::pairSeat(const MultiSeatSeat& seat, const QString& address,
@@ -219,7 +256,7 @@ void MultiSeatBackend::withSeatBackend(const QString& seatId, SeatBackendCallbac
         };
 
         if (synthetic->pairState == NvComputer::PS_PAIRED) {
-            ready();
+            fillSeatVersion(seat, address, ready);
             return;
         }
 
@@ -230,7 +267,7 @@ void MultiSeatBackend::withSeatBackend(const QString& seatId, SeatBackendCallbac
                          return;
                      }
                      seatHost(seat, address); // pick up the certificate just stored
-                     ready();
+                     fillSeatVersion(seat, address, ready);
                  });
     });
 }
@@ -501,6 +538,34 @@ void MultiSeatBackend::quit(const QString& seatId, const QString& clientUniqueId
             }
             backend->quit(owned, clientUniqueId, cb);
         });
+}
+
+void MultiSeatBackend::runningAppForDevice(const QString& deviceId, BackendIntCallback cb)
+{
+    // Never claims a seat: asking which app runs is not a reason to hand the
+    // device an account. No seat, nothing of its own running.
+    const QString owned = ownedSeat(deviceId);
+    if (owned.isEmpty()) {
+        cb(true, BackendError{}, 0);
+        return;
+    }
+    withSeatBackend(owned, [owned, cb](GameStreamBackend* backend, const BackendError& err) {
+        if (!backend) {
+            cb(false, err, 0);
+            return;
+        }
+        backend->runningApp(owned, cb);
+    });
+}
+
+void MultiSeatBackend::releaseDevice(const QString& deviceId)
+{
+    const QString owned = ownedSeat(deviceId);
+    if (owned.isEmpty()) return;
+    Logger::info(QStringLiteral("MultiSeat: seat %1 is free again — %2 has neither a game nor a "
+                                "stream on it")
+                     .arg(owned, deviceId));
+    releaseOwnership(deviceId);
 }
 
 void MultiSeatBackend::provisionSeat(const QJsonObject& params, BackendSeatCallback cb)

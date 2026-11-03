@@ -24,6 +24,7 @@
 #include <QSslKey>
 #include <QSslSocket>
 #include <QNetworkProxy>
+#include <QRegularExpression>
 
 #include "IdentityManager.h"
 #include <QUuid>
@@ -61,6 +62,7 @@ QNetworkReply* NvHTTP::getServerInfoAsync(const NvAddress& address, const QStrin
     QNetworkRequest req(url);
     req.setTransferTimeout(FAST_FAIL_TIMEOUT_MS);
     req.setRawHeader("User-Agent", "MoonlightWeb/0.1");
+    closeWhenDone(req);
     // Force a fresh connection each poll: Sunshine closes idle keep-alive
     // sockets, and reusing a dead one yields spurious RemoteHostClosedError.
     req.setRawHeader("Connection", "close");
@@ -70,18 +72,19 @@ QNetworkReply* NvHTTP::getServerInfoAsync(const NvAddress& address, const QStrin
 
 QNetworkReply* NvHTTP::getServerInfoAsyncHttps(const NvAddress& address, const QString& uniqueId,
                                                const QByteArray& clientCertPem,
-                                               const QByteArray& clientKeyPem)
+                                               const QByteArray& clientKeyPem, quint16 httpsPort)
 {
     // Build URL as string to avoid any QUrl encoding quirks
     QString urlStr = QString("https://%1:%2/serverinfo?uniqueid=%3&uuid=%4")
                          .arg(address.address())
-                         .arg(MW_HTTPS_PORT)
+                         .arg(httpsPort ? httpsPort : MW_HTTPS_PORT)
                          .arg(uniqueId, QUuid::createUuid().toString(QUuid::WithoutBraces));
     QUrl url(urlStr);
 
     QNetworkRequest req(url);
     req.setTransferTimeout(REQUEST_TIMEOUT_MS);
     req.setRawHeader("User-Agent", "MoonlightWeb/0.1");
+    closeWhenDone(req);
     // Close immediately: Qt would otherwise keep the TLS socket alive ~120s for
     // reuse, holding Sunshine's single-threaded HTTPS server and making the host
     // appear offline to co-located native clients during that window.
@@ -202,6 +205,7 @@ QNetworkReply* NvHTTP::getAppListAsync(const NvAddress& address, quint16 httpsPo
     QNetworkRequest req(url);
     req.setTransferTimeout(REQUEST_TIMEOUT_MS);
     req.setRawHeader("User-Agent", "MoonlightWeb/0.1");
+    closeWhenDone(req);
     // Close immediately — see getServerInfoAsyncHttps. This periodic pair-check
     // (every 5 min) was the connection that lingered ~120s and wedged Sunshine's
     // HTTPS server, cycling the host offline for native iOS/Qt clients.
@@ -248,6 +252,14 @@ QVector<NvApp> NvHTTP::parseAppList(const QString& xml)
     return apps;
 }
 
+// A launch or resume URL fit for the log: rikey is the key every keystroke and
+// click of the session is encrypted with, and a log ends up attached to issues.
+static QString loggableUrl(const QUrl& url)
+{
+    static const QRegularExpression rikey(QStringLiteral("rikey=[0-9A-Fa-f]*"));
+    return url.toString().replace(rikey, QStringLiteral("rikey=(hidden)"));
+}
+
 QNetworkReply* NvHTTP::launchAppAsync(const NvAddress& address, quint16 httpsPort, int appId,
                                       const QString& uniqueId, const QByteArray& rikey, int rikeyid,
                                       int width, int height, int fps, int bitrate,
@@ -273,11 +285,12 @@ QNetworkReply* NvHTTP::launchAppAsync(const NvAddress& address, quint16 httpsPor
 
     QUrl url(QString("https://%1:%2/launch?%3").arg(address.address()).arg(httpsPort).arg(query));
 
-    qDebug() << "[NvHTTP] launchApp URL:" << url.toString();
+    qDebug() << "[NvHTTP] launchApp URL:" << loggableUrl(url);
 
     QNetworkRequest req(url);
     req.setTransferTimeout(timeoutMs > 0 ? timeoutMs : LAUNCH_TIMEOUT_MS);
     req.setRawHeader("User-Agent", "MoonlightWeb/0.1");
+    closeWhenDone(req);
 
     QSslConfiguration sslConfig = req.sslConfiguration();
     QSslCertificate clientCert(clientCertPem, QSsl::Pem);
@@ -312,12 +325,13 @@ QNetworkReply* NvHTTP::resumeAppAsync(const NvAddress& address, quint16 httpsPor
 
     QUrl url(QString("https://%1:%2/resume?%3").arg(address.address()).arg(httpsPort).arg(query));
 
-    qDebug() << "[NvHTTP] resumeApp URL:" << url.toString();
+    qDebug() << "[NvHTTP] resumeApp URL:" << loggableUrl(url);
 
     QNetworkRequest req(url);
     req.setTransferTimeout(timeoutMs > 0 ? timeoutMs
                                          : LAUNCH_TIMEOUT_MS); // resume blocks like launch
     req.setRawHeader("User-Agent", "MoonlightWeb/0.1");
+    closeWhenDone(req);
 
     QSslConfiguration sslConfig = req.sslConfiguration();
     sslConfig.setLocalCertificate(QSslCertificate(clientCertPem, QSsl::Pem));
@@ -341,8 +355,9 @@ QNetworkReply* NvHTTP::quitAppAsync(const NvAddress& address, quint16 httpsPort,
                  .arg(uuid));
 
     QNetworkRequest req(url);
-    req.setTransferTimeout(REQUEST_TIMEOUT_MS);
+    req.setTransferTimeout(QUIT_TIMEOUT_MS);
     req.setRawHeader("User-Agent", "MoonlightWeb/0.1");
+    closeWhenDone(req);
     // Close immediately — see getServerInfoAsyncHttps. This one is the parent
     // process's, and the parent outlives every stream: a pooled /cancel socket
     // sits on Sunshine's single-threaded HTTPS server for the whole ~120s Qt
@@ -362,9 +377,9 @@ QNetworkReply* NvHTTP::quitAppAsync(const NvAddress& address, quint16 httpsPort,
     return m_Nam->get(req);
 }
 
-void NvHTTP::dropPooledConnections()
+void NvHTTP::closeWhenDone(QNetworkRequest& req)
 {
-    m_Nam->clearConnectionCache();
+    req.setAttribute(QNetworkRequest::ConnectionCacheExpiryTimeoutSecondsAttribute, 0);
 }
 
 QString NvHTTP::parseSessionUrl(const QString& launchXml)

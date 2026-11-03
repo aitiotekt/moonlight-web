@@ -59,6 +59,11 @@
  *    this same executable under the installation directory.
  *  - The worker checks the same thing from its side before it reads a byte of
  *    config: a pipe server that is not this executable is refused.
+ *  - The server checks the worker too, which it can only do because the
+ *    service gives the worker a DACL of its own: the user who asked may read
+ *    its image, wait on it and stop it — no more (a SYSTEM token's default
+ *    DACL shuts a non-elevated server out, and v0.3.1 fell back to the task on
+ *    every session for that alone).
  *  - The service is demand-start and does nothing until asked.
  *
  * What it deliberately does NOT claim: a user who can run the installed
@@ -98,6 +103,13 @@ bool available();
 /// `base`. Returns true once the service has reported the process created —
 /// the worker connecting back is then awaited on the pipes themselves.
 bool requestWorker(const QString& base, QString* error);
+
+/// Ask the service to press Ctrl+Alt+Suppr on the console session. Windows
+/// takes SendSAS from a service in session 0 and ignores it from the worker,
+/// which runs in the console session, SYSTEM or not (design §31.7). The same
+/// checks on the caller as for a worker; true once the service says it
+/// pressed it, false with the reason (the machine's policy, most often).
+bool requestSecureAttention(QString* error);
 
 /// `--worker-service`: the service's own entry point. Runs the control loop
 /// until the SCM stops it, and returns the process exit code.

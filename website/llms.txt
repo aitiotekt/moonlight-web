@@ -14,17 +14,19 @@
   Quick Sync, VA-API, VideoToolbox, with a software fallback stage).
 - Up to 4K HDR at up to 240 fps, with H264, HEVC and AV1 codecs (hardware-decoded
   via WebCodecs).
-- Under 20 ms latency over Wi-Fi using a WebRTC UDP transport with automatic
-  fallback (UDP → TCP).
-- GPU Video Enhancement in the browser (WebGPU running SGSRv1 + FSR1): stream at
-  720p, display near-1440p quality.
+- Under 20 ms latency over Wi-Fi using a direct WebRTC UDP transport, with an
+  automatic TCP fallback where UDP is blocked, never through a relay.
+- GPU Video Enhancement in the browser (WebGL2 or WebGPU running MWSR, MoonlightWeb's own upscaler): stream
+  at 720p, display near-1440p quality.
 - Full input support: keyboard, pointer-lock mouse, multi-touch trackpad, virtual
-  keyboard, Xbox and PlayStation controllers with rumble.
+  keyboard, Xbox and PlayStation controllers with rumble. Racing wheels, flight
+  sticks and RC radios (EdgeTX, OpenTX) too, sent to the game as themselves from
+  Chrome or Edge, with force feedback for wheels on Windows and Linux hosts.
 - Zero-config: the machine it runs on needs no pairing at all (one card per
   display); other hosts — Sunshine/Apollo, Wolf (Games-on-Whales), MultiSeat — are
   auto-discovered on the LAN via mDNS and paired with a PIN.
-- Internet access (opt-in): direct peer-to-peer WebRTC streams; per-session
-  UPnP port mapping; no public DNS record or certificate. The host holds one
+- Internet access (opt-in): direct peer-to-peer WebRTC streams; UPnP port
+  mapping for the streams; no public DNS record or certificate. The host holds one
   outgoing connection to an introduction server and is reached at a link of its
   own; both ends ask a self-hosted STUN server for their public address.
   Pre-existing sub-domains keep working until February 2027.
@@ -36,12 +38,11 @@ straight to the GPU encoder inside the process that holds the WebRTC connection 
 no loopback network hop, no RTP, no FEC — then sends video, audio and input to
 browsers over WebRTC. For a host you pair with instead, the same server embeds
 moonlight-common-c and speaks the GameStream protocol (RTSP/RTP/ENet) to it. The
-client is 100% web: WebCodecs for decoding, WebGPU for rendering, AudioWorklet for
-Opus audio.
+client is 100% web: WebCodecs for decoding, WebGL2 or WebGPU for rendering, the browser's WebRTC stack for Opus audio.
 
 ## Platforms (server)
 
-- Windows x64 / arm64 (guided .exe installer)
+- Windows x64 (guided .exe installer; an arm64 build pairs with other hosts)
 - macOS Apple Silicon (.pkg installer, or `brew install --cask linckosz/tap/moonlightweb`)
 - Linux x64 (.deb, .rpm, portable AppImage, or the signed apt/dnf repositories
   and the AUR package `moonlightweb-bin`)
@@ -60,6 +61,16 @@ The client requires no install: any modern browser (Chrome, Edge, Safari, Firefo
 - Install on Windows: https://moonlightweb.top/guides/windows.html
 - Install on macOS: https://moonlightweb.top/guides/macos.html
 - Install on Linux: https://moonlightweb.top/guides/linux.html
+- Play on iPhone and iPad: https://moonlightweb.top/play/iphone-ipad.html
+- Play on a Chromebook: https://moonlightweb.top/play/chromebook.html
+- Play on a TV: https://moonlightweb.top/play/tv.html
+- Wheels, flight sticks and RC radios: https://moonlightweb.top/controllers.html
+- Using it as a Sunshine web client: https://moonlightweb.top/sunshine-web-client.html
+- Compared with Parsec and Steam Remote Play: https://moonlightweb.top/browser-game-streaming.html
+- MWSR (MoonlightWeb Super Resolution), its open-source real-time upscaler, next to FSR1, NIS and SGSR1
+  on your own GPU: https://moonlightweb.top/mwsr/
+- MWSR's source, under the MIT License (WGSL, GLSL, HLSL, C++): https://github.com/linckosz/moonlight-web/tree/main/mwsr
+- Connect to a host by its code: https://moonlightweb.top/server-access/
 - Source code & downloads: https://github.com/linckosz/moonlight-web
 - Latest releases: https://github.com/linckosz/moonlight-web/releases
 - Sunshine (one of the host types it can pair with): https://github.com/LizardByte/Sunshine

@@ -20,6 +20,7 @@
 #include <QObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QUrl>
 #include <QXmlStreamReader>
 
@@ -56,6 +57,14 @@ public:
     // /start response. Sunshine answers a healthy launch in well under a second
     // (a wedged one never answers at all), so the margin is generous.
     static constexpr int LAUNCH_TIMEOUT_MS = 20000;
+    // Deadline for /cancel. Sunshine answers it only once the app is gone: it
+    // asks the app to close, waits its exit-timeout (5 s by default) and only
+    // then kills it — so a /cancel of an app with a live process takes longer
+    // than REQUEST_TIMEOUT_MS by construction. At 5 s every such quit timed
+    // out (issue #24 bench, 05/10/2026: 10 s on Sunshine 2026.914 for Windows),
+    // the Stop that quits the app answered 502, and stop-session read back the
+    // app as still running.
+    static constexpr int QUIT_TIMEOUT_MS = 30000;
 
     explicit NvHTTP(QNetworkAccessManager* nam, QObject* parent = nullptr);
 
@@ -65,7 +74,8 @@ public:
     // HTTPS variant for paired hosts (port 47989) — returns real PairStatus
     QNetworkReply* getServerInfoAsyncHttps(const NvAddress& address, const QString& uniqueId,
                                            const QByteArray& clientCertPem,
-                                           const QByteArray& clientKeyPem);
+                                           const QByteArray& clientKeyPem,
+                                           quint16 httpsPort = MW_HTTPS_PORT);
 
     // App list (HTTPS, requires client cert, async)
     QNetworkReply* getAppListAsync(const NvAddress& address, quint16 httpsPort,
@@ -93,10 +103,14 @@ public:
                                 const QByteArray& clientCertPem, const QByteArray& clientKeyPem,
                                 const QString& uniqueId = QString());
 
-    // Evict idle pooled sockets. Qt keeps finished TLS sockets alive ~120s for
-    // reuse; against Sunshine's single-threaded HTTPS server that lingering
-    // socket blocks other clients. Call after a one-shot request completes.
-    void dropPooledConnections();
+    // Closes the request's connection as soon as its reply is done. Qt keeps a
+    // finished socket pooled ~120s for reuse, whatever "Connection: close" the
+    // request carries; against Sunshine's single-threaded HTTPS server that
+    // lingering socket blocks every other client. Set on each request instead
+    // of calling QNetworkAccessManager::clearConnectionCache(): that one tears
+    // down the manager's whole HTTP thread, waits up to 5 s for it on the
+    // calling thread, and strands every request still in flight to any host.
+    static void closeWhenDone(QNetworkRequest& req);
 
     // Static XML helpers
     static void verifyResponseStatus(const QString& xml);

@@ -10,6 +10,10 @@ name: Build + AddressSanitizer (Windows)
 on:
   workflow_dispatch:
 
+# Builds and nothing else: the token reads the repository.
+permissions:
+  contents: read
+
 jobs:
   asan:
     name: Backend build (ASan)
@@ -20,9 +24,9 @@ jobs:
           submodules: recursive
 
       - name: Install Qt 6.11
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
         with:
-          version: '6.11.0'
+          version: '6.11.2'
           arch: win64_msvc2022_64
           modules: qtwebsockets
           # aqt 3.3.0 doesn't know the new Qt 6.11 per-arch repo layout (404s on

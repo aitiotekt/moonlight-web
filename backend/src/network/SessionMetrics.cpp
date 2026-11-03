@@ -16,6 +16,7 @@
  */
 
 #include "SessionMetrics.h"
+#include "AddressRace.h"
 #include "common/Edition.h"
 #include "common/Logger.h"
 
@@ -158,6 +159,7 @@ void SessionMetrics::post(const char* event, const Facts& facts, const QString& 
     // would be a way to have the report land somewhere else entirely.
     req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                      QVariant::fromValue(QNetworkRequest::ManualRedirectPolicy));
+    AddressRace::enableOn(req);
 
     QNetworkReply* reply = m_nam->post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
     connect(reply, &QNetworkReply::finished, reply, [reply]() {

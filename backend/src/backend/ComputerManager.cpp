@@ -28,10 +28,13 @@
 #include "streambackend/NativeProbeService.h"
 #include "VirtualDisplay.h"
 #include "mw/native/Capabilities.h"
+#include "mw/native/HidPassthrough.h"
 #include "streambackend/StreamBackendSetup.h"
 #include "IdentityManager.h"
 #include "SunshineInstaller.h"
 #include "common/Logger.h"
+#include "server/AppSettings.h"
+#include "server/HostAppImage.h"
 
 #include <qmdnsengine/server.h>
 #include <qmdnsengine/browser.h>
@@ -219,6 +222,52 @@ std::unique_ptr<IStreamBackend> ComputerManager::backendForHost(const QString& u
     return StreamBackendRegistry::instance().create(type, config);
 }
 
+void ComputerManager::refreshRunningApp(const QString& uuid, std::function<void(bool, int)> cb,
+                                        const QString& deviceId)
+{
+    std::shared_ptr<IStreamBackend> backend(backendForHost(uuid).release());
+    if (!backend || !backend->capabilities().resumableApps) {
+        if (cb) cb(false, 0);
+        return;
+    }
+    // A per-device answer (MultiSeat: the device's own seat) is the device's,
+    // not the host's: it is handed back, never stored on the host, whose
+    // currentGameId every other device would then read as its own.
+    if (backend->capabilities().runningAppPerDevice) {
+        if (deviceId.isEmpty()) {
+            if (cb) cb(false, 0);
+            return;
+        }
+        backend->runningAppForDevice(deviceId, [backend, uuid, cb](bool ok, const BackendError& err,
+                                                                   int appId) {
+            if (!ok)
+                Logger::warning(
+                    QString("Running app of %1 for a device unknown: %2").arg(uuid, err.message));
+            if (cb) cb(ok, ok ? appId : 0);
+        });
+        return;
+    }
+    // The lambda keeps `backend` alive until the answer comes back: its reply
+    // is parented to it.
+    QPointer<ComputerManager> self(this);
+    backend->runningApp(
+        uuid, [self, backend, uuid, cb](bool ok, const BackendError& err, int appId) {
+            if (!ok) {
+                Logger::warning(QString("Running app of %1 unknown: %2").arg(uuid, err.message));
+                if (cb) cb(false, 0);
+                return;
+            }
+            if (self) {
+                if (NvComputer* host = self->findHostByUuid(uuid);
+                    host && host->currentGameId != appId) {
+                    host->currentGameId = appId;
+                    emit self->hostsChanged();
+                }
+            }
+            if (cb) cb(true, appId);
+        });
+}
+
 ComputerManager::~ComputerManager()
 {
     qDeleteAll(m_Hosts);
@@ -285,8 +334,14 @@ void ComputerManager::refreshNativeHost()
     const bool noDisplay =
         !available && NativeHostBackend::isEnabled() &&
         NativeProbeService::instance().snapshot().reason == mw::native::Unavailability::NoDisplay;
+    // A Mac whose Screen Recording grant went away after the install (an
+    // update signed differently, a tccutil reset): the same reasoning. A card
+    // that vanishes says nothing; one that stays says which switch to flip.
+    const bool noPermission = !available && NativeHostBackend::isEnabled() &&
+                              NativeProbeService::instance().snapshot().reason ==
+                                  mw::native::Unavailability::CapturePermission;
 
-    if (!available && !noDisplay) {
+    if (!available && !noDisplay && !noPermission) {
         if (existing) {
             m_Hosts.remove(uuid);
             delete existing;
@@ -323,6 +378,10 @@ void ComputerManager::refreshNativeHost()
     if (noDisplay)
         Logger::info(QString("Native host has no display: %1 — card kept for the virtual display")
                          .arg(host->name));
+    if (noPermission)
+        Logger::warning(QString("Native host lost its Screen Recording permission: %1 — card "
+                                "kept to say so")
+                            .arg(host->name));
     else
         Logger::info(QString("Native host available: %1").arg(host->name));
     emit hostsChanged();
@@ -339,8 +398,21 @@ QJsonObject ComputerManager::nativeDisplayJson()
     obj["state"] = caps.available ? QStringLiteral("ok")
                    : caps.reason == mw::native::Unavailability::NoDisplay
                        ? QStringLiteral("no_display")
+                   : caps.reason == mw::native::Unavailability::CapturePermission
+                       ? QStringLiteral("no_capture_permission")
                        : QStringLiteral("unavailable");
+    // macOS alone can withhold it (Accessibility): false means a stream would
+    // show a picture and take none of the viewer's input — said on the card
+    // and when the stream starts, since macOS itself says nothing.
+    obj["input_permission"] = caps.inputPermission;
     obj["virtual_display"] = VirtualDisplay::toJson(VirtualDisplay::probe());
+    // The HID passthrough's verdict for Settings' « As itself » switch, before
+    // any stream: "ok", or why not in a word the page explains (the stream's
+    // hidcaps stays the authority once it runs).
+    obj["hid"] = QString::fromLatin1(mw::native::HidPassthrough::supportToken());
+    // Whether this host codes PyroWave (Windows, the D3D12 route): Settings'
+    // codec menu offers it only where a host says so, before any stream.
+    obj["pyrowave"] = NativeHostBackend::pyrowaveSupported();
     return obj;
 }
 
@@ -510,8 +582,11 @@ void ComputerManager::onPollTick()
         const NvAddress addr = pollAddressFor(host);
         if (addr.isNull()) continue;
 
-        // [NETWORK] diagnostic: trace every outbound serverinfo poll.
-        Logger::info(
+        // [NETWORK] diagnostic: trace every outbound serverinfo poll. DEBUG:
+        // one line per host every few seconds was half the log. What it showed
+        // at a glance, a host coming and going and at which address, is the
+        // INFO line at the end of onPollReplyFinished.
+        Logger::debug(
             QString("[NETWORK] poll serverinfo HTTP -> %1 (%2)").arg(addr.toString(), host->name));
 
         QNetworkReply* reply = m_Http->getServerInfoAsync(addr, clientUniqueId());
@@ -550,8 +625,8 @@ void ComputerManager::onBackupPollTick()
         if (addr.isNull()) continue;
 
         // [NETWORK] diagnostic: trace backup serverinfo poll (every 60s).
-        Logger::info(QString("[NETWORK] backup poll serverinfo HTTP -> %1 (%2)")
-                         .arg(addr.toString(), host->name));
+        Logger::debug(QString("[NETWORK] backup poll serverinfo HTTP -> %1 (%2)")
+                          .arg(addr.toString(), host->name));
 
         QNetworkReply* reply = m_Http->getServerInfoAsync(addr, clientUniqueId());
         m_PendingPolls[reply] = uuid;
@@ -712,6 +787,20 @@ void ComputerManager::onPollReplyFinished()
         } catch (const std::exception& e) {
             registerFailure(e.what());
         }
+    }
+
+    // A host coming and going, and the address that answered: what the
+    // per-poll trace (DEBUG now) was read for. Against what was last logged,
+    // not the state before this poll: discovery can bring a host online first,
+    // and its first poll still says so once.
+    if (host->state != NvComputer::CS_UNKNOWN &&
+        m_LoggedState.value(uuid, NvComputer::CS_UNKNOWN) != host->state) {
+        m_LoggedState[uuid] = host->state;
+        Logger::info(QString("[NETWORK] %1 is %2 (%3)")
+                         .arg(host->name,
+                              host->state == NvComputer::CS_ONLINE ? QStringLiteral("online")
+                                                                   : QStringLiteral("offline"),
+                              reply->url().authority()));
     }
 
     if (changed) {
@@ -948,6 +1037,15 @@ QJsonArray ComputerManager::getHostsJson() const
         // than in NvComputer::toJson() because it is not a property of the host:
         // it is whether *we* hold a way to bounce its service without asking
         // anyone for a password.
+        // Moonlight's model — Stop leaves the app running, the card offers to
+        // resume or quit it — applies only where the backend says the app is
+        // ours to keep. Read off a provider instance, like the capabilities.
+        if (std::unique_ptr<IStreamBackend> backend = backendForHost(it.key())) {
+            obj["resumableApps"] = backend->capabilities().resumableApps;
+            // Its running app is the device's to ask for (GET running-app with
+            // client_uniqueid): the host's currentGameId says nothing about it.
+            obj["runningAppPerDevice"] = backend->capabilities().runningAppPerDevice;
+        }
         obj["restartSupported"] = it.value()->isLocalMachine()
                                       ? localSunshinePresent()
                                       : caps.value("restartService").toBool();
@@ -1303,7 +1401,8 @@ std::pair<int, QJsonObject> ComputerManager::handleStartPairing(const QString& u
                              host->activeHttpsPort > 0 ? host->activeHttpsPort : MW_HTTPS_PORT);
     m_ActivePairings[uuid] = pm;
 
-    Logger::info(QString("Pairing initiated for %1, PIN: %2").arg(uuid, pin));
+    // Not the PIN: it is on the page, and a log gets shared.
+    Logger::info(QString("Pairing initiated for %1").arg(uuid));
 
     QJsonObject obj;
     obj["status"] = "initiated";
@@ -1872,13 +1971,9 @@ void ComputerManager::onPairCheckFinished()
     QNetworkReply* reply = qobject_cast<QNetworkReply*>(sender());
     if (!reply) return;
 
-    // Force-evict the pooled TLS socket. Qt ignores a request-side
-    // "Connection: close" (hop-by-hop header it manages itself) and Sunshine
-    // answers keep-alive, so the socket would otherwise sit Established ~120s
-    // holding Sunshine's single-threaded HTTPS server and cycling co-located
-    // native clients offline. The response body is already buffered in `reply`.
-    m_Nam->clearConnectionCache();
-
+    // The TLS socket is already closed: getAppListAsync asks for it
+    // (NvHTTP::closeWhenDone), so nothing lingers on Sunshine's single-threaded
+    // HTTPS server.
     QString uuid = reply->property("mwHostUuid").toString();
     m_PendingPairChecks.remove(uuid);
     if (uuid.isEmpty()) {
@@ -1967,11 +2062,34 @@ void ComputerManager::handleGetBoxArt(const QString& uuid, int appId, const QStr
     // Validate host
     NvComputer* host = findHostByUuid(uuid);
     if (host && host->isNativeEngine()) {
-        // The native host's "apps" are displays, which have no box art to
-        // fetch. Answered accurately rather than falling into the pairing
-        // check below, whose "not paired" would be a puzzling thing to read
-        // about a host that cannot be paired at all.
-        respond(HttpResponse::error(404, "This host has no box art"));
+        // The native host's displays have no box art; its apps have the image
+        // the owner gave them (HostAppImage), read from disk each time rather
+        // than kept here — it changes under the same app id. Its URL carries
+        // the image's hash (the card's device.art), so the browser may keep
+        // it for good. Anything else is answered accurately rather than
+        // falling into the pairing check below, whose "not paired" would be a
+        // puzzling thing to read about a host that cannot be paired at all.
+        const QJsonObject app = NativeHostBackend::hostAppFor(appId);
+        const QString hash = app.value("image").toString();
+        const QByteArray png = hash.isEmpty() ? QByteArray()
+                                              : HostAppImage::read(AppSettings().hostAppImagesDir(),
+                                                                   app.value("id").toString());
+        if (png.isEmpty()) {
+            respond(HttpResponse::error(404, "This host has no box art"));
+            return;
+        }
+        const QString etag = QStringLiteral("\"%1\"").arg(hash);
+        HttpResponse resp;
+        resp.headers["ETag"] = etag;
+        resp.headers["Cache-Control"] = "private, max-age=31536000, immutable";
+        if (!ifNoneMatch.isEmpty() && ifNoneMatch.contains(etag)) {
+            resp.statusCode = 304;
+        } else {
+            resp.statusCode = 200;
+            resp.contentType = "image/png";
+            resp.body = png;
+        }
+        respond(resp);
         return;
     }
     if (!host || host->pairState != NvComputer::PS_PAIRED || host->serverCertPem.isEmpty()) {
@@ -2039,8 +2157,9 @@ void ComputerManager::startBoxArtFetch(const QString& uuid, int appId)
     artReq.setTransferTimeout(5000);
     artReq.setRawHeader("User-Agent", "MoonlightWeb/0.1");
     // Close immediately — don't leave the TLS socket pooled ~120s holding
-    // Sunshine's single-threaded HTTPS server (see NvHTTP::getAppListAsync).
+    // Sunshine's single-threaded HTTPS server (see NvHTTP::closeWhenDone).
     artReq.setRawHeader("Connection", "close");
+    NvHTTP::closeWhenDone(artReq);
 
     QSslConfiguration sslConfig = artReq.sslConfiguration();
     sslConfig.setLocalCertificate(QSslCertificate(cert, QSsl::Pem));
@@ -2064,8 +2183,6 @@ void ComputerManager::startBoxArtFetch(const QString& uuid, int appId)
             }
         }
         artReply->deleteLater();
-        // Evict the pooled TLS socket — see onPairCheckFinished().
-        m_Nam->clearConnectionCache();
         onBoxArtFetchComplete(uuid, appId, ok);
     });
 }

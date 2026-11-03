@@ -3,7 +3,7 @@
 #
 #   powershell -NoProfile -File probe-run.ps1 -Label hevc-1080p60
 #              [-Clicks 10] [-SpacingMs 1500] [-ParkX 1950 -ParkY 710]
-#              [-ResultsDir <path>]
+#              [-ResultsDir <path>] [-TimeoutMs 1000]
 #
 # The sequence is the protocol, not decoration:
 #   1. park the host pointer on the inert click target — an injected click that
@@ -25,7 +25,10 @@ param(
     [int] $SpacingMs = 1500,
     [int] $ParkX = 1950, [int] $ParkY = 710,
     [int] $DebugPort = 9333,
-    [string] $ResultsDir = "$PSScriptRoot\results"
+    [string] $ResultsDir = "$PSScriptRoot\results",
+    # How long a click waits for its flag. The page's default (200 ms) cannot
+    # tell a slow flag from a lost one; 1000 shows the whole distribution.
+    [int] $TimeoutMs = 0
 )
 Add-Type -Namespace PR -Name U -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr c); [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);'
 if (-not [PR.U]::SetProcessDpiAwarenessContext([IntPtr](-4))) { [PR.U]::SetProcessDPIAware() | Out-Null }
@@ -44,18 +47,35 @@ if ($state -notlike 'visible*') {
     Write-Warning "the client page is not visible — the probe would hang; fix that before measuring"
 }
 
+# No probe on the page at all: the launch reply did not carry latency_flag,
+# which is what happens whenever the host's settings.json lacks
+# "latency_flag_enabled": true (default false, read at startup — a fresh
+# install resets it). Every series then came back as a bare {}: no label, no
+# reason, nothing to read (25/09/2026). Say so and write a line that says it.
+$has = python cdp.py --port $DebugPort eval "typeof window.mwLatency === 'object' && window.mwLatency !== null"
+if ($has -notmatch 'true') {
+    Write-Warning ("no click-to-photon probe on the page: the host did not raise latency_flag. " +
+                   "Set `"latency_flag_enabled`": true in the settings.json the host reads, and restart it.")
+    $none = @{ label = $Label; ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); n = 0; of = 0
+               all = @(); samples = @(); error = 'no probe: latency_flag_enabled is off on the host' } |
+            ConvertTo-Json -Compress
+    Add-Content -Path (Join-Path $ResultsDir 'probe-results.jsonl') -Value $none -Encoding UTF8
+    return
+}
+
 $warm = python cdp.py --port $DebugPort eval "(async()=>{const e=await mwLatency.run(1,500); return JSON.stringify(e);})()"
 "warm-up (discarded): $warm"
 Start-Sleep -Milliseconds 800
 [PR.U]::SetCursorPos($ParkX, $ParkY) | Out-Null
 
+$runOpts = if ($TimeoutMs -gt 0) { "{ timeoutMs: $TimeoutMs }" } else { '{}' }
 $js = @"
 (async()=>{
-  const e = await mwLatency.run($Clicks, $SpacingMs);
+  const e = await mwLatency.run($Clicks, $SpacingMs, $runOpts);
   const ok = e.filter(x=>x.ok).map(x=>x.latencyMs).sort((a,b)=>a-b);
   const at = p => ok[Math.min(ok.length-1, Math.max(0, Math.ceil(p*ok.length)-1))];
   return JSON.stringify({
-    label: '$Label', ts: Date.now(),
+    label: '$Label', ts: Date.now(), timeoutMs: $(if ($TimeoutMs -gt 0) { $TimeoutMs } else { 200 }),
     n: ok.length, of: e.length,
     median: at(0.5), p90: at(0.9), p99: at(0.99),
     min: ok[0], max: ok[ok.length-1],
@@ -64,6 +84,9 @@ $js = @"
   });
 })()
 "@
-$out = python cdp.py --port $DebugPort eval $js
+# The whole series is ONE evaluation: every click's spacing and its wait for the
+# flag, plus margin. cdp.py's default 30 s is exactly 20 clicks 1.5 s apart.
+$evalTimeout = [math]::Ceiling($Clicks * ($SpacingMs + [math]::Max($TimeoutMs, 200)) / 1000) + 30
+$out = python cdp.py --port $DebugPort --timeout $evalTimeout eval $js
 $out
 Add-Content -Path (Join-Path $ResultsDir 'probe-results.jsonl') -Value $out -Encoding UTF8

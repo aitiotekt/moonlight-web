@@ -17,11 +17,13 @@
 
 #include "encode/RateControl.h"
 #include "encode/RateGovernor.h"
+#include "mw/native/EncoderTuning.h"
 #include "native_test_framework.h"
 
 using mw::native::LinkFeedback;
 using mw::native::encode::RateGovernor;
 
+using mw::native::EncoderTuning;
 using mw::native::encode::EffectiveCadence;
 using mw::native::encode::intraRefreshCountFrames;
 using mw::native::encode::intraRefreshPeriodFrames;
@@ -30,10 +32,12 @@ using mw::native::encode::kIntraRefreshMinFrames;
 using mw::native::encode::kIntraRefreshSeconds;
 using mw::native::encode::kStillBoost;
 using mw::native::encode::kStillMaxKbps;
+using mw::native::encode::kVaapiMinQp;
 using mw::native::encode::kVbvFrameRateFloor;
 using mw::native::encode::LinkOccupancy;
 using mw::native::encode::RefineConvergence;
 using mw::native::encode::stillBitrateKbps;
+using mw::native::encode::vaapiMinQp;
 using mw::native::encode::vbvBitsPerFrame;
 
 void run_rate_control_tests()
@@ -463,6 +467,83 @@ void run_rate_control_tests()
         CHECK_EQ(g.targetKbps(), 12800);
     }
 
+    SECTION("RateGovernor — calm: at the setting, every report quiet for the time asked");
+    {
+        RateGovernor g;
+        g.start(20000, 0);
+        LinkFeedback quiet;
+        CHECK(!g.calm(1000, 2000));
+        g.report(quiet, 1500);
+        CHECK(g.calm(2000, 2000));
+        // A queue there but not growing: no cut, and no calm for two seconds.
+        LinkFeedback standing;
+        standing.owdRiseMs = 15;
+        CHECK(!g.report(standing, 2500));
+        CHECK(!g.limiting());
+        CHECK(!g.calm(4000, 2000));
+        g.report(quiet, 4000);
+        CHECK(g.calm(4500, 2000));
+        // A cut: not calm until the target is back at the setting.
+        LinkFeedback rising;
+        rising.owdRiseMs = 45;
+        CHECK(g.report(rising, 5000));
+        CHECK(!g.calm(5500, 0));
+        g.report(quiet, 7500);
+        CHECK(!g.calm(8000, 2000));
+        // Reports that stopped coming: not calm either.
+        RateGovernor s;
+        s.start(20000, 0);
+        s.report(quiet, 100);
+        CHECK(s.calm(3000, 2000));
+        CHECK(!s.calm(4200, 2000));
+    }
+
+    SECTION("RateGovernor — SCTP's retransmissions cut only under retrcut=");
+    {
+        // The Windows session's own, measured (plan Wi-Fi W2 B).
+        CHECK_EQ(RateGovernor::kRetransCutPermille, 3);
+        // Unset, the governor does not look at SCTP, whatever it says.
+        RateGovernor off;
+        off.start(40000, 0);
+        CHECK_EQ(off.retransCut(), 0);
+        LinkFeedback retrans;
+        retrans.retransPermille = 30;
+        CHECK(!off.report(retrans, 500));
+        CHECK_EQ(off.targetKbps(), 40000);
+        CHECK_EQ(off.retransOveruses(), 0);
+
+        // retrcut=5: 5 in a thousand or more is overuse, with no delay rise.
+        RateGovernor g;
+        g.start(40000, 0);
+        g.setRetransCut(5);
+        LinkFeedback four;
+        four.retransPermille = 4;
+        CHECK(!g.report(four, 500));
+        CHECK_EQ(g.targetKbps(), 40000);
+        LinkFeedback five;
+        five.retransPermille = 5;
+        CHECK(g.report(five, 1000));
+        CHECK_EQ(g.targetKbps(), 32000);
+        CHECK_EQ(g.retransOveruses(), 1);
+        // Under the threshold but not under half of it: held, never raised.
+        LinkFeedback three;
+        three.retransPermille = 3;
+        for (int64_t t = 1500; t <= 8000; t += 500)
+            CHECK(!g.report(three, t));
+        CHECK_EQ(g.targetKbps(), 32000);
+        // Under half of it (2 * 2 < 5): quiet, and after three seconds a raise.
+        LinkFeedback two;
+        two.retransPermille = 2;
+        // Quiet counts from the last report that was not (8000).
+        CHECK(!g.report(two, 8500));
+        CHECK(!g.report(two, 10500));
+        CHECK(g.report(two, 11000));
+        CHECK(g.targetKbps() > 32000);
+        // A negative or zero cut is off.
+        g.setRetransCut(-3);
+        CHECK_EQ(g.retransCut(), 0);
+    }
+
     SECTION("RateGovernor — never below the floor, never above the setting");
     {
         RateGovernor g;
@@ -479,6 +560,39 @@ void run_rate_control_tests()
         for (int i = 0; i < 40; i++)
             big.report(bad, i * 500);
         CHECK_EQ(big.targetKbps(), 20000);
+    }
+
+    SECTION("RateGovernor — a session's own floor: the guests' feed holds 60 % of its setting");
+    {
+        // The shared feed of a native host's guests (SessionConfig::
+        // governorFloorPercent): the slowest guest pulls the rate down, never
+        // under 60 %; under that it drops frames alone.
+        RateGovernor g;
+        g.start(10000, 0, false, 60);
+        CHECK_EQ(g.floorPercent(), 60);
+        CHECK_EQ(g.floorKbps(), 6000);
+        LinkFeedback bad;
+        bad.owdRiseMs = 200;
+        CHECK(g.report(bad, 500));
+        CHECK_EQ(g.targetKbps(), 8000);
+        CHECK(g.report(bad, 1000));
+        CHECK_EQ(g.targetKbps(), 6400);
+        CHECK(g.report(bad, 1500));
+        CHECK_EQ(g.targetKbps(), 6000); // 5 120 would be under the floor
+        CHECK(!g.report(bad, 2000));    // at the floor: nothing left to cut
+        CHECK_EQ(g.targetKbps(), 6000);
+        // kFloorKbps still under a small setting's share.
+        RateGovernor small;
+        small.start(3000, 0, false, 60);
+        CHECK_EQ(small.floorKbps(), RateGovernor::kFloorKbps);
+        // Out of range is clamped, and the default is unchanged.
+        RateGovernor odd;
+        odd.start(10000, 0, false, 150);
+        CHECK_EQ(odd.floorPercent(), 100);
+        CHECK_EQ(odd.floorKbps(), 10000);
+        RateGovernor plain;
+        plain.start(10000, 0);
+        CHECK_EQ(plain.floorPercent(), RateGovernor::kFloorPercent);
     }
 
     SECTION("RateGovernor — a queue that is present but not growing holds");
@@ -631,6 +745,111 @@ void run_rate_control_tests()
         CHECK_EQ(g.targetKbps(), 5250);
     }
 
+    SECTION("RateGovernor — shed frames move nothing while the rule is off (ovfgood=0)");
+    {
+        RateGovernor g;
+        g.start(30000, 0);
+        CHECK(!g.overflowLowersGood());
+        LinkFeedback quiet;
+        for (int64_t t = 500; t <= 6000; t += 500)
+            g.report(quiet, t);
+        LinkFeedback shed;
+        shed.overflows = 3;
+        CHECK(!g.report(shed, 6500));
+        CHECK_EQ(g.targetKbps(), 30000);
+        CHECK_EQ(g.goodKbps(), 30000);
+        CHECK_EQ(g.overuses(), 0);
+        CHECK_EQ(g.overflows(), 0);
+    }
+
+    SECTION("RateGovernor — the product's rule: a queue that overflowed lowers the good rate");
+    {
+        // The N95 of 19/10/2026: 30 Mbit/s proven, then the send buffer
+        // overflowed at that rate long after the last climb.
+        RateGovernor g;
+        g.start(30000, 0);
+        g.setOverflowLowersGood(true);
+        LinkFeedback quiet;
+        for (int64_t t = 500; t <= 14500; t += 500)
+            g.report(quiet, t);
+        CHECK_EQ(g.goodKbps(), 30000);
+        LinkFeedback shed;
+        shed.overflows = 1;
+        CHECK(g.report(shed, 15000)); // overuse on its own, no delay needed
+        CHECK_EQ(g.targetKbps(), 24000);
+        CHECK_EQ(g.goodKbps(), 24000); // one cut under the rate that overflowed
+        CHECK_EQ(g.overflows(), 1);
+        LinkFeedback rising;
+        rising.owdRiseMs = 45;
+        CHECK(g.report(rising, 15500));
+        CHECK_EQ(g.targetKbps(), 19200);
+        CHECK_EQ(g.goodKbps(), 24000); // a delay alone still proves nothing
+        // Back fast to the good rate, then the slow steps above it:
+        // 19 200 → 24 000, then 25 200 → 26 460 → 27 783 → 29 172 → 30 000.
+        CHECK(!g.report(quiet, 18000));
+        CHECK(g.report(quiet, 18500));
+        CHECK(g.lastRaiseFast());
+        CHECK_EQ(g.targetKbps(), 24000);
+        CHECK(g.report(quiet, 19000));
+        CHECK(!g.lastRaiseFast());
+        CHECK_EQ(g.targetKbps(), 25200);
+        int64_t t = 19500;
+        int steps = 0;
+        while (g.limiting() && steps < 100) {
+            g.report(quiet, t);
+            t += 500;
+            steps++;
+        }
+        CHECK_EQ(g.targetKbps(), 30000);
+        CHECK_EQ(steps, 4);
+        // Without the key, the same reports went from 24 000 straight back.
+        RateGovernor off;
+        off.start(30000, 0);
+        for (int64_t u = 500; u <= 14500; u += 500)
+            off.report(quiet, u);
+        off.report(rising, 15000);
+        off.report(rising, 15500);
+        off.report(quiet, 18500);
+        off.report(quiet, 19000);
+        CHECK_EQ(off.targetKbps(), 30000);
+    }
+
+    SECTION("RateGovernor — ovfgood=: the probe's own rule still holds inside the grace");
+    {
+        RateGovernor g;
+        g.start(20000, 0);
+        g.setOverflowLowersGood(true);
+        LinkFeedback quiet;
+        for (int64_t t = 500; t <= 6000; t += 500)
+            g.report(quiet, t);
+        LinkFeedback frozen;
+        frozen.owdRiseMs = 200;
+        for (int64_t t = 6500; t <= 10000; t += 500)
+            g.report(frozen, t);
+        CHECK(g.report(quiet, 13000));
+        CHECK(g.report(quiet, 13500));
+        CHECK(g.report(quiet, 14000));
+        CHECK_EQ(g.targetKbps(), 7812);
+        LinkFeedback shed;
+        shed.overflows = 2;
+        CHECK(g.report(shed, 14500));
+        CHECK_EQ(g.goodKbps(), 4000); // where the climb started, under 6 250
+    }
+
+    SECTION("RateGovernor — the target's mean over time");
+    {
+        RateGovernor g;
+        g.start(20000, 0);
+        CHECK_EQ(g.meanTargetKbps(0), 20000);
+        LinkFeedback rising;
+        rising.owdRiseMs = 45;
+        g.report(rising, 1000); // 20 000 for 1 s, then 16 000
+        CHECK_EQ(g.meanTargetKbps(3000), 17333);
+        g.tick(3000);
+        CHECK_EQ(g.meanTargetKbps(3000), 17333);
+        CHECK_EQ(g.meanTargetKbps(5000), 16800);
+    }
+
     SECTION("RateGovernor — a session's first seconds prove nothing");
     {
         RateGovernor g;
@@ -659,6 +878,28 @@ void run_rate_control_tests()
         CHECK_EQ(g.targetKbps(), 10000);
     }
 
+    SECTION("RateGovernor — the bench's governor=off: the setting, both ways, at once");
+    {
+        RateGovernor g;
+        g.start(20000, 0, /*followSetting=*/true);
+        // No receiver: the silence cuts nothing.
+        CHECK(!g.tick(10000));
+        CHECK_EQ(g.targetKbps(), 20000);
+        // Down and back up, each on the spot — a ramp= step reaches the encoder.
+        g.setSetting(5000);
+        CHECK_EQ(g.targetKbps(), 5000);
+        g.setSetting(20000);
+        CHECK_EQ(g.targetKbps(), 20000);
+        CHECK_EQ(g.changes(), 2);
+        // A report of overuse moves nothing either.
+        LinkFeedback lossy;
+        lossy.gaps = 3;
+        lossy.owdRiseMs = 80;
+        CHECK(!g.report(lossy, 11000));
+        CHECK_EQ(g.targetKbps(), 20000);
+        CHECK_EQ(g.overuses(), 0);
+    }
+
     SECTION("EffectiveCadence — the clock closes windows of one second");
     {
         EffectiveCadence c;
@@ -674,5 +915,14 @@ void run_rate_control_tests()
             changed = c.noteFrame(1000 + i * 16667) || changed;
         CHECK(changed);
         CHECK_EQ(c.currentFps, 60);
+    }
+
+    SECTION("VA-API's QP floor — 18 by default (§32.28), the bench's vaminqp= over it, -1 none");
+    {
+        CHECK_EQ(kVaapiMinQp, 18);
+        CHECK_EQ(vaapiMinQp(0), 18);
+        CHECK_EQ(vaapiMinQp(26), 26);
+        CHECK_EQ(vaapiMinQp(-1), 0);
+        CHECK_EQ(vaapiMinQp(EncoderTuning{}.vaapiMinQp), 18);
     }
 }

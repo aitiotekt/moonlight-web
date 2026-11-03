@@ -21,6 +21,7 @@
 #include <QHash>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QJsonObject>
 #include <functional>
 
@@ -65,6 +66,19 @@ public:
 
     /** Clear the lookup cache. */
     void clearCache();
+
+    /**
+     * The request a lookup of @p ip sends. It stays on HTTP/1.1, where Qt tries
+     * the provider's IPv4 and IPv6 addresses side by side: over HTTP/2 it tries
+     * them one by one, and an IPv6 that drops packets in silence holds the
+     * lookup past its 5 s timeout. Public for the tests.
+     */
+    static QNetworkRequest lookupRequest(const QString& ip);
+
+    /// Whether @p ip is a global address, the only kind a lookup sends out:
+    /// not private, loopback, link-local, unique-local (fc00::/7) or
+    /// carrier-grade NAT (100.64/10). Public for the tests.
+    static bool worthLocating(const QString& ip);
 
 private:
     AppSettings* m_settings;

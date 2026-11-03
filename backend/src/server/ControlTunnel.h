@@ -29,6 +29,7 @@
 #include <QStringList>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -116,6 +117,15 @@ public:
     /// trust-on-first-use otherwise leaves them without.
     QString hostKeyFingerprint() const;
 
+    /// Whether a request vouches for the device that sent it: a signed-in
+    /// session, or an invited player's cookie. Set by main(), which holds the
+    /// invitations; until then, the session alone. A tunnel that has carried
+    /// one such request outlives a `close` from the server (TunnelPeerPolicy).
+    void setKnownCaller(std::function<bool(const HttpRequest&)> isKnown)
+    {
+        m_KnownCaller = std::move(isKnown);
+    }
+
     // The wire format lives in server/TunnelFrame.h, on its own and free of
     // libdatachannel — its other half is JavaScript on a machine we will never
     // see, so it is the one part of this that has to be testable in isolation.
@@ -134,6 +144,11 @@ private:
 
         std::shared_ptr<rtc::PeerConnection> pc;
         std::shared_ptr<rtc::DataChannel> dc;
+        /// Which peer connection of this session `pc` is: a pinned port that
+        /// will not bind is followed by a second one on an ephemeral port, and
+        /// what the first says after it has been replaced is not about this
+        /// session any more. See buildPeerConnection().
+        int attempt = 0;
 
         /// The router hole this connection listens behind, or 0 when there is
         /// none and ICE is left to an ephemeral port. See takeTunnelPort().
@@ -147,6 +162,10 @@ private:
         /// easily reaches eight. Rewriting each of them would send the browser
         /// eight identical candidates to check in turn.
         bool publicCandidateSent = false;
+        bool publicTcpCandidateSent = false; // the passive listener's, ice_tcp_passive
+        /// The bench switch debug_ice_drop_udp, read when the connection was
+        /// built: no UDP candidate crosses either way (mw::ice::isUdpCandidate).
+        bool dropUdp = false;
 
         // ── MW-BIND-v1, per connection ──────────────────────────────────────
         bool helloSeen = false;
@@ -169,10 +188,28 @@ private:
         /// Queued outbound frames, drained as the channel makes room.
         QList<QByteArray> outbox;
         bool draining = false;
+
+        /// A request on this tunnel has vouched for its device (setKnownCaller).
+        bool known = false;
+        /// The server has said `close` and the tunnel stayed up: the server no
+        /// longer counts it, and nothing is sent to it about this session.
+        bool detached = false;
+        /// When it was detached, in m_DetachSeq order: the ceiling's clock.
+        quint64 detachOrder = 0;
     };
 
     Peer* peer(const QString& sessionId);
     void dropPeer(const QString& sessionId, const QString& why);
+
+    /// The channel is open: the tunnel no longer needs the server at all.
+    static bool channelOpen(const Peer& p);
+    /// Remember that a request on this tunnel vouched for its device.
+    void noteCaller(Peer& p, const HttpRequest& req);
+    /// The line to the server dropped: a handshake still under way can never
+    /// finish, so it goes now, with its router hole.
+    void dropUnfinishedPeers();
+    /// Hold detached tunnels to TunnelPeerPolicy::kMaxDetached.
+    void enforceDetachedCap();
 
     /// Where this browser actually is, as ICE settled it — or a label while
     /// there is no selected pair yet. Never a claim the browser made.
@@ -265,4 +302,7 @@ private:
     /// Peers are held behind pointers so a reference into one stays valid while
     /// another connects: Qt 6's QHash moves its values when it grows.
     QHash<QString, std::shared_ptr<Peer>> m_Peers;
+
+    std::function<bool(const HttpRequest&)> m_KnownCaller;
+    quint64 m_DetachSeq = 0;
 };

@@ -17,8 +17,10 @@
 
 #pragma once
 
+#include "../../core/ClickTrace.h"
 #include "../IInputSink.h"
 #include "../RecentreDetector.h"
+#include "../WheelCarry.h"
 #include "X11Pointer.h"
 #include "XkbTextMap.h"
 
@@ -70,6 +72,9 @@ public:
     void inject(const InputEvent& event) override;
     void setDisplayRect(int left, int top, int right, int bottom) override;
     void setDesktopRect(int left, int top, int right, int bottom) override;
+    /// The bench's click trace (clicktrace=1): each press timed around its
+    /// write to the uinput device. Set before start(); null, the product.
+    void setClickTrace(ClickTrace* trace) { m_ClickTrace = trace; }
 
 private:
     /// Create one uinput device. @p absolute selects the pointer that reports
@@ -95,7 +100,7 @@ private:
     /// carries it rather than typed and let go — so it is a real key with a
     /// real repeat, unlike injectText. Falls back to injectText for a character
     /// only a dead-key pair can reach, which no single key can hold.
-    void injectChar(const std::string& utf8, bool down);
+    void injectChar(const std::string& utf8, bool down, bool altGraph = false);
 
     /// Compile the host's keymap on first use. False when it is unreadable, in
     /// which case nothing character-based can be typed at all.
@@ -113,6 +118,10 @@ private:
     /// nobody left to release it — the same reason Win32Input keeps its own.
     std::set<uint16_t> m_HeldKeys;
     std::set<uint16_t> m_HeldButtons;
+
+    /// What is left of a notch the browser sent in pieces. See WheelCarry.
+    WheelCarry m_WheelCarry;
+    WheelCarry m_HWheelCarry;
 
     /// Guards the descriptors and the held sets. inject() is documented as
     /// callable from any thread, and on the native path it really is called
@@ -165,6 +174,8 @@ private:
     /// worth an info line; the rest are not, and a display rectangle that does
     /// not match the X root would otherwise log on every single movement.
     bool m_WarpLogged = false;
+
+    ClickTrace* m_ClickTrace = nullptr;
 };
 
 } // namespace mw::native::input

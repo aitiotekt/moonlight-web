@@ -19,12 +19,37 @@
 
 #include "server/NetClassify.h"
 
+#include <QDeadlineTimer>
 #include <QHostAddress>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QMutex>
 #include <QNetworkInterface>
 
 #include <algorithm>
+
+namespace {
+
+/// This machine's own interface addresses, re-read at most every few seconds.
+/// QNetworkInterface::allAddresses() walks every adapter through
+/// GetAdaptersAddresses — a few milliseconds each on a PC with Hyper-V, VPN
+/// and virtual display adapters — and isLocalMachine() runs twice per host on
+/// every /api/hosts, on the GUI thread: ~120 ms per call for 18 hosts, and
+/// 2-3 s while the adapters settle just after start.
+QList<QHostAddress> ownAddresses()
+{
+    static QMutex mutex;
+    static QList<QHostAddress> cached;
+    static QDeadlineTimer fresh(0);
+    QMutexLocker lock(&mutex);
+    if (fresh.hasExpired()) {
+        cached = QNetworkInterface::allAddresses();
+        fresh.setRemainingTime(5000);
+    }
+    return cached;
+}
+
+} // namespace
 
 // --- Construction from serverInfo XML ---------------------------------------
 
@@ -53,6 +78,7 @@ NvComputer::NvComputer(const QString& serverInfo, const NvAddress& activeAddr)
     QString serverState = NvHTTP::getXmlString(serverInfo, "state");
     isNvidiaServerSoftware = (!serverState.isEmpty() && serverState.contains("MJOLNIR"));
     currentGameId = NvHTTP::getCurrentGame(serverInfo);
+    runningAppOverHttpsOnly = serverInfo.contains(QLatin1String("<Permission>"));
 
     // Version info
     gfeVersion = NvHTTP::getXmlString(serverInfo, "GfeVersion");
@@ -179,7 +205,9 @@ bool NvComputer::update(const NvComputer& that)
 
     ASSIGN_IF_CHANGED(state)
     ASSIGN_IF_CHANGED(activeAddress)
-    ASSIGN_IF_CHANGED(currentGameId)
+    // Not from a reading that cannot see it (runningAppOverHttpsOnly).
+    if (!that.runningAppOverHttpsOnly) ASSIGN_IF_CHANGED(currentGameId)
+    ASSIGN_IF_CHANGED(runningAppOverHttpsOnly)
     ASSIGN_IF_CHANGED(serverCodecModeSupport)
     ASSIGN_IF_CHANGED(maxLumaPixelsHEVC)
     ASSIGN_IF_CHANGED(isNvidiaServerSoftware)
@@ -319,7 +347,7 @@ bool NvComputer::isLocalMachine() const
     // loopback, or an address bound to one of this machine's own network
     // interfaces (mDNS may register the local Sunshine under its LAN IP rather
     // than 127.0.0.1).
-    const QList<QHostAddress> selfAddrs = QNetworkInterface::allAddresses();
+    const QList<QHostAddress> selfAddrs = ownAddresses();
     for (const NvAddress& na : {activeAddress, localAddress, manualAddress}) {
         if (na.isNull()) continue;
         const QString addrStr = na.address();

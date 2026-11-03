@@ -123,8 +123,8 @@ bool CpuConvert::convert(const capture::KmsFrame& frame, const capture::CursorSt
         return false;
     }
     // Only a linear buffer has a layout this code knows. A modifier here means
-    // a real GPU's tiled scanout — and a real GPU has a render node, so the
-    // Selector would not have sent it here.
+    // a real GPU's tiled scanout, which GlReadback takes when that GPU can
+    // render (CpuPipeline): arriving here, it could not (issue #34).
     if (frame.modifier != 0 && frame.modifier != DRM_FORMAT_MOD_LINEAR) {
         error = "the scanout buffer is tiled (modifier 0x" + [&] {
             char buf[24];
@@ -143,9 +143,11 @@ bool CpuConvert::convert(const capture::KmsFrame& frame, const capture::CursorSt
 
     // The whole first plane. Mapped per frame: the fds are per frame (the
     // capture closes them when the next buffer replaces this one), and a
-    // mapping costs far less than the pass that follows it.
-    const size_t length = static_cast<size_t>(frame.offsets[0]) +
-                          static_cast<size_t>(frame.pitches[0]) * static_cast<size_t>(frame.height);
+    // mapping costs far less than the pass that follows it. At the buffer's
+    // height: a screen of an X11 desktop over several is a window of it.
+    const size_t length =
+        static_cast<size_t>(frame.offsets[0]) +
+        static_cast<size_t>(frame.pitches[0]) * static_cast<size_t>(frame.importHeight());
     void* map = MAP_FAILED;
     if (!alreadyMapped) {
         map = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, frame.fds[0], 0);
@@ -164,6 +166,11 @@ bool CpuConvert::convert(const capture::KmsFrame& frame, const capture::CursorSt
 
     BgraToI420Params p;
     p.src = alreadyMapped ? frame.mapped : static_cast<const uint8_t*>(map) + frame.offsets[0];
+    // The picture's window of the buffer; every format read here is 4 bytes a
+    // pixel. Only a scanout has one (the portal's mapping is the picture).
+    if (!alreadyMapped)
+        p.src += static_cast<size_t>(frame.sourceY) * frame.pitches[0] +
+                 static_cast<size_t>(frame.sourceX) * 4;
     p.srcPitch = frame.pitches[0];
     if (m_TenBit != TenBit::No) {
         // One pass over the buffer while it is mapped: the bands below then

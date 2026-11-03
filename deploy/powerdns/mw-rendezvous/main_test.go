@@ -247,6 +247,31 @@ func TestNewClaimBudgetIsPerAddress(t *testing.T) {
 	}
 }
 
+// The address Caddy forwards is what pays, and an IPv6 one pays per /64: a
+// second address of the same subscriber finds the budget already spent.
+func TestClaimBudgetFollowsTheForwardedIPv6Subscriber(t *testing.T) {
+	s, ts := testServer(t)
+	s.claimQuota = newQuota(1, time.Hour)
+	claimFrom := func(xff, token, id string) int {
+		body, _ := json.Marshal(claimRequest{ID: id})
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/claim", bytes.NewReader(body))
+		req.Header.Set("X-MW-Owner", token)
+		req.Header.Set("X-Forwarded-For", xff)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if status := claimFrom("2001:db8:1:2::1", tokenA, idA); status != http.StatusOK {
+		t.Fatalf("first claim of the /64: status %d", status)
+	}
+	if status := claimFrom("2001:db8:1:2::9, 172.19.0.2", tokenB, idB); status != http.StatusTooManyRequests {
+		t.Fatalf("another address of the same /64: status %d, want 429", status)
+	}
+}
+
 // The held line ─────────────────────────────────────────────────────────────
 
 func TestHostLineRequiresOwnership(t *testing.T) {
@@ -702,6 +727,43 @@ func TestQuotaSweepsIdleAddresses(t *testing.T) {
 	}
 	if _, ok := q.hits["5.6.7.8"]; !ok {
 		t.Fatal("a live address was swept")
+	}
+}
+
+func TestQuotaKey(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"203.0.113.7", "203.0.113.7"},
+		{" 203.0.113.7 ", "203.0.113.7"},
+		{"203.0.113.7:51234", "203.0.113.7"},
+		{"::ffff:203.0.113.7", "203.0.113.7"},
+		{"[::ffff:203.0.113.7]:443", "203.0.113.7"},
+		{"2001:db8:1:2:aaaa:bbbb:cccc:dddd", "2001:db8:1:2::/64"},
+		{"[2001:db8:1:2::1]", "2001:db8:1:2::/64"},
+		{"[2001:db8:1:2::1]:443", "2001:db8:1:2::/64"},
+		{"fe80::1%eth0", "fe80::/64"},
+		{"not an address", "not an address"},
+	} {
+		if got := quotaKey(c.in); got != c.want {
+			t.Errorf("quotaKey(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// One IPv6 subscriber holds a /64: walking through it must not buy new budget,
+// while the next /64 — another subscriber — starts with a full one.
+func TestQuotaChargesAnIPv6SubscriberPerSlash64(t *testing.T) {
+	q := newQuota(2, time.Hour)
+	if !q.allow("2001:db8:1:2::1") || !q.allow("2001:db8:1:2::2") {
+		t.Fatal("the first two attempts of a /64 must be allowed")
+	}
+	if q.allow("2001:db8:1:2:ffff:ffff:ffff:ffff") {
+		t.Fatal("a third address of the same /64 got a fresh budget")
+	}
+	if !q.allow("2001:db8:1:3::1") {
+		t.Fatal("the next /64 must start with its own budget")
+	}
+	if !q.allow("::ffff:198.51.100.1") || !q.allow("198.51.100.1") || q.allow("198.51.100.1") {
+		t.Fatal("a mapped IPv4 address must share the budget of the plain one")
 	}
 }
 

@@ -115,8 +115,8 @@ for platforms with no host networking — read the caveats in it first.
 | Tag | What it is |
 |---|---|
 | `latest` | The newest release. What you want. |
-| `0.2.4` | That exact release, forever. |
-| `0.2` | The newest `0.2.x` — minor updates, no major jump. |
+| `0.4.1` | That exact release, forever. |
+| `0.4` | The newest `0.4.x` — minor updates, no major jump. |
 | `sha-<commit>` | One commit, pinned forever. |
 
 **Every tag here is a release.** There is no `edge` and no nightly: an image is
@@ -214,11 +214,11 @@ outside the LAN.
 |---|---|---|---|
 | **443** | TCP | **Always** | The web UI, the REST API, and the `wss://…/ws` upgrade that carries WebRTC signalling. The one port a browser cannot do without. |
 | **80** | TCP | Recommended | Redirect to HTTPS, so `http://server` reaches the app instead of failing. |
-| **48010–48033** | UDP | **Always** (host firewall) | WebRTC media, audio and input. Each stream slot binds `48010 + slot`, with or without UPnP, so a host firewall can let the block through; with UPnP the router forwards a port to it (the slot's own first). |
+| **48550–48573** | UDP | **Always** (host firewall) | WebRTC media, audio and input. Each stream slot binds `48550 + slot`, with or without UPnP, so a host firewall can let the block through; with UPnP the router forwards a port to it (the slot's own first). |
 | **47999** | UDP | Legacy Internet Access | Mapped alongside 80/443 only by an install that still holds a legacy `moonlightweb.top` sub-domain. |
-| *ephemeral* | UDP | Fallback | Only when the slot's port is already taken (a second instance on the same machine): libdatachannel then takes whatever the kernel gives it, which a host firewall blocks. |
+| *ephemeral* | UDP | Fallback | When the slot's port is already taken (a second instance on the same machine), the stream takes another free port of the block. Only when the whole block is taken does libdatachannel take whatever the kernel gives it, which a host firewall blocks. |
 
-> **In short:** on a LAN, **443/tcp**, **80/tcp** and **48010–48033/udp**.
+> **In short:** on a LAN, **443/tcp**, **80/tcp** and **48550–48573/udp**.
 > The `.deb`, `.rpm` and AUR package open them for you in
 > firewalld/ufw; a container does not touch the host's firewall, so that is
 > yours to do.
@@ -363,7 +363,7 @@ runtime, no VA-API packages.
 MoonlightWeb never decodes or re-encodes the stream. Sunshine encodes on the
 gaming PC's GPU; this server re-packetises the encrypted RTP into WebRTC and
 the **browser** decodes it on the viewer's device. The upscaling and sharpening
-(FSR1 / SGSRv1) run in the browser on WebGPU, on the viewer's GPU. The
+(FSR1 / SGSRv1) run in the browser on WebGL2 (WebGPU in HDR), on the viewer's GPU. The
 container's job is packet plumbing and TLS, and it is comfortable on a
 Raspberry Pi 4 or an N100 mini PC.
 
@@ -373,6 +373,29 @@ packets to Sunshine. No `/dev/input`, no `uinput`, no privileged container.
 
 **Sunshine is not in this image and cannot be.** A container has no display to
 capture. Run Sunshine on the machine with the GPU, and add it here by IP.
+
+---
+
+## The microphone
+
+A viewer can send their microphone (Settings › *Send my microphone*). It comes
+out as **"MoonlightWeb Microphone"**, an input device in the PipeWire of a
+desktop user on the Docker host — so it is only useful when Sunshine runs on
+**that same machine**: GameStream carries no microphone to another one, and the
+server says so to the viewer rather than send it nowhere.
+
+Give the container that user's PipeWire socket, at the image's
+`XDG_RUNTIME_DIR` (`id -u` gives the uid; 1000 on most desktops):
+
+```sh
+docker run … -v /run/user/1000/pipewire-0:/tmp/runtime-moonlightweb/pipewire-0 …
+```
+
+The device is created at the first stream and stays in that PipeWire session,
+so a game or a chat app can select it once. Without the socket the image runs
+exactly as before, and a viewer who asks is told there is no PipeWire to play
+into. `docker exec <c> pw-cli ls Node | grep moonlightweb_mic` shows it from
+inside the container.
 
 ---
 

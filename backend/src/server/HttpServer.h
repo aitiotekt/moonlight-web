@@ -23,6 +23,7 @@
 #include <QSslSocket>
 #include <QSslConfiguration>
 #include <QNetworkInterface>
+#include <QHash>
 #include <QList>
 #include <functional>
 #include <limits>
@@ -199,11 +200,24 @@ public:
 
     /// Set the AuthManager for PIN-based authentication of remote requests.
     void setAuthManager(AuthManager* am) { m_AuthManager = am; }
+    /// --noadmin: no request is granted admin rights, and the ones that change
+    /// what the booth offers are refused (RequestGuard::lockedByNoAdmin).
+    void setAdminLocked(bool locked) { m_AdminLocked = locked; }
+    bool adminLocked() const { return m_AdminLocked; }
+    /// share_in_booth_mode: under --noadmin, the share slots and a guest's PIN
+    /// are let through (issue #40).
+    void setBoothShare(bool allowed) { m_BoothShare = allowed; }
     AuthManager* authManager() const { return m_AuthManager; }
 
     /// Check whether the request carries a valid session cookie.
     /// Returns true if no AuthManager is set (auth disabled).
     bool isAuthenticated(const HttpRequest& req) const;
+    /// A session cookie carried over a tunnel whose browser key is not the one
+    /// the session was paired with. The key cannot leave the browser it was
+    /// made in (non-extractable), so the cookie was: copied out of the jar it
+    /// lives in, and replayed from somewhere else. A session with no key bound
+    /// (one older than key binding) is let through as before.
+    bool tunnelKeyRefused(const HttpRequest& req) const;
 
     /// Extract the raw mw_session cookie token from a request ("" if absent).
     static QString sessionTokenFromRequest(const HttpRequest& req);
@@ -235,6 +249,12 @@ private slots:
     void onDisconnected();
 
 private:
+    /// The sha256 of each static file as served, for /api/app/manifest, kept
+    /// while the files' contentTag stays the same. The shell rewritten for the
+    /// tunnel is hashed per request instead.
+    QHash<QString, QString> m_ShellHashes;
+    QString m_ShellHashesTag;
+
     /// Create (and listen on) an SslServer for @p port using the shared cert
     /// configs and socket-registration wiring. Returns nullptr if the bind
     /// fails. Used by both the primary start() path and the secondary listener.
@@ -242,11 +262,16 @@ private:
 
     void processRequest(QTcpSocket* socket, const QByteArray& requestData);
     void onReadyReadSocket(QTcpSocket* socket);
-    /// Write @p response and close. @p hostHeader is the request's Host, used to
-    /// scope the CSP's connect-src to the origin the page was served from; leave
-    /// it empty for responses that are never a document (errors, early refusals).
+    /// Write @p response, then close, or with @p keepAlive leave the connection
+    /// open for the browser's next request. @p hostHeader is the request's Host,
+    /// used to scope the CSP's connect-src to the origin the page was served
+    /// from; leave it empty for responses that are never a document (errors,
+    /// early refusals).
     void sendResponse(QTcpSocket* socket, const HttpResponse& response,
-                      const QString& hostHeader = QString());
+                      const QString& hostHeader = QString(), bool keepAlive = false);
+    /// Close @p socket once it has sat KEEPALIVE_IDLE_MS between two requests.
+    void armIdleClose(QTcpSocket* socket);
+    void stopIdleClose(QTcpSocket* socket);
     void handleWebSocketUpgrade(QTcpSocket* clientSocket, const QByteArray& requestData);
     bool isLanHost(const QString& host) const;
 
@@ -305,9 +330,18 @@ private:
 
     QMap<QTcpSocket*, QByteArray> m_Buffers;
     QSet<QTcpSocket*> m_PendingAsyncSockets;
+    /// The request a socket is answering. A kept-alive connection carries one
+    /// request after another: a response or a timeout that comes back late
+    /// must find its own request still there, never the next one. The ids run
+    /// across all sockets, so a socket allocated where a freed one was cannot
+    /// inherit its late answers either.
+    QHash<QTcpSocket*, quint64> m_RequestIds;
+    quint64 m_NextRequestId = 0;
 
     /// PIN-based authentication manager (nullable — auth disabled when null).
     AuthManager* m_AuthManager = nullptr;
+    bool m_AdminLocked = false;
+    bool m_BoothShare = false;
 
     /// Per-run secret required on admin writes (see adminKeyMatches). Generated
     /// in the constructor, never written to disk.
@@ -323,4 +357,7 @@ private:
     bool rejectIfAbusive(QTcpSocket* socket);
 
     static constexpr int ASYNC_TIMEOUT_MS = 30000;
+    /// How long a kept-alive connection may wait for its next request. Chrome
+    /// keeps idle connections longer and opens a new one when this closes it.
+    static constexpr int KEEPALIVE_IDLE_MS = 15000;
 };

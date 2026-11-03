@@ -79,6 +79,12 @@ public:
     // would offer a display that has since been unplugged.
     bool isNativeEngine() const { return backendType == QLatin1String("native"); }
 
+    // True when ending a stream on this host means sending it a GameStream
+    // /cancel. The native engine has no server to send one to — its address is
+    // empty — so the /cancel only ever came back "Host not found", and Stop
+    // answered the browser with a 502 for a stream that had ended cleanly.
+    bool takesHostCancel() const { return !isNativeEngine(); }
+
     // State management
     static PairState pairStateFromString(const QString& s);
     static QString pairStateToString(PairState ps);
@@ -103,6 +109,12 @@ public:
     PairState pairState = PS_UNKNOWN;
     NvAddress activeAddress;
     int currentGameId = 0;
+    /// Apollo names the running app only on its paired HTTPS port and answers
+    /// 0 on plain HTTP, which is what the host poll reads. Recognised by the
+    /// <Permission> element no Sunshine sends. Its currentGameId is then left
+    /// to ComputerManager::refreshRunningApp (HTTPS), or every poll would wipe
+    /// the Running card 10 s after a Stop (issue #24 bench, 05/10/2026).
+    bool runningAppOverHttpsOnly = false;
     QString gfeVersion;
     QString appVersion;
     QString gpuModel;

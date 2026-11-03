@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Scaler lab</title>
+    <style>
+      body {
+        margin: 0;
+        background: #111;
+        color: #ccc;
+        font: 12px/1.4 monospace;
+      }
+      pre {
+        margin: 8px;
+        white-space: pre-wrap;
+      }
+      #shots img {
+        display: block;
+        margin: 8px;
+        image-rendering: pixelated;
+        border: 1px solid #333;
+      }
+    </style>
+  </head>
+  <body>
+    <pre id="log"></pre>
+    <div id="shots"></div>
+    <script type="module">
+      // The upscaler laboratory of the v0.4.1 plan (docs/design/upscaler-mwsr.md,
+      // §6.1 and §6.4): N cells × the same pictures × GPU timestamps. The
+      // parameters are the URL's query (see scaler-lab.js); the result is left
+      // in window.__labResult, and posted to the serving script when post=1
+      // (a phone's Safari or Chrome, which nothing drives over CDP).
+      const params = Object.fromEntries(new URLSearchParams(location.search));
+      const out = document.getElementById('log');
+      const log = (s) => {
+        out.textContent += s + '\n';
+      };
+      // The module is imported here, not statically: a fetch that fails on
+      // the lab's own server (seen once in fifty on the software adapter)
+      // then becomes a result the driver reloads at once, where a failed
+      // static import left the page silent until the driver's deadline.
+      // seq=1: the sequence mode (seq-lab.js, plan §14.3), with a result of
+      // its own: per frame and per variant, no cells.
+      window.__labResult = (
+        params.seq === '1'
+          ? import('./seq-lab.js').then(({ runSeq }) => runSeq(params, log))
+          : import('./scaler-lab.js').then(({ runLab }) => runLab(params, log))
+      ).catch((e) => ({
+        error: String(e && e.stack ? e.stack : e),
+      }));
+      window.__labResult.then(async (r) => {
+        window.__labDone = r; // what the driver polls for (a value, not a promise)
+        if (r.error) log('ERROR ' + r.error);
+        else if (r.seq)
+          log(
+            'done: ' + r.frames.length + ' frames × ' + Object.keys(r.metrics).length +
+              ' bitrates × ' + r.variants.length + ' variants in ' + r.seconds.toFixed(0) + ' s',
+          );
+        else {
+          log('done: ' + r.cells.length + ' cells');
+          for (const c of r.cells)
+            log(
+              c.name.padEnd(18) +
+                (c.gpu ? ' gpu p50 ' + c.gpu.p50.toFixed(3) + ' ms' : ' no timestamps') +
+                (c.wallPerIter != null ? '  wall/iter ' + c.wallPerIter.toFixed(3) : '') +
+                (c.disp != null ? '  disp ' + c.disp.toFixed(1) + '%' : ''),
+            );
+          if (r.shots) {
+            const box = document.getElementById('shots');
+            for (const [name, url] of Object.entries(r.shots)) {
+              const img = new Image();
+              img.src = url;
+              img.title = name;
+              box.appendChild(img);
+            }
+          }
+        }
+        if (params.post === '1') {
+          try {
+            await fetch('/__result?name=' + encodeURIComponent(params.tag || 'phone'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(r),
+            });
+            log('posted');
+          } catch (e) {
+            log('post failed: ' + e.message);
+          }
+        }
+      });
+    </script>
+  </body>
+</html>

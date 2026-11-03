@@ -19,6 +19,7 @@
 
 #include "InputPolicy.h"
 
+#include <QJsonObject>
 #include <QObject>
 #include <memory>
 #include <string>
@@ -27,10 +28,12 @@
 namespace rtc {
 class Candidate;
 class PeerConnection;
+class Track;
 struct Configuration;
 } // namespace rtc
 
 class IMediaEngine;
+class MicUplink;
 
 /// Abstract base class for DataChannelRelay and MediaTrackRelay.
 ///
@@ -93,6 +96,13 @@ public:
     /// Stop the relay, close all channels and the PeerConnection.
     virtual void stop() = 0;
 
+    /// End the session on the signalling side's word: it saw the session fail
+    /// before the PeerConnection could (SignalingServer: a browser that never
+    /// came, left mid-handshake or was refused). Emits sessionEnded() once,
+    /// under the same guard as the relay's own exits, so whichever side speaks
+    /// first ends it and the other is a no-op.
+    virtual void endFromSignaling() = 0;
+
     /// Notify the browser that its session was taken over by another device,
     /// so it can show a graceful "session interrupted" exit before the channels
     /// close. Sent on the control channel just before stop(); implementations
@@ -109,11 +119,26 @@ public:
     /// Same delivery guarantee as notifyClientTakenOver().
     virtual void notifyClientSessionEnded() {}
 
-    /// Restrict what this session's client may send to the host. Set once,
-    /// before the relay starts, from the share activation the player joined
-    /// with; the owner's own sessions leave it unrestricted.
-    void setInputPolicy(const InputMsg::Policy& policy) { m_InputPolicy = policy; }
+    /// Restrict what this session's client may send to the host. Set before
+    /// the relay starts, from the share activation the player joined with (the
+    /// owner's own sessions leave it unrestricted), and again whenever the
+    /// owner moves the player's boxes on the sharing board.
+    void setInputPolicy(const InputMsg::Policy& policy)
+    {
+        const bool hidMoved = m_InputPolicy.hid != policy.hid;
+        const bool keyboardMouseMoved = m_InputPolicy.keyboardMouse != policy.keyboardMouse;
+        m_InputPolicy = policy;
+        if (hidMoved) onHidPolicyChanged();
+        if (keyboardMouseMoved) onKeyboardMousePolicyChanged();
+    }
     const InputMsg::Policy& inputPolicy() const { return m_InputPolicy; }
+
+    /// The viewer's microphone (MicUplink.h), already started: the audio
+    /// section is then offered sendrecv and what the browser sends on it is
+    /// played into this machine's virtual microphone. Set before prepare(),
+    /// with the same lifetime discipline as m_ClipboardEnabled; the relay
+    /// stops it with the PeerConnection.
+    void setMicUplink(std::shared_ptr<MicUplink> mic) { m_Mic = std::move(mic); }
 
     /// Request an IDR frame from Sunshine (keyframe).
     virtual void requestIdrFrame() = 0;
@@ -155,6 +180,33 @@ signals:
     void sessionEnded();
 
 protected:
+    /// The HID passthrough was given or taken under a running stream. Runs on
+    /// the thread that set the policy, after it is in place. The relays tell
+    /// the page again (hidcaps) and, when it was taken, remove the devices
+    /// already recreated: dropping their reports alone would leave them
+    /// plugged in on the host, at rest. Also runs for the policy set before
+    /// the start, where there is no page and nothing attached yet.
+    virtual void onHidPolicyChanged() {}
+
+    /// The keyboard and mouse were given or taken under a running stream. The
+    /// relays tell the page (inputcaps), which shows its own pointer over the
+    /// picture while its mouse reaches nothing. Same thread as
+    /// onHidPolicyChanged().
+    virtual void onKeyboardMousePolicyChanged() {}
+
+    /// The devices one page may have recreated at once (slots 0..7 of
+    /// hidattach), mw::native::HidPassthrough::kMaxSlots on the host side.
+    static constexpr int kHidSlots = 8;
+
+    /// The hidcaps message both relays send: whether this host recreates WebHID
+    /// devices for this player (`available`, else `why`), with force feedback
+    /// (`ffb`) and the Linux HID++ relay (`hidpp`).
+    static QJsonObject hidCapsMessage(const InputMsg::Policy& policy, IMediaEngine& engine);
+
+    /// The inputcaps message both relays send: whether this player's keyboard
+    /// and mouse reach the host (`keyboardMouse`).
+    static QByteArray inputCapsMessage(const InputMsg::Policy& policy);
+
     /// Apply the UPnP host-candidate rewrite and the IPv6 suppression, then
     /// emit signalingIceCandidate. Both relays call this from their
     /// onLocalCandidate handler; the logic used to be duplicated verbatim in
@@ -174,10 +226,34 @@ protected:
     /// @param logTag prefix for this relay's log lines, e.g. "[MediaTrackRelay]".
     void logSelectedCandidatePair(rtc::PeerConnection& pc, const char* logTag);
 
+    /// Hands what the browser sends on the audio track to m_Mic. The track
+    /// holds a weak reference only: the relay's stopMic() ends the uplink,
+    /// whatever libdatachannel still holds of the track afterwards.
+    void wireMicUplink(rtc::Track& audioTrack, const char* logTag);
+
+    /// What the browser's answer made of the microphone, in one line: whether
+    /// it sends on the audio section, and with the SSRC libdatachannel needs
+    /// to route that RTP to the track at all.
+    void logMicAnswer(const std::string& sdp, const char* logTag) const;
+
+    /// Closes the microphone's device. Both relays call it from stop().
+    void stopMic();
+
+    /// The audio section's Opus parameters. stereo=1;sprop-stereo=1 keep the
+    /// browser's decoder stereo (see the relays). With a microphone, the
+    /// section also says what this side takes from the browser: up to 128
+    /// kbit/s, which Chrome and Firefox use as their encoder's target where
+    /// they would otherwise speak at 32–64; the page sets the rate it wants
+    /// below that per quality (MicUplink.js).
+    std::string micOpusFmtp() const;
+
     /// Written once on the main thread before the relay moves to its own
     /// thread, read-only afterwards — same lifetime discipline as
     /// m_ClipboardEnabled.
     InputMsg::Policy m_InputPolicy;
+
+    /// See setMicUplink. Null: no microphone, the audio section sendonly.
+    std::shared_ptr<MicUplink> m_Mic;
 
     // ── ICE connectivity deadline ───────────────────────────────────────────
     /// Set by prepare() from the peer classification; read by

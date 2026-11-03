@@ -28,6 +28,19 @@ const VIEW_MESSAGES = new Set([
     // Native host only: presses refused, and the display changing mode.
     'inputgate',
     'displayformat',
+    // Native host, a guest on the shared feed: the feed changes codec.
+    'feedcodec',
+    // Native host: its answer to a step of Auto's detection.
+    'fpsstep',
+    // The relay's answer to a stamped input (stream/InputUplink.js).
+    'inputstamp',
+    // Native host: the HID passthrough's word (hid/HidPassthrough.js).
+    'hidcaps',
+    'hidattached',
+    'hidrequest',
+    'hidffb',
+    // A guest's mouse given or taken by the owner (StreamView._setMouseAllowed).
+    'inputcaps',
 ]);
 
 /** Whether a host message of this type goes to the stream view. */

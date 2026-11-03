@@ -111,7 +111,8 @@ export class StreamViewTouch {
                     !this._touchMoved &&
                     this._touchFingerCount === 1 &&
                     this._touchMaxFingers === 1 &&
-                    !this._touchDragging
+                    !this._touchDragging &&
+                    !this._tvTapOffPicture(this._touchStartX, this._touchStartY)
                 ) {
                     this._touchDragging = true;
                     // Touch-screen mode: grab the button right under the finger.
@@ -236,12 +237,33 @@ export class StreamViewTouch {
     }
 
     /**
+     * A TV browser's cursor over no part of the picture — a letterbox bar, the
+     * stream's header. _sendAbsTouch would pin it to the nearest edge, and the
+     * tap then clicked there: the host's pointer leapt to a border and clicked
+     * something the viewer never aimed at (Freebox, 03/10/2026). A finger on a
+     * phone keeps that pinning: it lands near the edge it means.
+     * @this {StreamViewInstance}
+     */
+    _tvTapOffPicture(clientX, clientY) {
+        if (!this._tvCursor) return false;
+        const rect = this._mediaRect();
+        if (!rect || !rect.width || !rect.height) return true;
+        const x = clientX - rect.left;
+        const y = clientY - rect.top;
+        return x < 0 || y < 0 || x > rect.width || y > rect.height;
+    }
+
+    /**
      * Apply the current zoom/pan to the streamed display (canvas + video).
      * Pan is clamped so the scaled image edges never reveal the black area.
      * Origin is the center; the input layer stays unscaled.
      * @this {StreamViewInstance}
      */
     _applyZoomTransform() {
+        // With the special-keys bar up, the area already ends at the bar: the
+        // bottom of the picture is reachable without pushing it any higher, and
+        // black under it is what the bar's seating removes (27/10/2026).
+        const typing = !!this._kbToolbar?.classList.contains('visible');
         if (this.canvasArea) {
             const rect = this.canvasArea.getBoundingClientRect();
             // Displayed image size at zoom 1 (object-fit: contain letterboxes it
@@ -269,7 +291,7 @@ export class StreamViewTouch {
             // Allow pushing the image up beyond the standard clamp so its bottom
             // edge can travel up to the middle of the visible area (black bar up
             // to half the height). Other edges keep the strict no-black clamp.
-            const extraDown = rect.height / 2;
+            const extraDown = typing ? 0 : rect.height / 2;
             this._panX = Math.max(-maxX, Math.min(maxX, this._panX));
             this._panY = Math.max(-(maxY + extraDown), Math.min(maxY, this._panY));
         }
@@ -279,6 +301,8 @@ export class StreamViewTouch {
                 : '';
         if (this.canvas) this.canvas.style.transform = transform;
         if (this.videoEl) this.videoEl.style.transform = transform;
+        // The zoom changes how much of the area the picture leaves free.
+        this._seatPictureOnKbToolbar?.(typing);
         // getBoundingClientRect reflects the transform, so zoom/pan moves the
         // media rect — the cached measurement is now stale.
         this._invalidateMediaRect();
@@ -335,6 +359,19 @@ export class StreamViewTouch {
             } else {
                 this._seedMultiTouch(e.touches);
             }
+            return;
+        }
+
+        if (count === 1 && this._tvCursor && !this._touchDragging) {
+            // A TV browser has no finger to drag. TV Bro scrolls a page whose
+            // cursor pushes against an edge by faking a swipe from well inside
+            // it — read as a touch-screen scroll, it pulled the host's pointer
+            // to the swipe's start and scrolled whatever window was there, as
+            // soon as the cursor went past the picture (Freebox, 04/10/2026).
+            // The stream page has nothing to scroll: the swipe sends nothing,
+            // and is no tap either.
+            this._touchMoved = true;
+            this._clearLongPress();
             return;
         }
 
@@ -596,8 +633,17 @@ export class StreamViewTouch {
                 : this._touchMaxFingers === 2
                   ? 450
                   : this._touchTapTimeThreshold;
+        // A cancelled touch is never a tap: the system took it back. TV Bro's
+        // edge scroll cancels each fake swipe and opens the next with a
+        // touchstart cancelled at once — as taps, a cursor held against an edge
+        // clicked a dozen times a second where the swipes began (Freebox,
+        // 04/10/2026).
         const isTap =
-            !this._touchMoved && dist < distTol && elapsed < timeTol && this._touchStartTime > 0;
+            e.type !== 'touchcancel' &&
+            !this._touchMoved &&
+            dist < distTol &&
+            elapsed < timeTol &&
+            this._touchStartTime > 0;
 
         if (this._touchDragging) {
             // End the long-press drag — release the held left button.
@@ -608,6 +654,8 @@ export class StreamViewTouch {
             } else if (this._touchMaxFingers === 2) {
                 this._sendMouseButton(3, true);
                 this._sendMouseButton(3, false); // 2-finger tap → right click
+            } else if (this._tvTapOffPicture(this._touchStartX, this._touchStartY)) {
+                // A TV cursor off the picture: nothing aimed at, nothing sent.
             } else {
                 // 1-finger tap → left click. Touch-screen mode positions the
                 // cursor first; a fast double-tap at the same spot lands a second

@@ -23,6 +23,8 @@ void run_pairing_binding_tests();
 void run_gamepad_driver_tests();
 void run_virtual_display_tests();
 void run_clipboard_policy_tests();
+void run_driver_package_tests();
+void run_update_apply_tests();
 
 int main(int argc, char** argv)
 {
@@ -40,6 +42,8 @@ int main(int argc, char** argv)
     run_gamepad_driver_tests();
     run_virtual_display_tests();
     run_clipboard_policy_tests();
+    run_driver_package_tests();
+    run_update_apply_tests();
 
     const int total = g_stats.passed + g_stats.failed;
     std::fprintf(stderr, "\n========================================\n");

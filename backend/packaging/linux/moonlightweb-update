@@ -1,0 +1,52 @@
+#!/bin/sh
+# ============================================================================
+# MoonlightWeb — upgrade this package from its own signed repository.
+#
+# Installed as /opt/moonlightweb/bin/moonlightweb-update, root-owned, by the
+# production .deb/.rpm. The polkit action top.moonlightweb.update lets the user
+# of the active local session run it through pkexec WITHOUT a password, so the
+# app can update itself from the web UI (SelfUpdater's "repo" path) instead of
+# leaving a password prompt on a screen nobody is looking at.
+#
+# That waiver is only safe because of what this script refuses to do: it takes
+# no argument and reads nothing the user controls. It upgrades the one package
+# from the one repository the postinst configured, and apt or dnf checks that
+# repository's signature against the key the package shipped. The worst a
+# program of that user can do with it is bring MoonlightWeb up to date.
+#
+# Exit codes: 0 done (or nothing newer), 3 no repository configured, other =
+# the package manager's own failure (its output is in the app's installer.log).
+# ============================================================================
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+NAME=moonlightweb
+
+if command -v apt-get >/dev/null 2>&1 && [ -s /etc/apt/sources.list.d/$NAME.sources ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    # Refresh our source alone: another repository that fails must not stop
+    # the update, and refreshing them is not ours to do. List-Cleanup=0 keeps
+    # the lists of every other source where they are.
+    apt-get update \
+        -o Dir::Etc::SourceList=/etc/apt/sources.list.d/$NAME.sources \
+        -o Dir::Etc::SourceParts=- \
+        -o APT::Get::List-Cleanup=0 || exit $?
+    # --only-upgrade: never installs it where it is not, and never anything
+    # but this package (its dependencies excepted). Existing configuration
+    # files are kept as they are, without a question nobody would answer.
+    exec apt-get install -y --only-upgrade \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+        $NAME
+fi
+
+if command -v dnf >/dev/null 2>&1 && [ -s /etc/yum.repos.d/$NAME.repo ]; then
+    exec dnf -y --refresh --disablerepo='*' --enablerepo=$NAME upgrade $NAME
+fi
+
+if command -v zypper >/dev/null 2>&1 && [ -s /etc/zypp/repos.d/$NAME.repo ]; then
+    zypper --non-interactive --gpg-auto-import-keys refresh $NAME || exit $?
+    exec zypper --non-interactive update --repo $NAME $NAME
+fi
+
+echo "moonlightweb-update: no MoonlightWeb repository is configured" >&2
+exit 3

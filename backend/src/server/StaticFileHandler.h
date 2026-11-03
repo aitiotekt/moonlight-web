@@ -45,6 +45,13 @@ public:
     /// which is most of them.
     QStringList listFiles() const;
 
+    /// Size in bytes of the file that answers a listFiles() path, -1 if none.
+    ///
+    /// The bootstrap fetches the largest files first: over a long round trip
+    /// each file is slow to start, and the large ones then overlap the small
+    /// ones instead of trailing alone at the end.
+    qint64 servedSize(const QString& requestPath) const;
+
     /// Fingerprint of the bytes listFiles() would serve (mtime + size of each,
     /// folded into a short hash).
     ///

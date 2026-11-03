@@ -94,6 +94,12 @@ public:
     /// When true, ICE-TCP is enabled (UDP + TCP candidates).
     /// When false (default), only UDP candidates are used.
     void setEnableIceTcp(bool enable) { m_ForceIceTcp = enable; }
+    /// With ICE-TCP, also listen on the media port's TCP side while the checks
+    /// run: a browser never offers a TCP candidate to dial, it only dials one.
+    void setIceTcpPassive(bool enable) { m_IceTcpPassive = enable; }
+    /// The bench switch "debug_ice_drop_udp" (AppSettings::debugIceDropUdp): no UDP
+    /// candidate crosses either way, so passive ICE-TCP carries the stream.
+    void setDebugIceDropUdp(bool enable) { m_DebugIceDropUdp = enable; }
 
     /// Control whether WS fallback is allowed on ICE timeout.
     /// In auto mode (allow=false): iceTimedOut → sessionEnded() so the
@@ -177,6 +183,8 @@ private:
     std::atomic<bool> m_Stopping{false};
     bool m_SignalingComplete = false;
     bool m_DataChannelsOpen = false;
+    /// A browser has opened this socket at least once (SignalingWait.h).
+    bool m_ClientArrived = false;
 
     int m_ClientPort = 0;
 
@@ -192,6 +200,10 @@ private:
 
     /// Force ICE-TCP candidates (true = UDP + TCP, false = UDP only).
     bool m_ForceIceTcp = false;
+    /// Listen for a browser's TCP connection too (docs/design/ice-tcp-passive.md).
+    bool m_IceTcpPassive = false;
+    /// Drop every UDP candidate, ours and the browser's (debug_ice_drop_udp).
+    bool m_DebugIceDropUdp = false;
 
     // ── The router hole this stream is reached through ──────────────────────
     //
@@ -224,8 +236,15 @@ public:
     ///  - isPrivateOrLoopback → do we need STUN? A mesh VPN peer says yes, so
     ///    its srflx address survives if the tunnel path fails.
     ///  - isTrustedPeer → may we show it our internal host candidate? A mesh
-    ///    VPN peer says yes too; a public peer never does, or the LAN leaks.
+    ///    VPN peer says yes too; a public peer never does, or the LAN leaks —
+    ///    unless it sits on our own network after all (setClientSameNetwork).
     void setClientKind(NetClassify::Kind kind) { m_ClientKind = kind; }
+
+    /// A Public client on the host's own network (NetClassify::sharesHostNetwork):
+    /// a LAN browser that came in through a public link. It is shown the LAN
+    /// host candidate so it never has to race the router's hairpin; its ICE
+    /// servers stay those of an internet peer.
+    void setClientSameNetwork(bool same) { m_ClientSameNetwork = same; }
 
     // ── MW-BIND-v1 (docs/design/pairing-signature.md) ──────────────────────
     //
@@ -258,8 +277,8 @@ private:
     /// router forwards to, and the relay rewrites host candidates to the
     /// public address.
     static rtc::Configuration buildIceConfig(bool isInternet, bool mapped, uint16_t mediaPort,
-                                             const QString& stunServerUrl,
-                                             bool forceIceTcp = false);
+                                             const QString& stunServerUrl, bool forceIceTcp = false,
+                                             bool iceTcpPassive = false);
 
     // ── MW-BIND-v1 state ───────────────────────────────────────────────────
     /// Sign the pending SDP offer and hand it to the browser. Called once the
@@ -286,10 +305,11 @@ private:
     bool m_HelloReceived = false;
 
     /// Distinct WebRTC media UDP port for this slot (base + slot). Keeps
-    /// concurrent workers off each other's port; slot 0 keeps 48010. See
+    /// concurrent workers off each other's port; slot 0 takes 48550. See
     /// setMediaPort() and mw::routerports::kMediaBasePort.
-    quint16 m_MediaPort = 48010;
+    quint16 m_MediaPort = 48550;
     NetClassify::Kind m_ClientKind = NetClassify::Kind::Public; // see setClientKind
+    bool m_ClientSameNetwork = false;                           // see setClientSameNetwork
     /// The router hole, as handed down by the parent. See setPresetMapping().
     uint16_t m_UpnpExternalPort = 0;
     QString m_UpnpPublicIP;

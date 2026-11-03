@@ -65,6 +65,12 @@ public:
     AcquireStatus acquire(int timeoutMs, CapturedFrame& frame) override;
     void release() override;
     void stop() override;
+    /// The duplication let go and asked for again, of the same output on the
+    /// same device: a new duplication's first frame is the whole desktop,
+    /// whether anything moved or not. Its size and format must be the ones
+    /// start() read, or the display changed meanwhile and the next acquire()
+    /// says Lost — as it does when DXGI refuses the new duplication.
+    bool retake(std::string& error) override;
 
     ID3D11Device* device() const override { return m_Device.Get(); }
     ID3D11DeviceContext* context() const override { return m_Context.Get(); }
@@ -77,6 +83,16 @@ public:
     int cursorHotspotY() const override { return m_CursorHotspotY; }
     bool pointerPaintedIn() const override { return m_PaintedPointer.paintedIn(); }
     int64_t foldedPresents() const override { return m_FoldedPresents; }
+    /// From the duplication's ModeDesc.RefreshRate, read at each start().
+    int64_t refreshPeriodNs() const override { return m_RefreshPeriodNs; }
+
+    /// Whether the last start() was refused for a reason that can pass, so
+    /// that a later one may succeed: the secure desktop below SYSTEM
+    /// (E_ACCESSDENIED), another program's duplication in the way, a display
+    /// between two modes. False after a success, and for the refusals that
+    /// stay — DXGI_ERROR_UNSUPPORTED above all, a display another GPU drives,
+    /// the hybrid laptop Windows.Graphics.Capture exists for.
+    bool refusalMayPass() const { return m_RefusalMayPass; }
 
 private:
     /// Ask Win32 where the pointer is, for as long as PaintedPointer has no
@@ -86,6 +102,10 @@ private:
     /// Find the adapter whose LUID matches, and its requested output.
     bool openAdapterAndOutput(Microsoft::WRL::ComPtr<IDXGIAdapter1>& adapter,
                               Microsoft::WRL::ComPtr<IDXGIOutput>& output, std::string& error);
+
+    /// m_Duplication made of m_Output on m_Device: start()'s, and retake()'s.
+    /// Sets m_RefusalMayPass.
+    bool duplicate(std::string& error);
 
     /// Fold this frame's pointer information into m_Cursor. Returns true when
     /// anything the consumer can see changed (position, visibility or shape).
@@ -111,7 +131,15 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_Device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_Context;
+    /// The output start() found, kept for retake(): asked again by index, it
+    /// could be another display by then (OutputMatch.h).
+    Microsoft::WRL::ComPtr<IDXGIOutput> m_Output;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> m_Duplication;
+    /// retake() was answered: the next frame is flagged retaken.
+    bool m_Retaking = false;
+    /// retake() let go of the duplication and got none back, or one of
+    /// another mode: the next acquire() says Lost.
+    bool m_RetakeLost = false;
 
     /// The texture handed out by the last successful acquire(). Held so
     /// release() can return it, and so a caller that forgets cannot deadlock
@@ -126,6 +154,7 @@ private:
 
     int m_Width = 0;
     int m_Height = 0;
+    int64_t m_RefreshPeriodNs = 0;
     DXGI_FORMAT m_Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     DesktopRect m_DesktopRect;
 
@@ -144,6 +173,8 @@ private:
     std::vector<uint8_t> m_ShapeBuffer;
     /// Whether this duplication keeps the pointer apart at all. Reset by start().
     PaintedPointer m_PaintedPointer;
+    /// See refusalMayPass().
+    bool m_RefusalMayPass = false;
 
     /// Calibration for qpcToMicroseconds: ticks per second, plus one sample of
     /// both clocks taken at the same instant in start().

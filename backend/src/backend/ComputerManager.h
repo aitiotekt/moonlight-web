@@ -116,6 +116,14 @@ public:
     /// Public because the stream path builds one per session.
     std::unique_ptr<IStreamBackend> backendForHost(const QString& uuid) const;
 
+    /// Ask the host which app it runs right now and store the answer as its
+    /// currentGameId, so the next host list says so without waiting for the
+    /// poll — which pauses while a stream runs. `cb` (optional) gets the id,
+    /// or ok == false when the backend cannot tell or the host did not answer.
+    void refreshRunningApp(const QString& uuid,
+                           std::function<void(bool ok, int appId)> cb = nullptr,
+                           const QString& deviceId = QString());
+
     /// What the host's backend can do, as the frontend consumes it: {multiUser,
     /// provisioning, lobbies}. Read off a real provider instance so it cannot
     /// claim something the code does not implement. Empty object for a plain
@@ -249,6 +257,10 @@ private:
     // first candidate has gone dead is found again on one of the others instead
     // of staying offline forever. Absent uuid means 0.
     QHash<QString, int> m_PollAddrIndex;
+
+    // The state each host was last logged in ("[NETWORK] <host> is online"):
+    // one line when it changes, rather than one per poll.
+    QHash<QString, NvComputer::ComputerState> m_LoggedState;
 
     // Services seen since the current mDNS window opened — reported when it
     // closes, so a scan that found nothing says so.

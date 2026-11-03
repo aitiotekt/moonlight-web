@@ -25,8 +25,8 @@ C'est la correction la plus importante du plan initial, qui demandait
 |---|---|---|---|---|
 | **ViGEmBus + ViGEmClient** | BSD-3 (pilote) + MIT (client) | ✅ X360 natif | DS4 seulement | **Le seul praticable** |
 | libvirtualhid (LizardByte) | lib MIT, **pilote payant** | ❌ (pas de XUSB) | ✅ | **Exclu** : licence par utilisateur |
-| vJoy | **GPL** | ❌ (DirectInput) | ✅ | **Exclu** : licence + pas de XInput |
-| Pilote UMDF2 maison (VHF) | à nous | ❌ | ✅ | **Coût réel** : signature EV + attestation Microsoft, plusieurs centaines d'euros/an |
+| vJoy | **MIT** ⚠️ (noté GPL jusqu'au 29/09/2026) | ❌ (DirectInput) | ❌ (identité fixe « vJoy Device ») | **Exclu** : pas de XInput, pas un passthrough |
+| Pilote UMDF2 maison (VHF) | à nous | ❌ | ✅ | ⚠️ **Corrigé le 29/09/2026** : signature SignPath suffisante (UMDF, pas de signature noyau) — voir `hid-passthrough-study.md` |
 
 ### 2.1 ViGEmBus est archivé, et ce n'est pas un problème technique
 
@@ -38,16 +38,24 @@ Un successeur (*VirtualPad*) est annoncé mais n'est pas sorti.
 **Ne pas le remplacer par réflexe.** L'abstraction de §5 contient le changement
 à un seul fichier le jour où VirtualPad existe.
 
-### 2.2 ⚠️ Le HID virtuel sous Windows n'est pas gratuit
+### 2.2 ⚠️ Le HID virtuel sous Windows exige un pilote — mais pas un certificat EV
 
 Le plan initial disait « privilégier un périphérique HID virtuel standard ». Cela
 suppose qu'il en existe un accessible en user-mode. **Il n'y en a pas.** Il faut
-VHF, donc un pilote UMDF2, donc une signature EV et une attestation Microsoft.
-C'est exactement ce que libvirtualhid fait payer.
+VHF, donc un pilote « source ».
 
-**Conséquence directe** : les profils DualSense, Switch Pro et Generic HID sont
-**hors de portée sans écrire et signer un pilote**. Ils restent dans
-l'architecture (§6) mais pas dans le périmètre livrable.
+⚠️ **Corrigé le 29/09/2026.** Ce paragraphe concluait « donc une signature EV et
+une attestation Microsoft ». C'est vrai pour un pilote **KMDF**, faux pour un pilote
+**UMDF2** : la politique de signature du noyau ne s'y applique pas, et une signature
+Authenticode du catalogue suffit. Notre propre installeur en est la preuve : le
+pilote d'écran virtuel (IddCx, UMDF) est signé par la SignPath Foundation, sans
+Microsoft. Détail, options et coûts : `hid-passthrough-study.md` §3.
+
+**Conséquence** : les profils DualSense, Switch Pro et Generic HID ne sont plus
+hors de portée par principe. Ils restent hors du périmètre livré tant que le
+passthrough HID de `hid-passthrough-study.md` n'est pas planifié. Il est à
+inscrire à la feuille de route, derrière son POC et l'accord de SignPath pour
+signer un pilote.
 
 ### 2.3 ⚠️ Volants et palonniers : hors périmètre, assumé
 
@@ -57,6 +65,24 @@ L'API Gamepad du navigateur les présente de toute façon comme des manettes
 génériques à axes nombreux, que ViGEm ne peut pas restituer.
 
 À documenter comme limite, pas à poursuivre.
+
+⚠️ **Mis à jour le 29/09/2026.** Deux voies sont désormais ouvertes :
+- le plan radios fait passer volants, joysticks et radios par le mapping vers la
+  manette Xbox 360, sans retour de force ;
+- `hid-passthrough-study.md` propose de recréer l'appareil tel quel sur l'hôte natif
+  (WebHID côté client, pilote UMDF côté Windows, `uhid` côté Linux).
+
+> **Livré le 01/10/2026 (première voie).** Radios, joysticks de vol et volants
+> passent par le mapping vers la manette Xbox 360 : 4 axes de 16 bits, 2
+> gâchettes de 8 bits, 15 boutons et la croix. Le reste de l'appareil n'est pas
+> transmis. Les radios EdgeTX/OpenTX sont reconnues au branchement (profil
+> intégré, §7) ; volants et joysticks passent une fois par l'assistant, qui
+> parle leur langage. **Pas de retour de force** : le jeu voit une manette, pas
+> un volant ; côté client, le ressort de centrage de G HUB tient la jante. Le
+> passthrough complet, retour de force compris, reste hors de ce périmètre :
+> c'est l'objet de `hid-passthrough-study.md`, où l'étude du retour de force a
+> été fusionnée le 29/09/2026. Réglages côté jeu et limites : wiki, chapitre 4
+> §4.8.
 
 ---
 
@@ -192,6 +218,78 @@ USB/Bluetooth et version du système. Détection à plusieurs niveaux :
 > secondes, avec le nom rapporté par le navigateur et le conseil de passer en
 > XInput. Rebrancher la manette réarme le message.
 
+> **Révisé le 23/09/2026 : la décision du 02/09 est renversée.** Une GameSir
+> G8+ sur Chrome Android (qui n'a pas de mode XInput à proposer) a été écartée ;
+> le conseil « passez en XInput » n'y peut rien. Les deux niveaux sont écrits,
+> **côté navigateur uniquement** — l'hôte voit toujours un état X360, le
+> protocole ne change pas.
+>
+> `stream/gamepadMapping.js` résout chaque manette, dans cet ordre :
+>
+> 1. **mappage de l'utilisateur** (`util/gamepadMappingsStore.js`, localStorage
+>    `mw-gamepad-mappings`, clé = `usb:vid:pid` ou `name:<nom>`) — aussi sur une
+>    manette standard, pour qui veut remapper ;
+> 2. `mapping === 'standard'` → inchangé ;
+> 3. **Chrome Android**, `mapping: ''` → lue comme standard : Chromium
+>    (`UnknownGamepadMappings`) a déjà rangé boutons et axes dans l'ordre
+>    standard, il ne le déclare simplement pas ;
+> 4. **SDL_GameControllerDB** (zlib, `stream/gamepadDb.js` généré par
+>    `npm run gamepad-db` à un commit épinglé ; Windows, macOS, Linux ; ~1 900
+>    entrées, chargé par `import()` seulement quand une manette non standard
+>    apparaît). Boutons SDL = boutons navigateur ; axes gardés s'ils existent ;
+>    le chapeau `h0.N` devient l'axe 9 de Chrome Windows/macOS (pas de 2/7,
+>    neutre à 9/7) ou la dernière paire d'axes sous Linux ;
+> 5. rien → pas transmise, toast avec **Configurer**.
+>
+> Une manette **devinée** (3 ou 4) est annoncée par un toast « reconnue
+> automatiquement » avec **Remapper** : la crainte d'origine (boutons ailleurs,
+> difficile à diagnostiquer) devient une correction en un geste.
+>
+> **Assistant** (`ui/GamepadRemapDialog.js` + `ui/GamepadArt.js`, manette SVG) :
+> vue test en direct, puis une commande à la fois (21 étapes, Passer/Retour) ;
+> la première entrée qui bouge est retenue (`detectInput` : gâchette au repos à
+> −1 → axe entier, chapeau à 9/7 → direction du chapeau, axe centré → demi-axe
+> ou axe entier pour un stick). Le stream est mis en pause pendant l'assistant
+> (`GamepadManager.setPaused`). Accès : Réglages → Manettes (propriétaire),
+> toasts, et pour l'invité la page d'accueil du partage et un bouton manette
+> dans l'en-tête.
+>
+> **Invités (liens de partage avec manette autorisée)** : une seule manette par
+> partage, choisie sur la page d'accueil, toujours envoyée comme manette 0
+> (`GamepadManager` mode `single`). Cela corrige aussi une collision : avec
+> `gamepadOffset`, une manette d'invité à l'index navigateur 1 tombait sur la
+> manette virtuelle de l'invité suivant. Une manette non reconnue doit être
+> configurée avant d'entrer.
+
+> **Complété le 01/10/2026 : profils intégrés, type d'appareil, axe garé.**
+>
+> - **Profil intégré** (`BUILTIN_PADS`, source `builtin`) : un niveau de plus,
+>   entre le standard (2) et Chrome Android (3), pour un appareil que SDL ne
+>   connaît pas. Bureau seulement, par vid:pid, avant même le chargement de la
+>   base SDL. Premier occupant : les radios EdgeTX/OpenTX (`1209:4f54`, mode
+>   USB « Classic »), lues en Mode 2 et dans l'ordre AETR, comme une TX12 les
+>   rapporte dans Chrome sous Windows (relevé du 01/10/2026). Deuxième, le
+>   02/10/2026 : le volant Logitech G923 pour Xbox (`046d:c26e`, le mode PC
+>   où G HUB le met ; sans G HUB, il reste un appareil Xbox, `046d:c26d`,
+>   qu'aucun navigateur ne voit). Le mappage de
+>   l'utilisateur reste prioritaire. Une manette mise en place sans lui
+>   (`isAutoMapped` : `builtin`, Android, SDL) reçoit le toast « reconnue
+>   automatiquement » et le badge « Auto ».
+> - **Type d'appareil** (`padKind`) : manette, radio, joystick de vol ou
+>   volant. Il vient du choix de l'utilisateur (sélecteur « Type » du dialogue,
+>   enregistrable seul par `setKind`), puis des ids USB connus, puis d'un
+>   indice tiré du nom (radio, puis vol, puis course ; « Joystick » seul ne dit
+>   rien) ; sinon, manette. Il ne change rien au fil : l'hôte voit toujours un
+>   état X360. Il choisit les étapes de l'assistant et leurs mots
+>   (`WIZARD_STEPS` par type, « montez les gaz », « pédale de frein ») et le
+>   dessin de Tester / Remapper (`DeviceArt.js` : radio, joystick, volant et
+>   pédalier, chaque commande étiquetée de ce que reçoit le jeu).
+> - **Axe garé** (`detectInput`, étape de stick) : un axe qui repose en butée
+>   (|repos| > 0,9), comme des gaz ou une manette des gaz, prend son sens de la
+>   butée et non du mouvement. Il ne sort donc plus inversé quand on demande
+>   « vers le bas » à des gaz déjà en bas. Le repos est relevé à l'ouverture de
+>   l'assistant.
+
 ### 7.1 Sélection manuelle — debug uniquement
 
 L'auto-détection est le comportement de production. Un sélecteur manuel de
@@ -245,6 +343,16 @@ serveur → navigateur
 - Pas de numéro de version. Un champ nouveau se lit comme absent par un serveur
   plus ancien, et c'est assez pour gyro ou touchpad le jour où le navigateur
   les expose.
+- `gamepad` est un **instantané**, envoyé quand l'état change, plus une
+  répétition toutes les 500 ms. Une manette n'émet aucun événement : un bouton
+  n'est vu qu'au relevé de `navigator.getGamepads()`. Depuis le 01/10/2026, le
+  client relève à 250 Hz, la cadence d'échantillonnage de Chrome : une
+  minuterie de 4 ms s'ajoute au rAF, armée tant qu'une manette est transmise,
+  la page visible et le flux hors pause. Relevée une fois par image, une
+  manette attendait ~8 ms en moyenne à 60 Hz, sticks et boutons compris.
+  Mesuré dans Chrome 154 : 16,7 ms entre deux relevés avant, 3,6 ms après (p95
+  4,8 ms). Une manette n'envoie pas plus que sa propre cadence (TX12 : ≤ 197
+  mises à jour/s), soit au plus ~30 Ko/s à 250 messages/s.
 
 > Le plan initial prévoyait `GAMEPAD_CREATE { profile }` et un rumble avec
 > durée. Ni l'un ni l'autre n'existe ; ce bloc décrit le fil tel qu'il est
@@ -498,15 +606,17 @@ Chemin critique : pas de JSON si mesuré coûteux (§8.1), pas d'allocation, pas
 verrou par événement. Messages binaires de taille fixe, structures
 préallouées, bitfields.
 
-⚠️ **Le vrai gain de latence est ailleurs, et il est identifié** : le relais
-marshale chaque message d'entrée vers le thread Qt
-(`DataChannelRelay.cpp`, `onMessage` → `Qt::QueuedConnection`) parce que le même
-handler pilote presse-papier, politique et statistiques. C'est **un tour de
-boucle d'événements** par événement d'entrée. Le sink natif est déjà sûr pour
-s'en passer ; le relais ne l'est pas.
-
-Sortir clavier/souris/manette du handler partagé vaut plus que tout
-micro-optimisation d'encodage.
+⚠️ **Le vrai gain de latence était ailleurs, et il est pris.** Ce paragraphe
+disait que le relais marshale chaque message d'entrée vers le thread Qt
+(`onMessage` → `Qt::QueuedConnection`), soit un tour de boucle d'événements
+par entrée. **Ce n'est plus vrai** (relevé le 01/10/2026) : chaque message est
+lu et injecté sur le fil libdatachannel qui l'a reçu, sous `m_InputMutex`,
+quel que soit le moteur (`DataChannelRelay.cpp:1015-1031`, `m_DirectInput`
+toujours vrai, `DataChannelRelay.h:299`). La forme en file n'est plus qu'une
+branche que rien n'emprunte. Le JSON coûte 0,65 à 1,6 µs par message (wiki,
+chapitre 5 §5.5) : ce qui reste à gagner, c'est **quand** le message part du
+navigateur. D'où la lecture des manettes à 250 Hz (§8) et la souris au rythme
+de l'appareil (`pointerrawupdate`).
 
 ---
 

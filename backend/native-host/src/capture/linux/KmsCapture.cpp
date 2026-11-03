@@ -17,7 +17,9 @@
 
 #include "KmsCapture.h"
 
+#include "../ScanoutWindow.h"
 #include "../../core/Log.h"
+#include "../../platform/linux/ScopedCapability.h"
 
 #include <cerrno>
 #include <chrono>
@@ -27,7 +29,6 @@
 #include <linux/dma-buf.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
 #include <xf86drm.h>
@@ -46,9 +47,7 @@ namespace {
 /// process holds it permitted. The app deliberately runs with the capability
 /// permitted but not effective (the HTTP server and everything else in the
 /// process never carry it), so the ioctl that checks it — GETFB2 — is wrapped
-/// in one of these. Raw capget/capset on the calling thread, no libcap: the
-/// module links nothing it does not have to, and libcap's setter would sync
-/// every thread of the process, which is the opposite of the intent.
+/// in one of these (platform/linux/ScopedCapability.h).
 ///
 /// A process without the capability at all is left alone: GETFB2 then hands
 /// back zero handles and the callers say why.
@@ -56,32 +55,11 @@ class ScopedSysAdmin
 {
 public:
     ScopedSysAdmin()
-    {
-        __user_cap_header_struct header{};
-        __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3]{};
-        header.version = _LINUX_CAPABILITY_VERSION_3;
-        if (syscall(SYS_capget, &header, data) != 0) return;
-        if (!(data[kIndex].permitted & kBit) || (data[kIndex].effective & kBit)) return;
-        data[kIndex].effective |= kBit;
-        m_Raised = syscall(SYS_capset, &header, data) == 0;
-    }
-    ~ScopedSysAdmin()
-    {
-        if (!m_Raised) return;
-        __user_cap_header_struct header{};
-        __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3]{};
-        header.version = _LINUX_CAPABILITY_VERSION_3;
-        if (syscall(SYS_capget, &header, data) != 0) return;
-        data[kIndex].effective &= ~kBit;
-        syscall(SYS_capset, &header, data);
-    }
-    ScopedSysAdmin(const ScopedSysAdmin&) = delete;
-    ScopedSysAdmin& operator=(const ScopedSysAdmin&) = delete;
+        : m_Capability(CAP_SYS_ADMIN)
+    {}
 
 private:
-    static constexpr unsigned kIndex = CAP_SYS_ADMIN >> 5;
-    static constexpr unsigned kBit = 1u << (CAP_SYS_ADMIN & 31);
-    bool m_Raised = false;
+    platform::ScopedCapability m_Capability;
 };
 
 const char* const kNeedsCapability =
@@ -159,6 +137,11 @@ struct PlaneProps
     /// Only a virtualized adapter's cursor plane has these (see start()).
     uint32_t hotspotX = 0;
     uint32_t hotspotY = 0;
+    /// The window of its buffer the plane scans out (ScanoutWindow.h).
+    uint32_t srcX = 0;
+    uint32_t srcY = 0;
+    uint32_t srcW = 0;
+    uint32_t srcH = 0;
     uint64_t typeValue = 0;
 };
 
@@ -183,11 +166,42 @@ bool readPlaneProps(int card, uint32_t planeId, PlaneProps& out)
             out.hotspotX = p->prop_id;
         } else if (std::strcmp(p->name, "HOTSPOT_Y") == 0) {
             out.hotspotY = p->prop_id;
+        } else if (std::strcmp(p->name, "SRC_X") == 0) {
+            out.srcX = p->prop_id;
+        } else if (std::strcmp(p->name, "SRC_Y") == 0) {
+            out.srcY = p->prop_id;
+        } else if (std::strcmp(p->name, "SRC_W") == 0) {
+            out.srcW = p->prop_id;
+        } else if (std::strcmp(p->name, "SRC_H") == 0) {
+            out.srcH = p->prop_id;
         }
         drmModeFreeProperty(p);
     }
     drmModeFreeObjectProperties(props);
     return out.type != 0;
+}
+
+/// The connector's EDID blob as the kernel holds it — what an X driver reads
+/// too, byte for byte (input/linux/X11Layout.h). Empty when it has none.
+std::vector<uint8_t> connectorEdid(int card, const drmModeConnector* c)
+{
+    std::vector<uint8_t> edid;
+    for (int i = 0; i < c->count_props && edid.empty(); ++i) {
+        drmModePropertyRes* p = drmModeGetProperty(card, c->props[i]);
+        if (!p) continue;
+        if ((p->flags & DRM_MODE_PROP_BLOB) && std::strcmp(p->name, "EDID") == 0 &&
+            c->prop_values[i] != 0) {
+            drmModePropertyBlobRes* blob =
+                drmModeGetPropertyBlob(card, static_cast<uint32_t>(c->prop_values[i]));
+            if (blob) {
+                const auto* data = static_cast<const uint8_t*>(blob->data);
+                if (data) edid.assign(data, data + blob->length);
+                drmModeFreePropertyBlob(blob);
+            }
+        }
+        drmModeFreeProperty(p);
+    }
+    return edid;
 }
 
 } // namespace
@@ -215,6 +229,17 @@ std::string KmsCapture::modeSignature(const std::string& cardPath)
     return signature;
 }
 
+std::string KmsCapture::renderNodeFor(const std::string& cardPath)
+{
+    const int card = ::open(cardPath.c_str(), O_RDWR | O_CLOEXEC);
+    if (card < 0) return {};
+    char* render = drmGetRenderDeviceNameFromFd(card);
+    std::string node = render ? render : "";
+    if (render) ::free(render);
+    ::close(card);
+    return node;
+}
+
 std::vector<KmsOutput> KmsCapture::listOutputs(const std::string& cardPath, std::string& error)
 {
     std::vector<KmsOutput> outputs;
@@ -239,6 +264,7 @@ std::vector<KmsOutput> KmsCapture::listOutputs(const std::string& cardPath, std:
         out.name = std::string(connectorTypeName(c->connector_type)) + "-" +
                    std::to_string(c->connector_type_id);
         out.connected = c->connection == DRM_MODE_CONNECTED;
+        if (out.connected) out.edid = connectorEdid(card, c);
         if (out.connected && c->encoder_id) {
             drmModeEncoder* e = drmModeGetEncoder(card, c->encoder_id);
             if (e && e->crtc_id) {
@@ -394,6 +420,7 @@ bool KmsCapture::resolveTopology(std::string& error)
     // A plane that is not lit costs nothing to watch: updateCursor() reads
     // FB_ID 0 and reports the pointer hidden until it appears.
     m_PrimaryPlane = m_CursorPlane = 0;
+    m_PropSrcX = m_PropSrcY = m_PropSrcW = m_PropSrcH = 0;
     const uint32_t crtcBit = 1u << static_cast<unsigned>(m_CrtcIndex);
     bool cursorAttached = false;
     drmModePlaneRes* planes = drmModeGetPlaneResources(m_Card);
@@ -406,7 +433,13 @@ bool KmsCapture::resolveTopology(std::string& error)
             PlaneProps props;
             if (readPlaneProps(m_Card, p->plane_id, props)) {
                 if (props.typeValue == DRM_PLANE_TYPE_PRIMARY) {
-                    if (attached) m_PrimaryPlane = p->plane_id;
+                    if (attached) {
+                        m_PrimaryPlane = p->plane_id;
+                        m_PropSrcX = props.srcX;
+                        m_PropSrcY = props.srcY;
+                        m_PropSrcW = props.srcW;
+                        m_PropSrcH = props.srcH;
+                    }
                 } else if (props.typeValue == DRM_PLANE_TYPE_CURSOR) {
                     // One attached to us beats one that merely could be: a
                     // card with several CRTCs has a cursor plane per CRTC,
@@ -513,6 +546,9 @@ bool KmsCapture::start(std::string& error)
     drmModeFreePlane(p);
 
     m_LastFbId = 0;
+    m_WindowSaid = false;
+    m_InPlaceSaid = false;
+    m_InPlaceFrames = 0;
     m_CursorFbId = 0;
     m_Cursor = CursorState{};
     m_SteadyOriginUs = steadyNowUs();
@@ -588,6 +624,34 @@ bool KmsCapture::exportFramebuffer(uint32_t fbId, KmsFrame& frame, std::string& 
         }
     }
     return true;
+}
+
+ScanoutWindow KmsCapture::primaryWindow(int bufferWidth, int bufferHeight)
+{
+    uint64_t srcX = 0, srcY = 0, srcW = 0, srcH = 0;
+    if (m_PropSrcW && m_PropSrcH) {
+        // One read for the four: a buffer changes at every flip, and a name
+        // lookup per property would be a dozen ioctls each time.
+        drmModeObjectProperties* props =
+            drmModeObjectGetProperties(m_Card, m_PrimaryPlane, DRM_MODE_OBJECT_PLANE);
+        for (uint32_t i = 0; props && i < props->count_props; ++i) {
+            const uint32_t id = props->props[i];
+            const uint64_t value = props->prop_values[i];
+            if (id == m_PropSrcX)
+                srcX = value;
+            else if (id == m_PropSrcY)
+                srcY = value;
+            else if (id == m_PropSrcW)
+                srcW = value;
+            else if (id == m_PropSrcH)
+                srcH = value;
+        }
+        if (props) drmModeFreeObjectProperties(props);
+    }
+    // 16.16 fixed point; an X server places its screens on whole pixels.
+    return scanoutWindow(bufferWidth, bufferHeight, m_Width, m_Height,
+                         static_cast<int64_t>(srcX >> 16), static_cast<int64_t>(srcY >> 16),
+                         static_cast<int64_t>(srcW >> 16), static_cast<int64_t>(srcH >> 16));
 }
 
 bool KmsCapture::updateCursor()
@@ -702,6 +766,7 @@ AcquireStatus KmsCapture::acquire(int timeoutMs, KmsFrame& frame)
 
     for (;;) {
         int64_t vblankUs = 0;
+        int64_t vblankSeq = -1;
         if (!m_Polled) {
             // Wait for the next vblank on OUR crtc. This is the display's
             // clock: the compositor flips at vblank, so a new buffer is visible
@@ -735,6 +800,7 @@ AcquireStatus KmsCapture::acquire(int timeoutMs, KmsFrame& frame)
                 return AcquireStatus::Lost;
             }
             vblankUs = static_cast<int64_t>(vbl.reply.tval_sec) * 1000000 + vbl.reply.tval_usec;
+            vblankSeq = vbl.reply.sequence;
         } else {
             // Our own clock at the display's rate; re-anchored when we fell
             // behind rather than catching up in a burst.
@@ -754,7 +820,13 @@ AcquireStatus KmsCapture::acquire(int timeoutMs, KmsFrame& frame)
         drmModeFreePlane(p);
         if (!fbId || crtc != m_CrtcId) return AcquireStatus::Lost;
 
-        if (fbId != m_LastFbId) {
+        // The same buffer with a new picture in it: an X server that draws into
+        // the buffer it scans out instead of flipping says so by its damage
+        // (X11Damage) — read again, exactly as a new buffer is.
+        const bool redrawn = fbId == m_LastFbId && !m_Polled && m_InPlace && m_InPlace();
+        if (fbId != m_LastFbId || redrawn) {
+            // A flip shows whatever was drawn before it: the flag goes with it.
+            if (!redrawn && m_InPlace) m_InPlace();
             // The previous buffer's fds go now, with a new one about to replace
             // it — see the note at the top.
             closeFrameFds();
@@ -763,16 +835,41 @@ AcquireStatus KmsCapture::acquire(int timeoutMs, KmsFrame& frame)
                 log::warning("[native] KMS: " + error);
                 return AcquireStatus::Lost;
             }
-            if (frame.width != m_Width || frame.height != m_Height) {
-                // The mode changed under us: the caller rebuilds everything.
+            // The picture's window of the buffer: all of it, or — an X11
+            // desktop over several screens — this display's part of the root
+            // window (ScanoutWindow.h). Anything else is the mode changing
+            // under us: the caller rebuilds everything.
+            const ScanoutWindow window = primaryWindow(frame.width, frame.height);
+            if (!window.usable) {
                 closeFrameFds();
                 return AcquireStatus::Lost;
+            }
+            if (window.windowed) {
+                frame.bufferWidth = frame.width;
+                frame.bufferHeight = frame.height;
+                frame.sourceX = window.x;
+                frame.sourceY = window.y;
+                frame.width = m_Width;
+                frame.height = m_Height;
+                if (!m_WindowSaid) {
+                    m_WindowSaid = true;
+                    log::info("[native] KMS: this display is a " + std::to_string(m_Width) + "x" +
+                              std::to_string(m_Height) + " window at " + std::to_string(window.x) +
+                              "," + std::to_string(window.y) + " of a " +
+                              std::to_string(frame.bufferWidth) + "x" +
+                              std::to_string(frame.bufferHeight) +
+                              " buffer (an X11 desktop over several screens) — converting that "
+                              "window");
+                }
             }
             m_LastFbId = fbId;
             // The vblank timestamp is CLOCK_MONOTONIC, which is what
             // steady_clock is on Linux: same domain, no conversion.
             frame.capturedUs = steadyNowUs();
             frame.presentUs = vblankUs;
+            frame.presentRawUs = vblankUs;
+            frame.sequence = vblankSeq;
+            frame.accumulated = 1;
             // ⚠️ Capped at "now", for the same reason as WgcCapture. The kernel
             // does not read the vblank's time off a clock when the interrupt
             // fires: it PREDICTS the edge from the scanout position, and the
@@ -782,13 +879,21 @@ AcquireStatus KmsCapture::acquire(int timeoutMs, KmsFrame& frame)
             // client's one-way delay off (arrival − present) — a present in the
             // future has it cut the bitrate on a healthy link.
             if (frame.presentUs > frame.capturedUs) frame.presentUs = frame.capturedUs;
+            if (redrawn) {
+                ++m_InPlaceFrames;
+                if (!m_InPlaceSaid) {
+                    m_InPlaceSaid = true;
+                    log::info("[native] KMS: the X server draws into the scanned-out buffer "
+                              "without flipping — the same buffer is read again on its damage");
+                }
+            }
             m_LastFrame = frame;
             if (m_Polled) {
                 // Map the held buffer once for the hold, and remember what it
                 // looks like now.
-                const size_t length =
-                    static_cast<size_t>(frame.offsets[0]) +
-                    static_cast<size_t>(frame.pitches[0]) * static_cast<size_t>(frame.height);
+                const size_t length = static_cast<size_t>(frame.offsets[0]) +
+                                      static_cast<size_t>(frame.pitches[0]) *
+                                          static_cast<size_t>(frame.importHeight());
                 void* map = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, frame.fds[0], 0);
                 if (map != MAP_FAILED) {
                     m_HeldMap = map;

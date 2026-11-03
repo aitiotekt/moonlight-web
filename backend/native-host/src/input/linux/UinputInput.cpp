@@ -363,8 +363,10 @@ void UinputInput::injectButton(const InputEvent& event, bool down)
 {
     const uint16_t code = buttonCode(event.button);
     if (code == 0) return;
+    const int64_t startUs = m_ClickTrace && down ? steadyNowUs() : 0;
     emit(m_Keyboard, EV_KEY, code, down ? 1 : 0);
     emitSyn(m_Keyboard);
+    if (startUs) m_ClickTrace->press(0, startUs, steadyNowUs());
     if (down)
         m_HeldButtons.insert(code);
     else
@@ -387,7 +389,7 @@ bool UinputInput::ensureTextMap()
     return m_TextMap.isOpen();
 }
 
-void UinputInput::injectChar(const std::string& utf8, bool down)
+void UinputInput::injectChar(const std::string& utf8, bool down, bool altGraph)
 {
     if (utf8.empty() || !ensureTextMap()) return;
 
@@ -438,13 +440,20 @@ void UinputInput::injectChar(const std::string& utf8, bool down)
     const auto wants = [&stroke](uint16_t mod) {
         return stroke.mods[0] == mod || stroke.mods[1] == mod;
     };
-    uint16_t lift[3] = {0, 0, 0}; // held by the viewer, unwanted by the stroke
+    uint16_t lift[5] = {0, 0, 0, 0, 0}; // held by the viewer, unwanted by the stroke
     int lifts = 0;
     if (!wants(KEY_LEFTSHIFT)) {
         if (m_HeldKeys.count(KEY_LEFTSHIFT)) lift[lifts++] = KEY_LEFTSHIFT;
         if (m_HeldKeys.count(KEY_RIGHTSHIFT)) lift[lifts++] = KEY_RIGHTSHIFT;
     }
     if (!wants(KEY_RIGHTALT) && m_HeldKeys.count(KEY_RIGHTALT)) lift[lifts++] = KEY_RIGHTALT;
+    // AltGr, or a Mac's Option, composed this character on the client: the
+    // viewer's Alt, and the Ctrl a Windows AltGr comes with, are a level
+    // here, not the chord a left Alt or a Ctrl otherwise is.
+    if (altGraph && !wants(KEY_LEFTALT) && m_HeldKeys.count(KEY_LEFTALT))
+        lift[lifts++] = KEY_LEFTALT;
+    if (altGraph && !wants(KEY_LEFTCTRL) && m_HeldKeys.count(KEY_LEFTCTRL))
+        lift[lifts++] = KEY_LEFTCTRL;
 
     uint16_t mine[2] = {0, 0}; // wanted by the stroke, not held by the viewer
     int count = 0;
@@ -603,8 +612,20 @@ void UinputInput::inject(const InputEvent& event)
     switch (event.type) {
     case Type::KeyDown: injectKey(event, true); break;
     case Type::KeyUp: injectKey(event, false); break;
-    case Type::CharDown: injectChar(event.text, true); break;
-    case Type::CharUp: injectChar(event.text, false); break;
+    // A chord of the touch keyboard's bar keeps its US position here, as it
+    // always went: the Windows host alone resolves it by its character.
+    case Type::CharDown:
+        if (event.chord)
+            injectKey(event, true);
+        else
+            injectChar(event.text, true, event.altGraph);
+        break;
+    case Type::CharUp:
+        if (event.chord)
+            injectKey(event, false);
+        else
+            injectChar(event.text, false, event.altGraph);
+        break;
     case Type::Utf8Text: injectText(event.text); break;
     case Type::MouseButtonDown: injectButton(event, true); break;
     case Type::MouseButtonUp: injectButton(event, false); break;
@@ -704,19 +725,25 @@ void UinputInput::inject(const InputEvent& event)
 
     // The wire carries 120-unit notches, as Windows does. evdev's REL_WHEEL is
     // in whole notches, so the amount is divided rather than forwarded — sent
-    // raw, one notch of the wheel would scroll a hundred and twenty lines.
-    case Type::MouseScrollVertical:
-        if (event.scrollAmount != 0) {
-            emit(m_Keyboard, EV_REL, REL_WHEEL, event.scrollAmount / 120);
+    // raw, one notch of the wheel would scroll a hundred and twenty lines. A
+    // notch that arrives in pieces is added up first (WheelCarry): divided one
+    // piece at a time, each was 0 and the wheel only moved now and then.
+    case Type::MouseScrollVertical: {
+        const int32_t notches = m_WheelCarry.add(event.scrollAmount);
+        if (notches != 0) {
+            emit(m_Keyboard, EV_REL, REL_WHEEL, notches);
             emitSyn(m_Keyboard);
         }
         break;
-    case Type::MouseScrollHorizontal:
-        if (event.scrollAmount != 0) {
-            emit(m_Keyboard, EV_REL, REL_HWHEEL, event.scrollAmount / 120);
+    }
+    case Type::MouseScrollHorizontal: {
+        const int32_t notches = m_HWheelCarry.add(event.scrollAmount);
+        if (notches != 0) {
+            emit(m_Keyboard, EV_REL, REL_HWHEEL, notches);
             emitSyn(m_Keyboard);
         }
         break;
+    }
 
     // Not this sink's business: the gamepad has its own device (UinputGamepad),
     // and aligning the host's lock keys would mean toggling CapsLock and NumLock

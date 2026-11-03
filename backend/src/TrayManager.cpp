@@ -18,6 +18,7 @@
 #include "TrayManager.h"
 #include "Autostart.h"
 #include "common/Edition.h"
+#include "common/DetachedProcess.h"
 #include "server/HttpServer.h"
 
 #include <QApplication>
@@ -132,7 +133,7 @@ bool TrayManager::init()
     // service there, already up before anyone logs in, and a login item beside
     // it would only be another way into the very update trouble a service
     // install has. The tick is re-read from the OS each time the menu opens.
-    if (!m_ClientMode && Autostart::isSupported()) {
+    if (!m_ClientMode && !m_AdminLocked && Autostart::isSupported()) {
         m_AutostartAction = m_Menu->addAction(tr("Start at &login"));
         m_AutostartAction->setCheckable(true);
         connect(m_AutostartAction, &QAction::toggled, this, &TrayManager::onAutostartToggled);
@@ -148,6 +149,13 @@ bool TrayManager::init()
     connect(controlPanelAction, &QAction::triggered, this, &TrayManager::onOpenSettings);
     connect(restartAction, &QAction::triggered, this, &TrayManager::onRestart);
     connect(quitAction, &QAction::triggered, this, &TrayManager::onQuit);
+    // Booth mode: nothing here may change or stop the server. Hidden rather
+    // than left out, so the Dock menu below, which shares them, follows.
+    if (m_AdminLocked) {
+        controlPanelAction->setVisible(false);
+        restartAction->setVisible(false);
+        quitAction->setVisible(false);
+    }
     connect(m_TrayIcon, &QSystemTrayIcon::activated, this, &TrayManager::onActivated);
 
     m_TrayIcon->setContextMenu(m_Menu);
@@ -345,6 +353,10 @@ void TrayManager::onOpen()
 
 void TrayManager::onOpenSettings()
 {
+    if (m_AdminLocked) {
+        onOpen(); // no settings page in booth mode: the Dock click lands here
+        return;
+    }
     openAppPage(QStringLiteral("/admin"));
 }
 
@@ -410,7 +422,7 @@ void TrayManager::onRestart()
     QStringList args = QCoreApplication::arguments();
     if (!args.isEmpty()) args.removeFirst(); // argv[0] is the app path, startDetached handles it
 
-    if (!QProcess::startDetached(appPath, args)) {
+    if (!mw::startDetached(appPath, args)) {
         qWarning() << "[TrayManager] Restart failed — could not launch new process";
         return;
     }

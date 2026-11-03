@@ -71,6 +71,8 @@ public:
 
     void stop() override;
 
+    void endFromSignaling() override;
+
     void notifyClientTakenOver() override;
 
     void notifyClientRevoked() override;
@@ -106,6 +108,16 @@ private slots:
 private:
     // Best-effort exit notice ({"type": ...}) on the input DC before stop().
     void sendExitNotice(const char* type);
+
+    // hidcaps on the input DC, when it is open: whether this host recreates
+    // WebHID devices for this player, and why not.
+    void sendHidCaps();
+    void onHidPolicyChanged() override;
+
+    // inputcaps on the input DC, when it is open: whether this player's
+    // keyboard and mouse reach the host.
+    void sendInputCaps();
+    void onKeyboardMousePolicyChanged() override { sendInputCaps(); }
 
     void setupPeerConnection(const rtc::Configuration& config);
     void createTracksAndChannels();
@@ -154,6 +166,8 @@ private:
     // the audio stream, eliminating the periodic micro-dropouts.
     std::shared_ptr<rtc::Track> m_AudioTrack;
     std::shared_ptr<rtc::DataChannel> m_InputDc;
+    // The HID passthrough's reports (id 4) — see DataChannelRelay.
+    std::shared_ptr<rtc::DataChannel> m_HidDc;
 
     std::atomic<bool> m_Connected{false};
     std::atomic<bool> m_Stopping{false};

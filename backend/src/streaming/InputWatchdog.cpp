@@ -39,16 +39,20 @@ InputWatchdog::InputWatchdog(Sink sink, QObject* parent)
 
 // --- Feeds -------------------------------------------------------------------
 
-void InputWatchdog::noteKey(const HeldKey& key, bool down)
+bool InputWatchdog::noteKey(const HeldKey& key, bool down)
 {
+    bool repeat = false;
     {
         QMutexLocker lock(&m_Mutex);
-        if (down)
+        if (down) {
+            repeat = m_HeldKeys.contains(key.keyCode);
             m_HeldKeys.insert(key.keyCode, key);
-        else
+        } else {
             m_HeldKeys.remove(key.keyCode);
+        }
     }
     arm();
+    return repeat;
 }
 
 void InputWatchdog::noteButton(int button, bool down, bool hold)

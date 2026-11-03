@@ -16,11 +16,57 @@
  */
 
 /**
- * WebGpuRenderer — WebGPU output path (feature On). SGSRv1 (C4), FSR1 (C6) and NIS.
+ * WebGpuRenderer — WebGPU output path (feature On). SGSRv1 (C4), FSR1 (C6), NIS
+ * and mwsr.
  *
  * Common Pass 0 (blit): importExternalTexture(frame) → inputTex (rgba8unorm,
  * frame res). A texture_external can only be read with textureSampleBaseClampToEdge,
- * but the enhancers need textureGather → materialize the frame first.
+ * but the enhancers need textureGather → materialize the frame first. (mwsr
+ * needs no gather; it keeps the pass 0 because the external texture costs two
+ * fetches a sample, which lost to pass 0 + kernel on every GPU measured,
+ * upscaler-mwsr-p2.md §3.) A browser that refuses the import (Chrome on a
+ * machine whose decoded frames cannot be shared with WebGPU) gets the frame
+ * copied through an ImageBitmap into inputTex instead, or, where that copy
+ * is refused too, read back as RGBA and written into a texture pass 0 copies
+ * from, and the picture stays on screen (see _importFrame, _copyFrame). A
+ * renderer that gets no frame onto its canvas for a while gives up (`failed`)
+ * and the page moves the picture to another one.
+ *
+ * mwsr (algo 'mwsr'): 2 passes — Pass 0 blit, Pass 1 mwsr inputTex → canvas.
+ *   MoonlightWeb's own upscaler (MwsrShader.js, docs/design/upscaler-mwsr.md).
+ *   One pipeline per regime, all built at creation and specialised by
+ *   override: the `up` kernel (CHROMA444 on a 4:4:4 stream) and the reduction
+ *   grids; mwsrRegime() picks one per frame from the frame and canvas sizes,
+ *   the uniforms are rewritten when those change. In SDR the reduction reads
+ *   inputTex through its `-srgb` view and draws into the canvas' `-srgb` view:
+ *   the sampler decodes before it filters and the target encodes on write, so
+ *   the average is taken in linear light for free (P3, journal J15) — both
+ *   textures are created with those view formats, and the reduction falls back
+ *   to the software light (LINEAR_LIGHT 1, the 2×2 grid) where the browser
+ *   refuses them. On the float canvas (HDR `linear`) the YUV pass 0 writes the
+ *   linear light itself for a reduction, which the views' grids filter and
+ *   encode at the output (LINEAR_LIGHT 3, journal J47); a frame that pass did
+ *   not take keeps the software light. The f16 module (`half`) runs
+ *   where the adapter has shader-f16 and is not NVIDIA's: 9-10 % off the
+ *   kernel on the AMD iGPU for the same pixels, nothing on the RTX (P2.3).
+ *
+ * mwsr 2 and 3 (opts.deblock 'fixed' or 'qp': the debug menu's « MoonlightWeb
+ *   2 » and « 3 », never 'auto'): the same kernel after a deblocking of the
+ *   frame (DeblockShader.js) — a compute pass over inputTex into a fixed-point
+ *   buffer, then a pass into dbTex, which the kernel reads instead. 'qp' sets
+ *   the strength of each frame from the QP its header carried (noteFrameQp),
+ *   and skips both passes on a frame fine enough. SDR only (rgba8unorm).
+ *   Without opts.deblock nothing of it is built, and no QP is asked for.
+ *
+ * mwsr's zones (opts.zoneMap: the page asked the native host for them at
+ *   /start, plan B §12 c): the `up` kernel's second text (mwsrWgsl's `map`),
+ *   built beside the first, reads a texture of one texel per zone of the
+ *   capture, the drop the host's tree chose there under the sharpness law.
+ *   A frame's zones are kept by its timestamp until it is drawn
+ *   (noteFrameZones), and read only where the page draws at the scale the
+ *   host decided them for (mwsrZonesFit); every other frame, and every other
+ *   host, takes the first text and the law. Without opts.zoneMap nothing of
+ *   it is built.
  *
  * SGSRv1 (algo 'sgsr'): 2 passes — Pass 0 blit, Pass 1 SGSR inputTex → canvas.
  *   Port (Qualcomm, BSD-3-Clause) from sgsr1.h, mode 1, luma = GREEN, EdgeThreshold
@@ -41,15 +87,53 @@
  *   EASU uniform = (inW, inH, outW, outH); RCAS uniform offsets are TEXEL sizes
  *   → (outW, outH, 1/outW, 1/outH).
  *
+ * At 1:1 — frame and canvas the same size on both axes (scaleRegime.js) —
+ * none of the three runs: the frame goes straight to the canvas through the
+ * 'off' copy, one pass and no inputTex, whatever pass is selected, and the
+ * pass resumes on the next frame whose size differs (upscaler-mwsr.md §5).
+ * `passthrough` says when that happened, for the overlay and the ladder.
+ *
  * Dev/setting-gated (video_enhancement). Lifecycle constraints (see plan):
  *   - A canvas in 'webgpu' context can NEVER go back to '2d' → requestAdapter/
  *     requestDevice run BEFORE getContext('webgpu') so a failure falls back to
  *     Canvas2D.
  *   - External texture expires each task → its blit bind group is per-frame.
- *   - Perceptual space: non-srgb formats only.
+ *   - Perceptual space: the textures stay non-srgb; only mwsr's reduction
+ *     binds the `-srgb` views of inputTex and of the canvas (above).
  */
 import { VideoRenderer } from './VideoRenderer.js';
 import { nisConfig, nisCoefTexture, readNisSharpness, nisScaleInRange } from './NisTables.js';
+import { fitOutputSize, isIdentityScale } from './scaleRegime.js';
+import {
+    MWSR_UNIFORM_FLOATS,
+    mwsrClassOverrides,
+    mwsrRegime,
+    mwsrRegimeKey,
+    mwsrRegimes,
+    mwsrUniforms,
+    mwsrWgsl,
+} from './MwsrShader.js';
+import {
+    DEBLOCK_DCT_WGSL,
+    DEBLOCK_FIN_WGSL,
+    deblockDispatch,
+    deblockStrength,
+    deblockUniforms,
+} from './DeblockShader.js';
+import { GazeZone } from '../GazeZone.js';
+import { mwsrZoneTexels, mwsrZonesFit } from '../MwsrZoneBlock.js';
+import { IS_HANDHELD } from '../../util/BrowserDetect.js';
+
+// The kernel's constants the product sets for this device's class (plan §9,
+// Bruno's decisions of 24/10/2026), under the laboratory's overrides.
+const MWSR_CLASS = mwsrClassOverrides({ handheld: IS_HANDHELD });
+
+// Whether the zones' texture holds these codes already (null: nothing yet).
+function sameCodes(a, b) {
+    if (!a || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+}
 
 // Full-screen triangle (uv 0..1, v down — matches texture sampling).
 const FULLSCREEN_VS = /* wgsl */ `
@@ -80,6 +164,62 @@ fn fs(in : VSOut) -> @location(0) vec4f {
     return textureSampleBaseClampToEdge(tex, samp, in.uv);
 }
 `;
+
+// The eye test's split screen (setMwsrSplit): the grid's picture and the
+// law's, each drawn whole from the same frame, put side by side at 1:1 — the
+// centre half twice, the left half twice, or each its own half — with a
+// black line of 2 pixels between. view: BrowserDetect.MWSR_SPLIT_VIEWS' index.
+const SPLIT_WGSL =
+    FULLSCREEN_VS +
+    /* wgsl */ `
+struct Split { view : u32, gridLeft : u32, width : u32, pad : u32 };
+@group(0) @binding(0) var gridTex : texture_2d<f32>;
+@group(0) @binding(1) var lawTex : texture_2d<f32>;
+@group(0) @binding(2) var<uniform> u : Split;
+
+@fragment
+fn fs(in : VSOut) -> @location(0) vec4f {
+    let w = i32(u.width);
+    let half = w / 2;
+    let x = i32(in.pos.x);
+    if (x == half - 1 || x == half) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+    let right = x >= half;
+    let x0 = select(x, x - half, right);
+    var sx = x;
+    if (u.view == 0u) { sx = x0 + w / 4; }
+    if (u.view == 1u) { sx = x0; }
+    let p = vec2i(sx, i32(in.pos.y));
+    if (right == (u.gridLeft == 1u)) { return textureLoad(lawTex, p, 0); }
+    return textureLoad(gridTex, p, 0);
+}
+`;
+
+/** BrowserDetect.MWSR_SPLIT_VIEWS, as SPLIT_WGSL numbers them. */
+const SPLIT_VIEW_INDEX = { 'centre-twice': 0, 'left-twice': 1, halves: 2 };
+
+// The same copy from a texture: the plain copy to the canvas when the frame
+// came in another way than the import (an ImageBitmap into inputTex, or the
+// readback into readbackTex, see _copyFrame), and the readback's pass 0.
+const BLIT_TEX_WGSL =
+    FULLSCREEN_VS +
+    /* wgsl */ `
+@group(0) @binding(0) var samp : sampler;
+@group(0) @binding(1) var tex : texture_2d<f32>;
+
+@fragment
+fn fs(in : VSOut) -> @location(0) vec4f {
+    return textureSampleLevel(tex, samp, in.uv, 0.0);
+}
+`;
+
+// After a refused import, the import is tried again this many draws later:
+// a refusal that was transient ends the slower copies by itself.
+const IMPORT_RETRY_FRAMES = 300;
+
+// Frames in a row that never reached the canvas (no way in took them, the
+// draw threw, or their work did not complete) before the renderer gives up
+// and the page moves the picture to another renderer: half a second at 60 fps.
+const LOST_FRAMES_LIMIT = 30;
 
 // HDR tone-map (Pass 0 replacement). Reads the decoded 10/12-bit YUV planes
 // (frame.copyTo readback) instead of importExternalTexture — the only way to get
@@ -122,7 +262,8 @@ fn linToSrgb(c : vec3f) -> vec3f {
 }
 
 // Transfer-encoded R'G'B' (PQ, BT.2020) → the render target's own space.
-// params: (refWhite nits, _, exposure, curve 0=soft-clip 1=ACES 2=linear HDR out)
+// params: (refWhite nits, _, exposure, curve 0=soft-clip 1=ACES 2=linear HDR
+// out 3=the same, not encoded)
 fn tonemapPq(rgbE : vec3f, params : vec4f) -> vec4f {
     let linear2020 = pqEotf(rgbE);
     // SDR diffuse white (refWhite nits) maps to 1.0 before tone mapping.
@@ -131,12 +272,17 @@ fn tonemapPq(rgbE : vec3f, params : vec4f) -> vec4f {
         // HDR output: no tone curve. Scene light in the canvas' own Display-P3
         // gamut (BT.2020 → P3, linear, column-major), 1.0 = reference white,
         // highlights above it, encoded with the sRGB transfer the float16
-        // canvas extends past 1.0 (toneMapping 'extended').
+        // canvas extends past 1.0 (toneMapping 'extended') — or left linear
+        // (3) for mwsr's reduction, which encodes once it has filtered.
         let P = mat3x3f(
             1.343578, -0.065298,  0.002822,
            -0.282180,  1.075788, -0.019599,
            -0.061399, -0.010491,  1.016777);
-        return vec4f(linToSrgb(max(P * scaled, vec3f(0.0))), 1.0);
+        let lin = max(P * scaled, vec3f(0.0));
+        if (params.w > 2.5) {
+            return vec4f(lin, 1.0);
+        }
+        return vec4f(linToSrgb(lin), 1.0);
     }
     // BT.2020 → Rec.709 gamut (linear), column-major.
     let M = mat3x3f(
@@ -176,7 +322,7 @@ const HDR_TONEMAP_WGSL =
 @group(0) @binding(1) var texU : texture_2d<u32>;
 @group(0) @binding(2) var texV : texture_2d<u32>;
 @group(0) @binding(3) var<uniform> dims : vec4f;   // (yW, yH, cW, cH)
-@group(0) @binding(4) var<uniform> params : vec4f; // (refWhite nits, codeScale, exposure, curve 0=soft-clip 1=ACES 2=linear HDR out)
+@group(0) @binding(4) var<uniform> params : vec4f; // (refWhite nits, codeScale, exposure, curve 0=soft-clip 1=ACES 2=linear HDR out 3=the same, not encoded)
 @group(0) @binding(5) var<uniform> csp : vec4f;    // frame.colorSpace: (fullRange, bt709 matrix, isPq, _)
 
 @fragment
@@ -229,6 +375,16 @@ fn fs(in : VSOut) -> @location(0) vec4f {
 // so all that is left is the tail: PQ EOTF → gamut → tone curve → sRGB. Unlike
 // the readback path this needs no software decoder, so it is the only tone-map
 // available for HEVC — and it runs before the enhancer like the other one.
+//
+// Safari 27 on macOS does not quite hand back PQ for HEVC Main 10 (a MacBook
+// Air M3, 26/10/2026): its decoder gives SDR frames already (NV12, BT.709, the
+// sRGB transfer), and pale. Imported as they are, they show pale: grey 50 % at
+// 0.51, red at 0.55/0.34/0.23. Read as PQ and tone-mapped here, they come out
+// as the browser's own <video> shows the stream: grey 0.71/0.68/0.70, red
+// 0.90/0/0, the same to Bruno's eye. The curve makes up for Safari's paleness;
+// converting only the frames that say PQ or HLG would have left the picture
+// pale, so these frames take this pass too. A Safari that hands back true PQ
+// one day is to be measured again.
 const HDR_EXT_TONEMAP_WGSL =
     FULLSCREEN_VS +
     HDR_COMMON_WGSL +
@@ -881,8 +1037,54 @@ export class WebGpuRenderer extends VideoRenderer {
         // only construction path and overwrites all of them before returning.
         /** @type {string} 'h264' | 'hevc' | 'av1'. */
         this.videoCodec = '';
-        /** @type {'sgsr'|'nis'|'fsr1'|'off'} Upscaler pass; 'off' blits through. */
+        /** @type {'sgsr'|'nis'|'fsr1'|'mwsr'|'off'} Upscaler pass; 'off' blits through. */
         this._algo = 'sgsr';
+        /** The last draw copied the frame 1:1 instead of running the pass. */
+        this._passthrough = false;
+        /** 4:4:4 stream: mwsr votes and sharpens per channel (CHROMA444). */
+        this._yuv444 = false;
+        /** mwsr's f16 module: shader-f16 granted (asked for off NVIDIA). */
+        this._mwsrHalf = false;
+        /** SDR: inputTex and the canvas carry `-srgb` view formats (mwsr's reduction). */
+        this._srgbViews = false;
+        /** HDR `linear`: mwsr's reduction takes the linear light pass 0 writes for it
+         *  (LINEAR_LIGHT 3, journal J47); false, the encoded feed and the 2×2 grid of
+         *  before (the lab's comparison). */
+        this._mwsrLinearDown = true;
+        /** This draw's pass 0 writes that linear light (set before the upload). */
+        this._p0Linear = false;
+        /** mwsr's gaze zone (setMwsrZone): null, none; else its values over MWSR_ZONE's. */
+        this._mwsrZone = null;
+        /** Its weight pinned by setMwsrGaze (the lab), or null: the stream's motion decides. */
+        this._mwsrGazePinned = null;
+        /** @type {GazeZone|null} that motion, fed by noteEncodedFrame. */
+        this._gaze = null;
+        /** mwsr 2 / 3 (DeblockShader.js): 'fixed', 'qp', or null — no pass, nothing built. */
+        this._deblock = null;
+        /** 'qp': each frame's QP by its timestamp (noteFrameQp), and the last one drawn. */
+        this._qpByTs = new Map();
+        this._lastQp = null;
+        /** The last mwsr draw's deblocking, for the overlay: {qp, thr}, thr 0 when skipped. */
+        this.deblockLast = null;
+        /** mwsr's zones (opts.zoneMap): the second `up` text, built only when asked. */
+        this._zoneMap = false;
+        /** Each frame's zones by its timestamp (noteFrameZones), until it is drawn. */
+        this._zonesByTs = new Map();
+        /** The zones' texture (r16float, a texel per zone), its size and the codes in it. */
+        this._zoneTex = null;
+        this._zoneTexView = null;
+        this._zoneTexDims = '';
+        this._zoneCodes = null;
+        /** The second text's bind groups, by the view the kernel reads. */
+        this._mwsrMapGroups = new WeakMap();
+        /** Frames the kernel drew with their zones, since creation. */
+        this.mwsrZoneFrames = 0;
+        /** The eye test's split screen (setMwsrSplit), null: none; and what it draws with. */
+        this._split = null;
+        this._splitTex = null;
+        this._splitPipeline = null;
+        this._splitUniform = null;
+        this._splitGroup = null;
         /** NIS sharpness (0..1, 0.5 neutral) and its re-read throttle. */
         this._nisSharpness = 0.5;
         this._nisKnobsMs = 0;
@@ -890,6 +1092,8 @@ export class WebGpuRenderer extends VideoRenderer {
         /** Click-to-photon probe: three canvas texels copied out per frame. */
         this._probeActive = false;
         this._probePixels = null;
+        this._probeDrawnAt = null;
+        this._probeQueuedAt = 0;
         this._probeBuf = null;
         this._probeBusy = false;
         /** @type {boolean} HDR→SDR tone-map path (exclusive with _hdr). */
@@ -906,14 +1110,30 @@ export class WebGpuRenderer extends VideoRenderer {
         // ── Steps that may fail on unsupported platforms — BEFORE getContext ──
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) throw new Error('WebGPU requestAdapter returned null');
-        const device = await adapter.requestDevice();
+        const device = await WebGpuRenderer._requestDevice(adapter);
 
         const r = new WebGpuRenderer();
         r.canvas = canvas;
         r.videoCodec = opts.videoCodec;
         // 'off' = WebGPU pass-through (blit only, no upscaler); sgsr is the safe default.
         r._algo =
-            opts.algo === 'fsr1' || opts.algo === 'nis' || opts.algo === 'off' ? opts.algo : 'sgsr';
+            opts.algo === 'fsr1' ||
+            opts.algo === 'nis' ||
+            opts.algo === 'mwsr' ||
+            opts.algo === 'off'
+                ? opts.algo
+                : 'sgsr';
+        r._yuv444 = opts.yuv444 === true;
+        // mwsr 2 / 3: the deblocking before the kernel (the debug menu's).
+        r._deblock = opts.deblock === 'fixed' || opts.deblock === 'qp' ? opts.deblock : null;
+        // The gaze zone the caller wants (BrowserDetect.mwsrGazeWanted): the
+        // kernel's pipelines take it, its weight follows the stream's motion.
+        if (opts.gazeZone) r.setMwsrZone({});
+        // mwsr's zones (BrowserDetect.mwsrMapWanted): the kernel's second text.
+        r._zoneMap = opts.zoneMap === true;
+        // The eye test's split screen (BrowserDetect.mwsrSplitWanted).
+        if (opts.mwsrSplit) r.setMwsrSplit(opts.mwsrSplit);
+        r._mwsrHalf = device.features.has('shader-f16');
         // HDR: rgba16float canvas in extended tone-mapping mode (values > 1.0
         // map to the display's HDR headroom). Gated on opts.hdr; _configure()
         // self-downgrades to SDR if the browser rejects the HDR canvas config.
@@ -953,6 +1173,23 @@ export class WebGpuRenderer extends VideoRenderer {
         r._yuvCH = 0;
         r._yuvFormatLogged = false;
         r._copyWarned = false;
+        // The import fallback (see _importFrame) and the once-per-message log.
+        r._importRefused = false;
+        r._importRefusedAt = 0;
+        r._importWarned = false;
+        // Its two copies (see _copyFrame): the bitmap's refusal, asked again
+        // with the import, and the readback's buffer.
+        r._bitmapRefused = false;
+        r._bitmapWarned = false;
+        r._readbackBuf = null;
+        r._readbackWarned = false;
+        // Frames that never reached the canvas, in a row; frames drawn on
+        // this device; whether the renderer gave up (see _noteFrame).
+        r._lostFrames = 0;
+        r._framesOnDevice = 0;
+        r._failed = false;
+        r._drawCount = 0;
+        r._drawErrors = new Set();
         r._adapter = adapter;
         r._device = device;
         r._ready = false;
@@ -979,9 +1216,40 @@ export class WebGpuRenderer extends VideoRenderer {
                 ' hdrLinear=' +
                 r._hdrLinear +
                 ' hdrExtTonemap=' +
-                r._hdrExtTonemap,
+                r._hdrExtTonemap +
+                ' half=' +
+                r._mwsrHalf +
+                ' srgbViews=' +
+                r._srgbViews +
+                ' yuv444=' +
+                r._yuv444 +
+                ' deblock=' +
+                r._deblock +
+                ' zones=' +
+                r._zoneMap,
         );
         return r;
+    }
+
+    /**
+     * The device, with shader-f16 where the adapter has it and is not
+     * NVIDIA's: mwsr's f16 module took 9-10 % off the kernel on the AMD iGPU
+     * for the same pixels and nothing on the RTX (upscaler-mwsr-p2.md §3), and
+     * a feature granted costs nothing to the other passes. A device refused
+     * with it is asked for bare; the kernel then runs in f32.
+     * @param {GPUAdapter} adapter
+     * @returns {Promise<GPUDevice>}
+     */
+    static async _requestDevice(adapter) {
+        const vendor = String((adapter.info && adapter.info.vendor) || '').toLowerCase();
+        if (adapter.features.has('shader-f16') && vendor !== 'nvidia') {
+            try {
+                return await adapter.requestDevice({ requiredFeatures: ['shader-f16'] });
+            } catch (e) {
+                console.warn('[WebGpuRenderer] shader-f16 refused, f32 kernel: ' + e.message);
+            }
+        }
+        return await adapter.requestDevice();
     }
 
     get ready() {
@@ -992,10 +1260,18 @@ export class WebGpuRenderer extends VideoRenderer {
         return 'webgpu';
     }
 
-    /** Effective algorithm name for the overlay: 'SGSR' | 'NIS' | 'FSR1' | 'Off'. */
+    /** See VideoRenderer.passthrough: the last frame was copied 1:1, no pass run. */
+    get passthrough() {
+        return this._passthrough;
+    }
+
+    /** Effective algorithm name for the overlay: 'SGSR' | 'NIS' | 'FSR1' | 'MWSR' | 'Off'. */
     get algoName() {
         if (this._algo === 'fsr1') return 'FSR1';
         if (this._algo === 'nis') return 'NIS';
+        if (this._algo === 'mwsr') {
+            return this._deblock === 'qp' ? 'MWSR 3' : this._deblock ? 'MWSR 2' : 'MWSR';
+        }
         if (this._algo === 'off') return 'Off';
         return 'SGSR';
     }
@@ -1005,20 +1281,42 @@ export class WebGpuRenderer extends VideoRenderer {
         return !!this._hdr;
     }
 
+    /** See VideoRenderer.failed: given up, for the page to move the picture (_noteFrame). */
+    get failed() {
+        return this._failed;
+    }
+
+    /**
+     * See VideoRenderer.serialDrawsOnly. The import path may be pipelined: its
+     * commands run in submission order. A frame copied in instead (see
+     * _copyFrame) awaits before it is drawn: two such draws could resolve out
+     * of order and present the older frame last, and the readback reuses one
+     * buffer.
+     */
+    get serialDrawsOnly() {
+        return this._importRefused;
+    }
+
     /**
      * See VideoRenderer.probeActive. A presented WebGPU canvas cannot be read
      * back with drawImage, so while a measurement is on, each frame copies the
      * probe's three texels from the canvas texture into a mappable buffer
      * (before submit) and maps it afterwards; the probe polls `probePixels`.
      * The HDR float canvas is read too: its half floats are clamped to 0..1 and
-     * scaled to 8 bits, which is all the flag test needs.
+     * scaled to 8 bits, which is all the flag test needs. The pixels come
+     * back after the map, a few ms later; `probeDrawnAt` is the submit of the
+     * frame they were copied from.
      */
     set probeActive(on) {
         this._probeActive = !!on;
         this._probePixels = null;
+        this._probeDrawnAt = null;
     }
     get probePixels() {
         return this._probePixels;
+    }
+    get probeDrawnAt() {
+        return this._probeDrawnAt;
     }
 
     _queueProbeRead(encoder, texture, cw, ch) {
@@ -1044,11 +1342,13 @@ export class WebGpuRenderer extends VideoRenderer {
             );
         }
         this._probeBusy = true;
+        this._probeQueuedAt = performance.now();
         return true;
     }
 
     _mapProbeRead() {
         const buf = this._probeBuf;
+        const drawnAt = this._probeQueuedAt;
         const bgra = this._format === 'bgra8unorm';
         const half = this._format === 'rgba16float';
         // IEEE half → float, enough for a clamped 0..1 read (no NaN/Inf care).
@@ -1079,7 +1379,10 @@ export class WebGpuRenderer extends VideoRenderer {
                     px[i * 4 + 3] = 255;
                 }
                 buf.unmap();
-                if (this._probeActive) this._probePixels = px;
+                if (this._probeActive) {
+                    this._probePixels = px;
+                    this._probeDrawnAt = drawnAt;
+                }
             })
             .catch(() => {})
             .finally(() => {
@@ -1095,6 +1398,11 @@ export class WebGpuRenderer extends VideoRenderer {
             this._format = 'rgba16float';
             this._interFormat = 'rgba16float';
             this._importColorSpace = 'display-p3';
+            // A browser older than the option (Chrome before 129) drops
+            // `toneMapping` without a word and clamps the canvas at white,
+            // which would flatten every highlight. Dictionary conversion reads
+            // only the members the browser knows: the getter tells.
+            let toneMappingRead = false;
             try {
                 this.ctx.configure({
                     device: this._device,
@@ -1102,8 +1410,15 @@ export class WebGpuRenderer extends VideoRenderer {
                     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
                     alphaMode: 'opaque',
                     colorSpace: 'display-p3',
-                    toneMapping: { mode: 'extended' },
+                    get toneMapping() {
+                        toneMappingRead = true;
+                        return { mode: 'extended' };
+                    },
                 });
+                if (!toneMappingRead) throw new Error('toneMapping unknown to this browser');
+                // No sRGB view of a float canvas: the reduction averages in
+                // software light there.
+                this._srgbViews = false;
                 return;
             } catch (e) {
                 console.warn(
@@ -1122,18 +1437,34 @@ export class WebGpuRenderer extends VideoRenderer {
                 }
             }
         }
-        // Standard 8-bit sRGB canvas (SDR).
+        // Standard 8-bit sRGB canvas (SDR). Its `-srgb` view format is declared
+        // for mwsr's reduction, which draws its linear-light average through
+        // that view (the texels stored are the same sRGB bytes as ever, so the
+        // probe and the other passes see no difference). A browser that
+        // refuses the view formats gets the plain configuration, and the
+        // reduction its software light.
         this._format = navigator.gpu.getPreferredCanvasFormat();
         this._interFormat = 'rgba8unorm';
         this._importColorSpace = 'srgb';
-        this.ctx.configure({
+        const config = {
             device: this._device,
             format: this._format,
             // COPY_SRC: the click-to-photon probe copies three texels out.
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
             alphaMode: 'opaque',
             colorSpace: 'srgb',
-        });
+        };
+        try {
+            this.ctx.configure({ ...config, viewFormats: [this._format + '-srgb'] });
+            this._srgbViews = true;
+        } catch (e) {
+            console.warn(
+                '[WebGpuRenderer] sRGB view formats refused, reduction in software light: ' +
+                    e.message,
+            );
+            this._srgbViews = false;
+            this.ctx.configure(config);
+        }
     }
 
     _buildResources() {
@@ -1167,15 +1498,32 @@ export class WebGpuRenderer extends VideoRenderer {
         if (this._hdrYuv) this._buildHdrTonemapResources();
         if (this._hdrExtTonemap) this._buildHdrExtTonemapResources();
 
+        // The copy to the canvas: the 'off' pass, and every pass's 1:1 frame.
+        this._buildPassthroughResources();
+        // mwsr's pipelines belong to this device: a recovered one builds anew.
+        this._mwsrLayout = null;
+        this._mwsrPipelines = null;
+        this._zoneTex = null;
+        this._zoneTexDims = '';
+        this._splitPipeline = null;
+        this._splitTex = null;
         if (this._algo === 'fsr1') {
             this._buildFsr1Resources();
         } else if (this._algo === 'nis') {
             this._buildNisResources();
-        } else if (this._algo === 'off') {
-            this._buildPassthroughResources();
-        } else {
+        } else if (this._algo === 'mwsr') {
+            this._buildMwsrResources();
+        } else if (this._algo !== 'off') {
             this._buildSgsrResources();
         }
+        // mwsr 2 / 3: on the SDR intermediates only, its thresholds being code
+        // values of an 8-bit picture; built with the kernel's pipelines.
+        this._dbPipelines = null;
+        if (this._deblock && this._interFormat !== 'rgba8unorm') {
+            console.log('[WebGpuRenderer] deblocking off: HDR intermediates');
+            this._deblock = null;
+        }
+        if (this._deblock && this._algo === 'mwsr') this._buildDeblockResources();
 
         // Size-dependent resources (lazily (re)created in draw()).
         this._inputTex = null;
@@ -1188,9 +1536,211 @@ export class WebGpuRenderer extends VideoRenderer {
         this._intermH = 0;
         this._enhanceBindGroup = null; // SGSR / EASU bind group (samples inputTex)
         this._rcasBindGroup = null; // FSR1 RCAS bind group (samples intermTex)
+        this._inputTexViewSrgb = null; // inputTex through its `-srgb` view (mwsr's reduction)
+        this._mwsrBindGroup = null; // mwsr: the plain view (the kernel)
+        this._mwsrBindGroupSrgb = null; // mwsr: the sRGB view (the reduction)
+        this._dbTex = null; // mwsr 2 / 3: the deblocked frame, and the sums' buffer
+        this._dbAcc = null;
     }
 
-    // 'off' mode: a blit pipeline targeting the canvas (external → canvas, no upscaler).
+    // mwsr 2 / 3 (DeblockShader.js): the two layouts and pipelines and the
+    // uniform block; dbTex and the sums' buffer come with inputTex.
+    _buildDeblockResources() {
+        const device = this._device;
+        const layout = (visibility, type) =>
+            device.createBindGroupLayout({
+                entries: [
+                    { binding: 0, visibility, texture: { sampleType: 'float' } },
+                    { binding: 1, visibility, buffer: { type } },
+                    { binding: 2, visibility, buffer: { type: 'uniform' } },
+                ],
+            });
+        const dctLayout = layout(GPUShaderStage.COMPUTE, 'storage');
+        const finLayout = layout(GPUShaderStage.FRAGMENT, 'read-only-storage');
+        const dct = device.createShaderModule({ code: DEBLOCK_DCT_WGSL });
+        const fin = device.createShaderModule({ code: DEBLOCK_FIN_WGSL });
+        this._dbPipelines = {
+            dctLayout,
+            finLayout,
+            dct: device.createComputePipeline({
+                layout: device.createPipelineLayout({ bindGroupLayouts: [dctLayout] }),
+                compute: { module: dct, entryPoint: 'cs' },
+            }),
+            fin: device.createRenderPipeline({
+                layout: device.createPipelineLayout({ bindGroupLayouts: [finLayout] }),
+                vertex: { module: fin, entryPoint: 'vs' },
+                fragment: {
+                    module: fin,
+                    entryPoint: 'fs',
+                    targets: [{ format: this._interFormat }],
+                },
+                primitive: { topology: 'triangle-list' },
+            }),
+        };
+        this._dbUniform = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this._dbUniKey = '';
+    }
+
+    // mwsr 2 / 3, with inputTex: dbTex (the same format and views), the sums'
+    // buffer, their bind groups, and the kernel's two bind groups on dbTex.
+    _ensureDeblockTex(inW, inH) {
+        const device = this._device;
+        if (!this._dbPipelines) this._buildDeblockResources();
+        this._dbTex = device.createTexture({
+            size: { width: inW, height: inH },
+            format: this._interFormat,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+            viewFormats: this._srgbViews ? [this._interFormat + '-srgb'] : [],
+        });
+        this._dbTexView = this._dbTex.createView();
+        this._dbAcc = device.createBuffer({
+            size: inW * inH * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        const entries = [
+            { binding: 0, resource: this._inputTexView },
+            { binding: 1, resource: { buffer: this._dbAcc } },
+            { binding: 2, resource: { buffer: this._dbUniform } },
+        ];
+        this._dbDctBindGroup = device.createBindGroup({
+            layout: this._dbPipelines.dctLayout,
+            entries,
+        });
+        this._dbFinBindGroup = device.createBindGroup({
+            layout: this._dbPipelines.finLayout,
+            entries,
+        });
+        const mk = (view) =>
+            device.createBindGroup({
+                layout: this._mwsrLayout,
+                entries: [
+                    { binding: 0, resource: this._sampler },
+                    { binding: 1, resource: view },
+                    { binding: 2, resource: { buffer: this._mwsrUniform } },
+                ],
+            });
+        this._mwsrBindGroupDb = mk(this._dbTexView);
+        this._mwsrBindGroupDbSrgb = this._srgbViews
+            ? mk(this._dbTex.createView({ format: this._interFormat + '-srgb' }))
+            : this._mwsrBindGroupDb;
+        this._dbUniKey = '';
+    }
+
+    _destroyDeblockTex() {
+        try {
+            if (this._dbTex) this._dbTex.destroy();
+            if (this._dbAcc) this._dbAcc.destroy();
+        } catch (e) {}
+        this._dbTex = null;
+        this._dbAcc = null;
+    }
+
+    // mwsr (MwsrShader.js): the uniform block, the layout both modes share
+    // (sampler, inputTex, uniforms) and one pipeline per regime, all built
+    // here so that nothing compiles while the stream runs (plan §4.3).
+    _buildMwsrResources() {
+        const device = this._device;
+        this._mwsrUniform = device.createBuffer({
+            size: MWSR_UNIFORM_FLOATS * 4,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this._mwsrUniKey = '';
+        this._mwsrLayout = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+                {
+                    binding: 1,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    texture: { sampleType: 'float' },
+                },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: {} },
+            ],
+        });
+        this._mwsrPipelineLayout = device.createPipelineLayout({
+            bindGroupLayouts: [this._mwsrLayout],
+        });
+        this._mwsrMapGroups = new WeakMap();
+        this._mwsrPipelines = new Map();
+        for (const reg of mwsrRegimes({ srgb: this._srgbViews, linear: this._hdrLinear }))
+            this._mwsrPipeline(reg);
+        // The zones: the same bindings and the zones' texture, the `up` kernel's
+        // second text, built now too, so that a frame's zones compile nothing.
+        if (this._zoneMap) {
+            this._mwsrMapLayout = device.createBindGroupLayout({
+                entries: [
+                    { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+                    {
+                        binding: 1,
+                        visibility: GPUShaderStage.FRAGMENT,
+                        texture: { sampleType: 'float' },
+                    },
+                    { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: {} },
+                    {
+                        binding: 3,
+                        visibility: GPUShaderStage.FRAGMENT,
+                        texture: { sampleType: 'float' },
+                    },
+                ],
+            });
+            this._mwsrMapPipelineLayout = device.createPipelineLayout({
+                bindGroupLayouts: [this._mwsrMapLayout],
+            });
+            this._mwsrPipeline({ mode: 'up', taps: 5, rDown: 0, linearLight: 0 }, true);
+        }
+    }
+
+    /**
+     * The pipeline of one mwsr regime (mwsrRegime), specialised by override:
+     * the kernel with CHROMA444 on a 4:4:4 stream; a reduction grid with its
+     * span and its light, drawing into the canvas' `-srgb` view where there
+     * is one. Built once per device, kept in a map by regime. `map`: the
+     * kernel's second text, which reads the zones (binding 3).
+     * @param {{mode: 'up'|'down', taps: number, rDown: number, linearLight: number}} reg
+     * @param {boolean} [map]
+     * @returns {GPURenderPipeline}
+     */
+    _mwsrPipeline(reg, map = false) {
+        const key = mwsrRegimeKey(reg) + (map ? 'map' : '');
+        let pipeline = this._mwsrPipelines.get(key);
+        if (pipeline) return pipeline;
+        const srgb = reg.mode === 'down' && this._srgbViews;
+        const module = this._device.createShaderModule({
+            code: mwsrWgsl({
+                feed: 'tex',
+                half: this._mwsrHalf,
+                mode: reg.mode,
+                taps: reg.taps,
+                map,
+            }),
+        });
+        pipeline = this._device.createRenderPipeline({
+            layout: map ? this._mwsrMapPipelineLayout : this._mwsrPipelineLayout,
+            vertex: { module, entryPoint: 'vs' },
+            fragment: {
+                module,
+                entryPoint: 'fs',
+                constants:
+                    reg.mode === 'up'
+                        ? {
+                              CHROMA444: this._yuv444 ? 1 : 0,
+                              GAZE: this._mwsrZone ? 1 : 0,
+                              ...MWSR_CLASS,
+                              ...(this._mwsrOverrides || {}),
+                          }
+                        : { R_DOWN: reg.rDown, LINEAR_LIGHT: reg.linearLight },
+                targets: [{ format: srgb ? this._format + '-srgb' : this._format }],
+            },
+            primitive: { topology: 'triangle-list' },
+        });
+        this._mwsrPipelines.set(key, pipeline);
+        return pipeline;
+    }
+
+    // The plain copy to the canvas (external → canvas, no upscaler): the 'off'
+    // pass, and the frame of every other pass when it is already at 1:1.
     _buildPassthroughResources() {
         const device = this._device;
         const blitModule = device.createShaderModule({ code: BLIT_WGSL });
@@ -1200,6 +1750,28 @@ export class WebGpuRenderer extends VideoRenderer {
             fragment: { module: blitModule, entryPoint: 'fs', targets: [{ format: this._format }] },
             primitive: { topology: 'triangle-list' },
         });
+        // The same copy from inputTex, for a frame that came in through an
+        // ImageBitmap (the import fallback); its bind group follows inputTex.
+        this._texBlitLayout = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+            ],
+        });
+        const texModule = device.createShaderModule({ code: BLIT_TEX_WGSL });
+        this._texBlitPipeline = device.createRenderPipeline({
+            layout: device.createPipelineLayout({ bindGroupLayouts: [this._texBlitLayout] }),
+            vertex: { module: texModule, entryPoint: 'vs' },
+            fragment: { module: texModule, entryPoint: 'fs', targets: [{ format: this._format }] },
+            primitive: { topology: 'triangle-list' },
+        });
+        this._texBlitBindGroup = null;
+        // The readback's texture and pass 0, made at its first frame.
+        this._readbackTex = null;
+        this._readbackW = 0;
+        this._readbackH = 0;
+        this._readbackBindGroup = null;
+        this._texPass0Pipeline = null;
     }
 
     _buildSgsrResources() {
@@ -1340,15 +1912,20 @@ export class WebGpuRenderer extends VideoRenderer {
             ],
         });
         const mod = device.createShaderModule({ code: HDR_EXT_TONEMAP_WGSL });
-        // Like the YUV pass: 'off' has no enhancer stage, so Pass 0 IS the
-        // canvas pass and must target the canvas format.
-        const target = this._algo === 'off' ? this._format : this._interFormat;
-        this._extPipeline = device.createRenderPipeline({
-            layout: device.createPipelineLayout({ bindGroupLayouts: [this._extLayout] }),
-            vertex: { module: mod, entryPoint: 'vs' },
-            fragment: { module: mod, entryPoint: 'fs', targets: [{ format: target }] },
-            primitive: { topology: 'triangle-list' },
-        });
+        // Two targets, like the YUV pass: inputTex ahead of an enhancer pass,
+        // the canvas itself when the frame goes straight there ('off', or any
+        // pass at 1:1). One pipeline serves both when the formats agree.
+        const layout = device.createPipelineLayout({ bindGroupLayouts: [this._extLayout] });
+        const build = (format) =>
+            device.createRenderPipeline({
+                layout,
+                vertex: { module: mod, entryPoint: 'vs' },
+                fragment: { module: mod, entryPoint: 'fs', targets: [{ format }] },
+                primitive: { topology: 'triangle-list' },
+            });
+        this._extPipeline = build(this._interFormat);
+        this._extCanvasPipeline =
+            this._format === this._interFormat ? this._extPipeline : build(this._format);
     }
 
     // HDR tone-map Pass 0: 3 uint planes (Y/U/V) + dims/params uniforms → SDR.
@@ -1389,15 +1966,20 @@ export class WebGpuRenderer extends VideoRenderer {
             ],
         });
         const mod = device.createShaderModule({ code: HDR_TONEMAP_WGSL });
-        // 'off' mode has no enhancer pass: the tone map renders straight to the
-        // canvas, so it must target the canvas format instead of inputTex's.
-        const target = this._algo === 'off' ? this._format : this._interFormat;
-        this._yuvPipeline = device.createRenderPipeline({
-            layout: device.createPipelineLayout({ bindGroupLayouts: [this._yuvLayout] }),
-            vertex: { module: mod, entryPoint: 'vs' },
-            fragment: { module: mod, entryPoint: 'fs', targets: [{ format: target }] },
-            primitive: { topology: 'triangle-list' },
-        });
+        // Two targets: inputTex ahead of an enhancer pass, the canvas itself
+        // when the frame goes straight there ('off', or any pass at 1:1), whose
+        // format differs on the SDR tone-map path. One pipeline when they agree.
+        const layout = device.createPipelineLayout({ bindGroupLayouts: [this._yuvLayout] });
+        const build = (format) =>
+            device.createRenderPipeline({
+                layout,
+                vertex: { module: mod, entryPoint: 'vs' },
+                fragment: { module: mod, entryPoint: 'fs', targets: [{ format }] },
+                primitive: { topology: 'triangle-list' },
+            });
+        this._yuvPipeline = build(this._interFormat);
+        this._yuvCanvasPipeline =
+            this._format === this._interFormat ? this._yuvPipeline : build(this._format);
         // Force texture (re)creation on the next upload (device recovery rebuilds this).
         this._texY = null;
         this._yuvW = 0;
@@ -1505,7 +2087,7 @@ export class WebGpuRenderer extends VideoRenderer {
                 this._refWhite,
                 codeScale * this._codeScale,
                 this._exposure,
-                this._curve,
+                this._p0Linear ? 3 : this._curve,
             ]),
         );
         const cs = frame.colorSpace || {};
@@ -1585,14 +2167,31 @@ export class WebGpuRenderer extends VideoRenderer {
                 this._inputTex.destroy();
             } catch (e) {}
         }
+        this._destroyDeblockTex();
         this._inputTex = this._device.createTexture({
             size: { width: inW, height: inH },
             format: this._interFormat,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+            // COPY_DST: the import fallback copies the frame in (see _importFrame).
+            usage:
+                GPUTextureUsage.RENDER_ATTACHMENT |
+                GPUTextureUsage.TEXTURE_BINDING |
+                GPUTextureUsage.COPY_DST,
+            // The `-srgb` view mwsr's reduction reads through (SDR).
+            viewFormats: this._srgbViews ? [this._interFormat + '-srgb'] : [],
         });
         this._inputTexView = this._inputTex.createView();
+        this._inputTexViewSrgb = this._srgbViews
+            ? this._inputTex.createView({ format: this._interFormat + '-srgb' })
+            : null;
         this._inW = inW;
         this._inH = inH;
+        this._texBlitBindGroup = this._device.createBindGroup({
+            layout: this._texBlitLayout,
+            entries: [
+                { binding: 0, resource: this._sampler },
+                { binding: 1, resource: this._inputTexView },
+            ],
+        });
 
         if (this._algo === 'fsr1') {
             this._enhanceBindGroup = this._device.createBindGroup({
@@ -1613,7 +2212,27 @@ export class WebGpuRenderer extends VideoRenderer {
                     { binding: 3, resource: { buffer: this._nisUniform } },
                 ],
             });
-        } else {
+        } else if (this._algo === 'mwsr') {
+            // Two bind groups, kept with the texture: the plain view for the
+            // kernel, the sRGB view for the reduction (one and the same without
+            // the views).
+            const mk = (view) =>
+                this._device.createBindGroup({
+                    layout: this._mwsrLayout,
+                    entries: [
+                        { binding: 0, resource: this._sampler },
+                        { binding: 1, resource: view },
+                        { binding: 2, resource: { buffer: this._mwsrUniform } },
+                    ],
+                });
+            this._mwsrBindGroup = mk(this._inputTexView);
+            this._mwsrBindGroupSrgb = this._inputTexViewSrgb
+                ? mk(this._inputTexViewSrgb)
+                : this._mwsrBindGroup;
+            if (this._deblock) this._ensureDeblockTex(inW, inH);
+        } else if (this._algo !== 'off') {
+            // SGSR. 'off' has no pass of its own: the copy's bind group above
+            // serves it, and SGSR's layout does not exist there.
             this._enhanceBindGroup = this._device.createBindGroup({
                 layout: this._enhanceLayout,
                 entries: [
@@ -1651,11 +2270,58 @@ export class WebGpuRenderer extends VideoRenderer {
         });
     }
 
+    // readbackTex = the frame read back as RGBA (see _copyFrame), what pass 0
+    // or the plain copy to the canvas reads in place of the external texture;
+    // its pass 0 targets inputTex's format (float in HDR).
+    _ensureReadbackTex(w, h) {
+        if (this._readbackTex && this._readbackW === w && this._readbackH === h) return;
+        if (this._readbackTex) {
+            try {
+                this._readbackTex.destroy();
+            } catch (e) {}
+        }
+        const device = this._device;
+        this._readbackTex = device.createTexture({
+            size: { width: w, height: h },
+            format: 'rgba8unorm',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        this._readbackW = w;
+        this._readbackH = h;
+        this._readbackBindGroup = device.createBindGroup({
+            layout: this._texBlitLayout,
+            entries: [
+                { binding: 0, resource: this._sampler },
+                { binding: 1, resource: this._readbackTex.createView() },
+            ],
+        });
+        if (!this._texPass0Pipeline) {
+            const module = device.createShaderModule({ code: BLIT_TEX_WGSL });
+            this._texPass0Pipeline = device.createRenderPipeline({
+                layout: device.createPipelineLayout({ bindGroupLayouts: [this._texBlitLayout] }),
+                vertex: { module, entryPoint: 'vs' },
+                fragment: { module, entryPoint: 'fs', targets: [{ format: this._interFormat }] },
+                primitive: { topology: 'triangle-list' },
+            });
+        }
+    }
+
     _armDeviceLost() {
         this._device.lost.then((info) => {
-            if (this._disposed || info.reason === 'destroyed') return;
+            if (this._disposed) return;
             console.warn('[WebGpuRenderer] device lost (' + info.reason + '): ' + info.message);
             this._ready = false;
+            // A device that never finished a frame would not do better a
+            // second time. Chrome destroys the device of a canvas it cannot
+            // give a texture to present, and every new one the same way: Linux
+            // on the software adapter, where the swap chain finds no shared
+            // image to allocate and the page's whole WebGPU instance goes with
+            // the device (22/10/2026, CI 39737555924). The loss is then the
+            // browser's: 'destroyed' is only this renderer's own once disposed.
+            if (this._framesOnDevice === 0) {
+                this._giveUp('its device was lost before it finished a frame');
+                return;
+            }
             this._recover();
         });
     }
@@ -1665,7 +2331,9 @@ export class WebGpuRenderer extends VideoRenderer {
             const adapter = await navigator.gpu.requestAdapter();
             if (!adapter) throw new Error('no adapter on recovery');
             this._adapter = adapter;
-            this._device = await adapter.requestDevice();
+            this._device = await WebGpuRenderer._requestDevice(adapter);
+            this._mwsrHalf = this._device.features.has('shader-f16');
+            this._framesOnDevice = 0;
             this._armDeviceLost();
             this._configure();
             this._buildResources(); // resets size-dependent textures (recreated on next draw)
@@ -1673,6 +2341,7 @@ export class WebGpuRenderer extends VideoRenderer {
             console.log('[WebGpuRenderer] device recovered');
         } catch (e) {
             console.error('[WebGpuRenderer] device recovery failed:', e.message);
+            this._giveUp('its device could not be recovered');
         }
     }
 
@@ -1684,44 +2353,480 @@ export class WebGpuRenderer extends VideoRenderer {
     }
 
     /**
+     * The mwsr kernel's per-draw values (MwsrShader's mwsrLaw: the vote
+     * threshold `tau`, the sharpness `sharp` and the others), for the
+     * laboratory's side-by-side viewer; the product draws with the law. Takes
+     * effect at the next draw.
+     * @param {{tau?: number, sharp?: number}|null} tuning null: the law
+     */
+    setMwsrTuning(tuning) {
+        this._mwsrTuning = tuning || null;
+        this._mwsrUniKey = '';
+    }
+
+    /**
+     * The mwsr kernel's pipeline constants of the `up` mode beyond the
+     * product's (MwsrShader's MWSR_OVERRIDE_SPEC: FLAT_TAPS, FLAT_C…), for
+     * the laboratory's side-by-side viewer, over the device class's
+     * (mwsrClassOverrides), the only ones the product sets. A changed set
+     * drops the kernel's pipelines, rebuilt at the next draw.
+     * @param {Object<string, number>|null} overrides null or {}: the product's
+     */
+    setMwsrOverrides(overrides) {
+        const next = overrides || {};
+        if (JSON.stringify(next) === JSON.stringify(this._mwsrOverrides || {})) return;
+        this._mwsrOverrides = next;
+        if (this._mwsrPipelines) this._mwsrPipelines.clear();
+    }
+
+    /**
+     * The mwsr kernel's gaze zone (MwsrShader's MWSR_ZONE, plan §15.2):
+     * null, the text has no zone (the product's default); an object, the
+     * zone's values over the defaults, the kernel's pipelines built with
+     * GAZE 1 and its weight following the stream's motion (noteEncodedFrame,
+     * GazeZone) unless setMwsrGaze pins it.
+     * @param {{cx?: number, cy?: number, rx?: number, ry?: number, ring?: number, tau?: number, sharp?: number}|null} zone
+     */
+    setMwsrZone(zone) {
+        const next = zone ? { ...zone } : null;
+        if (JSON.stringify(next) === JSON.stringify(this._mwsrZone)) return;
+        const flip = !next !== !this._mwsrZone;
+        this._mwsrZone = next;
+        this._mwsrUniKey = '';
+        if (flip && this._mwsrPipelines) this._mwsrPipelines.clear();
+        if (next && !this._gaze) this._gaze = new GazeZone();
+    }
+
+    /**
+     * The zone's weight pinned, 0 to 1 (the laboratory: 1 is the zone as on
+     * a moving picture), or null: the stream's motion decides.
+     * @param {number|null} level
+     */
+    setMwsrGaze(level) {
+        this._mwsrGazePinned =
+            level === null || level === undefined ? null : Math.min(Math.max(level, 0), 1);
+        this._mwsrUniKey = '';
+    }
+
+    /** @override The picture's motion, for the gaze zone; nothing without one. */
+    noteEncodedFrame(bytes, key) {
+        if (this._gaze) this._gaze.note(bytes, key, performance.now());
+    }
+
+    /** See VideoRenderer.wantsFrameQp: mwsr 3 only, while its pass is the one running. */
+    get wantsFrameQp() {
+        return this._deblock === 'qp' && this._algo === 'mwsr';
+    }
+
+    /** See VideoRenderer.noteFrameQp: kept by timestamp until its frame is drawn. */
+    noteFrameQp(timestamp, qp) {
+        if (!this.wantsFrameQp) return;
+        this._qpByTs.set(timestamp, qp);
+        if (this._qpByTs.size > 64) this._qpByTs.delete(this._qpByTs.keys().next().value);
+    }
+
+    /** See VideoRenderer.wantsFrameZones: the mwsr kernel, when the page asked for them. */
+    get wantsFrameZones() {
+        return this._zoneMap && this._algo === 'mwsr';
+    }
+
+    /** See VideoRenderer.noteFrameZones: kept by timestamp until its frame is drawn. */
+    noteFrameZones(timestamp, zones) {
+        if (!this.wantsFrameZones || !zones) return;
+        this._zonesByTs.set(timestamp, zones);
+        if (this._zonesByTs.size > 64) this._zonesByTs.delete(this._zonesByTs.keys().next().value);
+    }
+
+    /**
+     * The eye test's split screen (BrowserDetect.mwsrSplitWanted), or null for
+     * none: a frame with its zones is drawn whole by the grid and whole by the
+     * law, and the two are put side by side (SPLIT_WGSL), the grid on the side
+     * `gridLeft` says. Any other frame is drawn as ever, by the law.
+     * @param {{gridLeft: boolean, view: string} | null} split
+     */
+    setMwsrSplit(split) {
+        const view = split ? SPLIT_VIEW_INDEX[split.view] : undefined;
+        this._split = view === undefined ? null : { gridLeft: !!split.gridLeft, view };
+    }
+
+    /**
+     * Draw a frame with its zones split (setMwsrSplit): the `up` kernel by
+     * each text into a texture of the canvas' size, then both onto the canvas.
+     * @param {GPUCommandEncoder} encoder
+     * @param {GPUTexture} canvasTex
+     * @param {number} cw
+     * @param {number} ch
+     * @param {object} reg
+     * @param {GPUTextureView} input inputTex's view, or dbTex's
+     * @param {GPUBindGroup} lawGroup the first text's bind group for `input`
+     */
+    _drawMwsrSplit(encoder, canvasTex, cw, ch, reg, input, lawGroup) {
+        const device = this._device;
+        if (!this._splitPipeline) {
+            const module = device.createShaderModule({ code: SPLIT_WGSL });
+            this._splitPipeline = device.createRenderPipeline({
+                layout: 'auto',
+                vertex: { module, entryPoint: 'vs' },
+                fragment: { module, entryPoint: 'fs', targets: [{ format: this._format }] },
+                primitive: { topology: 'triangle-list' },
+            });
+            this._splitUniform = device.createBuffer({
+                size: 16,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+        }
+        if (!this._splitTex || this._splitTex.w !== cw || this._splitTex.h !== ch) {
+            if (this._splitTex) for (const t of this._splitTex.tex) t.destroy();
+            const tex = [0, 1].map(() =>
+                device.createTexture({
+                    size: { width: cw, height: ch },
+                    format: this._format,
+                    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+                }),
+            );
+            this._splitTex = { w: cw, h: ch, tex, views: tex.map((t) => t.createView()) };
+            this._splitGroup = device.createBindGroup({
+                layout: this._splitPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: this._splitTex.views[0] },
+                    { binding: 1, resource: this._splitTex.views[1] },
+                    { binding: 2, resource: { buffer: this._splitUniform } },
+                ],
+            });
+        }
+        device.queue.writeBuffer(
+            this._splitUniform,
+            0,
+            new Uint32Array([this._split.view, this._split.gridLeft ? 1 : 0, cw, 0]),
+        );
+        const target = (view) => ({
+            colorAttachments: [
+                {
+                    view,
+                    loadOp: 'clear',
+                    storeOp: 'store',
+                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                },
+            ],
+        });
+        for (const grid of [true, false]) {
+            const p = encoder.beginRenderPass(target(this._splitTex.views[grid ? 0 : 1]));
+            p.setPipeline(this._mwsrPipeline(reg, grid));
+            p.setBindGroup(0, grid ? this._mwsrMapGroup(input) : lawGroup);
+            p.draw(3);
+            p.end();
+        }
+        const p = encoder.beginRenderPass(target(canvasTex.createView()));
+        p.setPipeline(this._splitPipeline);
+        p.setBindGroup(0, this._splitGroup);
+        p.draw(3);
+        p.end();
+    }
+
+    /**
+     * Whether the frame drawn at `ts` has zones that fit `scale` (output /
+     * input, the smaller axis; mwsrZonesFit), now in the zones' texture. The
+     * frame's entry goes, and any the decoder dropped before it. False: the
+     * frame takes the law.
+     * @param {number} ts
+     * @param {number} scale
+     * @returns {boolean}
+     */
+    _zonesReady(ts, scale) {
+        const zones = this._zonesByTs.get(ts);
+        for (const t of this._zonesByTs.keys()) {
+            if (t > ts) break;
+            this._zonesByTs.delete(t);
+        }
+        if (!zones || !mwsrZonesFit(zones, scale)) return false;
+        const { cols, rows, codes } = zones;
+        const dims = cols + 'x' + rows;
+        if (this._zoneTexDims !== dims) {
+            try {
+                if (this._zoneTex) this._zoneTex.destroy();
+            } catch (e) {}
+            this._zoneTex = this._device.createTexture({
+                size: { width: cols, height: rows },
+                format: 'r16float',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+            });
+            this._zoneTexView = this._zoneTex.createView();
+            this._zoneTexDims = dims;
+            this._zoneCodes = null;
+            this._mwsrMapGroups = new WeakMap();
+        }
+        // Rewritten only when they change: a still picture keeps its zones.
+        if (!sameCodes(this._zoneCodes, codes)) {
+            this._device.queue.writeTexture(
+                { texture: this._zoneTex },
+                mwsrZoneTexels(codes),
+                { bytesPerRow: cols * 2 },
+                { width: cols, height: rows },
+            );
+            this._zoneCodes = codes.slice();
+        }
+        return true;
+    }
+
+    /** The second text's bind group: `view` (inputTex, or dbTex) and the zones. */
+    _mwsrMapGroup(view) {
+        let group = this._mwsrMapGroups.get(view);
+        if (!group) {
+            group = this._device.createBindGroup({
+                layout: this._mwsrMapLayout,
+                entries: [
+                    { binding: 0, resource: this._sampler },
+                    { binding: 1, resource: view },
+                    { binding: 2, resource: { buffer: this._mwsrUniform } },
+                    { binding: 3, resource: this._zoneTexView },
+                ],
+            });
+            this._mwsrMapGroups.set(view, group);
+        }
+        return group;
+    }
+
+    /**
+     * The deblocking of the frame drawn at `ts` (deblockStrength), or null to
+     * leave it out; mwsr 3 takes that frame's QP, or the last one known.
+     * @param {number} ts
+     * @returns {{thr: number, cmax: number}|null}
+     */
+    _deblockFor(ts) {
+        if (this._deblock === 'qp') {
+            const qp = this._qpByTs.get(ts);
+            if (qp !== undefined) {
+                this._lastQp = qp;
+                // The frames drawn, and any the decoder dropped before them.
+                for (const t of this._qpByTs.keys()) {
+                    if (t > ts) break;
+                    this._qpByTs.delete(t);
+                }
+            }
+        }
+        const s = deblockStrength(this._deblock, this._lastQp);
+        this.deblockLast = { qp: this._lastQp, thr: s ? s.thr : 0 };
+        return s;
+    }
+
+    /** The zone's weight for a draw of a frame of `area` pixels: 0 without a zone. */
+    _mwsrGazeFor(area) {
+        if (!this._mwsrZone) return 0;
+        if (this._mwsrGazePinned !== null) return this._mwsrGazePinned;
+        return this._gaze ? this._gaze.level(performance.now(), area) : 0;
+    }
+
+    /**
      * Switch the upscaler pass at runtime (EnhancerGovernor's ladder). Only the
      * chosen algo's resources are built at create(), so the target's are built
      * on first use and kept — a switch back is then free.
      *
-     * Two things must be invalidated, not just the algo field:
-     *   - the enhancer bind group, whose LAYOUT differs between FSR1 and SGSR:
-     *     zeroing the cached input size forces _ensureInputTex to rebuild it;
-     *   - the HDR tone-map pipeline, whose render target is the canvas format
-     *     in 'off' mode and the intermediate format otherwise.
+     * Besides the algo field, the enhancer bind group must be invalidated: its
+     * LAYOUT differs between FSR1 and SGSR, and zeroing the cached input size
+     * forces _ensureInputTex to rebuild it. (The copy to the canvas and the HDR
+     * pass 0 exist in both of their targets from the start, so 'off' needs
+     * nothing built or rebuilt.)
      *
-     * @param {string} algo 'sgsr' | 'nis' | 'fsr1' | 'off'; anything else is refused.
+     * @param {string} algo 'sgsr' | 'nis' | 'fsr1' | 'mwsr' | 'off'; anything else is refused.
      * @returns {boolean} true when the renderer switched.
      */
     setAlgo(algo) {
         if (algo === this._algo) return false;
         if (!this._ready || !this._device) return false;
-        if (algo !== 'sgsr' && algo !== 'nis' && algo !== 'fsr1' && algo !== 'off') return false;
+        if (
+            algo !== 'sgsr' &&
+            algo !== 'nis' &&
+            algo !== 'fsr1' &&
+            algo !== 'mwsr' &&
+            algo !== 'off'
+        )
+            return false;
 
         try {
-            if (algo === 'off' && !this._passthroughPipeline) this._buildPassthroughResources();
-            else if (algo === 'sgsr' && !this._enhancePipeline) this._buildSgsrResources();
+            if (algo === 'sgsr' && !this._enhancePipeline) this._buildSgsrResources();
             else if (algo === 'nis' && !this._nisPipeline) this._buildNisResources();
             else if (algo === 'fsr1' && !this._easuPipeline) this._buildFsr1Resources();
+            else if (algo === 'mwsr' && !this._mwsrLayout) this._buildMwsrResources();
         } catch (e) {
             console.error('[WebGpuRenderer] setAlgo(' + algo + ') failed: ' + e.message);
             return false;
         }
 
-        const wasOff = this._algo === 'off';
         this._algo = algo;
         this._inW = 0;
         this._inH = 0;
         this._intermW = 0;
         this._intermH = 0;
-        if (this._hdrYuv && wasOff !== (algo === 'off')) this._buildHdrTonemapResources();
-        if (this._hdrExtTonemap && wasOff !== (algo === 'off')) this._buildHdrExtTonemapResources();
         console.log('[WebGpuRenderer] algo → ' + algo);
         return true;
+    }
+
+    /**
+     * The frame as an external texture, or null when the browser refuses the
+     * import. Chrome on a machine whose decoded frames cannot be shared with
+     * WebGPU (a Linux runner on the software adapter, 21/10/2026) threw
+     * "Failed to import texture from video" on every frame, and the canvas
+     * stayed black while the console filled up. From the first refusal on,
+     * draw() copies the frames in instead (_copyFrame) and tries the import
+     * again every IMPORT_RETRY_FRAMES draws, in case the refusal was
+     * transient — at once after a frame that got in by no way at all, there
+     * being nothing to lose. One console line in all.
+     * @param {VideoFrame} frame
+     * @returns {GPUExternalTexture|null}
+     */
+    _importFrame(frame) {
+        if (
+            this._importRefused &&
+            this._lostFrames === 0 &&
+            this._drawCount - this._importRefusedAt < IMPORT_RETRY_FRAMES
+        )
+            return null;
+        try {
+            const tex = this._device.importExternalTexture({
+                source: frame,
+                colorSpace: this._importColorSpace || 'srgb',
+            });
+            this._importRefused = false;
+            return tex;
+        } catch (e) {
+            if (!this._importWarned) {
+                this._importWarned = true;
+                console.warn(
+                    '[WebGpuRenderer] importExternalTexture refused the frame (' +
+                        e.message +
+                        '): the frames are copied in from now on',
+                );
+            }
+            this._importRefused = true;
+            this._importRefusedAt = this._drawCount;
+            // Asked again with the import: the bitmap may work now too.
+            this._bitmapRefused = false;
+            return null;
+        }
+    }
+
+    /**
+     * A frame the import refused, copied in another way: through an
+     * ImageBitmap into inputTex (one GPU copy, the WebGL renderer's own
+     * fallback for a refused VideoFrame), else read back by the browser as
+     * RGBA and written into readbackTex (a round trip through memory, the
+     * slowest), which pass 0 copies as it would the external texture (Bruno's
+     * third fallback, 22/10/2026). A refused bitmap is asked again with the
+     * import. In HDR either copy is the browser's SDR rendering of the frame:
+     * a picture, not the HDR one.
+     * @param {VideoFrame} frame
+     * @returns {Promise<''|'bitmap'|'readback'>} the way that took the frame,
+     *   '' when neither did: the frame is lost (_noteFrame).
+     */
+    async _copyFrame(frame, inW, inH) {
+        if (!this._bitmapRefused) {
+            try {
+                this._ensureInputTex(inW, inH);
+                await this._copyFrameThroughBitmap(frame, inW, inH);
+                return 'bitmap';
+            } catch (e) {
+                this._bitmapRefused = true;
+                if (!this._bitmapWarned) {
+                    this._bitmapWarned = true;
+                    console.warn(
+                        '[WebGpuRenderer] the ImageBitmap copy failed too (' +
+                            e.message +
+                            '): the frames are read back (VideoFrame.copyTo) instead',
+                    );
+                }
+            }
+        }
+        try {
+            await this._copyFrameThroughReadback(frame);
+            return 'readback';
+        } catch (e) {
+            if (!this._readbackWarned) {
+                this._readbackWarned = true;
+                console.warn(
+                    '[WebGpuRenderer] the readback failed too (' +
+                        e.message +
+                        '): no way in for the frame',
+                );
+            }
+            return '';
+        }
+    }
+
+    /** The bitmap copy's pass 0: the frame, as an ImageBitmap, copied into inputTex. */
+    async _copyFrameThroughBitmap(frame, inW, inH) {
+        const bmp = await createImageBitmap(frame);
+        try {
+            this._device.queue.copyExternalImageToTexture(
+                { source: bmp },
+                { texture: this._inputTex, colorSpace: 'srgb', premultipliedAlpha: false },
+                { width: Math.min(bmp.width, inW), height: Math.min(bmp.height, inH) },
+            );
+        } finally {
+            bmp.close();
+        }
+    }
+
+    /**
+     * The readback: the frame as RGBA in memory (VideoFrame.copyTo, the
+     * browser's own conversion of the decoded picture, in sRGB), written into
+     * readbackTex. copyTo converts only where the browser knows the `format`
+     * member — WebIDL reads every member it knows, so the getter tells — and
+     * would otherwise hand back the frame's own planes, NV12 or I420, for the
+     * texture to show as colours.
+     * @param {VideoFrame} frame
+     */
+    async _copyFrameThroughReadback(frame) {
+        let converts = false;
+        const asked = {
+            get format() {
+                converts = true;
+                return 'RGBA';
+            },
+        };
+        const size = frame.allocationSize(asked);
+        if (!converts) throw new Error('VideoFrame.copyTo has no RGBA conversion here');
+        if (!this._readbackBuf || this._readbackBuf.byteLength < size)
+            this._readbackBuf = new ArrayBuffer(size);
+        const [plane] = await frame.copyTo(this._readbackBuf, { format: 'RGBA' });
+        const rect = frame.visibleRect;
+        const w = rect ? rect.width : frame.codedWidth;
+        const h = rect ? rect.height : frame.codedHeight;
+        this._ensureReadbackTex(w, h);
+        this._device.queue.writeTexture(
+            { texture: this._readbackTex },
+            this._readbackBuf,
+            { offset: plane.offset, bytesPerRow: plane.stride, rowsPerImage: h },
+            { width: w, height: h },
+        );
+    }
+
+    /**
+     * Count the frames that never reached the canvas: no way in took them,
+     * the draw threw, or their work did not complete on a device that stayed
+     * up. LOST_FRAMES_LIMIT of them in a row and the renderer gives up (Bruno,
+     * 22/10/2026: the picture moves to the same pass on WebGL2, else to
+     * Canvas2D, rather than stay black); a frame drawn starts the count again.
+     * @param {boolean} drawn
+     * @param {string} [why] what kept the frame off the canvas
+     */
+    _noteFrame(drawn, why) {
+        if (drawn) {
+            this._lostFrames = 0;
+            this._framesOnDevice++;
+            return;
+        }
+        this._lostFrames++;
+        if (this._lostFrames >= LOST_FRAMES_LIMIT)
+            this._giveUp(
+                this._lostFrames + ' frames in a row did not reach the canvas (' + why + ')',
+            );
+    }
+
+    /** See VideoRenderer.failed: once, and said in the console. */
+    _giveUp(why) {
+        if (this._failed) return;
+        this._failed = true;
+        console.warn('[WebGpuRenderer] giving up: ' + why);
     }
 
     async draw(frame) {
@@ -1739,6 +2844,13 @@ export class WebGpuRenderer extends VideoRenderer {
         // what a rising framerate turns into). See VideoRenderer.lastDraw.
         const drawStart = performance.now();
         let uploadMs = 0;
+        // Set when the frame came in another way than the import (see
+        // _copyFrame): 'bitmap' into inputTex, 'readback' into readbackTex.
+        let copied = '';
+        // The frame's device, and whether its work went in (see _noteFrame).
+        const device = this._device;
+        let submitted = false;
+        let lostWhy = 'their work did not complete';
 
         const inW = frame.displayWidth || frame.codedWidth || 0;
         const inH = frame.displayHeight || frame.codedHeight || 0;
@@ -1748,24 +2860,21 @@ export class WebGpuRenderer extends VideoRenderer {
             } catch (e) {}
             return;
         }
+        this._drawCount++;
 
-        // Canvas backing = frame-aspect rect fitting the output box (else frame res).
-        let cw = inW,
-            ch = inH;
-        if (this._hasOutputSize) {
-            const frameAspect = inW / inH;
-            const boxAspect = this._outW / this._outH;
-            cw = frameAspect >= boxAspect ? this._outW : Math.round(this._outH * frameAspect);
-            ch = Math.round(cw / frameAspect);
-            // Clamp to the max texture dimension (preserve aspect): bounds GPU cost
-            // when the output box is inflated by pinch-zoom.
-            const MAX_DIM = 4096;
-            if (cw > MAX_DIM || ch > MAX_DIM) {
-                const k = MAX_DIM / Math.max(cw, ch);
-                cw = Math.round(cw * k);
-                ch = Math.round(ch * k);
-            }
-        }
+        // Canvas backing = frame-aspect rect fitting the output box (else frame
+        // res), capped (scaleRegime.js). At exactly the frame size the pass has
+        // nothing to do: the frame is copied straight to the canvas, as in
+        // 'off', and the pass resumes on the next frame whose size differs.
+        const { cw, ch } = fitOutputSize(
+            inW,
+            inH,
+            this._hasOutputSize ? this._outW : 0,
+            this._hasOutputSize ? this._outH : 0,
+        );
+        const identity = isIdentityScale(inW, inH, cw, ch);
+        const direct = this._algo === 'off' || identity;
+        this._passthrough = identity && this._algo !== 'off';
         if (cw > 0 && ch > 0 && (this.canvas.width !== cw || this.canvas.height !== ch)) {
             this.canvas.width = cw;
             this.canvas.height = ch;
@@ -1773,8 +2882,16 @@ export class WebGpuRenderer extends VideoRenderer {
 
         // HDR readback paths (tone-map or linear): read back the raw 10-bit YUV
         // (importExternalTexture would tone-map the HDR away). On failure, fall
-        // back to the blit below.
+        // back to the blit below. On `linear`, mwsr's reduction has pass 0 write
+        // the linear light, so that the sampler mixes light, not encoded values
+        // (J45: 1000- and 0.5-nit stripes kept 0.72 to 0.92 of their light).
         let useYuv = false;
+        this._p0Linear =
+            this._hdrLinear &&
+            this._mwsrLinearDown &&
+            this._algo === 'mwsr' &&
+            !direct &&
+            mwsrRegime(inW, inH, cw, ch).mode === 'down';
         if (this._hdrYuv) {
             const uploadStart = performance.now();
             try {
@@ -1797,41 +2914,77 @@ export class WebGpuRenderer extends VideoRenderer {
             // The external texture feeds either the plain blit or, on a browser
             // that did not tone-map it on import, the ext tone-map pass.
             const useExt = !useYuv && this._hdrExtTonemap && !!this._extPipeline;
+            // A refused import: the frame is copied in here (_copyFrame), into
+            // inputTex (pass 0 done) or readbackTex (pass 0 reads it), and the
+            // plain copy to the canvas reads that texture. A frame no way took
+            // in is lost.
             if (!useYuv) {
-                const externalTex = this._device.importExternalTexture({
-                    source: frame,
-                    colorSpace: this._importColorSpace || 'srgb',
-                });
-                if (useExt) {
-                    this._readHdrKnobs();
-                    // Written each frame (cheap) so the localStorage knobs apply live.
-                    this._device.queue.writeBuffer(
-                        this._extParams,
-                        0,
-                        new Float32Array([this._refWhite, 1.0, this._exposure, this._curve]),
-                    );
+                const externalTex = this._importFrame(frame);
+                if (!externalTex) {
+                    const uploadStart = performance.now();
+                    copied = await this._copyFrame(frame, inW, inH);
+                    uploadMs += performance.now() - uploadStart;
+                    if (!copied) {
+                        frame.close();
+                        this._noteFrame(false, 'no way in');
+                        this._noteDraw(drawStart, uploadMs, this._algo + '+lost');
+                        return;
+                    }
+                } else {
+                    if (useExt) {
+                        this._readHdrKnobs();
+                        // Written each frame (cheap) so the localStorage knobs apply live.
+                        this._device.queue.writeBuffer(
+                            this._extParams,
+                            0,
+                            new Float32Array([this._refWhite, 1.0, this._exposure, this._curve]),
+                        );
+                    }
+                    blitBindGroup = this._device.createBindGroup({
+                        layout: useExt ? this._extLayout : this._blitLayout,
+                        entries: useExt
+                            ? [
+                                  { binding: 0, resource: this._sampler },
+                                  { binding: 1, resource: externalTex },
+                                  { binding: 2, resource: { buffer: this._extParams } },
+                              ]
+                            : [
+                                  { binding: 0, resource: this._sampler },
+                                  { binding: 1, resource: externalTex },
+                              ],
+                    });
                 }
-                blitBindGroup = this._device.createBindGroup({
-                    layout: useExt ? this._extLayout : this._blitLayout,
-                    entries: useExt
-                        ? [
-                              { binding: 0, resource: this._sampler },
-                              { binding: 1, resource: externalTex },
-                              { binding: 2, resource: { buffer: this._extParams } },
-                          ]
-                        : [
-                              { binding: 0, resource: this._sampler },
-                              { binding: 1, resource: externalTex },
-                          ],
-                });
             }
 
             const encoder = this._device.createCommandEncoder();
             const canvasTex = this.ctx.getCurrentTexture();
 
-            // 'off' mode: single pass to the canvas (linear scale, no upscaler) —
-            // either the plain external blit or the HDR YUV tone map.
-            if (this._algo === 'off') {
+            // Straight to the canvas, one pass: 'off' (linear scale, no
+            // upscaler), and every pass at 1:1 — the plain external copy, or
+            // the HDR pass 0 in its canvas-format flavour. The HDR pass 0 reads
+            // its planes texel by texel: drawn at another size than the frame's
+            // it would scale by the nearest texel, so a scaled 'off' frame takes
+            // it at the frame's size into inputTex first, and the bilinear copy
+            // the SDR frames get (hdr_check.py, journal J45).
+            if (direct) {
+                const yuvScaled = useYuv && !identity;
+                if (yuvScaled) {
+                    this._ensureInputTex(inW, inH);
+                    const p0 = encoder.beginRenderPass({
+                        colorAttachments: [
+                            {
+                                view: this._inputTexView,
+                                loadOp: 'clear',
+                                storeOp: 'store',
+                                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                            },
+                        ],
+                    });
+                    p0.setPipeline(this._yuvPipeline);
+                    p0.setBindGroup(0, this._yuvBindGroup);
+                    p0.draw(3);
+                    p0.end();
+                }
                 const pass = encoder.beginRenderPass({
                     colorAttachments: [
                         {
@@ -1842,11 +2995,20 @@ export class WebGpuRenderer extends VideoRenderer {
                         },
                     ],
                 });
-                if (useYuv) {
-                    pass.setPipeline(this._yuvPipeline);
+                if (yuvScaled) {
+                    pass.setPipeline(this._texBlitPipeline);
+                    pass.setBindGroup(0, this._texBlitBindGroup);
+                } else if (useYuv) {
+                    pass.setPipeline(this._yuvCanvasPipeline);
                     pass.setBindGroup(0, this._yuvBindGroup);
+                } else if (copied) {
+                    pass.setPipeline(this._texBlitPipeline);
+                    pass.setBindGroup(
+                        0,
+                        copied === 'bitmap' ? this._texBlitBindGroup : this._readbackBindGroup,
+                    );
                 } else {
-                    pass.setPipeline(useExt ? this._extPipeline : this._passthroughPipeline);
+                    pass.setPipeline(useExt ? this._extCanvasPipeline : this._passthroughPipeline);
                     pass.setBindGroup(0, blitBindGroup);
                 }
                 pass.draw(3);
@@ -1854,43 +3016,60 @@ export class WebGpuRenderer extends VideoRenderer {
                 const probing =
                     this._probeActive && this._queueProbeRead(encoder, canvasTex, cw, ch);
                 this._device.queue.submit([encoder.finish()]);
+                submitted = true;
                 if (probing) this._mapProbeRead();
                 frame.close();
                 // Backpressure: resolve only when the GPU finished, so the caller's
                 // render guard reflects real GPU throughput (drop-to-latest then
                 // discards the backlog instead of letting it grow → no lag creep).
                 const gpuStart = performance.now();
+                let done = false;
                 try {
-                    await this._device.queue.onSubmittedWorkDone();
+                    await device.queue.onSubmittedWorkDone();
+                    done = true;
                 } catch (e) {}
-                this._noteDraw(drawStart, uploadMs + (performance.now() - gpuStart), 'off');
+                this._noteFrame(done && device === this._device && this._ready, lostWhy);
+                this._noteDraw(
+                    drawStart,
+                    uploadMs + (performance.now() - gpuStart),
+                    (this._passthrough ? '1:1' : 'off') +
+                        (useYuv ? '+yuv' : '') +
+                        (copied ? '+' + copied : ''),
+                );
                 return;
             }
 
             this._ensureInputTex(inW, inH);
 
-            // Pass 0: external → inputTex (frame res).
-            const p0 = encoder.beginRenderPass({
-                colorAttachments: [
-                    {
-                        view: this._inputTexView,
-                        loadOp: 'clear',
-                        storeOp: 'store',
-                        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-                    },
-                ],
-            });
-            if (useYuv) {
-                // HDR YUV → SDR (ACES) tone-map into inputTex.
-                p0.setPipeline(this._yuvPipeline);
-                p0.setBindGroup(0, this._yuvBindGroup);
-            } else {
-                // Plain blit, or the same ACES tone-map fed by the external texture.
-                p0.setPipeline(useExt ? this._extPipeline : this._blitPipeline);
-                p0.setBindGroup(0, blitBindGroup);
+            // Pass 0: external → inputTex (frame res). Already done by the copy
+            // when the frame came in through an ImageBitmap; from readbackTex
+            // when it was read back.
+            if (copied !== 'bitmap') {
+                const p0 = encoder.beginRenderPass({
+                    colorAttachments: [
+                        {
+                            view: this._inputTexView,
+                            loadOp: 'clear',
+                            storeOp: 'store',
+                            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                        },
+                    ],
+                });
+                if (useYuv) {
+                    // HDR YUV → SDR (ACES) tone-map into inputTex.
+                    p0.setPipeline(this._yuvPipeline);
+                    p0.setBindGroup(0, this._yuvBindGroup);
+                } else if (copied === 'readback') {
+                    p0.setPipeline(this._texPass0Pipeline);
+                    p0.setBindGroup(0, this._readbackBindGroup);
+                } else {
+                    // Plain blit, or the same ACES tone-map fed by the external texture.
+                    p0.setPipeline(useExt ? this._extPipeline : this._blitPipeline);
+                    p0.setBindGroup(0, blitBindGroup);
+                }
+                p0.draw(3);
+                p0.end();
             }
-            p0.draw(3);
-            p0.end();
 
             if (this._algo === 'fsr1') {
                 this._ensureIntermTex(cw, ch);
@@ -1991,6 +3170,124 @@ export class WebGpuRenderer extends VideoRenderer {
                 p1.setBindGroup(0, this._enhanceBindGroup);
                 p1.draw(3);
                 p1.end();
+            } else if (this._algo === 'mwsr') {
+                // The regime by the frame and canvas sizes — never 'copy', the
+                // 1:1 frame went straight to the canvas above. The reduction
+                // reads and draws through the sRGB views when the canvas has
+                // them, or reads the linear light the HDR pass 0 wrote; the
+                // kernel works in gamma, on the plain views.
+                const reg = mwsrRegime(inW, inH, cw, ch, {
+                    srgb: this._srgbViews,
+                    linear: useYuv && this._p0Linear,
+                });
+                const srgb = reg.mode === 'down' && this._srgbViews;
+                // The gaze zone's weight for this draw, 0 without a zone: it
+                // moves in steps of 1/64, so the block is rewritten rarely.
+                const gaze = this._mwsrGazeFor(inW * inH);
+                // The host's zones for this frame, read by the kernel's second
+                // text where they fit the scale it is drawn at (a reduction
+                // reads none); any other frame takes the first. Each has its
+                // own law: the zones' is tuned with their drops under it.
+                const zoned =
+                    this._zoneMap &&
+                    this._zonesReady(
+                        frame.timestamp,
+                        reg.mode === 'up' ? Math.min(cw / inW, ch / inH) : 0,
+                    );
+                const uniKey =
+                    inW + 'x' + inH + '>' + cw + 'x' + ch + '@' + gaze + (zoned ? 'z' : '');
+                if (this._mwsrUniKey !== uniKey) {
+                    this._mwsrUniKey = uniKey;
+                    this._device.queue.writeBuffer(
+                        this._mwsrUniform,
+                        0,
+                        mwsrUniforms(inW, inH, cw, ch, {
+                            ...(this._mwsrTuning || {}),
+                            zones: zoned,
+                            gaze,
+                            zone: this._mwsrZone || undefined,
+                        }),
+                    );
+                }
+                // mwsr 2 / 3: the frame deblocked into dbTex, which the kernel
+                // then reads; a frame mwsr 3 finds fine enough skips both passes.
+                const db = this._deblock && this._dbTex ? this._deblockFor(frame.timestamp) : null;
+                if (db) {
+                    const dbKey = inW + 'x' + inH + ':' + db.thr + ':' + db.cmax;
+                    if (this._dbUniKey !== dbKey) {
+                        this._dbUniKey = dbKey;
+                        this._device.queue.writeBuffer(
+                            this._dbUniform,
+                            0,
+                            deblockUniforms(inW, inH, db),
+                        );
+                    }
+                    encoder.clearBuffer(this._dbAcc);
+                    const pc = encoder.beginComputePass();
+                    pc.setPipeline(this._dbPipelines.dct);
+                    pc.setBindGroup(0, this._dbDctBindGroup);
+                    pc.dispatchWorkgroups(...deblockDispatch(inW, inH));
+                    pc.end();
+                    const pd = encoder.beginRenderPass({
+                        colorAttachments: [
+                            {
+                                view: this._dbTexView,
+                                loadOp: 'clear',
+                                storeOp: 'store',
+                                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                            },
+                        ],
+                    });
+                    pd.setPipeline(this._dbPipelines.fin);
+                    pd.setBindGroup(0, this._dbFinBindGroup);
+                    pd.draw(3);
+                    pd.end();
+                }
+                // The eye test's split screen: both texts, side by side, under
+                // one law, the zones': what differs is the grid.
+                if (zoned && this._split) {
+                    this._drawMwsrSplit(
+                        encoder,
+                        canvasTex,
+                        cw,
+                        ch,
+                        reg,
+                        db ? this._dbTexView : this._inputTexView,
+                        db ? this._mwsrBindGroupDb : this._mwsrBindGroup,
+                    );
+                    this.mwsrZoneFrames++;
+                } else {
+                    // Pass 1: mwsr inputTex (or dbTex) → canvas.
+                    const p1 = encoder.beginRenderPass({
+                        colorAttachments: [
+                            {
+                                view: srgb
+                                    ? canvasTex.createView({ format: this._format + '-srgb' })
+                                    : canvasTex.createView(),
+                                loadOp: 'clear',
+                                storeOp: 'store',
+                                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                            },
+                        ],
+                    });
+                    p1.setPipeline(this._mwsrPipeline(reg, zoned));
+                    if (zoned) {
+                        p1.setBindGroup(
+                            0,
+                            this._mwsrMapGroup(db ? this._dbTexView : this._inputTexView),
+                        );
+                        this.mwsrZoneFrames++;
+                    } else if (db) {
+                        p1.setBindGroup(
+                            0,
+                            srgb ? this._mwsrBindGroupDbSrgb : this._mwsrBindGroupDb,
+                        );
+                    } else {
+                        p1.setBindGroup(0, srgb ? this._mwsrBindGroupSrgb : this._mwsrBindGroup);
+                    }
+                    p1.draw(3);
+                    p1.end();
+                }
             } else {
                 // SGSR: viewport = (1/inW, 1/inH, inW, inH).
                 this._device.queue.writeBuffer(
@@ -2017,9 +3314,20 @@ export class WebGpuRenderer extends VideoRenderer {
 
             const probing = this._probeActive && this._queueProbeRead(encoder, canvasTex, cw, ch);
             this._device.queue.submit([encoder.finish()]);
+            submitted = true;
             if (probing) this._mapProbeRead();
         } catch (e) {
-            console.error('[WebGpuRenderer] draw failed:', e.message);
+            // Once per distinct message: a frame that fails is every frame.
+            const msg = String(e && e.message);
+            lostWhy = 'the draw threw: ' + msg;
+            if (!this._drawErrors.has(msg)) {
+                this._drawErrors.add(msg);
+                console.error(
+                    '[WebGpuRenderer] draw failed: ' +
+                        msg +
+                        ' (further frames failing the same way are not logged)',
+                );
+            }
         }
 
         frame.close();
@@ -2028,13 +3336,17 @@ export class WebGpuRenderer extends VideoRenderer {
         // VSync-off / worker path submits faster than the GPU presents and the
         // backlog grows unbounded → progressive latency (4K + FSR1 + zoom).
         const gpuStart = performance.now();
+        let done = false;
         try {
-            await this._device.queue.onSubmittedWorkDone();
+            await device.queue.onSubmittedWorkDone();
+            done = true;
         } catch (e) {}
+        // Drawn: its work went in and completed on a device that stayed up.
+        this._noteFrame(submitted && done && device === this._device && this._ready, lostWhy);
         this._noteDraw(
             drawStart,
             uploadMs + (performance.now() - gpuStart),
-            this._algo + (useYuv ? '+yuv' : ''),
+            this._algo + (useYuv ? '+yuv' : '') + (copied ? '+' + copied : ''),
         );
     }
 
@@ -2055,6 +3367,20 @@ export class WebGpuRenderer extends VideoRenderer {
         try {
             if (this._intermTex) this._intermTex.destroy();
         } catch (e) {}
+        this._destroyDeblockTex();
+        try {
+            if (this._zoneTex) this._zoneTex.destroy();
+        } catch (e) {}
+        this._zoneTex = null;
+        try {
+            if (this._splitTex) for (const t of this._splitTex.tex) t.destroy();
+        } catch (e) {}
+        this._splitTex = null;
+        try {
+            if (this._readbackTex) this._readbackTex.destroy();
+        } catch (e) {}
+        this._readbackTex = null;
+        this._readbackBuf = null;
         try {
             if (this._nisCoefTex) this._nisCoefTex.destroy();
         } catch (e) {}

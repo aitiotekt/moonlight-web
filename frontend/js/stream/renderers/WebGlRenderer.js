@@ -38,6 +38,13 @@
  *               the 6×6 luma support, the four 3×3 edge maps and the 64-phase
  *               filter banks are recomputed per fragment. Same output, more
  *               texture reads — which is the honest cost on a fragment path.
+ *   'gl-mwsr' — MoonlightWeb's own upscaler, the GLSL twin of the WGSL text
+ *               (MwsrShader.js, docs/design/upscaler-mwsr.md §3.6): the same
+ *               kernel and constants from the same tables, one program per
+ *               regime, the one to run picked per frame by the frame and
+ *               canvas sizes. Bilinear taps and screen derivatives only, no
+ *               gather to emulate. The reduction averages in software light:
+ *               a WebGL2 drawing buffer has no sRGB view.
  *
  * GLSL ES 3.00 (WebGL2) has no textureGather: every gather is four texelFetch
  * on the 2×2 footprint a bilinear tap would cover, in the same component
@@ -56,6 +63,21 @@
  */
 import { VideoRenderer } from './VideoRenderer.js';
 import { nisConfig, nisCoefTexture, readNisSharpness, nisScaleInRange } from './NisTables.js';
+import { fitOutputSize, isIdentityScale } from './scaleRegime.js';
+import {
+    mwsrClassOverrides,
+    mwsrGlsl,
+    mwsrRegime,
+    mwsrRegimeKey,
+    mwsrRegimes,
+    mwsrUniforms,
+} from './MwsrShader.js';
+import { GazeZone } from '../GazeZone.js';
+import { IS_HANDHELD } from '../../util/BrowserDetect.js';
+
+// The kernel's constants the product sets for this device's class (plan §9,
+// Bruno's decisions of 24/10/2026), under the laboratory's overrides.
+const MWSR_CLASS = mwsrClassOverrides({ handheld: IS_HANDHELD });
 
 // ── Shaders ─────────────────────────────────────────────────────────────────
 
@@ -570,9 +592,10 @@ void main() {
 `;
 
 // The enhancer ladder's last rung: the picture as it is, stretched by the
-// sampler's bilinear filter. Only ever reached through setAlgo — the menu's
-// "no enhancer" is Canvas2D — so a session the ladder stepped down can climb
-// back without changing renderer.
+// sampler's bilinear filter. Reached through setAlgo — the menu's "no
+// enhancer" is Canvas2D — so a session the ladder stepped down can climb back
+// without changing renderer; and every rung's frame at 1:1, where there is
+// nothing to reconstruct (upscaler-mwsr.md §5).
 const BLIT_FS = `#version 300 es
 precision mediump float;
 uniform sampler2D uTex;
@@ -583,7 +606,19 @@ void main() {
 }
 `;
 
-export const WEBGL_ALGOS = ['gl-fsr1', 'gl-sgsr', 'gl-nis'];
+export const WEBGL_ALGOS = ['gl-fsr1', 'gl-sgsr', 'gl-nis', 'gl-mwsr'];
+
+/**
+ * A draw's fence is looked at once it is this old (takeGpuBehind): at the next
+ * draw at 60 fps, as when the signal was calibrated (25/09/2026), two draws
+ * later at 120 fps. In Chrome a fence's status reaches the page with a delay
+ * of its own, and on a 120 Hz Radeon 780M (28/10/2026) that delay was often
+ * longer than one frame: a plain copy, 0.3 ms of GPU work, read "behind" in
+ * half the windows, and the ladder cut MWSR for a lag that was not there.
+ */
+const FENCE_MIN_AGE_MS = 12;
+/** Fences waiting for that age, at most; past it the oldest goes unread. */
+const FENCE_MAX_PENDING = 4;
 
 export class WebGlRenderer extends VideoRenderer {
     constructor() {
@@ -591,6 +626,20 @@ export class WebGlRenderer extends VideoRenderer {
         this.videoCodec = '';
         /** @type {string} one of WEBGL_ALGOS, or 'off' */
         this._algo = 'gl-fsr1';
+        /** The last draw copied the frame 1:1 instead of running the pass. */
+        this._passthrough = false;
+        /** 4:4:4 stream: mwsr votes and sharpens per channel (CHROMA444). */
+        this._yuv444 = false;
+        /** @type {Map<string, {prog: WebGLProgram, u: Object}>|null} mwsr's programs, by regime. */
+        this._mwsr = null;
+        this._mwsrUni = null;
+        this._mwsrUniKey = '';
+        /** gl-mwsr's gaze zone (setMwsrZone): null, none; else its values over MWSR_ZONE's. */
+        this._mwsrZone = null;
+        /** Its weight pinned by setMwsrGaze (the lab), or null: the stream's motion decides. */
+        this._mwsrGazePinned = null;
+        /** @type {GazeZone|null} that motion, fed by noteEncodedFrame. */
+        this._gaze = null;
         this.gl = null;
         this._outW = 0;
         this._outH = 0;
@@ -606,36 +655,102 @@ export class WebGlRenderer extends VideoRenderer {
         /** Click-to-photon probe: read the flag pixels after each draw. */
         this._probeActive = false;
         this._probePixels = null;
+        this._probeDrawnAt = null;
+        /**
+         * GPU lag, see takeGpuBehind(): the fences set after the draws and not
+         * looked at yet, oldest first ({sync, at}), and the draws counted since
+         * the last read.
+         */
+        this._fences = [];
+        this._gpuChecked = 0;
+        this._gpuBehind = 0;
+    }
+
+    /**
+     * Share of draws whose GPU work was still running when a later frame came
+     * to be drawn, since the last call — or null when none could be judged.
+     *
+     * drawArrays only records commands, so the draw timing measures submission
+     * and a pass that is too heavy for the GPU never shows there: it keeps the
+     * frame rate while every picture is finished frames late (EnhancerGovernor,
+     * GPU_BEHIND_DEGRADE). A fence after each draw, looked at when a later one
+     * starts — a later task, so its status has had the chance to move — says
+     * whether the GPU had caught up. It is looked at once FENCE_MIN_AGE_MS old:
+     * the next draw at 60 fps, the one after at 120 fps, and frames back to
+     * back after a network hiccup leave theirs for a later draw instead of
+     * reading them before any GPU could have finished.
+     */
+    takeGpuBehind() {
+        const n = this._gpuChecked;
+        const share = n > 0 ? this._gpuBehind / n : null;
+        this._gpuChecked = 0;
+        this._gpuBehind = 0;
+        return share;
+    }
+
+    _checkFences(now) {
+        const gl = this.gl;
+        // Oldest first: once one is too young, so are the ones after it.
+        while (this._fences.length > 0 && now - this._fences[0].at >= FENCE_MIN_AGE_MS) {
+            const sync = this._fences.shift().sync;
+            try {
+                this._gpuChecked++;
+                if (gl.getSyncParameter(sync, gl.SYNC_STATUS) !== gl.SIGNALED) this._gpuBehind++;
+                gl.deleteSync(sync);
+            } catch (e) {
+                // a lost context takes its syncs with it
+            }
+        }
+    }
+
+    _setFence(now) {
+        const gl = this.gl;
+        try {
+            const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+            if (sync) this._fences.push({ sync, at: now });
+            if (this._fences.length > FENCE_MAX_PENDING) gl.deleteSync(this._fences.shift().sync);
+        } catch (e) {
+            // a lost context sets no fence
+        }
     }
 
     /**
      * See VideoRenderer.probeActive. A desynchronized WebGL2 canvas cannot be
      * sampled with drawImage once presented, so while a measurement is on the
      * three flag pixels are read with readPixels at the end of draw() — a
-     * synchronous GPU round trip, paid only during the 200 ms of a probe.
+     * synchronous GPU round trip, paid only during the 200 ms of a probe. One
+     * read of the row between the three, not three reads (see
+     * Canvas2DRenderer.probeActive).
      */
     set probeActive(on) {
         this._probeActive = !!on;
         this._probePixels = null;
+        this._probeDrawnAt = null;
     }
     get probePixels() {
         return this._probePixels;
     }
+    get probeDrawnAt() {
+        return this._probeDrawnAt;
+    }
 
     _readProbePixels(cw, ch) {
         const gl = this.gl;
-        const px = new Uint8ClampedArray(12);
-        const one = new Uint8Array(4);
+        const drawnAt = performance.now();
         // Same spots as LatencyProbe: 46.5 %, 50.5 %, 54.5 % of the width,
         // 2.5 % from the top (GL rows count from the bottom).
         const y = Math.min(ch - 1, Math.max(0, ch - 1 - Math.floor(ch * 0.025)));
-        const xs = [0.465, 0.505, 0.545];
+        const xs = [0.465, 0.505, 0.545].map((f) => Math.min(cw - 1, Math.floor(cw * f)));
+        const n = xs[2] - xs[0] + 1;
+        const row = new Uint8Array(n * 4);
+        gl.readPixels(xs[0], y, n, 1, gl.RGBA, gl.UNSIGNED_BYTE, row);
+        const px = new Uint8ClampedArray(12);
         for (let i = 0; i < 3; i++) {
-            const x = Math.min(cw - 1, Math.floor(cw * xs[i]));
-            gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, one);
-            px.set(one, i * 4);
+            const at = (xs[i] - xs[0]) * 4;
+            px.set(row.subarray(at, at + 4), i * 4);
         }
         this._probePixels = px;
+        this._probeDrawnAt = drawnAt;
     }
 
     /**
@@ -649,6 +764,22 @@ export class WebGlRenderer extends VideoRenderer {
         r.canvas = canvas;
         r.videoCodec = opts.videoCodec;
         r._algo = WEBGL_ALGOS.includes(opts.algo) || opts.algo === 'off' ? opts.algo : 'gl-fsr1';
+        r._yuv444 = opts.yuv444 === true;
+        // The gaze zone the caller wants (BrowserDetect.mwsrGazeWanted): the
+        // kernel's programs take it, its weight follows the stream's motion.
+        if (opts.gazeZone) r.setMwsrZone({});
+        // Diagnostics: mw_webgl_power picks the GPU preference, for the A/B of
+        // 25/09/2026 — FSR1 cost +34 ms of click-to-photon on a three-GPU
+        // client and nothing on a one-GPU one, and "high-performance" may put
+        // the context on another adapter than the one that decodes and scans
+        // out. Not a setting, same family as mw_raw_pointer.
+        let power = 'high-performance';
+        try {
+            const p = localStorage.getItem('mw_webgl_power');
+            if (p === 'default' || p === 'low-power' || p === 'high-performance') power = p;
+        } catch (e) {
+            // storage refused: the default stands
+        }
         // desynchronized is the whole point (see the file comment); the other
         // flags remove work the stream never needs: no depth, no blending with
         // the page, no MSAA, no readback of the previous frame.
@@ -660,10 +791,23 @@ export class WebGlRenderer extends VideoRenderer {
             stencil: false,
             premultipliedAlpha: false,
             preserveDrawingBuffer: false,
-            powerPreference: 'high-performance',
+            powerPreference: power,
         });
         if (!gl) throw new Error('WebGL2 unavailable');
         r.gl = gl;
+        // What was actually granted, and on which GPU: a hint the browser
+        // ignored, or a context on the wrong adapter, is invisible otherwise.
+        try {
+            const attrs = gl.getContextAttributes() || {};
+            const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+            const gpu = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '?';
+            console.log(
+                `[WebGlRenderer] context: gpu=${gpu} desynchronized=${attrs.desynchronized} ` +
+                    `power=${attrs.powerPreference || power}`,
+            );
+        } catch (e) {
+            // a context without the extension still renders
+        }
         canvas.addEventListener?.('webglcontextlost', (e) => {
             e.preventDefault();
             r._lost = true;
@@ -671,6 +815,8 @@ export class WebGlRenderer extends VideoRenderer {
         });
         canvas.addEventListener?.('webglcontextrestored', () => {
             r._lost = false;
+            // the lost context's fences went with it, unread
+            r._fences = [];
             r._buildResources();
             console.log('[WebGlRenderer] context restored');
         });
@@ -685,10 +831,16 @@ export class WebGlRenderer extends VideoRenderer {
         return 'webgl';
     }
 
+    /** See VideoRenderer.passthrough: the last frame was copied 1:1, no pass run. */
+    get passthrough() {
+        return this._passthrough;
+    }
+
     /** Effective algorithm name for the overlay. */
     get algoName() {
         if (this._algo === 'gl-nis') return 'WebGL NIS';
         if (this._algo === 'gl-sgsr') return 'WebGL SGSR';
+        if (this._algo === 'gl-mwsr') return 'WebGL MWSR';
         if (this._algo === 'off') return 'WebGL';
         return 'WebGL FSR1';
     }
@@ -724,6 +876,86 @@ export class WebGlRenderer extends VideoRenderer {
         this._outW = width;
         this._outH = height;
         this._hasOutputSize = true;
+    }
+
+    /**
+     * The gl-mwsr kernel's per-draw values (MwsrShader's mwsrLaw: the vote
+     * threshold `tau`, the sharpness `sharp` and the others), for the
+     * laboratory's side-by-side viewer; the product draws with the law. Takes
+     * effect at the next draw.
+     * @param {{tau?: number, sharp?: number}|null} tuning null: the law
+     */
+    setMwsrTuning(tuning) {
+        this._mwsrTuning = tuning || null;
+        this._mwsrUniKey = '';
+    }
+
+    /**
+     * The gl-mwsr kernel's constants of the `up` mode beyond the product's
+     * (MwsrShader's MWSR_OVERRIDE_SPEC: FLAT_TAPS, FLAT_C…), baked into the
+     * texts, for the laboratory's side-by-side viewer, over the device class's
+     * (mwsrClassOverrides), the only ones the product sets. A changed set
+     * rebuilds the kernel's programs now, when the pass is the current one,
+     * else at its next build.
+     * @param {Object<string, number>|null} overrides null or {}: the product's
+     */
+    setMwsrOverrides(overrides) {
+        const next = overrides || {};
+        if (JSON.stringify(next) === JSON.stringify(this._mwsrOverrides || {})) return;
+        this._mwsrOverrides = next;
+        if (!this._mwsr) return;
+        const gl = this.gl;
+        if (gl && !this.isContextLost())
+            for (const p of this._mwsr.values()) gl.deleteProgram(p.prog);
+        this._mwsr = null;
+        if (this._algo === 'gl-mwsr' && gl && !this.isContextLost()) this._buildAlgo('gl-mwsr');
+    }
+
+    /**
+     * The gl-mwsr kernel's gaze zone (MwsrShader's MWSR_ZONE, plan §15.2):
+     * null, the texts have no zone (the product's default); an object, the
+     * zone's values over the defaults, the kernel's programs built with
+     * GAZE 1 (rebuilt now when the pass is the current one) and its weight
+     * following the stream's motion (noteEncodedFrame, GazeZone) unless
+     * setMwsrGaze pins it.
+     * @param {{cx?: number, cy?: number, rx?: number, ry?: number, ring?: number, tau?: number, sharp?: number}|null} zone
+     */
+    setMwsrZone(zone) {
+        const next = zone ? { ...zone } : null;
+        if (JSON.stringify(next) === JSON.stringify(this._mwsrZone)) return;
+        const flip = !next !== !this._mwsrZone;
+        this._mwsrZone = next;
+        this._mwsrUniKey = '';
+        if (next && !this._gaze) this._gaze = new GazeZone();
+        if (!flip || !this._mwsr) return;
+        const gl = this.gl;
+        if (gl && !this.isContextLost())
+            for (const p of this._mwsr.values()) gl.deleteProgram(p.prog);
+        this._mwsr = null;
+        if (this._algo === 'gl-mwsr' && gl && !this.isContextLost()) this._buildAlgo('gl-mwsr');
+    }
+
+    /**
+     * The zone's weight pinned, 0 to 1 (the laboratory: 1 is the zone as on
+     * a moving picture), or null: the stream's motion decides.
+     * @param {number|null} level
+     */
+    setMwsrGaze(level) {
+        this._mwsrGazePinned =
+            level === null || level === undefined ? null : Math.min(Math.max(level, 0), 1);
+        this._mwsrUniKey = '';
+    }
+
+    /** @override The picture's motion, for the gaze zone; nothing without one. */
+    noteEncodedFrame(bytes, key) {
+        if (this._gaze) this._gaze.note(bytes, key, performance.now());
+    }
+
+    /** The zone's weight for a draw of a frame of `area` pixels: 0 without a zone. */
+    _mwsrGazeFor(area) {
+        if (!this._mwsrZone) return 0;
+        if (this._mwsrGazePinned !== null) return this._mwsrGazePinned;
+        return this._gaze ? this._gaze.level(performance.now(), area) : 0;
     }
 
     _compile(type, src) {
@@ -780,11 +1012,14 @@ export class WebGlRenderer extends VideoRenderer {
         this._inW = 0;
         this._inH = 0;
 
-        // Only the pass in use is built; setAlgo builds the others on demand.
+        // Only the pass in use is built, plus the plain copy (the frame at 1:1,
+        // and the ladder's last rung); setAlgo builds the others on demand.
         // Whatever a lost context held is gone with it.
         this._easu = this._rcas = this._sgsr = this._nis = this._blit = null;
+        this._mwsr = null;
         this._intermTex = this._fbo = this._coefTex = null;
         this._buildAlgo(this._algo);
+        this._buildAlgo('off');
         gl.disable(gl.DEPTH_TEST);
         gl.disable(gl.BLEND);
         gl.disable(gl.SCISSOR_TEST);
@@ -804,6 +1039,35 @@ export class WebGlRenderer extends VideoRenderer {
             this._fbo = gl.createFramebuffer();
         } else if (algo === 'gl-sgsr') {
             if (!this._sgsr) this._sgsr = this._program(SGSR_FS, ['uTex', 'uView']);
+        } else if (algo === 'gl-mwsr') {
+            if (this._mwsr) return;
+            // One program per regime, all built here so that nothing compiles
+            // while the stream runs; the overrides baked into each text.
+            const programs = new Map();
+            for (const reg of mwsrRegimes()) {
+                const overrides =
+                    reg.mode === 'up'
+                        ? {
+                              CHROMA444: this._yuv444 ? 1 : 0,
+                              GAZE: this._mwsrZone ? 1 : 0,
+                              ...MWSR_CLASS,
+                              ...(this._mwsrOverrides || {}),
+                          }
+                        : { R_DOWN: reg.rDown, LINEAR_LIGHT: reg.linearLight };
+                programs.set(
+                    mwsrRegimeKey(reg),
+                    this._program(mwsrGlsl({ mode: reg.mode, taps: reg.taps, overrides }), [
+                        'uTex',
+                        'uTexelScale',
+                        'uDimsAcross',
+                        'uTauFc',
+                        'uZone',
+                        'uZoneBonus',
+                        'uGaze',
+                    ]),
+                );
+            }
+            this._mwsr = programs;
         } else {
             if (this._nis) return;
             this._nis = this._program(NIS_FS, [
@@ -877,6 +1141,9 @@ export class WebGlRenderer extends VideoRenderer {
         }
         const drawStart = performance.now();
         let waitMs = 0;
+        this._checkFences(drawStart);
+        // Closed before the draw below: the content-age probe dates it by this.
+        const frameTs = frame.timestamp;
 
         const inW = frame.displayWidth || frame.codedWidth || 0;
         const inH = frame.displayHeight || frame.codedHeight || 0;
@@ -888,21 +1155,18 @@ export class WebGlRenderer extends VideoRenderer {
         }
 
         // Canvas backing = frame-aspect rect fitting the output box (same rule
-        // as WebGpuRenderer), else the frame's own size.
-        let cw = inW,
-            ch = inH;
-        if (this._hasOutputSize) {
-            const frameAspect = inW / inH;
-            const boxAspect = this._outW / this._outH;
-            cw = frameAspect >= boxAspect ? this._outW : Math.round(this._outH * frameAspect);
-            ch = Math.round(cw / frameAspect);
-            const MAX_DIM = 4096;
-            if (cw > MAX_DIM || ch > MAX_DIM) {
-                const k = MAX_DIM / Math.max(cw, ch);
-                cw = Math.round(cw * k);
-                ch = Math.round(ch * k);
-            }
-        }
+        // as WebGpuRenderer, scaleRegime.js), else the frame's own size. At
+        // exactly the frame size the pass has nothing to do: the plain copy
+        // presents the frame, and the pass resumes when the size differs.
+        const { cw, ch } = fitOutputSize(
+            inW,
+            inH,
+            this._hasOutputSize ? this._outW : 0,
+            this._hasOutputSize ? this._outH : 0,
+        );
+        const identity = isIdentityScale(inW, inH, cw, ch);
+        const pass = identity ? 'off' : this._algo;
+        this._passthrough = identity && this._algo !== 'off';
         if (cw > 0 && ch > 0 && (this.canvas.width !== cw || this.canvas.height !== ch)) {
             this.canvas.width = cw;
             this.canvas.height = ch;
@@ -943,7 +1207,7 @@ export class WebGlRenderer extends VideoRenderer {
 
         try {
             gl.bindVertexArray(this._vao);
-            if (this._algo === 'gl-fsr1') {
+            if (pass === 'gl-fsr1') {
                 this._ensureInterm(cw, ch);
                 // Pass 1: EASU input → interm (output res).
                 gl.bindFramebuffer(gl.FRAMEBUFFER, this._fbo);
@@ -962,7 +1226,7 @@ export class WebGlRenderer extends VideoRenderer {
                 gl.uniform1i(this._rcas.u.uTex, 0);
                 gl.uniform4f(this._rcas.u.uRes, cw, ch, 1 / cw, 1 / ch);
                 gl.drawArrays(gl.TRIANGLES, 0, 3);
-            } else if (this._algo === 'gl-sgsr') {
+            } else if (pass === 'gl-sgsr') {
                 gl.bindFramebuffer(gl.FRAMEBUFFER, null);
                 gl.viewport(0, 0, cw, ch);
                 gl.useProgram(this._sgsr.prog);
@@ -971,7 +1235,40 @@ export class WebGlRenderer extends VideoRenderer {
                 gl.uniform1i(this._sgsr.u.uTex, 0);
                 gl.uniform4f(this._sgsr.u.uView, 1 / inW, 1 / inH, inW, inH);
                 gl.drawArrays(gl.TRIANGLES, 0, 3);
-            } else if (this._algo === 'off') {
+            } else if (pass === 'gl-mwsr') {
+                // The regime by the frame and canvas sizes — never 'copy', the
+                // 1:1 frame took the plain copy; the uniform block of the WGSL
+                // twin, kept while the sizes hold, in six vec4.
+                const reg = mwsrRegime(inW, inH, cw, ch);
+                const p = this._mwsr.get(mwsrRegimeKey(reg));
+                // The gaze zone's weight for this draw, 0 without a zone: it
+                // moves in steps of 1/64, so the block is remade rarely.
+                const gaze = this._mwsrGazeFor(inW * inH);
+                const uniKey = inW + 'x' + inH + '>' + cw + 'x' + ch + '@' + gaze;
+                if (this._mwsrUniKey !== uniKey) {
+                    this._mwsrUniKey = uniKey;
+                    this._mwsrUni = mwsrUniforms(inW, inH, cw, ch, {
+                        ...(this._mwsrTuning || {}),
+                        gaze,
+                        zone: this._mwsrZone || undefined,
+                    });
+                }
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                gl.viewport(0, 0, cw, ch);
+                gl.useProgram(p.prog);
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, this._inputTex);
+                gl.uniform1i(p.u.uTex, 0);
+                gl.uniform4fv(p.u.uTexelScale, this._mwsrUni.subarray(0, 4));
+                gl.uniform4fv(p.u.uDimsAcross, this._mwsrUni.subarray(4, 8));
+                gl.uniform4fv(p.u.uTauFc, this._mwsrUni.subarray(8, 12));
+                // The zone's values and what it moves: inactive, so null
+                // locations silently ignored, in a text built without GAZE.
+                gl.uniform4fv(p.u.uZone, this._mwsrUni.subarray(12, 16));
+                gl.uniform4fv(p.u.uZoneBonus, this._mwsrUni.subarray(16, 20));
+                gl.uniform4fv(p.u.uGaze, this._mwsrUni.subarray(20, 24));
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+            } else if (pass === 'off') {
                 gl.bindFramebuffer(gl.FRAMEBUFFER, null);
                 gl.viewport(0, 0, cw, ch);
                 gl.useProgram(this._blit.prog);
@@ -1015,13 +1312,15 @@ export class WebGlRenderer extends VideoRenderer {
                 gl.activeTexture(gl.TEXTURE0);
             }
             if (this._probeActive) this._readProbePixels(cw, ch);
+            if (this.afterDraw) this.afterDraw(this, frameTs);
+            this._setFence(performance.now());
         } catch (e) {
             console.error('[WebGlRenderer] draw failed: ' + e.message);
             path = 'failed';
         }
 
         this._rendered++;
-        this._noteDraw(drawStart, waitMs, this._algo + ':' + path);
+        this._noteDraw(drawStart, waitMs, (this._passthrough ? '1:1' : this._algo) + ':' + path);
     }
 
     /** Record the draw split for PipelineDiag (see VideoRenderer.lastDraw). */
@@ -1040,8 +1339,11 @@ export class WebGlRenderer extends VideoRenderer {
                     if (t) gl.deleteTexture(t);
                 if (this._fbo) gl.deleteFramebuffer(this._fbo);
                 if (this._vao) gl.deleteVertexArray(this._vao);
+                for (const f of this._fences) gl.deleteSync(f.sync);
+                this._fences = [];
                 for (const p of [this._easu, this._rcas, this._sgsr, this._nis, this._blit])
                     if (p) gl.deleteProgram(p.prog);
+                if (this._mwsr) for (const p of this._mwsr.values()) gl.deleteProgram(p.prog);
                 const ext = gl.getExtension('WEBGL_lose_context');
                 if (ext) ext.loseContext();
             } catch (e) {}

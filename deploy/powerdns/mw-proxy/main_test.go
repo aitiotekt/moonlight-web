@@ -146,6 +146,43 @@ func TestQuota(t *testing.T) {
 	}
 }
 
+// One IPv6 subscriber holds a /64: a new address inside it buys no new budget,
+// while the next /64 — another subscriber — starts with a full one.
+func TestQuotaChargesAnIPv6SubscriberPerSlash64(t *testing.T) {
+	p := testProxy(t, 2)
+	if code, _ := doPatch(p, "t1", "2001:db8:1:2::1", aReplace("aaaaaaaa")); code != 0 {
+		t.Fatalf("claim 1 rejected: %d", code)
+	}
+	if code, _ := doPatch(p, "t2", "2001:db8:1:2::2", aReplace("bbbbbbbb")); code != 0 {
+		t.Fatalf("claim 2 rejected: %d", code)
+	}
+	if code, _ := doPatch(p, "t3", "2001:db8:1:2:ffff::3", aReplace("cccccccc")); code != 429 {
+		t.Fatalf("claim 3 from the same /64 should be 429, got %d", code)
+	}
+	if code, _ := doPatch(p, "t4", "2001:db8:1:3::1", aReplace("dddddddd")); code != 0 {
+		t.Fatalf("claim from the next /64 rejected: %d", code)
+	}
+}
+
+func TestQuotaKey(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"203.0.113.7", "203.0.113.7"},
+		{" 203.0.113.7 ", "203.0.113.7"},
+		{"203.0.113.7:51234", "203.0.113.7"},
+		{"::ffff:203.0.113.7", "203.0.113.7"},
+		{"[::ffff:203.0.113.7]:443", "203.0.113.7"},
+		{"2001:db8:1:2:aaaa:bbbb:cccc:dddd", "2001:db8:1:2::/64"},
+		{"[2001:db8:1:2::1]", "2001:db8:1:2::/64"},
+		{"[2001:db8:1:2::1]:443", "2001:db8:1:2::/64"},
+		{"fe80::1%eth0", "fe80::/64"},
+		{"not an address", "not an address"},
+	} {
+		if got := quotaKey(c.in); got != c.want {
+			t.Errorf("quotaKey(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestRejectForbiddenTypes(t *testing.T) {
 	p := testProxy(t, 0)
 	// An NS rewrite disguised on a valid-looking name must be refused by type.

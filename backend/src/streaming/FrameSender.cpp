@@ -16,6 +16,7 @@
  */
 
 #include "FrameSender.h"
+#include "FrameChunks.h"
 #include "FrameSentSink.h"
 
 #include <rtc/rtc.hpp>
@@ -74,8 +75,15 @@ void leaveGamesTask(void* h)
 
 FrameSender::FrameSender(Options options)
     : m_Options(options)
+    , m_MaxQueuedDeltas(options.maxQueuedDeltas)
 {
     m_Thread = std::thread([this]() { run(); });
+}
+
+void FrameSender::setMaxQueuedDeltas(size_t deltas)
+{
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    m_MaxQueuedDeltas = deltas;
 }
 
 FrameSender::~FrameSender()
@@ -97,59 +105,19 @@ void FrameSender::stop()
 }
 
 void FrameSender::writeHeader(std::byte* dst, uint32_t frameId, uint16_t chunkIdx,
-                              uint16_t totalChunks, bool isKeyframe, uint32_t payloadSize,
+                              uint16_t totalChunks, uint8_t flags, uint32_t payloadSize,
                               uint32_t backendTs)
 {
-    // [frame_id:4][chunk_index:2][total_chunks:2][is_keyframe:1][payload_size:4][backend_ts:4]
-    // All multi-byte fields big endian.
-    dst[0] = static_cast<std::byte>((frameId >> 24) & 0xFF);
-    dst[1] = static_cast<std::byte>((frameId >> 16) & 0xFF);
-    dst[2] = static_cast<std::byte>((frameId >> 8) & 0xFF);
-    dst[3] = static_cast<std::byte>(frameId & 0xFF);
-
-    dst[4] = static_cast<std::byte>((chunkIdx >> 8) & 0xFF);
-    dst[5] = static_cast<std::byte>(chunkIdx & 0xFF);
-
-    dst[6] = static_cast<std::byte>((totalChunks >> 8) & 0xFF);
-    dst[7] = static_cast<std::byte>(totalChunks & 0xFF);
-
-    dst[8] = static_cast<std::byte>(isKeyframe ? 0x01 : 0x00);
-
-    dst[9] = static_cast<std::byte>((payloadSize >> 24) & 0xFF);
-    dst[10] = static_cast<std::byte>((payloadSize >> 16) & 0xFF);
-    dst[11] = static_cast<std::byte>((payloadSize >> 8) & 0xFF);
-    dst[12] = static_cast<std::byte>(payloadSize & 0xFF);
-
-    // Same value for all chunks of a frame.
-    dst[13] = static_cast<std::byte>((backendTs >> 24) & 0xFF);
-    dst[14] = static_cast<std::byte>((backendTs >> 16) & 0xFF);
-    dst[15] = static_cast<std::byte>((backendTs >> 8) & 0xFF);
-    dst[16] = static_cast<std::byte>(backendTs & 0xFF);
+    framechunks::writeHeader(dst, frameId, chunkIdx, totalChunks, flags, payloadSize, backendTs);
 }
 
-std::vector<FrameSender::Fragment> FrameSender::buildFragments(const uint8_t* data, size_t size,
-                                                               bool isKeyframe, uint32_t frameId,
-                                                               uint32_t backendTs)
+std::vector<FrameSender::Fragment>
+FrameSender::buildFragments(const uint8_t* data, size_t size, bool isKeyframe, uint32_t frameId,
+                            uint32_t backendTs, size_t maxPayload, const uint8_t* sideBlock,
+                            size_t sideBlockSize)
 {
-    std::vector<Fragment> fragments;
-    if (!data || size == 0) return fragments;
-
-    const size_t payloadMax = static_cast<size_t>(kMaxPayloadSize);
-    const size_t totalChunks = (size + payloadMax - 1) / payloadMax;
-    fragments.reserve(totalChunks);
-
-    for (size_t chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
-        const size_t offset = chunkIdx * payloadMax;
-        const size_t payloadSize = std::min(payloadMax, size - offset);
-
-        Fragment bin(static_cast<size_t>(kFragHeaderSize) + payloadSize);
-        writeHeader(bin.data(), frameId, static_cast<uint16_t>(chunkIdx),
-                    static_cast<uint16_t>(totalChunks), isKeyframe,
-                    static_cast<uint32_t>(payloadSize), backendTs);
-        std::memcpy(bin.data() + kFragHeaderSize, data + offset, payloadSize);
-        fragments.push_back(std::move(bin));
-    }
-    return fragments;
+    return framechunks::cut(data, size, isKeyframe, frameId, backendTs, maxPayload, sideBlock,
+                            sideBlockSize);
 }
 
 bool FrameSender::push(Job&& job, std::vector<uint32_t>* evicted)
@@ -175,10 +143,9 @@ bool FrameSender::push(Job&& job, std::vector<uint32_t>* evicted)
         // takes its place. Counted like the eviction above: the caller starts
         // recovery for the hole it leaves. Keyframes never wait behind a delta
         // either — they are what the recovery is waiting for.
-        if (m_Options.maxQueuedDeltas < kMaxQueued) {
-            const size_t keep = job.isKeyframe || m_Options.maxQueuedDeltas == 0
-                                    ? 0
-                                    : m_Options.maxQueuedDeltas - 1;
+        if (m_MaxQueuedDeltas < kMaxQueued) {
+            const size_t keep =
+                job.isKeyframe || m_MaxQueuedDeltas == 0 ? 0 : m_MaxQueuedDeltas - 1;
             size_t deltas = 0;
             for (const Job& j : m_Queue)
                 if (!j.isKeyframe) deltas++;
@@ -244,9 +211,62 @@ bool FrameSender::enqueueFragments(std::shared_ptr<rtc::DataChannel> dc,
     return push(std::move(job), evicted);
 }
 
+void FrameSender::setPacing(int64_t bytesPerSecond, size_t burstBytes)
+{
+    m_PaceBurst.store(burstBytes > 0 ? burstBytes : 16 * 1024, std::memory_order_relaxed);
+    m_PaceRate.store(bytesPerSecond > 0 ? bytesPerSecond : 0, std::memory_order_release);
+}
+
+FrameSender::PacingStats FrameSender::pacingStats() const
+{
+    PacingStats s;
+    s.frames = m_SentFrames.load(std::memory_order_relaxed);
+    s.pacedFrames = m_PacedFrames.load(std::memory_order_relaxed);
+    s.waitedUs = m_WaitedUs.load(std::memory_order_relaxed);
+    s.maxFrameWaitUs = m_MaxFrameWaitUs.load(std::memory_order_relaxed);
+    return s;
+}
+
+void FrameSender::waitUs(int64_t us)
+{
+    if (us <= 0) return;
+#ifdef _WIN32
+    // Not sleep_for: in a process that never asked for a finer timer, Windows
+    // sleeps a whole 15.6 ms period for a sleep of 0.7 ms (SctpFlood.cpp).
+    if (m_PaceTimer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -us * 10; // relative, in 100 ns units
+        if (SetWaitableTimerEx(static_cast<HANDLE>(m_PaceTimer), &due, 0, nullptr, nullptr, nullptr,
+                               0)) {
+            WaitForSingleObject(static_cast<HANDLE>(m_PaceTimer),
+                                static_cast<DWORD>(us / 1000 + 50));
+            return;
+        }
+    }
+#endif
+    std::this_thread::sleep_for(std::chrono::microseconds(us));
+}
+
+int64_t FrameSender::paceBefore(size_t bytes)
+{
+    if (!m_Pacer.active()) return 0;
+    int64_t waited = 0;
+    for (int64_t w = m_Pacer.waitUs(bytes, steadyNowUs()); w > 0 && !m_Stop.load();
+         w = m_Pacer.waitUs(bytes, steadyNowUs())) {
+        const int64_t t0 = steadyNowUs();
+        waitUs(w);
+        waited += steadyNowUs() - t0;
+    }
+    return waited;
+}
+
 void FrameSender::run()
 {
     void* mmcss = m_Options.multimediaPriority ? enterGamesTask() : nullptr;
+#ifdef _WIN32
+    m_PaceTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                         TIMER_ALL_ACCESS);
+#endif
     for (;;) {
         Job job;
         {
@@ -260,6 +280,10 @@ void FrameSender::run()
         }
         sendJob(job);
     }
+#ifdef _WIN32
+    if (m_PaceTimer) CloseHandle(static_cast<HANDLE>(m_PaceTimer));
+    m_PaceTimer = nullptr;
+#endif
     leaveGamesTask(mmcss);
 }
 
@@ -270,6 +294,21 @@ void FrameSender::sendJob(const Job& job)
     auto& dc = job.dc;
     if (!dc || !dc->isOpen()) return;
 
+    // The bench's pacing, as last asked for: taken up between two frames, so
+    // a frame is never cut by a change of rate.
+    const int64_t rate = m_PaceRate.load(std::memory_order_acquire);
+    const size_t burst = m_PaceBurst.load(std::memory_order_relaxed);
+    if (rate != m_PacerRate || burst != m_PacerBurst) {
+        m_Pacer.configure(rate, burst);
+        m_PacerRate = rate;
+        m_PacerBurst = burst;
+    }
+    int64_t frameWaitUs = 0;
+    const auto paced = [this, &frameWaitUs](size_t bytes) { frameWaitUs += paceBefore(bytes); };
+    const auto counted = [this](size_t bytes) {
+        if (m_Pacer.active()) m_Pacer.sent(bytes, steadyNowUs());
+    };
+
     // t₄, only when somebody is listening: the clock read is cheap, but a
     // stamp nobody reads is still work on the wire's thread.
     const int64_t firstByteUs = job.sink ? steadyNowUs() : 0;
@@ -278,8 +317,10 @@ void FrameSender::sendJob(const Job& job)
         // Ready-made chunks: nothing to build, just hand them over in order.
         for (const Fragment& bin : job.fragments) {
             if (m_Stop.load(std::memory_order_acquire)) return;
+            paced(bin.size());
             try {
                 dc->send(bin);
+                counted(bin.size());
             } catch (const std::exception& e) {
                 if (!m_Stop.load(std::memory_order_acquire)) {
                     qWarning() << "[FrameSender] send error:" << e.what();
@@ -299,13 +340,16 @@ void FrameSender::sendJob(const Job& job)
 
             rtc::binary bin(kFragHeaderSize + payloadSize);
             writeHeader(bin.data(), job.frameId, static_cast<uint16_t>(chunkIdx),
-                        static_cast<uint16_t>(totalChunks), job.isKeyframe,
+                        static_cast<uint16_t>(totalChunks),
+                        static_cast<uint8_t>(job.isKeyframe ? kFlagKeyframe : 0),
                         static_cast<uint32_t>(payloadSize), job.backendTs);
             std::memcpy(bin.data() + kFragHeaderSize, job.data.constData() + offset,
                         static_cast<size_t>(payloadSize));
 
+            paced(bin.size());
             try {
                 dc->send(bin);
+                counted(bin.size());
             } catch (const std::exception& e) {
                 if (!m_Stop.load(std::memory_order_acquire)) {
                     qWarning() << "[FrameSender] send error:" << e.what();
@@ -313,6 +357,14 @@ void FrameSender::sendJob(const Job& job)
                 return;
             }
         }
+    }
+
+    m_SentFrames.fetch_add(1, std::memory_order_relaxed);
+    if (frameWaitUs > 0) {
+        m_PacedFrames.fetch_add(1, std::memory_order_relaxed);
+        m_WaitedUs.fetch_add(frameWaitUs, std::memory_order_relaxed);
+        if (frameWaitUs > m_MaxFrameWaitUs.load(std::memory_order_relaxed))
+            m_MaxFrameWaitUs.store(frameWaitUs, std::memory_order_relaxed);
     }
 
     // t₅. A frame that failed part-way returned above and is not reported: a

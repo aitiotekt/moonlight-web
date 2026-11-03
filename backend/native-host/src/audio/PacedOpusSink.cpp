@@ -46,8 +46,10 @@ void raiseThreadPriority()
 
 } // namespace
 
-PacedOpusSink::PacedOpusSink(AudioCallback onPacket)
+PacedOpusSink::PacedOpusSink(AudioCallback onPacket, int frameSamples)
     : m_OnPacket(std::move(onPacket))
+    , m_FrameSamples(AudioPacer::isFrameSamples(frameSamples) ? frameSamples
+                                                              : AudioPacer::kFrameSamples)
 {}
 
 PacedOpusSink::~PacedOpusSink()
@@ -64,7 +66,7 @@ bool PacedOpusSink::start(const std::string& describe, std::string& error)
     }
 
     auto encoder = std::make_unique<OpusEncoder>();
-    if (!encoder->open(error)) return false;
+    if (!encoder->open(error, m_FrameSamples)) return false;
     m_Encoder = std::move(encoder);
 
     // Eight frames — 40 ms — of slack, twice a push capture's burst.
@@ -76,11 +78,13 @@ bool PacedOpusSink::start(const std::string& describe, std::string& error)
     // frames sent as silence in the same minute — the queue full and empty by
     // turns, at ten percent of the stream each way. The cap bounds the worst
     // case only; in the steady state the queue drains to nothing every burst,
-    // so nothing here is added latency.
-    m_Pacer = std::make_unique<AudioPacer>(8);
+    // so nothing here is added latency. Longer frames (`audioframe=`) keep the
+    // same 40 ms, and never fewer than two frames.
+    const int frameMs = m_FrameSamples / (AudioPacer::kSampleRate / 1000);
+    m_Pacer = std::make_unique<AudioPacer>(std::max(2, 40 / frameMs), m_FrameSamples);
     m_Pacer->start(steadyNowUs());
 
-    log::info("[native] audio: " + describe + " -> Opus 5 ms (" +
+    log::info("[native] audio: " + describe + " -> Opus " + std::to_string(frameMs) + " ms (" +
               std::string(OpusEncoder::libraryVersion()) + ")");
 
     m_Running.store(true);
@@ -140,7 +144,7 @@ void PacedOpusSink::runLoop()
 {
     raiseThreadPriority();
 
-    std::vector<float> frame(AudioPacer::kFrameFloats);
+    std::vector<float> frame(m_Pacer->frameFloats());
     std::vector<uint8_t> packet;
     int64_t lastReportUs = steadyNowUs();
     int64_t reportedDropped = 0, reportedUnderruns = 0, reportedDeferrals = 0;
@@ -157,7 +161,7 @@ void PacedOpusSink::runLoop()
             // Sleep until the next frame is owed, never longer than one period:
             // a stop() has to be noticed within a tick.
             int64_t target = m_Pacer->nextDueUs();
-            if (deferred) target += AudioPacer::kUnderrunGraceUs;
+            if (deferred) target += m_Pacer->underrunGraceUs();
             const int64_t waitUs =
                 std::clamp(target - steadyNowUs(), int64_t{0}, AudioPacer::kFramePeriodUs);
             if (waitUs > 0)
@@ -173,12 +177,14 @@ void PacedOpusSink::runLoop()
 
         for (int i = 0; i < due; ++i) {
             AudioPacer::Take got;
+            size_t queued = 0;
             {
                 // Taken under the lock (it moves the pacer's clock and its
                 // queue), encoded outside it: a push() from the capture's
                 // thread must never wait on libopus.
                 std::lock_guard<std::mutex> lock(m_Mutex);
                 got = m_Pacer->take(frame.data(), now);
+                queued = m_Pacer->queuedFrames();
             }
             if (got == AudioPacer::Take::Deferred) {
                 deferred = true;
@@ -189,8 +195,11 @@ void PacedOpusSink::runLoop()
             AudioPacket out;
             out.data = packet.data();
             out.size = n;
-            out.samplesPerChannel = AudioPacer::kFrameSamples;
+            out.samplesPerChannel = m_FrameSamples;
             out.capturedUs = now;
+            out.queuedFrames = static_cast<int>(queued);
+            out.peak = AudioPacer::peakOf(frame.data(), frame.size());
+            out.silence = got == AudioPacer::Take::Silence;
             m_OnPacket(out);
             m_Packets.fetch_add(1, std::memory_order_relaxed);
         }

@@ -25,11 +25,13 @@
 #include <windows.graphics.capture.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
+#include <windows.security.authorization.appcapabilityaccess.h>
 #include <winstring.h>
 #include <wrl/implements.h>
 #include <wrl/wrappers/corewrappers.h>
 
 #include <chrono>
+#include <thread>
 
 namespace WGC = ABI::Windows::Graphics::Capture;
 namespace WGD = ABI::Windows::Graphics::DirectX;
@@ -78,6 +80,54 @@ template <typename T> HRESULT factory(const wchar_t* name, ComPtr<T>& out)
     if (!ensureWinRt()) return E_FAIL;
     Microsoft::WRL::Wrappers::HStringReference ref(name);
     return ::RoGetActivationFactory(ref.Get(), IID_PPV_ARGS(out.ReleaseAndGetAddressOf()));
+}
+
+/// GraphicsCaptureAccess.RequestAccessAsync(Borderless), waited for here: the
+/// capture thread has no message pump, and a desktop process has its answer
+/// within milliseconds. Without this request, put_IsBorderRequired(false)
+/// succeeds and is ignored — the border stays, and nothing says so (the
+/// property's documentation). What it answered, for the log.
+std::string requestBorderlessAccess()
+{
+    namespace Access = ABI::Windows::Security::Authorization::AppCapabilityAccess;
+    ComPtr<WGC::IGraphicsCaptureAccessStatics> access;
+    HRESULT hr = factory(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureAccess, access);
+    if (FAILED(hr)) return "no GraphicsCaptureAccess on this Windows (" + hresultToString(hr) + ")";
+    ComPtr<
+        __FIAsyncOperation_1_Windows__CSecurity__CAuthorization__CAppCapabilityAccess__CAppCapabilityAccessStatus>
+        operation;
+    hr = access->RequestAccessAsync(WGC::GraphicsCaptureAccessKind_Borderless,
+                                    operation.ReleaseAndGetAddressOf());
+    if (FAILED(hr) || !operation)
+        return "the borderless access request was refused (" + hresultToString(hr) + ")";
+    ComPtr<ABI::Windows::Foundation::IAsyncInfo> info;
+    if (FAILED(operation.As(&info))) return "the borderless access request has no status";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    for (;;) {
+        ABI::Windows::Foundation::AsyncStatus status =
+            ABI::Windows::Foundation::AsyncStatus::Started;
+        if (FAILED(info->get_Status(&status)))
+            return "the borderless access request's status could not be read";
+        if (status != ABI::Windows::Foundation::AsyncStatus::Started) break;
+        if (std::chrono::steady_clock::now() > deadline)
+            return "the borderless access request did not answer within 3 s";
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Access::AppCapabilityAccessStatus result = Access::AppCapabilityAccessStatus_DeniedBySystem;
+    hr = operation->GetResults(&result);
+    if (FAILED(hr)) return "the borderless access request failed (" + hresultToString(hr) + ")";
+    switch (result) {
+    case Access::AppCapabilityAccessStatus_Allowed: return "borderless access allowed";
+    case Access::AppCapabilityAccessStatus_DeniedBySystem:
+        return "borderless access denied by the system";
+    case Access::AppCapabilityAccessStatus_DeniedByUser:
+        return "borderless access denied by the user";
+    case Access::AppCapabilityAccessStatus_NotDeclaredByApp:
+        return "borderless access not declared by the app";
+    case Access::AppCapabilityAccessStatus_UserPromptRequired:
+        return "borderless access would need a prompt";
+    }
+    return "borderless access status " + std::to_string(static_cast<int>(result));
 }
 
 /// The handler the frame pool calls when a frame lands.
@@ -151,13 +201,34 @@ WgcCapture::~WgcCapture()
     stop();
 }
 
-bool WgcCapture::available()
+void WgcCapture::useDevice(ID3D11Device* device)
+{
+    m_Given = device;
+}
+
+bool WgcCapture::available(std::string* why)
 {
     ComPtr<WGC::IGraphicsCaptureSessionStatics> statics;
-    if (FAILED(factory(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession, statics)))
+    const HRESULT made =
+        factory(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession, statics);
+    if (FAILED(made)) {
+        if (why)
+            *why = "the capture session's factory is unavailable (" + hresultToString(made) + ")";
         return false;
+    }
     boolean supported = false;
-    return SUCCEEDED(statics->IsSupported(&supported)) && supported;
+    const HRESULT asked = statics->IsSupported(&supported);
+    if (FAILED(asked)) {
+        if (why) *why = "IsSupported failed (" + hresultToString(asked) + ")";
+        return false;
+    }
+    if (!supported) {
+        if (why)
+            *why = "IsSupported says no (Windows 10 1903 at least, in a session with a compositor)";
+        return false;
+    }
+    if (why) why->clear();
+    return true;
 }
 
 int64_t WgcCapture::qpcToMicroseconds(int64_t qpc) const
@@ -182,8 +253,9 @@ bool WgcCapture::start(std::string& error)
         error = "the Windows Runtime could not be initialized";
         return false;
     }
-    if (!available()) {
-        error = "Windows.Graphics.Capture is not available on this system";
+    std::string why;
+    if (!available(&why)) {
+        error = "Windows.Graphics.Capture is not available on this system: " + why;
         return false;
     }
 
@@ -231,14 +303,35 @@ bool WgcCapture::start(std::string& error)
     }
     m_Monitor = outputDesc.Monitor;
 
-    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-    hr = ::D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                             D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
-                             D3D11_SDK_VERSION, m_Device.ReleaseAndGetAddressOf(), nullptr,
-                             m_Context.ReleaseAndGetAddressOf());
-    if (FAILED(hr)) {
-        error = "could not create a D3D11 device on that GPU (" + hresultToString(hr) + ")";
-        return false;
+    if (m_Given) {
+        // The caller's device — on this adapter, or the compositor would hand
+        // frames to a GPU the chain does not read.
+        ComPtr<IDXGIDevice> givenDxgi;
+        ComPtr<IDXGIAdapter> givenAdapter;
+        DXGI_ADAPTER_DESC givenDesc = {};
+        if (FAILED(m_Given.As(&givenDxgi)) || FAILED(givenDxgi->GetAdapter(&givenAdapter)) ||
+            FAILED(givenAdapter->GetDesc(&givenDesc))) {
+            error = "the device given to the capture names no adapter";
+            return false;
+        }
+        const uint64_t givenLuid = (static_cast<uint64_t>(givenDesc.AdapterLuid.HighPart) << 32) |
+                                   static_cast<uint32_t>(givenDesc.AdapterLuid.LowPart);
+        if (givenLuid != m_AdapterLuid) {
+            error = "the device given to the capture is on another GPU than the display";
+            return false;
+        }
+        m_Device = m_Given;
+        m_Device->GetImmediateContext(m_Context.ReleaseAndGetAddressOf());
+    } else {
+        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+        hr = ::D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
+                                 D3D11_SDK_VERSION, m_Device.ReleaseAndGetAddressOf(), nullptr,
+                                 m_Context.ReleaseAndGetAddressOf());
+        if (FAILED(hr)) {
+            error = "could not create a D3D11 device on that GPU (" + hresultToString(hr) + ")";
+            return false;
+        }
     }
 
     ComPtr<IDXGIDevice> dxgiDevice;
@@ -324,10 +417,26 @@ bool WgcCapture::start(std::string& error)
                   "client-drawn and magnified pointers are unavailable on this display");
     }
 
-    // The yellow "you are being captured" border. Windows 11 lets it be turned
-    // off; on Windows 10 it is not offered and the border stays.
+    // The yellow "you are being captured" border. Windows 11 lets a session off
+    // it, once the capture access without a border has been asked for
+    // (GraphicsCaptureAccess, 22H2; a desktop process is allowed without a
+    // prompt): put_IsBorderRequired(false) alone succeeds and is ignored. On
+    // Windows 10 neither exists and the border stays. Said in the log, read
+    // back from the session, because a border nobody asked for is what a
+    // viewer sees first.
+    m_BorderOff = false;
     ComPtr<WGC::IGraphicsCaptureSession3> session3;
-    if (SUCCEEDED(d->session.As(&session3))) session3->put_IsBorderRequired(false);
+    if (SUCCEEDED(d->session.As(&session3))) {
+        const std::string access = requestBorderlessAccess();
+        session3->put_IsBorderRequired(false);
+        boolean required = true;
+        if (SUCCEEDED(session3->get_IsBorderRequired(&required))) m_BorderOff = !required;
+        log::info(std::string("[native] WGC: capture border ") +
+                  (m_BorderOff ? "off" : "required") + " (" + access + ")");
+    } else {
+        log::info("[native] WGC: this Windows build draws its capture border (IsBorderRequired "
+                  "needs Windows 11)");
+    }
 
     if (FAILED(d->session->StartCapture())) {
         error = "the capture session refused to start";
@@ -356,8 +465,35 @@ bool WgcCapture::start(std::string& error)
     return true;
 }
 
+bool WgcCapture::retake(std::string& error)
+{
+    if (!d->session || !m_Device) {
+        error = "the capture is not open";
+        return false;
+    }
+    const ComPtr<ID3D11Device> given = m_Given;
+    const int width = m_Width;
+    const int height = m_Height;
+    m_Given = m_Device;
+    const bool started = start(error);
+    m_Given = given;
+    if (!started) {
+        m_RetakeLost = true;
+        return false;
+    }
+    if (m_Width != width || m_Height != height) {
+        error = "the display changed size meanwhile";
+        m_RetakeLost = true;
+        return false;
+    }
+    m_Retaking = true;
+    return true;
+}
+
 AcquireStatus WgcCapture::acquire(int timeoutMs, CapturedFrame& frame)
 {
+    // Said by the caller already, with the reason retake() gave.
+    if (m_RetakeLost) return AcquireStatus::Lost;
     if (!d->pool || !d->session) return AcquireStatus::Failed;
     if (m_Holding) {
         // The contract is one release() per Ok, and breaking it here would leak
@@ -459,6 +595,7 @@ AcquireStatus WgcCapture::acquire(int timeoutMs, CapturedFrame& frame)
                         ((hundredNs % 10000000) * m_QpcFrequency) / 10000000;
     frame.capturedUs = steadyNowUs();
     frame.presentUs = qpcToMicroseconds(qpc);
+    frame.presentRawUs = frame.presentUs;
 
     // ⚠️ Clamped, and this is not defensive coding — it is a real difference
     // between the two backends.
@@ -478,6 +615,8 @@ AcquireStatus WgcCapture::acquire(int timeoutMs, CapturedFrame& frame)
     // therefore a floor rather than a measurement — which is worth saying out
     // loud, and is one more reason DDA stays the primary.
     if (frame.presentUs > frame.capturedUs) frame.presentUs = frame.capturedUs;
+    frame.retaken = m_Retaking;
+    m_Retaking = false;
     return AcquireStatus::Ok;
 }
 
@@ -492,6 +631,8 @@ void WgcCapture::release()
 void WgcCapture::stop()
 {
     release();
+    m_Retaking = false;
+    m_RetakeLost = false;
     if (d->pool && d->token.value != 0) {
         d->pool->remove_FrameArrived(d->token);
         d->token = {};

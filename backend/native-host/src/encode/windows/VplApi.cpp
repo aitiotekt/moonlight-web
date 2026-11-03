@@ -71,7 +71,10 @@ VplApi::VplApi()
     // Never linked: the dispatcher belongs to the Intel driver, and its absence
     // is the normal state of every machine without an Intel GPU.
     HMODULE dll = ::GetModuleHandleW(L"libvpl.dll");
-    if (!dll) dll = ::LoadLibraryW(L"libvpl.dll");
+    // From System32 only, where the driver puts it: absent (any machine without
+    // that vendor's GPU), a bare name would go on down the search order to
+    // PATH, which the user writes, in a worker that may run elevated.
+    if (!dll) dll = ::LoadLibraryExW(L"libvpl.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!dll) {
         m_Reason = "no Intel oneVPL runtime on this machine";
         return;

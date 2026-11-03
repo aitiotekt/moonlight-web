@@ -70,6 +70,9 @@ REM  `neq 0` also catches a crashed runner: an access violation exits with
 REM  0xC0000005, which is negative and would pass an `if errorlevel 1` gate.
 "%RUNNER%"
 if !errorlevel! neq 0 goto tests_fail
+REM  The passive ICE-TCP patch on libjuice: a runner of its own, in C.
+"%~dp0build\run_juice_tests.exe"
+if !errorlevel! neq 0 goto tests_fail
 
 REM ---- 2) Coverage report (optional). OpenCppCoverage's own exit code is
 REM        unreliable, so we ignore it and gate on the parsed XML instead. ----

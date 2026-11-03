@@ -17,6 +17,14 @@ If you fork or redistribute this project, you must keep this copyright notice
 and credit the original author (Bruno Martin).
 
 ----------------------------------------------------------------------------
+Parts of MoonlightWeb under another license
+----------------------------------------------------------------------------
+
+  MWSR (mwsr/, frontend/js/stream/renderers/MwsrShader.js) ...... MIT
+    MoonlightWeb's upscaler, by the same author, packaged for other
+    programs. License: mwsr/LICENSE.
+
+----------------------------------------------------------------------------
 Third-party components (bundled under backend/third_party/)
 ----------------------------------------------------------------------------
 

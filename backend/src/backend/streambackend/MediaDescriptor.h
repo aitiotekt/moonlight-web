@@ -79,6 +79,27 @@ struct NativeHostMedia
     /// worth its cost. Asked for by the browser, never assumed: the receiver
     /// is the party that pays if it turns out to handle damage badly.
     bool rideOutLoss = false;
+
+    /// False when the client says its decoder falls silent under the
+    /// encoder's reference repairs (long-term references, an invalidated DPB):
+    /// the session then keeps one reference and heals a loss by a keyframe.
+    /// True — the engine's own repairs — for every other client.
+    bool refInvalidation = true;
+
+    /// The browser cuts each decoded frame to the size the host announces
+    /// (/start's crops_to_frame): an encoder may pad the frame past the
+    /// picture — see mw::native::SessionConfig::clientCropsToFrame. False for
+    /// every other client.
+    bool cropsToFrame = false;
+
+    /// "MoonlightWeb Virtual Display" only: the GPU that draws it, and the one
+    /// that drew the display it took the primary role from, when they differ.
+    /// An app started before the stream stays on the second, and every picture
+    /// it paints crosses to the first — seen 04/10/2026 on the UM790Pro: Steam
+    /// on the 780M, the virtual display on a GTX 1050, 130 ms per frame on
+    /// hover. Restarting the app moves it. Both empty when nothing differs.
+    QString virtualDisplayGpu;
+    QString previousPrimaryGpu;
 };
 
 struct MediaDescriptor

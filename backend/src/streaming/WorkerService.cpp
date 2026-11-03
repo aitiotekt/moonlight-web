@@ -199,8 +199,10 @@ bool pipeIo(HANDLE pipe, bool write, void* data, DWORD size, DWORD* done, DWORD 
 
 /// Who asked, and whether they may. Two questions, both about the caller and
 /// neither about what they sent: are they this same executable, and are they on
-/// the console session this service would put a SYSTEM process into?
-bool callerAllowed(HANDLE pipe, QString* why)
+/// the console session this service would put a SYSTEM process into? The
+/// caller's user SID comes back in @p callerSid: the worker is made theirs to
+/// look at (launchWorker).
+bool callerAllowed(HANDLE pipe, QString* why, std::wstring* callerSid)
 {
     ULONG pid = 0;
     if (!::GetNamedPipeClientProcessId(pipe, &pid)) {
@@ -221,17 +223,27 @@ bool callerAllowed(HANDLE pipe, QString* why)
     }
     HANDLE token = nullptr;
     DWORD session = 0xFFFFFFFF;
+    callerSid->clear();
     if (::OpenThreadToken(::GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
         DWORD size = 0;
         if (!::GetTokenInformation(token, TokenSessionId, &session, sizeof(session), &size))
             session = 0xFFFFFFFF;
+        size = 0;
+        ::GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+        std::vector<unsigned char> user(size);
+        LPWSTR sid = nullptr;
+        if (size && ::GetTokenInformation(token, TokenUser, user.data(), size, &size) &&
+            ::ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &sid)) {
+            *callerSid = sid;
+            ::LocalFree(sid);
+        }
         ::CloseHandle(token);
     }
     ::RevertToSelf();
 
     const DWORD console = ::WTSGetActiveConsoleSessionId();
-    if (session == 0xFFFFFFFF) {
-        *why = QStringLiteral("the caller's session could not be read");
+    if (session == 0xFFFFFFFF || callerSid->empty()) {
+        *why = QStringLiteral("the caller's session or user could not be read");
         return false;
     }
     if (session != console) {
@@ -251,7 +263,18 @@ bool callerAllowed(HANDLE pipe, QString* why)
 /// LocalSystem holds. `winsta0\default` is named explicitly: a service's own
 /// default is a window station nobody sees, and a worker started there would
 /// capture nothing and inject nowhere.
-bool launchWorker(const QString& base, DWORD* pid, QString* error)
+///
+/// The process is given a DACL of its own. Left to the SYSTEM token's default,
+/// only SYSTEM and administrators could open it, and the user's server — not
+/// elevated, the way it always runs — could not read the image it checks
+/// before trusting the pipes: it saw "", refused the worker and fell back to
+/// the elevated task, which cannot reach the secure desktop. Every session of
+/// v0.3.1 did (bench 28/09/2026). The user who asked (@p callerSid) gets what
+/// they have on their elevated worker: its image and exit code
+/// (PROCESS_QUERY_LIMITED_INFORMATION), a wait on it (SYNCHRONIZE) and
+/// stopping it (PROCESS_TERMINATE). Nothing that reads or writes its memory,
+/// its threads or its token.
+bool launchWorker(const QString& base, const std::wstring& callerSid, DWORD* pid, QString* error)
 {
     auto fail = [&](const QString& why) {
         *error = why;
@@ -305,11 +328,26 @@ bool launchWorker(const QString& base, DWORD* pid, QString* error)
     const std::wstring app = ownExecutable().toStdWString();
     const std::wstring cwd = QFileInfo(ownExecutable()).absolutePath().toStdWString();
 
+    // SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE.
+    const std::wstring sddl = L"D:(A;;GA;;;SY)(A;;GRGX;;;BA)(A;;0x101001;;;" + callerSid + L")";
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd,
+                                                                nullptr)) {
+        const DWORD sddlError = ::GetLastError();
+        if (env) ::DestroyEnvironmentBlock(env);
+        ::CloseHandle(token);
+        return fail(QStringLiteral("cannot build the worker's DACL (error %1)").arg(sddlError));
+    }
+    SECURITY_ATTRIBUTES processSecurity = {};
+    processSecurity.nLength = sizeof(processSecurity);
+    processSecurity.lpSecurityDescriptor = sd;
+
     PROCESS_INFORMATION pi = {};
     const BOOL created = ::CreateProcessAsUserW(
-        token, app.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+        token, app.c_str(), cmd.data(), &processSecurity, nullptr, FALSE,
         CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, cwd.c_str(), &si, &pi);
     const DWORD err = ::GetLastError();
+    ::LocalFree(sd);
     if (env) ::DestroyEnvironmentBlock(env);
     ::CloseHandle(token);
     if (!created) return fail(QStringLiteral("CreateProcessAsUser failed (error %1)").arg(err));
@@ -318,6 +356,82 @@ bool launchWorker(const QString& base, DWORD* pid, QString* error)
     ::CloseHandle(pi.hThread);
     ::CloseHandle(pi.hProcess);
     return true;
+}
+
+/// The request that asks for Ctrl+Alt+Suppr rather than for a worker. Not a
+/// pipe base name — '!' is outside what validBase accepts — so no request can
+/// be read as both.
+constexpr char kSecureAttentionRequest[] = "sas!";
+
+/// Ctrl+Alt+Suppr on the console session, pressed from here. Windows honours
+/// SendSAS from a service in session 0 and ignores it, without a word, from a
+/// SYSTEM process in the console session — which is what the worker is. Seen
+/// on 29/09/2026: the worker's own call opened nothing; the same call from a
+/// LocalSystem service opened the screen within a second. The machine's
+/// policy has to let services press it (SoftwareSASGeneration 1 or 3, which
+/// the installer sets); read first, so that a refusal is a reason in the log
+/// rather than a screen that never opens.
+bool pressSecureAttention(QString* error)
+{
+    DWORD policy = 0;
+    DWORD size = sizeof(policy);
+    const LSTATUS read = ::RegGetValueW(
+        HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        L"SoftwareSASGeneration", RRF_RT_REG_DWORD, nullptr, &policy, &size);
+    if (read != ERROR_SUCCESS) {
+        *error = QStringLiteral("the machine's SoftwareSASGeneration policy is not set: no "
+                                "service may press it");
+        return false;
+    }
+    if (policy != 1 && policy != 3) {
+        *error = QStringLiteral("the machine's SoftwareSASGeneration policy (%1) lets no service "
+                                "press it")
+                     .arg(policy);
+        return false;
+    }
+    // From System32 only: this is a LocalSystem process loading a library.
+    using SendSasFn = VOID(WINAPI*)(BOOL);
+    static const HMODULE library =
+        ::LoadLibraryExW(L"sas.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static const SendSasFn sendSas = library ? reinterpret_cast<SendSasFn>(reinterpret_cast<void*>(
+                                                   ::GetProcAddress(library, "SendSAS")))
+                                             : nullptr;
+    if (!sendSas) {
+        *error = QStringLiteral("sas.dll has no SendSAS on this machine");
+        return false;
+    }
+    // FALSE: as the service this is, not as the interactive user.
+    sendSas(FALSE);
+    return true;
+}
+
+void answerCaller(HANDLE pipe, const QString& answer)
+{
+    const QByteArray line = answer.toUtf8() + '\n';
+    DWORD written = 0;
+    pipeIo(pipe, true, const_cast<char*>(line.constData()), static_cast<DWORD>(line.size()),
+           &written, kRequestTimeoutMs);
+    ::FlushFileBuffers(pipe);
+}
+
+/// A worker asks for Ctrl+Alt+Suppr: the same two questions about who asks as
+/// for a worker, then the key press.
+void serveSecureAttention(HANDLE pipe)
+{
+    QString answer;
+    QString why;
+    std::wstring callerSid;
+    if (!callerAllowed(pipe, &why, &callerSid)) {
+        answer = QStringLiteral("err refused");
+        Logger::warning("[WorkerService] refused Ctrl+Alt+Suppr: " + why);
+    } else if (!pressSecureAttention(&why)) {
+        answer = QStringLiteral("err ") + why;
+        Logger::warning("[WorkerService] Ctrl+Alt+Suppr not pressed: " + why);
+    } else {
+        answer = QStringLiteral("ok");
+        Logger::info("[WorkerService] Ctrl+Alt+Suppr pressed on the console session");
+    }
+    answerCaller(pipe, answer);
 }
 
 void serveOne(HANDLE pipe)
@@ -330,29 +444,29 @@ void serveOne(HANDLE pipe)
     }
     buffer[got] = '\0';
     QString base = QString::fromLatin1(buffer, static_cast<int>(got)).trimmed();
+    if (base == QLatin1String(kSecureAttentionRequest)) {
+        serveSecureAttention(pipe);
+        return;
+    }
 
     QString answer;
     QString why;
+    std::wstring callerSid;
     DWORD pid = 0;
     if (!validBase(base)) {
         answer = QStringLiteral("err the pipe name is not one this service accepts");
         Logger::warning("[WorkerService] refused a malformed pipe name");
-    } else if (!callerAllowed(pipe, &why)) {
+    } else if (!callerAllowed(pipe, &why, &callerSid)) {
         answer = QStringLiteral("err refused");
         Logger::warning("[WorkerService] refused a request: " + why);
-    } else if (!launchWorker(base, &pid, &why)) {
+    } else if (!launchWorker(base, callerSid, &pid, &why)) {
         answer = QStringLiteral("err ") + why;
         Logger::warning("[WorkerService] could not start the worker: " + why);
     } else {
         answer = QStringLiteral("ok %1").arg(pid);
         Logger::info(QStringLiteral("[WorkerService] SYSTEM worker started, pid=%1").arg(pid));
     }
-
-    const QByteArray line = answer.toUtf8() + '\n';
-    DWORD written = 0;
-    pipeIo(pipe, true, const_cast<char*>(line.constData()), static_cast<DWORD>(line.size()),
-           &written, kRequestTimeoutMs);
-    ::FlushFileBuffers(pipe);
+    answerCaller(pipe, answer);
 }
 
 void controlLoop()
@@ -479,15 +593,16 @@ bool available()
     return installed;
 }
 
-bool requestWorker(const QString& base, QString* error)
+namespace {
+
+/// One request on the control pipe, and its one-line answer: true on "ok …",
+/// false with the reason on "err …" or when the service cannot be reached.
+bool askService(const QByteArray& request, QString* error)
 {
     auto fail = [&](const QString& why) {
-        g_ServiceBroken.store(true);
         if (error) *error = why;
         return false;
     };
-    if (!validBase(base)) return fail(QStringLiteral("the pipe name is not a valid one"));
-
     const std::wstring path = controlPipePath();
     HANDLE pipe =
         ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
@@ -506,7 +621,7 @@ bool requestWorker(const QString& base, QString* error)
                         : QStringLiteral("cannot reach the worker service (error %1)").arg(err));
     }
 
-    const QByteArray line = base.toLatin1() + '\n';
+    const QByteArray line = request + '\n';
     DWORD written = 0;
     if (!::WriteFile(pipe, line.constData(), static_cast<DWORD>(line.size()), &written, nullptr)) {
         const DWORD err = ::GetLastError();
@@ -526,6 +641,28 @@ bool requestWorker(const QString& base, QString* error)
                         ? answer.mid(4)
                         : QStringLiteral("the worker service refused: ") + answer);
     return true;
+}
+
+} // namespace
+
+bool requestWorker(const QString& base, QString* error)
+{
+    auto fail = [&](const QString& why) {
+        g_ServiceBroken.store(true);
+        if (error) *error = why;
+        return false;
+    };
+    if (!validBase(base)) return fail(QStringLiteral("the pipe name is not a valid one"));
+    QString why;
+    if (!askService(base.toLatin1(), &why)) return fail(why);
+    return true;
+}
+
+bool requestSecureAttention(QString* error)
+{
+    // No g_ServiceBroken here: a refused key press says nothing about whether
+    // the next worker can be started.
+    return askService(QByteArray(kSecureAttentionRequest), error);
 }
 
 int runService()
@@ -592,7 +729,7 @@ int installService()
         SERVICE_DESCRIPTIONW description = {};
         std::wstring text = L"Starts the " + serviceName().toStdWString() +
                             L" stream worker on the console desktop, so a remote viewer can "
-                            L"answer a UAC prompt and the lock screen.";
+                            L"answer a UAC prompt and the lock screen, and press Ctrl+Alt+Del.";
         description.lpDescription = const_cast<LPWSTR>(text.c_str());
         ::ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description);
     }
@@ -642,6 +779,12 @@ bool available()
 bool requestWorker(const QString&, QString* error)
 {
     if (error) *error = QStringLiteral("the worker service exists on Windows only");
+    return false;
+}
+
+bool requestSecureAttention(QString* error)
+{
+    if (error) *error = QStringLiteral("Ctrl+Alt+Suppr is a Windows notion");
     return false;
 }
 

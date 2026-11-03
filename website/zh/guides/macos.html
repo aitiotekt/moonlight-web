@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<!-- Generated from /guides/macos.html and _i18n/zh/guides/macos.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>在 macOS 上安装 MoonlightWeb — 把你的 Mac 串流到任意浏览器</title>
+<meta name="description" content="分步指南：在你的 Apple Silicon Mac 上安装 MoonlightWeb 服务器，把游戏串流到任何带浏览器的设备——iPhone、iPad、笔记本、电视。它自己捕获并编码这台 Mac，客户端无需安装任何东西。">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#05080d">
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="在 macOS 上安装 MoonlightWeb — 把你的 Mac 串流到任意浏览器">
+<meta property="og:description" content="分步指南：在你的 Apple Silicon Mac 上安装 MoonlightWeb 服务器，把游戏串流到任何带浏览器的设备——iPhone、iPad、笔记本、电视。它自己捕获并编码这台 Mac，客户端无需安装任何东西。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://moonlightweb.top/zh/guides/macos.html">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="在 macOS 上安装 MoonlightWeb — 把你的 Mac 串流到任意浏览器">
+<meta name="twitter:description" content="分步指南：在你的 Apple Silicon Mac 上安装 MoonlightWeb 服务器，把游戏串流到任何带浏览器的设备——iPhone、iPad、笔记本、电视。它自己捕获并编码这台 Mac，客户端无需安装任何东西。">
+<meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/zh/guides/macos.html">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/macos.html">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/macos.html">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/macos.html">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/macos.html">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/macos.html">
+<!-- /i18n:alternates -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<link rel="stylesheet" href="/assets/pages.css?v={{(fileStat `/assets/pages.css`).ModTime.Unix}}">
+<!-- Shared header/footer styling -->
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://moonlightweb.top/zh/"},
+        {"@type": "ListItem", "position": 2, "name": "Guides", "item": "https://moonlightweb.top/zh/guides/"},
+        {"@type": "ListItem", "position": 3, "name": "Install on macOS", "item": "https://moonlightweb.top/zh/guides/macos.html"}
+      ]
+    },
+    {
+      "@type": "HowTo",
+      "name": "Install MoonlightWeb on macOS and stream your Mac to any browser",
+      "description": "Install the MoonlightWeb server on an Apple Silicon Mac — it captures and encodes that Mac itself — and play from any device with a browser.",
+      "totalTime": "PT5M",
+      "estimatedCost": {"@type": "MonetaryAmount", "currency": "USD", "value": "0"},
+      "supply": [{"@type": "HowToSupply", "name": "Apple Silicon Mac (M1 or newer)"}],
+      "tool": [{"@type": "HowToTool", "name": "A modern browser on any client device (Chrome, Edge, Safari, Firefox)"}],
+      "step": [
+        {"@type": "HowToStep", "name": "Download the installer", "text": "Download the Apple Silicon .pkg from the MoonlightWeb releases page.", "url": "https://moonlightweb.top/zh/guides/macos.html#step-download"},
+        {"@type": "HowToStep", "name": "Run the guided installer", "text": "Run the .pkg on the Mac that runs your games. The setup wizard walks you through the configuration, including one-click Internet access.", "url": "https://moonlightweb.top/zh/guides/macos.html#step-install"},
+        {"@type": "HowToStep", "name": "Grant the two macOS permissions", "text": "At its first launch MoonlightWeb asks for both macOS permissions at once: Screen Recording, so this Mac can stream its own screen, and Accessibility, so your clicks and keystrokes reach it. Tick both in System Settings, Privacy & Security, then quit and reopen MoonlightWeb.", "url": "https://moonlightweb.top/zh/guides/macos.html#permissions"},
+        {"@type": "HowToStep", "name": "Open a browser on any device", "text": "Go to https://localhost on the Mac itself, or your LAN IP from another device on your network.", "url": "https://moonlightweb.top/zh/guides/macos.html#step-open"},
+        {"@type": "HowToStep", "name": "Your Mac is already there", "text": "The Mac is listed straight away, with one card per screen — no pairing, no PIN. Other hosts on the network (Sunshine, Wolf, MultiSeat) are discovered too and pair with a PIN.", "url": "https://moonlightweb.top/zh/guides/macos.html#step-pair"},
+        {"@type": "HowToStep", "name": "Press play", "text": "Pick a game or the full desktop and play from any browser in the house — or anywhere.", "url": "https://moonlightweb.top/zh/guides/macos.html#step-play"}
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/zh/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/zh/" data-nav="home">首页</a><a href="/zh/guides/" data-nav="guides" aria-current="page">指南</a><a href="/zh/faq.html" data-nav="faq">常见问题</a><a href="/zh/contact.html" data-nav="contact">联系</a><a href="/zh/server-access/" data-nav="connect">连接主机</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/guides/macos.html">English</option><option value="fr" data-href="/fr/guides/macos.html">Français</option><option value="de" data-href="/de/guides/macos.html">Deutsch</option><option value="zh" data-href="/zh/guides/macos.html" lang="zh" selected>中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<main>
+<div class="wrap">
+  <nav class="crumbs" aria-label="Breadcrumb" data-i18n-html="crumbs"><a href="/zh/">首页</a> / <a href="/zh/guides/">指南</a> / macOS</nav>
+  <span class="kicker" data-i18n="kicker">安装指南 · macOS</span>
+  <h1 data-i18n="h1">把你的 Mac 串流到任何浏览器</h1>
+  <p class="lead" data-i18n-html="lead">MoonlightWeb 是一个免费、开源（GPL-3.0）的服务器，把你的 Mac 串流到任何带浏览器的设备。<strong>在运行游戏的那台 Mac 上下载一次。其他每台设备只要打开一个网址。</strong></p>
+
+  <h2 data-i18n="need.h">你需要什么</h2>
+  <ul>
+    <li data-i18n-html="need.1">一台 <strong>Apple Silicon Mac</strong>（M1 或更新）——运行你游戏的那台机器。</li>
+    <li data-i18n-html="need.2"><strong>不需要别的。</strong>MoonlightWeb 自己捕获并编码这台 Mac（ScreenCaptureKit → VideoToolbox）——无需再装第二个串流服务器。已经在别处跑着 Sunshine、Wolf 或 MultiSeat？那些机器可以在同一个页面里配对。</li>
+    <li data-i18n="need.3">任何带现代浏览器的设备都可作客户端：Safari、Chrome、Edge 或 Firefox。无需应用、无需账户。</li>
+  </ul>
+
+  <h2 data-i18n="steps.h">逐步安装</h2>
+  <div class="gsteps">
+    <div class="gstep cyb" id="step-download">
+      <h3 data-i18n="step1.h">下载安装程序</h3>
+      <p data-i18n-html="step1.p">从<a href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener">发布页面</a>获取 <code>arm64 .pkg</code>。</p>
+    </div>
+    <div class="gstep cyb" id="step-install">
+      <h3 data-i18n="step2.h">运行向导式安装程序——在运行游戏的那台 Mac 上</h3>
+      <p data-i18n="step2.p">安装向导会带你完成配置，包括可选的互联网连接（远程串流会话，默认关闭）。完成后，服务器即在运行。</p>
+      <p data-i18n-html="step2.p2">随后 macOS 会请你为 MoonlightWeb 允许<strong>屏幕录制</strong>——没有它，这台 Mac 无法串流自己的屏幕。这是<a href="#permissions">只有你才能授予的两项权限</a>中的第一项；向导会为你打开对应的设置面板。</p>
+    </div>
+    <div class="gstep cyb" id="step-open">
+      <h3 data-i18n="step3.h">在任何设备上打开浏览器</h3>
+      <p data-i18n-html="step3.p">在 Mac 本机上：<code>https://localhost</code>。从你网络上的其他设备：你的局域网 IP。要从网络之外游玩：启用互联网访问，应用便会给你一个直达这台机器的远程接入链接。你也可以使用自己的域名和证书。</p>
+    </div>
+    <div class="gstep cyb" id="step-pair">
+      <h3 data-i18n="step4.h">你的 Mac 已经在那里</h3>
+      <p data-i18n="step4.p">这台 Mac 一开始就列在那里，每块屏幕一张卡片——无需配对，也没有 PIN 码。你网络上的其他主机（Sunshine、Wolf、MultiSeat）会通过 mDNS 出现在旁边：那些只需配对一次——对于 Sunshine，在其网页中输入 MoonlightWeb 显示的 PIN 码——之后永久记住。</p>
+    </div>
+    <div class="gstep cyb" id="step-play">
+      <h3 data-i18n="step5.h">按下开始</h3>
+      <p data-i18n="step5.p">选择一块屏幕、一款游戏或完整桌面。iPhone、iPad、另一台笔记本、一台电视——任何带浏览器的东西都能成为客户端。</p>
+    </div>
+  </div>
+
+  <p style="text-align:center"><a class="btn btn-primary" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-loc="guide-macos" data-i18n="dl.btn">⬇ 下载 macOS 版</a></p>
+
+  <h2 id="permissions" data-i18n="perm.h">macOS 会请你允许什么</h2>
+  <p data-i18n-html="perm.p">苹果不允许任何安装程序代你授予这些权限——macOS 上的每个串流服务器都要求同样的权限。一共<strong>两项</strong>，MoonlightWeb 会在安装后的首次启动时一次性请求两项，那时你还坐在这台 Mac 前面：</p>
+  <ul>
+    <li data-i18n-html="perm.1"><strong>屏幕录制</strong>，在首次启动时。在<strong>系统设置 → 隐私与安全性 → 屏幕录制</strong>（macOS 15 及更新版本中名为<em>屏幕与系统音频录制</em>）中勾选 <em>MoonlightWeb</em>，然后<strong>退出并重新打开 MoonlightWeb</strong>——macOS 只对授权之后启动的程序应用该权限。在此之前，主机页面会把这台 Mac 显示为不可用，并原样说明这一点。</li>
+    <li data-i18n-html="perm.2"><strong>辅助功能</strong>，紧接着一并请求。正是它让你的点击和按键到达这台 Mac。请在<strong>系统设置 → 隐私与安全性 → 辅助功能</strong>中勾选 <em>MoonlightWeb</em>。没有它，画面会出现而一切都没有反应——而且 macOS 自己不会给出任何提示，所以配置页面会说明这一点，并可以帮你打开该面板。</li>
+  </ul>
+  <p data-i18n-html="perm.rest">过程中，安装程序还会要求你的<strong>管理员密码</strong>（应用安装到 <code>/Applications</code>），并在第一页要求对“此软件包将运行一个程序以确定该软件能否安装”点击<strong>允许</strong>——那个程序就是安装程序自己的互联网页面。除此之外没有别的：安装程序已经在 macOS 防火墙中放行了 MoonlightWeb，因此不会出现传入连接的提示，也不会安装第二个串流服务器。</p>
+  <div class="note" data-i18n-html="perm.note"><strong>授予一次，此后保留。</strong>发布版本使用稳定证书签名，因此更新 MoonlightWeb 不会再次索要这些权限。</div>
+
+  <h2 id="one-line-install" data-i18n="cli.h">一条命令搞定——而且没有警告</h2>
+  <p data-i18n-html="cli.p">MoonlightWeb 免费且开源，这也意味着它没有用付费的 Apple Developer ID 签名。因此 macOS 会对<em>下载来的</em> <code>.pkg</code> 提示“<strong>无法打开，因为它来自身份不明的开发者</strong>”。这项检查只针对浏览器下载的文件，所以下面任意一条命令都能安装完全相同的软件包，无需任何额外点击：</p>
+  <pre><code>brew install --cask linckosz/tap/moonlightweb</code></pre>
+  <pre><code>curl -fsSL https://moonlightweb.top/install.sh | bash</code></pre>
+  <p data-i18n="cli.note">两者都会要求输入管理员密码，安装到 /Applications 并打开设置向导——同一个安装程序，同样的结果，少一个步骤。</p>
+
+  <h2 data-i18n="tr.h">疑难解答</h2>
+  <h3 data-i18n="tr0.h">macOS 拒绝打开安装程序：“身份不明的开发者”</h3>
+  <p data-i18n-html="tr0.p">这是预期行为，也无害：要消除该提示需要付费的 Apple Developer ID。使用上面两条命令之一就不会出现。如果你想用已经下载好的文件：在 <strong>macOS 15 Sequoia 及更新版本</strong>上先双击一次、让它被拒绝，然后打开<strong>系统设置 → 隐私与安全性</strong>，滚动到底部并点击<strong>仍要打开</strong>——旧的 Control-点按 → 打开的快捷方式已失效。终端等效命令：<code>xattr -dr com.apple.quarantine ~/Downloads/moonlightweb-*.pkg</code>。</p>
+  <h3 data-i18n="tr4.h">画面有了，但鼠标和键盘没有反应</h3>
+  <p data-i18n-html="tr4.p">这是<strong>辅助功能</strong>权限：缺少它时，macOS 会完全静默地丢弃注入的点击和按键。请在<strong>系统设置 → 隐私与安全性 → 辅助功能</strong>中勾选 <em>MoonlightWeb</em>，然后退出并重新打开应用。</p>
+  <h3 data-i18n="tr5.h">开关已经勾上了，还是不行</h3>
+  <p data-i18n-html="tr5.p">macOS 把权限绑定在应用的<em>签名</em>上，而不是它的名字上——于是旧副本或以不同方式构建的副本留下的条目仍然勾着，而正在运行的应用却被拒绝。在终端里清除它，让应用重新询问：</p>
+  <pre><code>tccutil reset ScreenCapture com.moonlightweb.server
+tccutil reset Accessibility com.moonlightweb.server</code></pre>
+  <p data-i18n-html="tr5.p2">重新打开 MoonlightWeb，并在它重新出现在这两个面板中时勾选它。对于预发布版本，标识符是 <code>com.moonlightweb.server.dev</code>。</p>
+  <h3 data-i18n="tr1.h">主机没有出现在浏览器里</h3>
+  <p data-i18n="tr1.p">请确保客户端设备与这台 Mac 处于同一网络。安装程序已在 macOS 防火墙中放行 MoonlightWeb，但第三方防火墙、或者会隔离客户端的访客 Wi-Fi 不会。你也可以通过 IP 手动添加主机。</p>
+  <h3 data-i18n="tr2.h">在 iPhone 或 iPad 上游玩</h3>
+  <p data-i18n="tr2.p">在 Safari 里打开同一个网址——无需从 App Store 下载。你将获得多点触控触控板和带修饰键的原生虚拟键盘；Mac 主机不接收游戏手柄（macOS 不允许虚拟手柄）。</p>
+  <h3 data-i18n="tr3.h">弱网络下串流卡顿</h3>
+  <p data-i18n-html="tr3.p">降低串流分辨率并启用 <strong>Video Enhancement（视频增强）</strong>：串流会在客户端 GPU 上放大并锐化（WebGL2 或 WebGPU 运行 MoonlightWeb 自研放大算法），于是 720p 串流看起来接近 1440p。</p>
+
+  <div class="note" data-i18n-html="note"><strong>网络受限？</strong>UDP 被屏蔽时，MoonlightWeb 会自动回退到 TCP，仍是直连，因此在大多数严格防火墙和恶劣的酒店 Wi-Fi 下也能继续工作。</div>
+
+  <h2 data-i18n="read.h">继续阅读</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/zh/faq.html"><strong data-i18n="x.faq.t">常见问题</strong><span data-i18n="x.faq.d">延迟、编解码器、安全、互联网远程游玩——所有常见问题。</span></a>
+    <a class="cyb" href="/zh/guides/windows.html"><strong data-i18n="x.win.t">在 Windows 上安装</strong><span data-i18n="x.win.d">向导式安装程序——一个向导，别的都不用配。</span></a>
+    <a class="cyb" href="/zh/guides/linux.html"><strong data-i18n="x.lin.t">在 Linux 上安装</strong><span data-i18n="x.lin.d">.deb、.rpm 或便携 AppImage。</span></a>
+  </div>
+</div>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/zh/">首页</a> · <a href="/zh/guides/">指南</a> · <a href="/zh/faq.html">常见问题</a> · <a href="/zh/contact.html">联系</a> · <a href="/zh/server-access/">连接主机</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>咖啡</span></a></span><span class="foot-play">畅玩设备： <a href="/zh/play/chromebook.html">Chromebook</a> · <a href="/zh/play/iphone-ipad.html">iPhone 和 iPad</a> · <a href="/zh/play/tv.html">电视</a> · <a href="/zh/sunshine-web-client.html">Sunshine 网页客户端</a> · <a href="/zh/browser-game-streaming.html">为什么选择浏览器客户端</a></span></div></footer>
+
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+</body>
+</html>

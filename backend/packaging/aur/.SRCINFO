@@ -1,5 +1,5 @@
 pkgbase = moonlightweb-bin
-	pkgdesc = Stream your Sunshine games to any device with a browser
+	pkgdesc = Stream your gaming PC to any device with a browser
 	pkgver = @MW_VERSION@
 	pkgrel = 1
 	url = https://moonlightweb.top/

@@ -32,6 +32,7 @@ import { BackendClient } from '../api/BackendClient.js';
 import { Toast } from './Toast.js';
 import { t } from '../i18n/i18n.js';
 import { escapeHtml } from '../util/escapeHtml.js';
+import { refreshClientLog } from '../util/ClientLog.js';
 import { GamepadDriverNotice } from './GamepadDriverNotice.js';
 
 export class AdminView {
@@ -69,6 +70,10 @@ export class AdminView {
         // so until one is set the door is advertised but opens for nobody.
         this._remoteAdminEnabled = true;
         this._adminPasswordSet = false;
+        // Whether the password is also accepted from the internet, through the
+        // rendezvous. Off by default: the LAN's door does not turn into the
+        // internet's unless the owner asks for exactly that.
+        this._remoteAdminInternet = false;
 
         // Server settings state
         this._httpsPort = 443;
@@ -95,6 +100,12 @@ export class AdminView {
         this._transportMode = 'auto';
         this._availableTransports = [];
         this._upnpAvailable = false;
+        // Off in settings.json: the router is never asked, which is not the
+        // same thing as a router that did not answer.
+        this._upnpEnabled = true;
+        this._customDomain = false;
+        this._mediaPortFirst = 48550;
+        this._mediaPortLast = 48573;
         this._active = false; // the manager is running (IP detected, router asked)
         this._rendezvousUrl = ''; // address this install is reached at, once claimed
         this._rendezvousOnline = false; // the held line is actually up
@@ -121,6 +132,18 @@ export class AdminView {
         // through the native host. Server-side setting: the tray obeys it, and
         // the tray may live in another process.
         this._streamNotifications = true;
+        // Network priority: the stream's packets ask the Wi-Fi for its video
+        // queue (AF41). On unless the admin unticks it for the house's sake.
+        this._packetMarking = true;
+        // The other screens off while a stream runs on the virtual display
+        // (issue #39). Offered on Windows once the display is installed.
+        this._vdExclusiveSupported = false;
+        this._vdExclusive = false;
+        // This PC's keyboard layout for the touch keyboard's text (issue #44).
+        // Offered when the server reads a layout here and a host runs here.
+        this._hostLayoutOffered = false;
+        this._hostLayoutDetected = '';
+        this._hostLayout = false;
         // Start at login. Offered only where the server says it can do it (a
         // desktop session, never a service), and ticked from what the OS
         // actually holds — the installer or the tray may have set it.
@@ -133,6 +156,31 @@ export class AdminView {
         this._instanceName = '';
         this._defaultInstanceName = '';
         this._instanceNameMax = 32;
+        // The picture chain of a native session (Advanced): what is stored,
+        // whether this machine has a choice to make at all — a Windows GPU
+        // whose encoder has a D3D12 route, a Linux GPU (VA-API or Vulkan) —
+        // and this OS's values. The section is hidden where there is none.
+        this._videoPipeline = 'auto';
+        this._videoPipelineSupported = false;
+        this._videoPipelineValues = ['auto', 'd3d11', 'd3d12'];
+        // Apps on this PC (the native host's apps): the list the server keeps,
+        // where they open, the launchers found on this PC, and whether this
+        // machine streams at all — the section is hidden where it does not.
+        /** @type {{id: string, app_id: number, name: string, command: string, source?: string, image?: string}[]} */
+        this._hostApps = [];
+        this._hostAppsSupported = false;
+        this._hostAppsMax = 16;
+        this._hostAppsScreen = 'primary';
+        /** @type {{source: string, name: string, listed: boolean, dismissed: boolean}[]} */
+        this._hostAppsDetected = [];
+        // Diagnostics (Advanced): the two modes in force, and whether the
+        // command line holds each on for this run — its box then cannot
+        // turn it off. The logs archive, while it is being built.
+        this._debugMode = false;
+        this._debugModeCli = false;
+        this._verboseLogs = false;
+        this._verboseLogsCli = false;
+        this._logsBusy = false;
 
         // Dirty tracking: snapshot of values at load time
         this._cleanState = {};
@@ -160,6 +208,8 @@ export class AdminView {
             return;
         }
         await this._loadState();
+        await this._loadStreamingState();
+        await this._loadHostApps();
         await this._loadInternetState();
         await this._loadSessions();
         this.render();
@@ -206,6 +256,12 @@ export class AdminView {
             this._httpPort = admin.http_port || 80;
             this._certAuthEnabled = admin.cert_auth_enabled || false;
             this._streamNotifications = admin.stream_notifications !== false;
+            this._packetMarking = admin.packet_marking !== false;
+            this._vdExclusiveSupported = admin.virtual_display_exclusive_supported === true;
+            this._vdExclusive = admin.virtual_display_exclusive === true;
+            this._hostLayoutOffered = admin.keyboard_host_layout_offered === true;
+            this._hostLayoutDetected = admin.keyboard_host_layout_detected || '';
+            this._hostLayout = admin.keyboard_host_layout === true;
             this._autostartSupported = admin.autostart_supported === true;
             this._autostartEnabled = admin.autostart_enabled === true;
             // Two values, not one: what was chosen (often nothing) and what the
@@ -215,8 +271,35 @@ export class AdminView {
             this._instanceName = admin.instance_name || '';
             this._defaultInstanceName = admin.default_instance_name || '';
             this._instanceNameMax = admin.instance_name_max || 32;
+            this._debugMode = admin.debug_mode === true;
+            this._debugModeCli = admin.debug_mode_cli === true;
+            this._verboseLogs = admin.verbose_logs === true;
+            this._verboseLogsCli = admin.verbose_logs_cli === true;
         } catch (err) {
             console.warn('[Admin] Failed to load server settings:', err);
+        }
+    }
+
+    async _loadStreamingState() {
+        try {
+            const settings = await BackendClient.getStreamingSettings();
+            this._videoPipeline = settings.native_video_pipeline || 'auto';
+            this._videoPipelineSupported = settings.native_video_pipeline_supported === true;
+            // An older server names no values: Windows', the only ones it had.
+            if (Array.isArray(settings.native_video_pipeline_options)) {
+                this._videoPipelineValues = settings.native_video_pipeline_options;
+            }
+        } catch (err) {
+            console.warn('[Admin] Failed to load streaming settings:', err);
+        }
+    }
+
+    async _loadHostApps() {
+        try {
+            this._applyHostAppsState(await BackendClient.getHostApps());
+        } catch (err) {
+            // An older server has no such route: the section stays hidden.
+            console.warn('[Admin] Failed to load the apps on this PC:', err);
         }
     }
 
@@ -239,6 +322,10 @@ export class AdminView {
             this._transportMode = status.transport_mode || 'auto';
             this._availableTransports = status.available_transports || [];
             this._upnpAvailable = status.upnp_available || false;
+            this._upnpEnabled = status.upnp_enabled !== false;
+            this._customDomain = status.custom_domain === true;
+            this._mediaPortFirst = status.media_port_first || this._mediaPortFirst;
+            this._mediaPortLast = status.media_port_last || this._mediaPortLast;
             this._active = status.active || false;
             // The address this install is reached at. It exists nowhere but
             // here: no record is published any more, so this page is where its
@@ -287,6 +374,7 @@ export class AdminView {
             if (status.remote_admin_enabled !== undefined) {
                 this._remoteAdminEnabled = !!status.remote_admin_enabled;
                 this._adminPasswordSet = !!status.admin_password_set;
+                this._remoteAdminInternet = !!status.remote_admin_internet;
             }
             if (status.pin) {
                 this._pin = status.pin;
@@ -355,6 +443,13 @@ export class AdminView {
         await this._postRemoteAdmin({ password }, t('admin.remoteAdminSaved'));
     }
 
+    // Forget the password: the door stays advertised but opens for nobody, and
+    // every machine that unlocked with it loses its access.
+    async _clearAdminPassword() {
+        if (!confirm(t('admin.remoteAdminConfirmRemove'))) return;
+        await this._postRemoteAdmin({ clear: true }, t('admin.remoteAdminRemoved'));
+    }
+
     // Open or close the LAN door entirely. Closing it revokes every unlock.
     async _toggleRemoteAdmin(enabled) {
         await this._postRemoteAdmin(
@@ -363,15 +458,30 @@ export class AdminView {
         );
     }
 
+    // Open or close the internet side of the same door. Closing it revokes
+    // every unlock too: the host does not record which ones the internet bought.
+    async _toggleRemoteAdminInternet(internet) {
+        await this._postRemoteAdmin(
+            { internet },
+            internet ? t('admin.remoteAdminInternetOn') : t('admin.remoteAdminInternetOff'),
+        );
+    }
+
     async _postRemoteAdmin(body, successMessage) {
         try {
             const result = await BackendClient.saveRemoteAdmin(body);
             this._remoteAdminEnabled = !!result.remote_admin_enabled;
             this._adminPasswordSet = !!result.admin_password_set;
+            this._remoteAdminInternet = !!result.remote_admin_internet;
             Toast.success(successMessage);
-            // A remote admin who just closed the LAN door closed it on itself.
+            // A remote admin who just closed a door may have closed it on
+            // itself: the LAN's, or the internet's, which revokes every unlock.
             // Reload rather than leave an admin page whose every button 403s.
-            if (!this._remoteAdminEnabled && !this._isRealHostMachine) {
+            const closedOnItself =
+                !this._remoteAdminEnabled ||
+                !this._adminPasswordSet ||
+                (body.internet === false && !this._remoteAdminInternet);
+            if (closedOnItself && !this._isRealHostMachine) {
                 setTimeout(() => window.location.reload(), 600);
                 return;
             }
@@ -552,6 +662,7 @@ export class AdminView {
         // unlocked admin access with the remote admin password — not just on
         // loopback. Named for what it gates (admin), not for where we are.
         if (this._hasAdminAccess) return true;
+        if (BackendClient.adminLocked) return false; // booth mode (--noadmin)
         const hostname = window.location.hostname;
         return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
     }
@@ -620,12 +731,17 @@ export class AdminView {
         // outside a debug build, or a hand-written value) is listed anyway:
         // dropping it would leave the select showing "auto" while the saved
         // setting says otherwise, and the next save would silently change it.
+        // transport_mode "all" is the auto chain with wss offered too: while wss
+        // is on the list, the Auto entry saves "all" so the list survives a save.
         const offered = this._availableTransports.slice();
-        if (this._transportMode !== 'auto' && !offered.includes(this._transportMode)) {
+        const autoValue = offered.includes('wss') ? 'all' : 'auto';
+        if (this._transportMode === 'all' || this._transportMode === 'auto') {
+            this._transportMode = autoValue;
+        } else if (!offered.includes(this._transportMode)) {
             offered.push(this._transportMode);
         }
         const transportOptions = [
-            { value: 'auto', label: t('admin.transportAuto') },
+            { value: autoValue, label: t('admin.transportAuto') },
             ...offered.map((mode) => ({
                 value: mode,
                 label:
@@ -739,41 +855,7 @@ export class AdminView {
                         : ''
                 }
 
-                <!-- Remote admin access (LAN password) -->
-                <div class="settings-section">
-                    <h3 class="settings-section-title">${t('admin.remoteAdmin')}</h3>
-                    <div class="settings-field u-pt-0">
-                        <label class="settings-checkbox-label">
-                            <input type="checkbox" id="chk-remote-admin"
-                                   ${this._remoteAdminEnabled ? 'checked' : ''} />
-                            <span class="settings-checkbox-text">${t('admin.remoteAdminEnable')}</span>
-                        </label>
-                        <p class="setting-desc">${t('admin.remoteAdminDesc')}</p>
-                        ${
-                            !this._remoteAdminEnabled
-                                ? ''
-                                : this._adminPasswordSet
-                                  ? `<p class="settings-hint">${t('admin.remoteAdminCustom')}</p>`
-                                  : `<div class="settings-status settings-status-pending">
-                                         ${t('admin.remoteAdminNoPassword')}
-                                     </div>`
-                        }
-                        ${
-                            this._remoteAdminEnabled
-                                ? `
-                        <input type="password" id="admin-remote-password" class="settings-input u-mt-2"
-                               autocomplete="new-password"
-                               placeholder="${this.esc(t('admin.remoteAdminPlaceholder'))}" />
-                        <div class="u-mt-2">
-                            <button class="btn btn-neutral" id="btn-set-admin-password">
-                                ${t('admin.remoteAdminChange')}
-                            </button>
-                        </div>
-                        <p class="settings-hint u-mt-2">${t('admin.remoteAdminHint')}</p>`
-                                : ''
-                        }
-                    </div>
-                </div>
+                ${this._renderRemoteAdmin()}
 
                 <!-- Internet -->
                 <div class="settings-section" id="admin-section-internet">
@@ -840,12 +922,20 @@ export class AdminView {
                     <div class="internet-info-box">
                         <p><strong class="internet-important-label">${t('admin.importantLabel')}</strong><br>
                         ${this._internetConsentText()}</p>
-                        <p>${this._upnpAvailable ? t('admin.upnpAvailableNote') : t('admin.upnpUnavailableNote')}</p>
+                        <p>${
+                            !this._upnpEnabled
+                                ? t('admin.upnpDisabledNote')
+                                : this._upnpAvailable
+                                  ? t('admin.upnpAvailableNote')
+                                  : t('admin.upnpUnavailableNote')
+                        }</p>
                         ${this._publicIp ? `<p>${t('admin.publicIp')} <code>${this.esc(this._publicIp)}</code></p>` : ''}
                         <p>${t('admin.upnpLabel')} ${
-                            this._upnpAvailable
-                                ? `<span class="text-success">${t('admin.available')}</span>`
-                                : `<span class="text-muted">${t('admin.notAvailable')}</span>`
+                            !this._upnpEnabled
+                                ? `<span class="text-muted">${t('admin.upnpDisabled')}</span>`
+                                : this._upnpAvailable
+                                  ? `<span class="text-success">${t('admin.available')}</span>`
+                                  : `<span class="text-muted">${t('admin.notAvailable')}</span>`
                         }
                         </p>
                     </div>
@@ -890,7 +980,11 @@ export class AdminView {
                             : ''
                     }
 
-                    <!-- Port Mapping: only shown when UPnP is NOT available -->
+                    <!-- Port Mapping: only shown when no hole is opened for us.
+                         What to forward is the stream block, UDP, each port to
+                         itself: the web port stays closed, the rendezvous
+                         introduces the browser. A user-owned domain is the one
+                         case that does need its HTTPS port forwarded. -->
                     ${
                         !this._upnpAvailable
                             ? `
@@ -898,10 +992,16 @@ export class AdminView {
                             <label class="settings-label">${t('admin.portMapping')}</label>
                             <p class="settings-hint">
                                 ${t('admin.portMappingHint')}
-                                <br />${t('admin.portMappingSource')} (<strong>Any:${this._httpsPort}</strong>) &rarr;
-                                ${t('admin.portMappingDest')} (<strong>${this._getLocalIpForDisplay() ? this.esc(this._getLocalIpForDisplay()) + ':' : ''}${this._httpsPort}</strong>)
+                                <br />${t('admin.portMappingSource')} (<strong>UDP ${this._mediaPortFirst}-${this._mediaPortLast}</strong>) &rarr;
+                                ${t('admin.portMappingDest')} (<strong>${this._getLocalIpForDisplay() ? this.esc(this._getLocalIpForDisplay()) + ':' : ''}${this._mediaPortFirst}-${this._mediaPortLast}</strong>)
                                 ${this._getLocalIpForDisplay() ? '' : `<br />${t('admin.portMappingEnterIp')}`}
-                                <br /><strong>${t('admin.portMappingProtocols')}</strong>.
+                                ${
+                                    this._customDomain
+                                        ? `<br />${t('admin.portMappingDomain')}
+                                (<strong>TCP ${this._httpsPort}</strong>) &rarr;
+                                (<strong>${this._getLocalIpForDisplay() ? this.esc(this._getLocalIpForDisplay()) + ':' : ''}${this._httpsPort}</strong>)`
+                                        : `<br />${t('admin.portMappingNoWebPort')}`
+                                }
                             </p>
                         </div>
                     `
@@ -988,6 +1088,47 @@ export class AdminView {
                             : ''
                     }
 
+                    <div class="settings-field" id="admin-packet-marking">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="chk-packet-marking"
+                                   ${this._packetMarking ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">${t('admin.packetMarking')}</span>
+                        </label>
+                        <p class="setting-desc">${t('admin.packetMarkingDesc')}</p>
+                    </div>
+
+                    ${
+                        this._vdExclusiveSupported
+                            ? `
+                    <div class="settings-field" id="admin-vd-exclusive">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="chk-vd-exclusive"
+                                   ${this._vdExclusive ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">${t('admin.vdExclusive')}</span>
+                        </label>
+                        <p class="setting-desc">${t('admin.vdExclusiveDesc')}</p>
+                    </div>
+                    `
+                            : ''
+                    }
+
+                    ${
+                        this._hostLayoutOffered
+                            ? `
+                    <div class="settings-field" id="admin-host-layout">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="chk-host-layout"
+                                   ${this._hostLayout ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">${t('admin.hostLayout', {
+                                layout: escapeHtml(this._hostLayoutDetected),
+                            })}</span>
+                        </label>
+                        <p class="setting-desc">${t('admin.hostLayoutDesc')}</p>
+                    </div>
+                    `
+                            : ''
+                    }
+
                     <div class="settings-field">
                         <label class="settings-label" for="admin-instance-name">
                             ${t('admin.instanceName')}
@@ -1045,6 +1186,8 @@ export class AdminView {
                         </div>
                     </div>
                 </div>
+                ${this._hostAppsSupported ? this._renderHostApps() : ''}
+                ${this._renderAdvanced()}
             </div>
         `;
 
@@ -1329,6 +1472,12 @@ export class AdminView {
         if (remoteChk) {
             remoteChk.addEventListener('change', () => this._toggleRemoteAdmin(remoteChk.checked));
         }
+        const internetAdminChk = this.container.querySelector('#chk-remote-admin-internet');
+        if (internetAdminChk) {
+            internetAdminChk.addEventListener('change', () =>
+                this._toggleRemoteAdminInternet(internetAdminChk.checked),
+            );
+        }
         const setPassBtn = this.container.querySelector('#btn-set-admin-password');
         const passInput = this.container.querySelector('#admin-remote-password');
         if (setPassBtn && passInput) {
@@ -1339,6 +1488,10 @@ export class AdminView {
                     this._saveAdminPassword(passInput.value);
                 }
             });
+        }
+        const clearPassBtn = this.container.querySelector('#btn-clear-admin-password');
+        if (clearPassBtn) {
+            clearPassBtn.addEventListener('click', () => this._clearAdminPassword());
         }
 
         // Internet Access checkbox toggle
@@ -1360,6 +1513,25 @@ export class AdminView {
                 this._saveInternetPrefs();
             });
         }
+
+        // Picture chain (Advanced): saved as soon as it changes
+        const pipelineSelect = this.container.querySelector('#select-video-pipeline');
+        if (pipelineSelect) {
+            pipelineSelect.addEventListener('change', () => {
+                this._saveVideoPipeline(pipelineSelect.value);
+            });
+        }
+
+        // Apps on this PC: each change saved at once.
+        this._bindHostApps();
+
+        // Diagnostics (Advanced): both modes saved at once, the archive on click.
+        for (const id of ['#chk-debug-mode', '#chk-verbose-logs']) {
+            const chk = /** @type {HTMLInputElement|null} */ (this.container.querySelector(id));
+            if (chk) chk.addEventListener('change', () => void this._saveDiagMode(chk));
+        }
+        const logsBtn = this.container.querySelector('#btn-download-logs');
+        if (logsBtn) logsBtn.addEventListener('click', () => void this._downloadLogs());
 
         // Port field dirty tracking
         const portInput = this.container.querySelector('#admin-https-port');
@@ -1594,6 +1766,62 @@ export class AdminView {
                     console.error('[Admin] Failed to save start-at-login setting:', err);
                     Toast.error(t('admin.saveFailed', { message: err.message }));
                     autostartChk.checked = !enabled; // revert
+                }
+            });
+        }
+
+        // ── Network priority ───────────────────────────────────────────────
+        // Saved on the spot; the next stream reads it as it opens.
+        const markingChk = this.container.querySelector('#chk-packet-marking');
+        if (markingChk) {
+            markingChk.addEventListener('change', async () => {
+                const enabled = markingChk.checked;
+                try {
+                    await BackendClient.saveAdminSettings({ packet_marking: enabled });
+                    this._packetMarking = enabled;
+                    Toast.success(
+                        enabled ? t('admin.packetMarkingOn') : t('admin.packetMarkingOff'),
+                    );
+                } catch (err) {
+                    console.error('[Admin] Failed to save network priority:', err);
+                    Toast.error(t('admin.saveFailed', { message: err.message }));
+                    markingChk.checked = !enabled; // revert
+                }
+            });
+        }
+
+        // ── Other screens off on the virtual display ───────────────────────
+        // Saved on the spot; the next stream's virtual display reads it.
+        const exclusiveChk = this.container.querySelector('#chk-vd-exclusive');
+        if (exclusiveChk) {
+            exclusiveChk.addEventListener('change', async () => {
+                const enabled = exclusiveChk.checked;
+                try {
+                    await BackendClient.saveAdminSettings({ virtual_display_exclusive: enabled });
+                    this._vdExclusive = enabled;
+                    Toast.success(enabled ? t('admin.vdExclusiveOn') : t('admin.vdExclusiveOff'));
+                } catch (err) {
+                    console.error('[Admin] Failed to save the other screens option:', err);
+                    Toast.error(t('admin.saveFailed', { message: err.message }));
+                    exclusiveChk.checked = !enabled; // revert
+                }
+            });
+        }
+
+        // ── This PC's keyboard layout for the touch keyboard ───────────────
+        // Saved on the spot; the next stream reads it as it opens.
+        const hostLayoutChk = this.container.querySelector('#chk-host-layout');
+        if (hostLayoutChk) {
+            hostLayoutChk.addEventListener('change', async () => {
+                const enabled = hostLayoutChk.checked;
+                try {
+                    await BackendClient.saveAdminSettings({ keyboard_host_layout: enabled });
+                    this._hostLayout = enabled;
+                    Toast.success(enabled ? t('admin.hostLayoutOn') : t('admin.hostLayoutOff'));
+                } catch (err) {
+                    console.error('[Admin] Failed to save the keyboard layout option:', err);
+                    Toast.error(t('admin.saveFailed', { message: err.message }));
+                    hostLayoutChk.checked = !enabled; // revert
                 }
             });
         }
@@ -2060,6 +2288,573 @@ export class AdminView {
         } catch (err) {
             console.warn('[Admin] Failed to save transport prefs:', err);
             Toast.error(t('admin.transportSaveFailed'));
+        }
+    }
+
+    // --- Remote admin access: the password door, the LAN's and on request the
+    // internet's (through the rendezvous only) ---
+    _renderRemoteAdmin() {
+        return `
+                <div class="settings-section">
+                    <h3 class="settings-section-title">${t('admin.remoteAdmin')}</h3>
+                    <div class="settings-field u-pt-0">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="chk-remote-admin"
+                                   ${this._remoteAdminEnabled ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">${t('admin.remoteAdminEnable')}</span>
+                        </label>
+                        <p class="setting-desc">${t('admin.remoteAdminDesc')}</p>
+                        ${
+                            !this._remoteAdminEnabled
+                                ? ''
+                                : this._adminPasswordSet
+                                  ? `<p class="settings-hint">${t('admin.remoteAdminCustom')}</p>`
+                                  : `<div class="settings-status settings-status-pending">
+                                         ${t('admin.remoteAdminNoPassword')}
+                                     </div>`
+                        }
+                        ${
+                            this._remoteAdminEnabled
+                                ? `
+                        <input type="password" id="admin-remote-password" class="settings-input u-mt-2"
+                               autocomplete="new-password"
+                               placeholder="${this.esc(t('admin.remoteAdminPlaceholder'))}" />
+                        <div class="u-mt-2">
+                            <button class="btn btn-neutral" id="btn-set-admin-password">
+                                ${t('admin.remoteAdminChange')}
+                            </button>
+                            ${
+                                this._adminPasswordSet
+                                    ? `<button class="btn btn-secondary" id="btn-clear-admin-password">
+                                ${t('admin.remoteAdminRemove')}
+                            </button>`
+                                    : ''
+                            }
+                        </div>
+                        <p class="settings-hint u-mt-2">${t('admin.remoteAdminHint')}</p>
+                        <div class="u-mt-3">
+                            <label class="settings-checkbox-label">
+                                <input type="checkbox" id="chk-remote-admin-internet"
+                                       ${this._remoteAdminInternet ? 'checked' : ''} />
+                                <span class="settings-checkbox-text">${t('admin.remoteAdminInternet')}</span>
+                            </label>
+                            <p class="setting-desc">${t('admin.remoteAdminInternetDesc')}</p>
+                        </div>`
+                                : ''
+                        }
+                    </div>
+                </div>`;
+    }
+
+    // --- Advanced: the picture chain of a native session ---
+
+    _videoPipelineOptions() {
+        const labels = {
+            auto: t('admin.videoPipelineAuto'),
+            d3d11: t('admin.videoPipelineD3d11'),
+            d3d12: t('admin.videoPipelineD3d12'),
+            vaapi: t('admin.videoPipelineVaapi'),
+            vulkan: t('admin.videoPipelineVulkan'),
+        };
+        // A stored value this OS does not list (a settings file carried across)
+        // is no opinion here: nothing matches it, and the select shows Auto,
+        // which is what runs.
+        return this._videoPipelineValues.map((value) => [value, labels[value] || value]);
+    }
+
+    // Always there, for the diagnostics. The picture chain only where the
+    // choice means something: the server says whether this machine has a GPU
+    // with a chain to choose.
+    _renderAdvanced() {
+        return `
+                <!-- Advanced -->
+                <div class="settings-section" id="admin-section-advanced">
+                    <h3 class="settings-section-title">${t('admin.advanced')}</h3>
+                    ${this._videoPipelineSupported ? this._renderVideoPipeline() : ''}
+                    ${this._renderDiagMode('chk-debug-mode', this._debugMode, this._debugModeCli, 'debugMode', '--debug')}
+                    ${this._renderDiagMode('chk-verbose-logs', this._verboseLogs, this._verboseLogsCli, 'verboseLogs', '--verbose')}
+                    <div class="settings-field">
+                        <span class="settings-label">${t('admin.logs')}</span>
+                        <p class="setting-desc">${t('admin.logsDesc')}</p>
+                        <div class="admin-logs-row">
+                            <button class="btn btn-secondary" id="btn-download-logs">
+                                ${t('admin.downloadLogs')}
+                            </button>
+                            <span class="admin-logs-progress" id="admin-logs-progress" role="progressbar"
+                                  aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+                                <span class="admin-logs-progress-fill"></span>
+                            </span>
+                            <span class="settings-hint admin-logs-status" id="admin-logs-status"></span>
+                        </div>
+                    </div>
+                </div>
+        `;
+    }
+
+    /**
+     * One diagnostic mode's box. Locked on when the command line turned the
+     * mode on for this run: unticking it could not turn it off.
+     * @param {string} id
+     * @param {boolean} on
+     * @param {boolean} fromCli
+     * @param {'debugMode'|'verboseLogs'} key
+     * @param {string} flag
+     */
+    _renderDiagMode(id, on, fromCli, key, flag) {
+        return `
+                    <div class="settings-field">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="${id}" ${on ? 'checked' : ''} ${fromCli ? 'disabled' : ''} />
+                            <span class="settings-checkbox-text">${t('admin.' + key)}</span>
+                        </label>
+                        <p class="setting-desc">${t('admin.' + key + 'Desc')}</p>
+                        ${fromCli ? `<p class="settings-hint">${t('admin.setByCommandLine', { flag })}</p>` : ''}
+                    </div>
+        `;
+    }
+
+    _renderVideoPipeline() {
+        return `
+                    <div class="settings-field">
+                        <label class="settings-label" for="select-video-pipeline">
+                            ${t('admin.videoPipeline')}
+                        </label>
+                        <select id="select-video-pipeline" class="settings-select">
+                            ${this._videoPipelineOptions()
+                                .map(
+                                    ([value, label]) =>
+                                        `<option value="${value}" ${value === this._videoPipeline ? 'selected' : ''}>${this.esc(label)}</option>`,
+                                )
+                                .join('')}
+                        </select>
+                        <p class="settings-hint">
+                            ${t(
+                                this._videoPipelineValues.includes('vulkan')
+                                    ? 'admin.videoPipelineHintLinux'
+                                    : 'admin.videoPipelineHint',
+                            )}
+                        </p>
+                    </div>
+        `;
+    }
+
+    /**
+     * Save one diagnostic mode from its box. The server answers with the mode
+     * in force, which the box then shows. Debug mode reaches this page at
+     * once; other pages pick it up the next time they load.
+     * @param {HTMLInputElement} chk
+     */
+    async _saveDiagMode(chk) {
+        const debug = chk.id === 'chk-debug-mode';
+        const enabled = chk.checked;
+        try {
+            const resp = await BackendClient.saveAdminSettings(
+                debug ? { debug_mode: enabled } : { verbose_logs: enabled },
+            );
+            const inForce = (debug ? resp.debug_mode : resp.verbose_logs) === true;
+            if (debug) this._debugMode = inForce;
+            else this._verboseLogs = inForce;
+            chk.checked = inForce;
+            if (debug) void refreshClientLog();
+            let key;
+            if (debug) key = inForce ? 'admin.debugModeOn' : 'admin.debugModeOff';
+            else key = inForce ? 'admin.verboseLogsOn' : 'admin.verboseLogsOff';
+            Toast.success(t(key));
+        } catch (err) {
+            console.error('[Admin] Failed to save a diagnostic mode:', err);
+            Toast.error(t('admin.saveFailed', { message: /** @type {Error} */ (err).message }));
+            chk.checked = !enabled; // revert
+        }
+    }
+
+    /**
+     * Build the logs archive on the server, then download it, on one bar: the
+     * compression fills the first 80 %, the transfer the rest.
+     */
+    async _downloadLogs() {
+        if (this._logsBusy) return;
+        const btn = /** @type {HTMLButtonElement|null} */ (
+            this.container.querySelector('#btn-download-logs')
+        );
+        const bar = /** @type {HTMLElement|null} */ (
+            this.container.querySelector('#admin-logs-progress')
+        );
+        const status = this.container.querySelector('#admin-logs-status');
+        const fill = bar ? /** @type {HTMLElement|null} */ (bar.firstElementChild) : null;
+        const setProgress = (/** @type {number} */ f) => {
+            const pct = Math.round(Math.max(0, Math.min(1, f)) * 100);
+            if (fill) fill.style.width = pct + '%';
+            if (bar) bar.setAttribute('aria-valuenow', String(pct));
+        };
+        const say = (/** @type {string} */ text) => {
+            if (status) status.textContent = text;
+        };
+        this._logsBusy = true;
+        if (btn) btn.disabled = true;
+        if (bar) bar.hidden = false;
+        setProgress(0);
+        say(t('admin.logsCompressing'));
+        try {
+            let s;
+            try {
+                s = await BackendClient.startLogArchive();
+            } catch (err) {
+                // Already being built (another tab): follow that one.
+                if (/** @type {any} */ (err).statusCode !== 409) throw err;
+                s = await BackendClient.getLogArchiveStatus();
+            }
+            while (s.state === 'running') {
+                setProgress(s.total_bytes > 0 ? (0.8 * s.done_bytes) / s.total_bytes : 0);
+                await new Promise((r) => setTimeout(r, 150));
+                s = await BackendClient.getLogArchiveStatus();
+            }
+            if (s.state !== 'done') throw new Error(s.error || s.state);
+            setProgress(0.8);
+            say(t('admin.logsDownloading'));
+            const blob = await BackendClient.downloadLogArchive((got, total) =>
+                setProgress(0.8 + (0.2 * got) / total),
+            );
+            setProgress(1);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = s.file_name || 'moonlightweb-logs.zip';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+            const size =
+                blob.size >= 1024 * 1024
+                    ? (blob.size / (1024 * 1024)).toFixed(1) + ' MB'
+                    : Math.max(1, Math.round(blob.size / 1024)) + ' KB';
+            Toast.success(t('admin.logsReady', { size }));
+        } catch (err) {
+            console.error('[Admin] Logs archive failed:', err);
+            Toast.error(t('admin.logsFailed', { message: /** @type {Error} */ (err).message }));
+        } finally {
+            this._logsBusy = false;
+            if (btn) btn.disabled = false;
+            say('');
+            setTimeout(() => {
+                if (bar && !this._logsBusy) bar.hidden = true;
+            }, 600);
+        }
+    }
+
+    // --- Apps on this PC (the native host's apps) ---
+
+    // A card each on this host, beside the displays: the name the card shows,
+    // the command or link that opens it, and its image. Where it opens is the
+    // same for every app of this machine (screen): in its own gamescope, on
+    // the virtual display, or on the primary display. A section named for what
+    // it does, not for what runs it: folded under Advanced, it read as a
+    // diagnostic and explained nothing (Bruno, 13/10/2026).
+    _renderHostApps() {
+        const full = this._hostApps.length >= this._hostAppsMax;
+        const screen = this._hostAppsScreen;
+        const desc =
+            screen === 'virtual'
+                ? t('admin.hostAppsDescVirtual')
+                : screen === 'gamescope'
+                  ? t('admin.hostAppsDescGamescope')
+                  : t('admin.hostAppsDescPrimary');
+        const rows = this._hostApps
+            .map((app, i) => {
+                const thumb = app.image
+                    ? `<img src="${this.esc(this._hostAppImageUrl(app))}" alt="" loading="lazy">`
+                    : '';
+                const auto =
+                    app.source && app.source !== 'user'
+                        ? `<span class="host-app-badge">${t('admin.hostAppAuto')}</span>`
+                        : '';
+                return `
+                        <li class="host-app-row">
+                            <div class="host-app-thumb">${thumb}</div>
+                            <div class="host-app-text">
+                                <div class="host-app-title">
+                                    <span class="host-app-name">${this.esc(app.name)}</span>${auto}
+                                </div>
+                                <code class="host-app-command">${this.esc(app.command)}</code>
+                                <div class="host-app-actions">
+                                    <button class="btn btn-secondary btn-small" data-host-app-image="${i}">
+                                        ${t('admin.hostAppChangeImage')}
+                                    </button>
+                                    ${
+                                        app.image
+                                            ? `<button class="btn btn-secondary btn-small" data-host-app-image-remove="${i}">
+                                        ${t('admin.hostAppRemoveImage')}
+                                    </button>`
+                                            : ''
+                                    }
+                                    <button class="btn btn-secondary btn-small" data-host-app-remove="${i}">
+                                        ${t('admin.hostAppRemove')}
+                                    </button>
+                                </div>
+                            </div>
+                        </li>`;
+            })
+            .join('');
+        // A launcher found on this PC whose card the owner removed: offered back.
+        const restorable = this._hostAppsDetected
+            .filter((d) => d.dismissed && !d.listed)
+            .map(
+                (d) => `
+                    <p class="settings-hint host-apps-detected">
+                        ${t('admin.hostAppsDetected', { name: this.esc(d.name) })}
+                        <button class="btn btn-link" data-host-app-restore="${this.esc(d.source)}" ${full ? 'disabled' : ''}>
+                            ${t('admin.hostAppRestore')}
+                        </button>
+                    </p>`,
+            )
+            .join('');
+        return `
+                <div class="settings-section host-apps" id="admin-section-host-apps">
+                    <h3 class="settings-section-title">${t('admin.hostApps')}</h3>
+                    <p class="settings-section-desc">${desc}</p>
+                    ${
+                        rows
+                            ? `<ul class="host-app-list">${rows}</ul>`
+                            : `<p class="settings-hint host-apps-empty">${t('admin.hostAppsEmpty')}</p>`
+                    }
+                    <div class="host-app-add">
+                        <input type="text" id="host-app-name" class="settings-input host-app-name-input"
+                               maxlength="40" placeholder="${this.esc(t('admin.hostAppName'))}"
+                               aria-label="${this.esc(t('admin.hostAppName'))}" ${full ? 'disabled' : ''} />
+                        <input type="text" id="host-app-command" class="settings-input host-app-command-input"
+                               maxlength="1000" placeholder="${this.esc(t('admin.hostAppCommand'))}"
+                               aria-label="${this.esc(t('admin.hostAppCommand'))}" ${full ? 'disabled' : ''} />
+                        <label class="btn btn-secondary host-app-file-label${full ? ' is-disabled' : ''}">
+                            <span id="host-app-file-name">${t('admin.hostAppImage')}</span>
+                            <input type="file" id="host-app-file" class="u-hidden"
+                                   accept="image/png,image/jpeg,image/webp" ${full ? 'disabled' : ''} />
+                        </label>
+                        <button class="btn btn-save u-shrink-0" id="btn-host-app-add" disabled>
+                            ${t('admin.hostAppAdd')}
+                        </button>
+                    </div>
+                    <p class="settings-hint host-apps-hint">${t('admin.hostAppsHint')}</p>
+                    ${restorable}
+                    ${full ? `<p class="settings-hint">${t('admin.hostAppsFull', { max: this._hostAppsMax })}</p>` : ''}
+                    <input type="file" id="host-app-image-file" class="u-hidden"
+                           accept="image/png,image/jpeg,image/webp" tabindex="-1" aria-hidden="true" />
+                </div>`;
+    }
+
+    /**
+     * The card's own image URL, as the host's grid asks for it — the hash in
+     * it makes each version a URL of its own.
+     * @param {{app_id: number, image?: string}} app
+     */
+    _hostAppImageUrl(app) {
+        return `/api/hosts/moonlightweb-native-host/appasset?appid=${app.app_id}&v=${encodeURIComponent(app.image ?? '')}`;
+    }
+
+    _bindHostApps() {
+        const section = this.container.querySelector('#admin-section-host-apps');
+        if (!section) return;
+        const name = /** @type {HTMLInputElement|null} */ (section.querySelector('#host-app-name'));
+        const command = /** @type {HTMLInputElement|null} */ (
+            section.querySelector('#host-app-command')
+        );
+        const file = /** @type {HTMLInputElement|null} */ (section.querySelector('#host-app-file'));
+        const fileName = section.querySelector('#host-app-file-name');
+        const add = /** @type {HTMLButtonElement|null} */ (
+            section.querySelector('#btn-host-app-add')
+        );
+        const ready = () => {
+            if (add && name && command) {
+                add.disabled = !name.value.trim() || !command.value.trim() || name.disabled;
+            }
+        };
+        if (name) name.addEventListener('input', ready);
+        if (command) {
+            command.addEventListener('input', ready);
+            command.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && add && !add.disabled) add.click();
+            });
+        }
+        if (file && fileName) {
+            file.addEventListener('change', () => {
+                fileName.textContent = file.files?.[0]?.name || t('admin.hostAppImage');
+            });
+        }
+        if (add && name && command) {
+            add.addEventListener('click', () => {
+                const app = { name: name.value.trim(), command: command.value.trim() };
+                void this._addHostApp(app, file?.files?.[0] ?? null);
+            });
+        }
+        section.querySelectorAll('[data-host-app-remove]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const index = Number(/** @type {HTMLElement} */ (btn).dataset.hostAppRemove);
+                const removed = this._hostApps[index];
+                void this._saveHostApps(
+                    () =>
+                        BackendClient.saveHostApps(
+                            this._hostApps
+                                .filter((_, i) => i !== index)
+                                .map((a) => ({ id: a.id, name: a.name, command: a.command })),
+                        ),
+                    t('admin.hostAppRemoved', { name: removed?.name ?? '' }),
+                );
+            });
+        });
+        // One hidden file input serves every row's "Change the image".
+        const picker = /** @type {HTMLInputElement|null} */ (
+            section.querySelector('#host-app-image-file')
+        );
+        let pickedFor = -1;
+        section.querySelectorAll('[data-host-app-image]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                pickedFor = Number(/** @type {HTMLElement} */ (btn).dataset.hostAppImage);
+                if (picker) {
+                    picker.value = '';
+                    picker.click();
+                }
+            });
+        });
+        if (picker) {
+            picker.addEventListener('change', () => {
+                const app = this._hostApps[pickedFor];
+                const picked = picker.files?.[0];
+                if (!app || !picked) return;
+                void this._saveHostApps(
+                    async () =>
+                        BackendClient.setHostAppImage(app.id, await this._hostAppPng(picked)),
+                    t('admin.hostAppImageChanged', { name: app.name }),
+                );
+            });
+        }
+        section.querySelectorAll('[data-host-app-image-remove]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const app =
+                    this._hostApps[
+                        Number(/** @type {HTMLElement} */ (btn).dataset.hostAppImageRemove)
+                    ];
+                if (!app) return;
+                void this._saveHostApps(
+                    () => BackendClient.removeHostAppImage(app.id),
+                    t('admin.hostAppImageRemoved', { name: app.name }),
+                );
+            });
+        });
+        section.querySelectorAll('[data-host-app-restore]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const source = /** @type {HTMLElement} */ (btn).dataset.hostAppRestore ?? '';
+                const found = this._hostAppsDetected.find((d) => d.source === source);
+                void this._saveHostApps(
+                    () => BackendClient.restoreHostApp(source),
+                    t('admin.hostAppRestored', { name: found?.name ?? source }),
+                );
+            });
+        });
+    }
+
+    /**
+     * Add one app, then its image when one was picked: the server gives the
+     * new entry its id first.
+     * @param {{name: string, command: string}} app
+     * @param {File|null} image
+     */
+    async _addHostApp(app, image) {
+        const before = new Set(this._hostApps.map((a) => a.id));
+        await this._saveHostApps(
+            async () => {
+                let state = await BackendClient.saveHostApps([
+                    ...this._hostApps.map((a) => ({ id: a.id, name: a.name, command: a.command })),
+                    app,
+                ]);
+                const added = Array.isArray(state.apps)
+                    ? state.apps.find((/** @type {{id: string}} */ a) => !before.has(a.id))
+                    : null;
+                if (image && added) {
+                    state = await BackendClient.setHostAppImage(
+                        added.id,
+                        await this._hostAppPng(image),
+                    );
+                }
+                return state;
+            },
+            t('admin.hostAppAdded', { name: app.name }),
+        );
+    }
+
+    /**
+     * The picked image as the card shows it: cropped to cover 3:4 and drawn
+     * at the card's size, as a PNG in base64 — whatever the file was (JPEG,
+     * WebP), the server reads PNG only.
+     * @param {Blob} file
+     * @returns {Promise<string>}
+     */
+    async _hostAppPng(file) {
+        /** @type {ImageBitmap} */
+        let bitmap;
+        try {
+            bitmap = await createImageBitmap(file);
+        } catch {
+            throw new Error(t('admin.hostAppImageUnreadable'));
+        }
+        const width = 600;
+        const height = 800;
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error(t('admin.hostAppImageUnreadable'));
+        const scale = Math.max(width / bitmap.width, height / bitmap.height);
+        const w = bitmap.width * scale;
+        const h = bitmap.height * scale;
+        ctx.drawImage(bitmap, (width - w) / 2, (height - h) / 2, w, h);
+        bitmap.close?.();
+        return canvas.toDataURL('image/png').replace(/^data:image\/png;base64,/, '');
+    }
+
+    /**
+     * Run one change, then show what the server kept.
+     * @param {() => Promise<any>} change resolves to the section's new state
+     * @param {string} done what the change did, once the server took it
+     */
+    async _saveHostApps(change, done) {
+        try {
+            this._applyHostAppsState(await change());
+            Toast.success(done);
+        } catch (err) {
+            console.warn('[Admin] Failed to save the apps on this PC:', err);
+            Toast.error(
+                t('admin.hostAppsSaveFailed', { message: /** @type {Error} */ (err).message }),
+            );
+        }
+        const section = this.container.querySelector('#admin-section-host-apps');
+        if (section) {
+            section.outerHTML = this._renderHostApps();
+            this._bindHostApps();
+        }
+    }
+
+    /** @param {any} state {supported, max, screen, apps, detected} */
+    _applyHostAppsState(state) {
+        if (!state || typeof state !== 'object') return;
+        this._hostAppsSupported = state.supported === true;
+        if (state.max > 0) this._hostAppsMax = state.max;
+        if (typeof state.screen === 'string') this._hostAppsScreen = state.screen;
+        if (Array.isArray(state.apps)) this._hostApps = state.apps;
+        if (Array.isArray(state.detected)) this._hostAppsDetected = state.detected;
+    }
+
+    // Saved at once, like the transport mode. It applies to the next stream: a
+    // running one keeps the chain it was built on.
+    async _saveVideoPipeline(value) {
+        try {
+            await BackendClient.saveStreamingSettings({ native_video_pipeline: value });
+            this._videoPipeline = value;
+            const option = this._videoPipelineOptions().find(([v]) => v === value);
+            Toast.success(t('admin.videoPipelineSaved', { pipeline: option ? option[1] : value }));
+        } catch (err) {
+            console.warn('[Admin] Failed to save the video pipeline:', err);
+            Toast.error(t('admin.videoPipelineSaveFailed'));
+            // The select shows what is stored, not what failed to be.
+            const select = this.container.querySelector('#select-video-pipeline');
+            if (select) select.value = this._videoPipeline;
         }
     }
 

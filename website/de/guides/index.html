@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<!-- Generated from /guides/index.html and _i18n/de/guides/index.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoonlightWeb-Installationsanleitungen — dein PC in jedem Browser</title>
+<meta name="description" content="Wähle deine Plattform und installiere den MoonlightWeb-Server: Schritt-für-Schritt-Anleitungen für Windows, macOS (Apple Silicon) und Linux. Ein Installer, sonst nichts.">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#05080d">
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="MoonlightWeb-Installationsanleitungen — dein PC in jedem Browser">
+<meta property="og:description" content="Wähle deine Plattform und installiere den MoonlightWeb-Server: Schritt-für-Schritt-Anleitungen für Windows, macOS (Apple Silicon) und Linux. Ein Installer, sonst nichts.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://moonlightweb.top/de/guides/">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="MoonlightWeb-Installationsanleitungen — dein PC in jedem Browser">
+<meta name="twitter:description" content="Wähle deine Plattform und installiere den MoonlightWeb-Server: Schritt-für-Schritt-Anleitungen für Windows, macOS (Apple Silicon) und Linux. Ein Installer, sonst nichts.">
+<meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/de/guides/">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/">
+<!-- /i18n:alternates -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<link rel="stylesheet" href="/assets/pages.css?v={{(fileStat `/assets/pages.css`).ModTime.Unix}}">
+<!-- Shared header/footer styling -->
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://moonlightweb.top/de/"},
+        {"@type": "ListItem", "position": 2, "name": "Guides", "item": "https://moonlightweb.top/de/guides/"}
+      ]
+    },
+    {
+      "@type": "ItemList",
+      "name": "MoonlightWeb install guides",
+      "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Install on Windows", "url": "https://moonlightweb.top/de/guides/windows.html"},
+        {"@type": "ListItem", "position": 2, "name": "Install on macOS", "url": "https://moonlightweb.top/de/guides/macos.html"},
+        {"@type": "ListItem", "position": 3, "name": "Install on Linux", "url": "https://moonlightweb.top/de/guides/linux.html"}
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/de/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/de/" data-nav="home">Start</a><a href="/de/guides/" data-nav="guides" aria-current="page">Anleitungen</a><a href="/de/faq.html" data-nav="faq">FAQ</a><a href="/de/contact.html" data-nav="contact">Kontakt</a><a href="/de/server-access/" data-nav="connect">Verbinden</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/guides/">English</option><option value="fr" data-href="/fr/guides/">Français</option><option value="de" data-href="/de/guides/" selected>Deutsch</option><option value="zh" data-href="/zh/guides/" lang="zh">中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<main>
+<div class="wrap">
+  <nav class="crumbs" aria-label="Breadcrumb" data-i18n-html="crumbs"><a href="/de/">Startseite</a> / Anleitungen</nav>
+  <span class="kicker" data-i18n="kicker">Installationsanleitungen</span>
+  <h1 data-i18n="h1">MoonlightWeb installieren — wähle deine Plattform</h1>
+  <p class="lead" data-i18n-html="lead">MoonlightWeb ist ein kostenloser Open-Source-Server (GPL-3.0), der deinen Gaming-Rechner auf jedes Gerät mit Browser streamt — Handy, Tablet, Laptop, TV. <strong>Ein Download auf dem Gaming-PC. Auf allen anderen Geräten wird nichts installiert — nur eine URL.</strong></p>
+
+  <h2 data-i18n="choose.h">Wähle dein Betriebssystem</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/de/guides/windows.html"><strong data-i18n="x.win.t">Unter Windows installieren</strong><span data-i18n="x.win.d">Geführter Installer — ein Assistent, sonst nichts einzurichten.</span></a>
+    <a class="cyb" href="/de/guides/macos.html"><strong data-i18n="x.mac.t">Unter macOS installieren</strong><span data-i18n="x.mac.d">Anleitung für Apple Silicon mit dem .pkg-Installer.</span></a>
+    <a class="cyb" href="/de/guides/linux.html"><strong data-i18n="x.lin.t">Unter Linux installieren</strong><span data-i18n="x.lin.d">.deb, .rpm oder portables AppImage.</span></a>
+  </div>
+
+  <h2 data-i18n="need.h">Was du brauchst</h2>
+  <ul>
+    <li data-i18n="need.1">Einen Gaming-PC mit einer GPU, die Hardware-Encoding beherrscht — den Rechner, auf dem deine Spiele laufen (Windows, macOS mit Apple Silicon oder Linux).</li>
+    <li data-i18n-html="need.2"><strong>Sonst nichts.</strong> MoonlightWeb erfasst und encodiert diesen PC selbst — kein zweiter Streaming-Server nötig. Du hast schon irgendwo Sunshine, Wolf oder MultiSeat laufen? Diese Rechner koppelst du auf derselben Seite.</li>
+    <li data-i18n="need.3">Als Client jedes Gerät mit einem modernen Browser: Chrome, Edge, Safari oder Firefox. Keine App, kein Download, kein Konto.</li>
+  </ul>
+
+  <div class="note" data-i18n-html="note"><strong>Unsicher, welcher?</strong> Installiere auf dem PC, auf dem deine Spiele laufen — nur dieser Rechner braucht den MoonlightWeb-Server. Alle anderen Geräte öffnen einfach einen Browser.</div>
+
+  <h2 data-i18n="read.h">Weiterlesen</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/de/faq.html"><strong data-i18n="x.faq.t">FAQ</strong><span data-i18n="x.faq.d">Latenz, Codecs, Sicherheit, Spielen übers Internet — alle häufigen Fragen.</span></a>
+    <a class="cyb" href="/de/contact.html"><strong data-i18n="x.contact.t">Kontakt</strong><span data-i18n="x.contact.d">Fragen, Fehlerberichte oder Feedback — schreib dem Maintainer.</span></a>
+  </div>
+</div>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/de/">Start</a> · <a href="/de/guides/">Anleitungen</a> · <a href="/de/faq.html">FAQ</a> · <a href="/de/contact.html">Kontakt</a> · <a href="/de/server-access/">Verbinden</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>Kaffee</span></a></span><span class="foot-play">Spielen auf: <a href="/de/play/chromebook.html">Chromebook</a> · <a href="/de/play/iphone-ipad.html">iPhone und iPad</a> · <a href="/de/play/tv.html">TV</a> · <a href="/de/sunshine-web-client.html">Web-Client für Sunshine</a> · <a href="/de/browser-game-streaming.html">Warum ein Browser-Client</a></span></div></footer>
+
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+</body>
+</html>

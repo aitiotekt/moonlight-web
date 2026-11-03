@@ -108,7 +108,7 @@ describe('HostListView app grid', () => {
         expect(names(container)).toEqual(['Desktop']);
         await settle();
 
-        expect(names(container)).toEqual(['Desktop', 'Cyberpunk 2077']);
+        expect(names(container)).toEqual(['Cyberpunk 2077', 'Desktop']);
     });
 
     it('keeps a remembered grid up when the host is momentarily unreachable', async () => {
@@ -376,6 +376,36 @@ describe('HostListView app grid', () => {
             expect(frame.querySelector('.app-icon--host').dataset.art).toMatch(/^windows-laptop:/);
             expect(frame.querySelector('img')).toBeNull();
             expect(frame.querySelector('.app-icon-label')).toBeNull();
+        });
+
+        it("shows an app's own image, else the arcade stand-in — never a machine", () => {
+            remember([
+                {
+                    id: 2000,
+                    name: 'Steam Big Picture',
+                    boxArt: true,
+                    device: { ...laptopPanel, key: 'host-app-1', screen: 'virtual', art: 'ab12' },
+                },
+                {
+                    id: 2001,
+                    name: 'Emu',
+                    boxArt: false,
+                    device: { ...laptopPanel, key: 'host-app-2', screen: 'virtual' },
+                },
+            ]);
+            BackendClient.getAppList.mockReturnValue(new Promise(() => {}));
+            mount();
+
+            const frameOf = (id) =>
+                grid(container).querySelector(`.app-card[data-app-id="${id}"] .app-card-image`);
+            const frames = [frameOf(2000), frameOf(2001)];
+            expect(frames[0].classList.contains('app-card-image--host')).toBe(false);
+            expect(frames[0].querySelector('img').getAttribute('src')).toMatch(
+                /appasset\?appid=2000&v=ab12$/,
+            );
+            expect(frames[1].classList.contains('app-card-image--host')).toBe(false);
+            expect(frames[1].querySelector('img')).toBeNull();
+            expect(frames[1].querySelector('.app-icon[data-sprite]')).not.toBeNull();
         });
 
         it('keeps an app without a device on its own art', () => {

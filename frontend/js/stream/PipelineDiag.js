@@ -102,6 +102,14 @@ class DiagWindow {
         for (const s of this._samples) sum += s.value;
         return sum;
     }
+
+    /** The value under which a fraction @p q of the window lies (0 if empty). */
+    quantile(q) {
+        this._prune();
+        if (this._samples.length === 0) return 0;
+        const sorted = this._samples.map((s) => s.value).sort((a, b) => a - b);
+        return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+    }
 }
 
 export class PipelineDiag {
@@ -236,22 +244,40 @@ export class PipelineDiag {
  * nothing in PipelineDiag can answer it: a late frame reads the same there
  * whether the network, the decoder or a busy event loop held it up.
  *
- * Three observations, all windowed like the rest:
+ * Four observations, all windowed like the rest:
  *   - input messages sent, and the time their handlers took,
  *   - event-loop lag: how late a 10ms timer fires. It fires late only when the
  *     thread was busy with something else, so its max is the longest stretch
  *     during which a frame that had arrived could not be touched,
- *   - long tasks (>50ms), as the browser reports them.
+ *   - long tasks (>50ms), as the browser reports them,
+ *   - the gamepads: how often a forwarded pad is read, how far apart two reads
+ *     are (a pad is seen only when read, so the gap is what a stick or a
+ *     button waits at worst), and how many states went out,
+ *   - the mouse: how old a report is when its motion goes out (now minus the
+ *     event's timeStamp) and how far apart two motions go. A report waits on
+ *     average about age + gap / 2 — what tells the per-report cadence
+ *     (pointerrawupdate) from the per-frame one (mousemove).
  *
  * Diagnostics only (mw_perf_diag): the timer runs only between start() and
- * stop(), and noteInput() costs a push.
+ * stop(), and each note costs a push.
  */
+/**
+ * Two mouse motions further apart than this belong to two movements: even
+ * coalesced to the frame at 30 Hz, a hand still moving reports every 33 ms.
+ */
+const MOUSE_IDLE_MS = 50;
+
 export class MainThreadProbe {
     constructor(windowMs = 2000) {
         this._windowMs = windowMs;
         this._inputMs = new DiagWindow(windowMs);
         this._lag = new DiagWindow(windowMs);
         this._longTasks = new DiagWindow(windowMs);
+        this._padGapMs = new DiagWindow(windowMs);
+        this._padSends = new DiagWindow(windowMs);
+        this._mouseAgeMs = new DiagWindow(windowMs);
+        this._mouseGapMs = new DiagWindow(windowMs);
+        this._lastMouseSendAt = 0;
         this._timer = null;
         this._observer = null;
     }
@@ -289,6 +315,29 @@ export class MainThreadProbe {
         this._inputMs.push(handlerMs);
     }
 
+    /** A forwarded pad was read, @p gapMs after the previous read. */
+    notePadRead(gapMs) {
+        this._padGapMs.push(gapMs);
+    }
+
+    /** One gamepad state went out. */
+    notePadSend() {
+        this._padSends.push(0);
+    }
+
+    /**
+     * One mouse motion went out, for a report @p ageMs old. The gap to the
+     * previous motion counts only inside one movement: past MOUSE_IDLE_MS the
+     * hand had stopped, and a pause is not a gap between two reports.
+     */
+    noteMouseSend(ageMs) {
+        const now = performance.now();
+        this._mouseAgeMs.push(ageMs);
+        const gap = now - this._lastMouseSendAt;
+        if (this._lastMouseSendAt && gap < MOUSE_IDLE_MS) this._mouseGapMs.push(gap);
+        this._lastMouseSendAt = now;
+    }
+
     snapshot() {
         const seconds = this._windowMs / 1000;
         return {
@@ -298,18 +347,32 @@ export class MainThreadProbe {
             loopLagMaxMs: this._lag.max,
             longTasks: this._longTasks.count,
             longTaskMaxMs: this._longTasks.max,
+            padReadsPerSec: this._padGapMs.count / seconds,
+            padSendsPerSec: this._padSends.count / seconds,
+            padGapP95Ms: this._padGapMs.quantile(0.95),
+            padGapMaxMs: this._padGapMs.max,
+            mouseSendsPerSec: this._mouseAgeMs.count / seconds,
+            mouseAgeAvgMs: this._mouseAgeMs.avg,
+            mouseAgeMaxMs: this._mouseAgeMs.max,
+            mouseGapAvgMs: this._mouseGapMs.avg,
+            mouseGapP95Ms: this._mouseGapMs.quantile(0.95),
         };
     }
 }
 
 /**
- * Render a MainThreadProbe snapshot as the tail of the [perf] line.
+ * Render a MainThreadProbe snapshot as the tail of the [perf] line. Two parts
+ * appear only while they have something to say, so a quiet session's line is
+ * unchanged:
+ *   - pad: reads/s, states sent/s, gap between reads p95/max;
+ *   - mouse: motions sent/s, report age avg/max, gap avg/p95, and the
+ *     average wait of a report, age + gap / 2.
  * @param {ReturnType<MainThreadProbe['snapshot']>|null} load
  */
 export function formatMainThread(load) {
     if (!load) return '';
     const n1 = (v) => (v || 0).toFixed(1);
-    return (
+    let line =
         'input ' +
         Math.round(load.inputsPerSec) +
         '/s ' +
@@ -322,8 +385,36 @@ export function formatMainThread(load) {
         load.longTasks +
         '/' +
         Math.round(load.longTaskMaxMs) +
-        'ms'
-    );
+        'ms';
+    if (load.padReadsPerSec > 0) {
+        line +=
+            ' · pad read ' +
+            Math.round(load.padReadsPerSec) +
+            '/s sent ' +
+            Math.round(load.padSendsPerSec) +
+            '/s gap ' +
+            n1(load.padGapP95Ms) +
+            '/' +
+            n1(load.padGapMaxMs) +
+            'ms';
+    }
+    if (load.mouseSendsPerSec > 0) {
+        line +=
+            ' · mouse ' +
+            Math.round(load.mouseSendsPerSec) +
+            '/s age ' +
+            n1(load.mouseAgeAvgMs) +
+            '/' +
+            n1(load.mouseAgeMaxMs) +
+            'ms gap ' +
+            n1(load.mouseGapAvgMs) +
+            '/' +
+            n1(load.mouseGapP95Ms) +
+            'ms wait ' +
+            n1(load.mouseAgeAvgMs + load.mouseGapAvgMs / 2) +
+            'ms';
+    }
+    return line;
 }
 
 /**

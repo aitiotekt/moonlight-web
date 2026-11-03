@@ -188,11 +188,8 @@ void GameStreamBackend::getAppList(const QString& seatId, BackendAppListCallback
     });
 
     connect(reply, &QNetworkReply::finished, this, [this, reply, answer]() {
-        // Force-evict the pooled TLS socket. Qt keeps a finished TLS socket alive
-        // ~120s; that socket holds Sunshine's single-threaded HTTPS server, and
-        // any other client polling the same host times out for the whole window.
-        m_Nam->clearConnectionCache();
-
+        // No pooled TLS socket to evict: getAppListAsync closes it when the
+        // reply is done (NvHTTP::closeWhenDone).
         const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
 
         if (reply->error() != QNetworkReply::NoError) {
@@ -409,9 +406,11 @@ void GameStreamBackend::quit(const QString& seatId, const QString& clientUniqueI
     // session the default identity owns, which may belong to another player.
     const QString uniqueId = clientUniqueId.isEmpty() ? im->getUniqueId() : clientUniqueId;
 
-    QNetworkReply* reply =
-        m_Http->quitAppAsync(host->uniqueAddresses().first(), httpsPort, im->getCertificate(),
-                             im->getPrivateKey(), uniqueId);
+    // Under the certificate this host paired: a seat's Apollo refuses any other
+    // (empty m_IdentitySeat = the default identity, as for every plain host).
+    const ClientIdentity identity = im->identityForSeat(m_IdentitySeat);
+    QNetworkReply* reply = m_Http->quitAppAsync(host->uniqueAddresses().first(), httpsPort,
+                                                identity.certPem, identity.keyPem, uniqueId);
 
     auto answered = std::make_shared<bool>(false);
     auto answer = [answered, cb](bool ok, const BackendError& e) {
@@ -420,7 +419,8 @@ void GameStreamBackend::quit(const QString& seatId, const QString& clientUniqueI
         cb(ok, e);
     };
 
-    QTimer::singleShot(NvHTTP::REQUEST_TIMEOUT_MS + 2000, reply, [answer]() {
+    // The host answers /cancel only once the app is gone (NvHTTP::QUIT_TIMEOUT_MS).
+    QTimer::singleShot(NvHTTP::QUIT_TIMEOUT_MS + 2000, reply, [answer]() {
         answer(false,
                BackendError::make(BackendError::Timeout, QStringLiteral("Quit request timed out")));
     });
@@ -432,6 +432,71 @@ void GameStreamBackend::quit(const QString& seatId, const QString& clientUniqueI
                               reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt()));
         } else {
             answer(true, BackendError{});
+        }
+        reply->deleteLater();
+    });
+}
+
+void GameStreamBackend::runningApp(const QString& seatId, BackendIntCallback cb)
+{
+    Q_UNUSED(seatId);
+
+    NvComputer* host = m_ResolveHost ? m_ResolveHost() : nullptr;
+    if (!host) {
+        cb(false, BackendError::make(BackendError::NotFound, QStringLiteral("Host not found")), 0);
+        return;
+    }
+    const NvAddress addr = !host->activeAddress.isNull()        ? host->activeAddress
+                           : !host->uniqueAddresses().isEmpty() ? host->uniqueAddresses().first()
+                                                                : NvAddress();
+    if (addr.isNull()) {
+        cb(false,
+           BackendError::make(BackendError::NoAddress,
+                              QStringLiteral("Host has no reachable address")),
+           0);
+        return;
+    }
+
+    // serverinfo, asked now: the poll pauses while a stream runs, so its value
+    // is stale exactly when the answer matters (right after a stream stops).
+    //
+    // Over HTTPS, as the paired client. Sunshine names `currentgame` on both
+    // ports, but Apollo only on the paired one, and answers 0 on plain HTTP
+    // whatever runs. Read there, a running app looked like none: a launch of
+    // another app was then refused with 400 and fell back to resuming the app
+    // that DID run — the very "click B, get A" this check exists to stop
+    // (issue #24 bench on Apollo 0.4.6, 05/10/2026).
+    // As the client this host knows: a MultiSeat seat was paired under its own
+    // certificate (m_IdentitySeat) and knows no other; empty = the default one.
+    IdentityManager* im = IdentityManager::get();
+    const ClientIdentity identity = im->identityForSeat(m_IdentitySeat);
+    QNetworkReply* reply = m_Http->getServerInfoAsyncHttps(
+        addr, im->getUniqueId(), identity.certPem, identity.keyPem, host->activeHttpsPort);
+
+    auto answered = std::make_shared<bool>(false);
+    auto answer = [answered, cb](bool ok, const BackendError& e, int appId) {
+        if (*answered) return;
+        *answered = true;
+        cb(ok, e, appId);
+    };
+
+    QTimer::singleShot(NvHTTP::FAST_FAIL_TIMEOUT_MS + 2000, reply, [answer]() {
+        answer(false,
+               BackendError::make(BackendError::Timeout,
+                                  QStringLiteral("Server info request timed out")),
+               0);
+    });
+
+    connect(reply, &QNetworkReply::finished, this, [reply, answer]() {
+        if (reply->error() != QNetworkReply::NoError) {
+            answer(false,
+                   BackendError::make(
+                       transportErrorKind(reply->error()), reply->errorString(),
+                       reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt()),
+                   0);
+        } else {
+            answer(true, BackendError{},
+                   NvHTTP::getCurrentGame(QString::fromUtf8(reply->readAll())));
         }
         reply->deleteLater();
     });

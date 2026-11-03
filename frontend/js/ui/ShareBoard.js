@@ -48,6 +48,9 @@ const POLL_MS = 5000;
 /** The lifetimes the backend accepts, in the order the slider walks them. */
 const TTL_CHOICES = [3600, 4 * 3600, 8 * 3600, 24 * 3600, 48 * 3600, 0];
 
+/** The guests' picture heights the backend accepts (ShareManager::feedHeight). */
+const FEED_HEIGHTS = [720, 1080, 1440];
+
 const ROW_ICON = {
     off: Icons.userPlus,
     shared: Icons.link,
@@ -124,7 +127,7 @@ export class ShareBoard {
         this._pendingTtl = new Map();
         this._pollTimer = null;
         this.overlay = null;
-        this._secrets = new Map(); // slot → {url, pin, local_only} | {available:false}
+        this._secrets = new Map(); // slot → {url, pin, reach, local_only} | {available:false}
         /**
          * Whether this machine answers from outside at this moment.
          *
@@ -138,6 +141,24 @@ export class ShareBoard {
         this._remoteReachable = true;
         /** Last refusal worth showing the owner; cleared by the next success. */
         this._error = '';
+        /**
+         * The guests' picture height. Only the owner's to pick on a host whose
+         * guests all watch one picture (a native host: `_ownerHeight`), where
+         * it is one choice for the whole board rather than a row's own.
+         */
+        this._feedHeight = 1080;
+        this._ownerHeight = false;
+        /** Those guests share one stream of it: a change resizes it live. */
+        this._sharedFeed = false;
+        /**
+         * The networks this host's links can carry (`auto`, then the LAN,
+         * Tailscale, other cards: LinkAddresses on the backend), and the
+         * owner's pick for this host, kept there. A pick whose network is gone
+         * stays the pick, flagged missing, while links fall back to Automatic.
+         */
+        this._linkAddresses = [];
+        this._linkAddress = 'auto';
+        this._linkAddressMissing = false;
         /**
          * Called once the board is gone, so whoever opened it can refresh what
          * it was covering — a host card's kebab state, the header's guest count.
@@ -235,9 +256,17 @@ export class ShareBoard {
     // ── State ───────────────────────────────────────────────────────────────
 
     async _load() {
-        const data = await BackendClient.getShareStatus();
+        const data = await BackendClient.getShareStatus(this.ctx.hostUuid);
         this.slots = Array.isArray(data.slots) ? data.slots : [];
         this._remoteReachable = data.remote_reachable !== false;
+        if (FEED_HEIGHTS.includes(Number(data.feed_height))) {
+            this._feedHeight = Number(data.feed_height);
+        }
+        this._ownerHeight = data.owner_height === true;
+        this._sharedFeed = data.shared_feed === true;
+        this._linkAddresses = Array.isArray(data.link_addresses) ? data.link_addresses : [];
+        this._linkAddress = typeof data.link_address === 'string' ? data.link_address : 'auto';
+        this._linkAddressMissing = data.link_address_missing === true;
 
         // Every live row shows its link and PIN, so every live row needs them.
         // Only ones we have never read: they do not change under us, and asking
@@ -263,12 +292,19 @@ export class ShareBoard {
         return JSON.stringify([
             this.appId,
             this._remoteReachable,
+            this._feedHeight,
+            this._ownerHeight,
+            this._sharedFeed,
+            this._linkAddress,
+            this._linkAddressMissing,
+            this._linkAddresses.map((a) => `${a.id}=${a.address || ''}`),
             this.slots.map((s) => [
                 s.slot,
                 s.state,
                 s.name,
                 s.permissions?.gamepad,
                 s.permissions?.keyboardMouse,
+                s.permissions?.hid,
                 s.streaming,
                 s.ttl_secs,
                 s.devices?.length,
@@ -369,6 +405,8 @@ export class ShareBoard {
                         aria-label="${escapeHtml(t('common.close'))}">✕</button>
             </div>
             ${this._appPickerHtml()}
+            ${this._feedHtml()}
+            ${this._linkAddressHtml()}
             ${
                 this._error
                     ? `<p class="share-board-note is-warning">${escapeHtml(this._error)}</p>`
@@ -383,6 +421,8 @@ export class ShareBoard {
             .querySelector('.share-board-close')
             .addEventListener('click', () => this.close());
         this._wireAppPicker();
+        this._wireFeed();
+        this._wireLinkAddress();
         this.slots.forEach((s) => this._wirePlayerRow(s));
     }
 
@@ -419,6 +459,92 @@ export class ShareBoard {
         `;
     }
 
+    /**
+     * The guests' picture height, on a host whose guests all watch one picture.
+     * One choice for the board, not a row's: a row of its own would mean two
+     * heights, and the guests' one stream cannot be both. It moves at any time
+     * — a stream already running is resized, and its guests follow.
+     */
+    _feedHtml() {
+        if (!this._ownerHeight) return '';
+        const buttons = FEED_HEIGHTS.map(
+            (h) =>
+                `<button class="btn share-feed-btn ${h === this._feedHeight ? 'is-selected' : ''}"
+                         type="button" data-height="${h}"
+                         aria-pressed="${h === this._feedHeight}">${h}p</button>`,
+        ).join('');
+        return `
+            <div class="share-board-feed">
+                <span class="share-field-label" id="share-feed-label">${escapeHtml(
+                    t('sharing.feedLabel'),
+                )}</span>
+                <div class="share-feed-choice" role="group"
+                     aria-labelledby="share-feed-label">${buttons}</div>
+                <p class="share-board-note">${escapeHtml(
+                    t(this._sharedFeed ? 'sharing.feedHintShared' : 'sharing.feedHint'),
+                )}</p>
+            </div>
+        `;
+    }
+
+    /** The name a pick goes by in a sentence: "Tailscale", a card's own name. */
+    _linkAddressName(id = this._linkAddress) {
+        if (id === 'domain') return t('sharing.networkDomain');
+        if (id === 'lan') return t('sharing.networkLan');
+        if (id === 'tailscale') return 'Tailscale';
+        const entry = this._linkAddresses.find((a) => a.id === id);
+        return entry?.adapter || id.replace(/^iface:/, '');
+    }
+
+    /** One menu entry: the network, and the address a guest would open. */
+    _linkAddressLabel(entry) {
+        if (entry.id === 'auto') return t('sharing.linkAddressAuto');
+        const vars = { address: entry.address, name: entry.adapter };
+        if (entry.kind === 'domain') return t('sharing.linkAddressDomain', vars);
+        if (entry.kind === 'lan') return t('sharing.linkAddressLan', vars);
+        if (entry.kind === 'tailscale') return t('sharing.linkAddressTailscale', vars);
+        return t('sharing.linkAddressOther', vars);
+    }
+
+    /**
+     * Which address this host's guest links carry. Only once the PC has a
+     * network to offer besides Automatic, and only on a board that knows its
+     * host, since the pick is kept per host.
+     */
+    _linkAddressHtml() {
+        if (!this.ctx.hostUuid || this._linkAddresses.length < 2) return '';
+        const options = this._linkAddresses.map(
+            (a) =>
+                `<option value="${escapeHtml(a.id)}" ${a.id === this._linkAddress ? 'selected' : ''}>` +
+                `${escapeHtml(this._linkAddressLabel(a))}</option>`,
+        );
+        const name = this._linkAddressName();
+        if (this._linkAddressMissing) {
+            // Still the pick, shown as such: the owner chose it, and it comes
+            // back by itself once the network does.
+            options.push(
+                `<option value="${escapeHtml(this._linkAddress)}" selected disabled>` +
+                    `${escapeHtml(t('sharing.linkAddressGone', { name }))}</option>`,
+            );
+        }
+        return `
+            <div class="share-board-address">
+                <label class="share-field-label" for="share-address-select">${escapeHtml(
+                    t('sharing.linkAddressLabel'),
+                )}</label>
+                <select class="share-app-select share-address-select"
+                        id="share-address-select">${options.join('')}</select>
+                ${
+                    this._linkAddressMissing
+                        ? `<p class="share-board-note is-warning">${escapeHtml(
+                              t('sharing.linkAddressMissing', { name }),
+                          )}</p>`
+                        : ''
+                }
+            </div>
+        `;
+    }
+
     _nameFieldHtml(value, key) {
         return `
             <span class="share-name-field">
@@ -436,7 +562,7 @@ export class ShareBoard {
         const state = row.state || 'off';
         const live = state !== 'off';
         const name = row.name || t('sharing.playerN', { n: index + 1 });
-        const perms = row.permissions || { gamepad: false, keyboardMouse: false };
+        const perms = row.permissions || { gamepad: false, keyboardMouse: false, hid: false };
         const level = row.access_level || 'viewer';
 
         // Header and detail are one block, not two stacked ones: the status rail
@@ -465,6 +591,12 @@ export class ShareBoard {
                         <input type="checkbox" class="share-perm-km"
                                ${perms.keyboardMouse ? 'checked' : ''} ${busy ? 'disabled' : ''}>
                         <span>${escapeHtml(t('sharing.keyboardMouse'))}</span>
+                    </label>
+                    <label class="share-check" title="${escapeHtml(t('sharing.hidDesc'))}">
+                        <input type="checkbox" class="share-perm-hid"
+                               ${perms.gamepad && perms.hid ? 'checked' : ''}
+                               ${busy || !perms.gamepad ? 'disabled' : ''}>
+                        <span>${escapeHtml(t('sharing.hid'))}</span>
                     </label>
                 </span>
                 <span class="share-access-badge" data-level="${escapeHtml(level)}">${escapeHtml(
@@ -523,10 +655,20 @@ export class ShareBoard {
         // the other says it can and the machine simply is not answering just now.
         // The first is fixed by turning internet access on; the second fixes
         // itself, and the link is already in someone's chat window either way.
+        //
+        // A link the owner pinned to one network says which, rather than
+        // pointing at internet access as if the LAN were an accident.
+        //
+        // The owner's own domain, or the name they opened this board on
+        // ("domain", "direct"), goes straight to this PC by a road nothing here
+        // can test: no sentence either way.
         let reach = '';
         if (live && creds?.available !== false) {
-            if (creds?.local_only) reach = 'lanOnly';
-            else if (!this._remoteReachable) reach = 'offline';
+            const where = creds?.reach || (creds?.local_only ? 'lan' : 'public');
+            if (where === 'lan') reach = this._linkAddress === 'lan' ? 'reachLan' : 'lanOnly';
+            else if (where === 'tailscale') reach = 'reachTailscale';
+            else if (where === 'other') reach = 'reachOther';
+            else if (where === 'public' && !this._remoteReachable) reach = 'offline';
         }
 
         // Built, then hidden by CSS (.share-warning). The badge already names
@@ -560,7 +702,14 @@ export class ShareBoard {
                     ${
                         reach
                             ? `<p class="share-reach" data-reach="${reach}">${escapeHtml(
-                                  t(`sharing.${reach}`),
+                                  t(`sharing.${reach}`, { name: this._linkAddressName() }),
+                              )}</p>`
+                            : ''
+                    }
+                    ${
+                        reach === 'reachTailscale'
+                            ? `<p class="share-reach share-tailscale-hint">${escapeHtml(
+                                  t('sharing.tailscaleHint'),
                               )}</p>`
                             : ''
                     }
@@ -708,6 +857,60 @@ export class ShareBoard {
         });
     }
 
+    _wireFeed() {
+        this.board.querySelectorAll('.share-feed-btn').forEach((b) => {
+            b.addEventListener('click', async () => {
+                const height = Number(/** @type {HTMLElement} */ (b).dataset.height);
+                if (height === this._feedHeight) return;
+                const was = this._feedHeight;
+                // Shown at once: a round trip before the button moves reads as a
+                // click that did not register.
+                this._feedHeight = height;
+                this._paint();
+                try {
+                    const data = await this._write(() => BackendClient.shareFeedHeight(height));
+                    if (FEED_HEIGHTS.includes(Number(data?.feed_height))) {
+                        this._feedHeight = Number(data.feed_height);
+                    }
+                } catch (err) {
+                    console.warn('[ShareBoard] picture height refused:', err);
+                    this._feedHeight = was;
+                }
+                this._paint();
+            });
+        });
+    }
+
+    _wireLinkAddress() {
+        const select = /** @type {HTMLSelectElement | null} */ (
+            this.board.querySelector('.share-address-select')
+        );
+        if (!select) return;
+        select.addEventListener('change', async () => {
+            const id = select.value;
+            const was = this._linkAddress;
+            const wasMissing = this._linkAddressMissing;
+            this._linkAddress = id;
+            this._linkAddressMissing = false;
+            try {
+                const data = await this._write(() =>
+                    BackendClient.shareLinkAddress(this.ctx.hostUuid, id),
+                );
+                if (typeof data?.link_address === 'string') this._linkAddress = data.link_address;
+                // A live row keeps its token and PIN: only the address in front
+                // of them moved, so its link is read again.
+                const live = this.slots.filter((s) => s.state !== 'off');
+                live.forEach((s) => this._secrets.delete(s.slot));
+                await this._write(() => Promise.all(live.map((s) => this._fetchSecrets(s.slot))));
+            } catch (err) {
+                console.warn('[ShareBoard] link address refused:', err);
+                this._linkAddress = was;
+                this._linkAddressMissing = wasMissing;
+            }
+            this._paint();
+        });
+    }
+
     _wirePlayerRow(row) {
         const slot = row.slot;
         const el = /** @type {HTMLElement} */ (
@@ -720,8 +923,17 @@ export class ShareBoard {
 
         const gamepad = /** @type {HTMLInputElement} */ (el.querySelector('.share-perm-gamepad'));
         const km = /** @type {HTMLInputElement} */ (el.querySelector('.share-perm-km'));
+        const hid = /** @type {HTMLInputElement} */ (el.querySelector('.share-perm-hid'));
         const pushPerms = async () => {
-            const perms = { gamepad: gamepad.checked, keyboardMouse: km.checked };
+            // A wheel sent as itself is a game controller too: without the
+            // gamepad the box is off and greyed, and the backend agrees.
+            hid.disabled = !gamepad.checked;
+            if (!gamepad.checked) hid.checked = false;
+            const perms = {
+                gamepad: gamepad.checked,
+                keyboardMouse: km.checked,
+                hid: gamepad.checked && hid.checked,
+            };
             // Repaint the badge from the boxes immediately: the owner is
             // watching the label, and a round trip before it moves reads as a
             // click that did not register.
@@ -754,6 +966,7 @@ export class ShareBoard {
         };
         gamepad.addEventListener('change', pushPerms);
         km.addEventListener('change', pushPerms);
+        hid.addEventListener('change', pushPerms);
 
         el.querySelector('.share-toggle-btn').addEventListener('click', () => {
             if (row.state === 'off') this._openRow(slot);

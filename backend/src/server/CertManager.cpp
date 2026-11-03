@@ -39,15 +39,49 @@
 
 // --- Helpers -------------------------------------------------------------------
 
+/// Read back a private key written by generateSelfSignedToFiles(). Returns
+/// nullptr when the file is missing, unreadable, encrypted, or not an RSA key of
+/// at least 2048 bits: the caller then generates a fresh one.
+static EVP_PKEY* readPrivateKeyFile(const QString& keyPath)
+{
+    QFile f(keyPath);
+    if (!f.open(QIODevice::ReadOnly)) return nullptr;
+    QByteArray pem = f.readAll();
+    f.close();
+
+    EVP_PKEY* pkey = nullptr;
+    if (BIO* bio = BIO_new_mem_buf(pem.constData(), static_cast<int>(pem.size()))) {
+        // No passphrase: never let OpenSSL prompt on a console for one.
+        pkey = PEM_read_bio_PrivateKey(
+            bio, nullptr, [](char*, int, int, void*) -> int { return 0; }, nullptr);
+        BIO_free(bio);
+    }
+    pem.fill('\0');
+
+    if (pkey && (EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA || EVP_PKEY_bits(pkey) < 2048)) {
+        EVP_PKEY_free(pkey);
+        pkey = nullptr;
+    }
+    return pkey;
+}
+
 /// Generate a self-signed RSA-2048 certificate + private key entirely via
 /// libcrypto — no external openssl.exe dependency (CI artifacts run on clean
 /// machines without OpenSSL on PATH). `sans` entries use the OpenSSL v3 conf
 /// syntax ("DNS:localhost", "IP:127.0.0.1", ...). Writes PEM files.
+///
+/// With @p reuseKey, a usable key already at @p keyPath signs the new
+/// certificate and its file is left untouched (@p keptKey reports it); a key
+/// that cannot be read is replaced by a fresh one.
 static bool generateSelfSignedToFiles(const QString& certPath, const QString& keyPath,
-                                      const QStringList& sans, const QString& commonName)
+                                      const QStringList& sans, const QString& commonName,
+                                      bool reuseKey = false, bool* keptKey = nullptr)
 {
     bool ok = false;
-    EVP_PKEY* pkey = EVP_RSA_gen(2048);
+    EVP_PKEY* pkey = reuseKey ? readPrivateKeyFile(keyPath) : nullptr;
+    const bool kept = pkey != nullptr;
+    if (keptKey) *keptKey = kept;
+    if (!pkey) pkey = EVP_RSA_gen(2048);
     X509* x509 = X509_new();
 
     do {
@@ -99,7 +133,7 @@ static bool generateSelfSignedToFiles(const QString& certPath, const QString& ke
             return wrote;
         };
 
-        if (!writePem(keyPath, [pkey](BIO* b) {
+        if (!kept && !writePem(keyPath, [pkey](BIO* b) {
                 return PEM_write_bio_PrivateKey(b, pkey, nullptr, nullptr, 0, nullptr, nullptr);
             }))
             break;
@@ -114,7 +148,9 @@ static bool generateSelfSignedToFiles(const QString& certPath, const QString& ke
 }
 
 /// Enumerate all private/local addresses on this machine (excluding loopback).
-/// Covers RFC 1918 IPv4 + IPv6 link-local (fe80::/10) and ULA (fc00::/7).
+/// Covers RFC 1918 IPv4, the 100.64.0.0/10 range a mesh VPN hands out
+/// (Tailscale: a guest link can carry it), and IPv6 link-local (fe80::/10) and
+/// ULA (fc00::/7, Tailscale's fd7a:115c:a1e0::/48 among them).
 /// Used to populate SANs in the self-signed certificate so local IP connections
 /// do not trigger hostname mismatch warnings.
 static QList<QHostAddress> getPrivateLanAddresses()
@@ -131,9 +167,10 @@ static QList<QHostAddress> getPrivateLanAddresses()
 
             if (addr.protocol() == QAbstractSocket::IPv4Protocol) {
                 quint32 ip = addr.toIPv4Address();
-                // RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                // RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, then
+                // 100.64.0.0/10 (CGNAT, what Tailscale hands out)
                 if ((ip & 0xFF000000) == 0x0A000000 || (ip & 0xFFF00000) == 0xAC100000 ||
-                    (ip & 0xFFFF0000) == 0xC0A80000) {
+                    (ip & 0xFFFF0000) == 0xC0A80000 || (ip & 0xFFC00000) == 0x64400000) {
                     result << addr;
                 }
             } else if (addr.protocol() == QAbstractSocket::IPv6Protocol) {
@@ -679,7 +716,7 @@ bool CertManager::generateSelfSignedCert()
 
     // Build SAN list dynamically: localhost, loopback, and all detected LAN IPs.
     // This ensures the self-signed certificate matches all local access methods
-    // (localhost, 127.0.0.1, ::1, 192.168.x.x, 10.x.x.x, etc.) and the browser
+    // (localhost, 127.0.0.1, ::1, 192.168.x.x, 10.x.x.x, Tailscale's 100.x, etc.) and the browser
     // only shows a single "untrusted CA" warning (no hostname mismatch).
     QStringList sans;
     sans << "DNS:localhost"
@@ -718,6 +755,10 @@ void CertManager::ensureLocalSslConfig()
     // This cert is ALWAYS regenerated with SANs for localhost + all current
     // LAN IPs so that every local access method gets a hostname-matching
     // certificate (DHCP changes are reflected on restart).
+    // Its KEY is kept across restarts: a client that pins the server's public
+    // key on first contact (MoonlightWeb TV pins the SPKI) would otherwise see
+    // a "server key changed" after every restart. Deleting local-key.pem
+    // rotates it.
     QString certDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/cert/";
     QDir().mkpath(certDir);
 
@@ -729,9 +770,8 @@ void CertManager::ensureLocalSslConfig()
     QString certPath = certDir + "local-cert.pem";
     QString keyPath = certDir + "local-key.pem";
 
-    // Delete old files and regenerate with fresh SANs and current LAN IPs
+    // Delete the old cert and regenerate it with fresh SANs and current LAN IPs
     QFile::remove(certPath);
-    QFile::remove(keyPath);
 
     // Build SAN list with current LAN IPs
     QStringList sans;
@@ -745,10 +785,13 @@ void CertManager::ensureLocalSslConfig()
         sans << "IP:" + clean.toString();
     }
 
-    if (!generateSelfSignedToFiles(certPath, keyPath, sans, "MoonlightWeb")) {
+    bool keptKey = false;
+    if (!generateSelfSignedToFiles(certPath, keyPath, sans, "MoonlightWeb", true, &keptKey)) {
         Logger::error("[CERT] Cannot generate local self-signed cert (libcrypto)");
         return;
     }
+    Logger::info(keptKey ? "[CERT] Local cert renewed with its existing key"
+                         : "[CERT] Local cert generated with a new key");
 
     // Restrict the private key to the owner (0600 on Unix, owner-only ACL on Win).
     QFile::setPermissions(keyPath, QFileDevice::ReadOwner | QFileDevice::WriteOwner);

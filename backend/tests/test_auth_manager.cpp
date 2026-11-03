@@ -2,6 +2,7 @@
  * MoonlightWeb — TNR suite. Copyright (C) 2026 Bruno Martin. GPLv3.
  */
 #include "test_framework.h"
+#include "common/PairingCrypto.h"
 #include "server/AuthManager.h"
 #include "server/AppSettings.h"
 
@@ -160,6 +161,28 @@ void run_auth_manager_tests()
     CHECK_EQ(auth.sessions().first().machineName, QStringLiteral("Home PC"));
     auth.destroyAllSessions();
 
+    // ── The browser key a session is bound to (MW-BIND-v1) ─────────────────
+    // What HttpServer::tunnelKeyRefused holds a tunnel's key against. A session
+    // keeps the key it was bound to: the cookie copied out of the browser it
+    // lives in cannot be bound again to the copier's own key.
+    {
+        const QByteArray keyA =
+            PairingCrypto::publicKeySpkiFromPrivatePem(PairingCrypto::generatePrivateKeyPem());
+        const QByteArray keyB =
+            PairingCrypto::publicKeySpkiFromPrivatePem(PairingCrypto::generatePrivateKeyPem());
+        const QString session = auth.createSession("198.51.100.50", "Phone");
+        CHECK(auth.sessionPairingKey(session).isEmpty()); // like one older than binding
+        CHECK(!auth.bindSessionKey(session, QByteArray("not a key")));
+        CHECK(auth.bindSessionKey(session, keyA));
+        CHECK(auth.bindSessionKey(session, keyA));  // the same browser, after a reconnect
+        CHECK(!auth.bindSessionKey(session, keyB)); // another browser's key
+        CHECK(auth.sessionPairingKey(session) == keyA);
+        CHECK(!auth.bindSessionKey(QString(), keyA));
+        CHECK(!auth.bindSessionKey("bogus-token", keyA));
+        CHECK(auth.sessionPairingKey("bogus-token").isEmpty());
+        auth.destroyAllSessions();
+    }
+
     // ── Certificate auth ───────────────────────────────────────────────────
     QString cert = auth.generateCertificateToken();
     CHECK(!cert.isEmpty());
@@ -262,6 +285,57 @@ void run_auth_manager_tests()
     CHECK(auth.adminPasswordSet());
     CHECK(auth.validateAdminPassword("192.168.5.32", "another-password").result ==
           AuthManager::Valid);
+
+    // The internet side of the door is shut out of the box, and opening it is
+    // persisted like the rest.
+    CHECK(!auth.remoteAdminInternet());
+    CHECK(!settings.remoteAdminInternet());
+    auth.setRemoteAdminInternet(true);
+    CHECK(auth.remoteAdminInternet());
+    CHECK(settings.remoteAdminInternet());
+
+    // From the internet every address shares one more counter: three wrong
+    // guesses from three addresses lock the fourth out as well. The LAN never
+    // feeds that counter and keeps its own.
+    CHECK(auth.validateAdminPassword("203.0.113.1", "wrong").result == AuthManager::InvalidPin);
+    CHECK(auth.validateAdminPassword("203.0.113.2", "wrong").result == AuthManager::InvalidPin);
+    {
+        const AuthManager::ValidateResult third =
+            auth.validateAdminPassword("203.0.113.3", "wrong");
+        CHECK(third.result == AuthManager::InvalidPin);
+        CHECK(third.lockoutSeconds > 0);
+        CHECK_EQ(third.remainingAttempts, 2); // the shared counter's tier: 5 - 3
+    }
+    CHECK(auth.validateAdminPassword("203.0.113.4", "another-password").result ==
+          AuthManager::RateLimited);
+    CHECK(auth.validateAdminPassword("192.168.5.33", "another-password").result ==
+          AuthManager::Valid);
+
+    // Closing the internet side takes back every unlock: which ones it bought
+    // is not recorded, and a LAN unlock is honoured from anywhere afterwards.
+    {
+        const QString office = auth.createSession("203.0.113.9", "Office laptop");
+        CHECK(auth.promoteSessionToAdmin(office));
+        auth.setRemoteAdminInternet(false);
+        CHECK(!auth.isAdminSession(office));
+        CHECK(auth.validateSession(office)); // still signed in, just not admin
+        CHECK(!settings.remoteAdminInternet());
+    }
+
+    // Removing the password shuts the door again and takes back every unlock;
+    // remote administration itself stays on, waiting for a new password.
+    {
+        const QString laptop = auth.createSession("192.168.5.40", "Laptop");
+        CHECK(auth.promoteSessionToAdmin(laptop));
+        auth.clearAdminPassword();
+        CHECK(!auth.adminPasswordSet());
+        CHECK(settings.adminPasswordDigest().isEmpty());
+        CHECK(!auth.isAdminSession(laptop));
+        CHECK(auth.validateSession(laptop));
+        CHECK(auth.remoteAdminEnabled());
+        CHECK(auth.validateAdminPassword("192.168.5.41", "another-password").result ==
+              AuthManager::InvalidPin);
+    }
     auth.destroyAllSessions();
 
     // ── LAN address classification (gates the unlock) ──────────────────────
@@ -304,6 +378,20 @@ void run_auth_manager_tests()
     CHECK(!AuthManager::canUnlockAdmin("peer-4f2a", false, true));
     CHECK(!AuthManager::canUnlockAdmin("", true, true));
 
+    // Once the owner opens the internet side: a public peer is admitted on
+    // the rendezvous tunnel, where it holds a session earned with the PIN
+    // over that link — never on a socket, where a proxy on this machine is
+    // exactly what forwards the whole internet here.
+    CHECK(AuthManager::canUnlockAdmin("8.8.8.8", false, /*viaTunnel*/ true, /*internet*/ true));
+    CHECK(AuthManager::canUnlockAdmin("2001:db8::1", false, true, true));
+    CHECK(!AuthManager::canUnlockAdmin("8.8.8.8", true, /*viaTunnel*/ false, true));
+    CHECK(!AuthManager::canUnlockAdmin("8.8.8.8", false, true, /*internet*/ false));
+    // A label is still nothing, and the LAN's own rules do not loosen.
+    CHECK(!AuthManager::canUnlockAdmin("peer-4f2a", false, true, true));
+    CHECK(!AuthManager::canUnlockAdmin("", false, true, true));
+    CHECK(!AuthManager::canUnlockAdmin("192.168.1.5", false, false, true));
+    CHECK(AuthManager::canUnlockAdmin("192.168.1.5", false, true, true));
+
     // ── Address helpers (static) ───────────────────────────────────────────
     CHECK_EQ(AuthManager::cleanClientAddress("::ffff:192.168.1.5"), QString("192.168.1.5"));
     CHECK_EQ(AuthManager::isPrivateIP("192.168.1.5"), QString("Local"));
@@ -311,6 +399,40 @@ void run_auth_manager_tests()
     CHECK_EQ(AuthManager::isPrivateIP("8.8.8.8"), QString("Remote"));
     CHECK_EQ(AuthManager::rateLimitKey("8.8.8.8"), QString("8.8.8.8"));   // IPv4 = raw
     CHECK(!AuthManager::rateLimitKey("2001:db8:abcd:1234::1").isEmpty()); // IPv6 = /64-ish
+
+    // ── Whose attempt: behind a local reverse proxy, the visitor's ─────────
+    {
+        using H = QMap<QString, QString>;
+        // No proxy headers: the peer, even on loopback.
+        CHECK_EQ(AuthManager::attemptAddress("127.0.0.1", H{}), QString("127.0.0.1"));
+        // Funnel / nginx: the LAST X-Forwarded-For entry is the proxy's own;
+        // what a visitor wrote before it is theirs to forge.
+        CHECK_EQ(AuthManager::attemptAddress("127.0.0.1",
+                                             H{{"x-forwarded-for", "6.6.6.6, 203.0.113.9"}}),
+                 QString("203.0.113.9"));
+        CHECK_EQ(AuthManager::attemptAddress("::1", H{{"x-forwarded-for", "203.0.113.9"}}),
+                 QString("203.0.113.9"));
+        // cloudflared names the visitor outright, and wins.
+        CHECK_EQ(AuthManager::attemptAddress("127.0.0.1", H{{"cf-connecting-ip", "198.51.100.7"},
+                                                            {"x-forwarded-for", "10.0.0.1"}}),
+                 QString("198.51.100.7"));
+        // RFC 7239, quoted IPv6 with a port, IPv4 with a port.
+        CHECK_EQ(AuthManager::attemptAddress(
+                     "127.0.0.1", H{{"forwarded", "for=1.1.1.1, for=\"[2001:db8::7]:4711\""}}),
+                 QString("2001:db8::7"));
+        CHECK_EQ(AuthManager::attemptAddress("127.0.0.1",
+                                             H{{"forwarded", "proto=https;for=192.0.2.60:80"}}),
+                 QString("192.0.2.60"));
+        // A LAN or internet peer is never believed: the header would buy a fresh
+        // counter with every guess.
+        CHECK_EQ(AuthManager::attemptAddress("192.168.1.20", H{{"x-forwarded-for", "9.9.9.9"}}),
+                 QString("192.168.1.20"));
+        CHECK_EQ(AuthManager::attemptAddress("8.8.8.8", H{{"cf-connecting-ip", "9.9.9.9"}}),
+                 QString("8.8.8.8"));
+        // Garbage in the header: the peer.
+        CHECK_EQ(AuthManager::attemptAddress("127.0.0.1", H{{"x-forwarded-for", "not-an-ip"}}),
+                 QString("127.0.0.1"));
+    }
 
     // ── Home-screen handoff ────────────────────────────────────────────────
     {

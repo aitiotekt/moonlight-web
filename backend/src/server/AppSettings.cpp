@@ -16,6 +16,7 @@
  */
 
 #include "AppSettings.h"
+#include "backend/VirtualDisplay.h"
 #include "common/Edition.h"
 #include "common/Logger.h"
 #include "common/PairingCrypto.h"
@@ -23,6 +24,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QHostInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -31,16 +33,42 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QHash>
+#include <QSet>
+#include <QUuid>
+
+#include <algorithm>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
 #endif
 
+namespace {
+QString g_FileOverride;
+}
+
 AppSettings::AppSettings()
 {
+    if (!g_FileOverride.isEmpty()) {
+        // Created on first write like the default one, so its directory has
+        // to exist too: QSaveFile does not make it.
+        QDir().mkpath(QFileInfo(g_FileOverride).absolutePath());
+        m_FilePath = g_FileOverride;
+        return;
+    }
     QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(dir);
     m_FilePath = dir + "/settings.json";
+}
+
+void AppSettings::setFileOverride(const QString& path)
+{
+    g_FileOverride = path.isEmpty() ? QString() : QFileInfo(path).absoluteFilePath();
+}
+
+QString AppSettings::fileOverride()
+{
+    return g_FileOverride;
 }
 
 // ── Low-level helpers ──────────────────────────────────────────────────────────
@@ -189,6 +217,13 @@ bool AppSettings::audioTimeStretch() const
 {
     QJsonObject obj = readAll();
     return obj.value("audio_time_stretch").toBool(true);
+}
+
+// ── The viewer's microphone ────────────────────────────────────────────────────
+
+QString AppSettings::micDevice() const
+{
+    return readAll().value("mic_device").toString().trimmed();
 }
 
 // ── Stream worker (per-session child process) ─────────────────────────────────
@@ -343,8 +378,29 @@ void AppSettings::seedDocumentedDefaults()
         obj["latency_flag_enabled"] = false;
         changed = true;
     }
-    if (!obj.contains("keyboard_layout_fidelity")) {
-        obj["keyboard_layout_fidelity"] = false;
+    // A boolean until 0.4.0, seeded false: a stored value cannot tell a choice
+    // from the seed, so false moves to the new default and true to the value
+    // that keeps its meaning (AppSettings.h).
+    {
+        const QJsonValue fidelity = obj.value("keyboard_layout_fidelity");
+        if (fidelity.isBool()) {
+            const QString moved =
+                fidelity.toBool() ? QStringLiteral("always") : QStringLiteral("auto");
+            Logger::info(QString("settings.json: keyboard_layout_fidelity %1 -> \"%2\"")
+                             .arg(fidelity.toBool() ? "true" : "false", moved));
+            obj["keyboard_layout_fidelity"] = moved;
+            changed = true;
+        } else if (!fidelity.isString()) {
+            obj["keyboard_layout_fidelity"] = QStringLiteral("auto");
+            changed = true;
+        }
+    }
+    if (!obj.contains("share_guests_admin_windows")) {
+        obj["share_guests_admin_windows"] = false;
+        changed = true;
+    }
+    if (!obj.contains("share_in_booth_mode")) {
+        obj["share_in_booth_mode"] = false;
         changed = true;
     }
     if (!obj.contains("stream_worker_enabled")) {
@@ -365,6 +421,22 @@ void AppSettings::seedDocumentedDefaults()
     }
     if (!obj.contains("session_location_enabled")) {
         obj["session_location_enabled"] = false;
+        changed = true;
+    }
+    // Written out so that the switch can be found in the file; nothing sets it.
+    // No release before 0.4.1 wrote it, so a false in the file is someone's own.
+    if (!obj.contains("ice_tcp_passive")) {
+        obj["ice_tcp_passive"] = true;
+        changed = true;
+    }
+    // The admin's codec of a native session (8f8d9307, never released): PyroWave
+    // moved to each browser's Settings → Video codec, where it is chosen per
+    // device — the one on Ethernet — rather than for every browser at once.
+    if (obj.contains("native_video_codec")) {
+        Logger::info(QString("settings.json: native_video_codec=%1 dropped — PyroWave is "
+                             "chosen per browser now (Settings → Video codec)")
+                         .arg(obj.value("native_video_codec").toString()));
+        obj.remove("native_video_codec");
         changed = true;
     }
     if (changed) writeAll(obj);
@@ -539,6 +611,30 @@ void AppSettings::setStreamNotifications(bool enabled)
     writeAll(obj);
 }
 
+bool AppSettings::debugMode() const
+{
+    return readAll().value("debug_mode").toBool(false);
+}
+
+void AppSettings::setDebugMode(bool enabled)
+{
+    QJsonObject obj = readAll();
+    obj["debug_mode"] = enabled;
+    writeAll(obj);
+}
+
+bool AppSettings::verboseLogs() const
+{
+    return readAll().value("verbose_logs").toBool(false);
+}
+
+void AppSettings::setVerboseLogs(bool enabled)
+{
+    QJsonObject obj = readAll();
+    obj["verbose_logs"] = enabled;
+    writeAll(obj);
+}
+
 // ── Chroma 4:4:4 ───────────────────────────────────────────────────────────────
 
 bool AppSettings::chroma444Enabled() const
@@ -577,16 +673,90 @@ bool AppSettings::latencyFlagEnabled() const
     return obj.value("latency_flag_enabled").toBool(false);
 }
 
-bool AppSettings::keyboardLayoutFidelity() const
+bool AppSettings::packetMarking() const
 {
     QJsonObject obj = readAll();
-    return obj.value("keyboard_layout_fidelity").toBool(false);
+    return obj.value("packet_marking").toBool(true);
+}
+
+void AppSettings::setPacketMarking(bool enabled)
+{
+    QJsonObject obj = readAll();
+    obj["packet_marking"] = enabled;
+    writeAll(obj);
+}
+
+bool AppSettings::iceTcpPassive() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("ice_tcp_passive").toBool(true);
+}
+
+bool AppSettings::debugIceDropUdp() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("debug_ice_drop_udp").toBool(false);
+}
+
+bool AppSettings::sharedFeedEnabled() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("shared_feed_enabled").toBool(true);
+}
+
+bool AppSettings::shareGuestsAdminWindows() const
+{
+    QJsonObject obj = readAll();
+    // Only a real true opens them: a value someone typed as "true" (a string)
+    // or 1 is not a decision to make a stranger administrator.
+    return obj.value("share_guests_admin_windows").toBool(false);
+}
+
+bool AppSettings::shareInBoothMode() const
+{
+    // Only a real true, as above: letting guests into a booth is a decision.
+    return readAll().value("share_in_booth_mode").toBool(false);
+}
+
+QString AppSettings::keyboardLayoutFidelity() const
+{
+    const QJsonValue value = readAll().value("keyboard_layout_fidelity");
+    // Read as the startup migration writes it, for a file not yet migrated.
+    if (value.isBool()) return value.toBool() ? QStringLiteral("always") : QStringLiteral("auto");
+    const QString text = value.toString().trimmed().toLower();
+    if (text == QLatin1String("always") || text == QLatin1String("never")) return text;
+    return QStringLiteral("auto");
+}
+
+bool AppSettings::keyboardHostLayout() const
+{
+    // Only a real true: typing on another layout's keys is a decision.
+    return readAll().value("keyboard_host_layout").toBool(false);
+}
+
+void AppSettings::setKeyboardHostLayout(bool enabled)
+{
+    QJsonObject obj = readAll();
+    obj["keyboard_host_layout"] = enabled;
+    writeAll(obj);
 }
 
 bool AppSettings::keyboardDebug() const
 {
     QJsonObject obj = readAll();
     return obj.value("keyboard_debug").toBool(false);
+}
+
+QString AppSettings::nativeTuning() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("native_tuning").toString().trimmed();
+}
+
+QString AppSettings::rtpVideo() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("rtp_video").toString().trimmed();
 }
 
 // ── Router ports ─────────────────────────────────────────────────────────────
@@ -618,6 +788,95 @@ void AppSettings::clearVirtualDisplay()
     if (!obj.contains(kVirtualDisplayKey)) return;
     obj.remove(kVirtualDisplayKey);
     writeAll(obj);
+}
+
+bool AppSettings::virtualDisplayExclusive() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("virtual_display_exclusive").toBool(false);
+}
+
+void AppSettings::setVirtualDisplayExclusive(bool enabled)
+{
+    QJsonObject obj = readAll();
+    obj["virtual_display_exclusive"] = enabled;
+    writeAll(obj);
+}
+
+QString AppSettings::virtualDisplayGpu() const
+{
+    const QString gpu = readAll().value("virtual_display_gpu").toString();
+    return VirtualDisplay::validGpuName(gpu) ? gpu : QString();
+}
+
+void AppSettings::setVirtualDisplayGpu(const QString& gpu)
+{
+    QJsonObject obj = readAll();
+    if (VirtualDisplay::validGpuName(gpu))
+        obj["virtual_display_gpu"] = gpu;
+    else
+        obj.remove("virtual_display_gpu");
+    writeAll(obj);
+}
+
+// ── The native host's display cards ──────────────────────────────────────────
+
+static const char kDisplayAppIdsKey[] = "display_app_ids";
+
+QList<int> AppSettings::displayAppIds(const QStringList& keys, const QList<int>& firstIds)
+{
+    QJsonObject obj = readAll();
+    QJsonObject kept = obj.value(kDisplayAppIdsKey).toObject();
+    const auto valid = [](int id) { return id >= 1 && id < kDisplayAppIdEnd; };
+    QSet<int> taken;
+    for (auto it = kept.constBegin(); it != kept.constEnd(); ++it)
+        if (valid(it.value().toInt())) taken.insert(it.value().toInt());
+    QSet<QString> here;
+    for (const QString& key : keys)
+        here.insert(key.toLower());
+
+    QList<int> ids;
+    ids.reserve(keys.size());
+    bool changed = false;
+    for (int i = 0; i < keys.size(); ++i) {
+        const QString key = keys.at(i).toLower();
+        int id = key.isEmpty() ? 0 : kept.value(key).toInt();
+        if (key.isEmpty() || valid(id)) {
+            ids.append(key.isEmpty() ? 0 : id);
+            continue;
+        }
+        id = firstIds.value(i);
+        if (!valid(id) || taken.contains(id)) {
+            id = 0;
+            for (int free = 1; free < kDisplayAppIdEnd && !id; ++free)
+                if (!taken.contains(free)) id = free;
+        }
+        if (!id) {
+            // A screen for every id: the lowest one of a screen not here now
+            // is given up.
+            QString gone;
+            for (auto it = kept.constBegin(); it != kept.constEnd(); ++it) {
+                const int theirs = it.value().toInt();
+                if (here.contains(it.key()) || !valid(theirs) || (id && theirs > id)) continue;
+                id = theirs;
+                gone = it.key();
+            }
+            if (!id) {
+                ids.append(0);
+                continue;
+            }
+            kept.remove(gone);
+        }
+        kept[key] = id;
+        taken.insert(id);
+        ids.append(id);
+        changed = true;
+    }
+    if (changed) {
+        obj[kDisplayAppIdsKey] = kept;
+        writeAll(obj);
+    }
+    return ids;
 }
 
 QList<quint16> AppSettings::rememberedTunnelPorts() const
@@ -803,20 +1062,85 @@ void AppSettings::setUniqueId(const QString& id)
 
 // ── Desktop portal consent ───────────────────────────────────────────────────
 
-QString AppSettings::portalRestoreToken() const
+namespace {
+QString portalTokenKey(bool virtualDisplay)
+{
+    return virtualDisplay ? QStringLiteral("portal_virtual_restore_token")
+                          : QStringLiteral("portal_restore_token");
+}
+} // namespace
+
+QString AppSettings::portalRestoreToken(bool virtualDisplay) const
 {
     QJsonObject obj = readAll();
-    return obj.value("portal_restore_token").toString();
+    return obj.value(portalTokenKey(virtualDisplay)).toString();
 }
 
-void AppSettings::setPortalRestoreToken(const QString& token)
+void AppSettings::setPortalRestoreToken(const QString& token, bool virtualDisplay)
 {
+    const QString key = portalTokenKey(virtualDisplay);
     QJsonObject obj = readAll();
     // Rewriting the same token would be a settings file written on every
     // session for nothing. The portal only issues a new one when it actually
     // asked, so equality here is the normal case on a machine that is working.
-    if (obj.value("portal_restore_token").toString() == token) return;
-    obj["portal_restore_token"] = token;
+    if (obj.value(key).toString() == token) return;
+    obj[key] = token;
+    writeAll(obj);
+}
+
+// ── Display rates the capture did not hold ───────────────────────────────────
+
+QJsonArray AppSettings::vddMatchRefused() const
+{
+    return readAll().value(QStringLiteral("vdd_match_refused")).toArray();
+}
+
+int AppSettings::addVddMatchRefusal(const QString& gpu, int milliHz, const QString& version,
+                                    qint64 nowMs)
+{
+    if (milliHz <= 0) return 0;
+    QJsonObject obj = readAll();
+    QJsonArray kept;
+    int count = 1;
+    for (const QJsonValue& v : obj.value(QStringLiteral("vdd_match_refused")).toArray()) {
+        const QJsonObject o = v.toObject();
+        if (o.value(QLatin1String("version")).toString() != version) continue;
+        if (o.value(QLatin1String("gpu")).toString() == gpu &&
+            o.value(QLatin1String("milli_hz")).toInteger() == milliHz) {
+            // Refused again once its hold ran out: one more in a row, held
+            // twice as long. Bounded, so the count never outgrows its doubling.
+            count = qMin(16, static_cast<int>(o.value(QLatin1String("count")).toInteger(1)) + 1);
+            continue;
+        }
+        kept.append(o);
+    }
+    // A handful at most: one per GPU and rate a client asked of this host.
+    while (kept.size() >= 8)
+        kept.removeFirst();
+    kept.append(QJsonObject{{QStringLiteral("gpu"), gpu},
+                            {QStringLiteral("milli_hz"), milliHz},
+                            {QStringLiteral("version"), version},
+                            {QStringLiteral("at"), nowMs},
+                            {QStringLiteral("count"), count}});
+    obj[QStringLiteral("vdd_match_refused")] = kept;
+    writeAll(obj);
+    return count;
+}
+
+void AppSettings::clearVddMatchRefusal(const QString& gpu, int milliHz)
+{
+    QJsonObject obj = readAll();
+    const QJsonArray before = obj.value(QStringLiteral("vdd_match_refused")).toArray();
+    QJsonArray kept;
+    for (const QJsonValue& v : before) {
+        const QJsonObject o = v.toObject();
+        if (o.value(QLatin1String("gpu")).toString() == gpu &&
+            o.value(QLatin1String("milli_hz")).toInteger() == milliHz)
+            continue;
+        kept.append(o);
+    }
+    if (kept.size() == before.size()) return; // nothing refused: no file written for nothing
+    obj[QStringLiteral("vdd_match_refused")] = kept;
     writeAll(obj);
 }
 
@@ -953,6 +1277,369 @@ void AppSettings::setTransportMode(const QString& mode)
     writeAll(obj);
 }
 
+namespace {
+
+/// "auto", "d3d11" or "d3d12", lower-cased; empty for anything else.
+QString videoPipelineName(const QString& value)
+{
+    // Windows' chains and Linux's (plan Phase 13); each OS ignores the
+    // other's, which is also what happens to a settings file carried across.
+    const QString v = value.trimmed().toLower();
+    return v == QLatin1String("auto") || v == QLatin1String("d3d11") ||
+                   v == QLatin1String("d3d12") || v == QLatin1String("vaapi") ||
+                   v == QLatin1String("vulkan")
+               ? v
+               : QString();
+}
+
+} // namespace
+
+QString AppSettings::nativeVideoPipeline() const
+{
+    const QString v = videoPipelineName(readAll().value("native_video_pipeline").toString());
+    return v.isEmpty() ? QStringLiteral("auto") : v;
+}
+
+bool AppSettings::setNativeVideoPipeline(const QString& pipeline)
+{
+    const QString v = videoPipelineName(pipeline);
+    if (v.isEmpty()) return false;
+    QJsonObject obj = readAll();
+    obj["native_video_pipeline"] = v;
+    writeAll(obj);
+    return true;
+}
+
+// ── The native host's apps ─────────────────────────────────────────────────
+
+namespace {
+
+const QStringList& hostAppSources()
+{
+    static const QStringList sources{QStringLiteral("user"), QStringLiteral("steam"),
+                                     QStringLiteral("playnite"), QStringLiteral("xbox")};
+    return sources;
+}
+
+bool validHostAppId(const QString& id)
+{
+    static const QRegularExpression uuid(
+        QStringLiteral("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"));
+    return uuid.match(id).hasMatch();
+}
+
+QString newHostAppId()
+{
+    return QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+
+/// A command of 1 to kHostAppCommandMax characters on one line, trimmed into
+/// @p out; false for anything else.
+bool hostAppCommand(const QJsonValue& value, QString* out)
+{
+    const QString command = value.toString().trimmed();
+    *out = command;
+    return !command.isEmpty() && command.size() <= AppSettings::kHostAppCommandMax &&
+           !command.contains(QLatin1Char('\n')) && !command.contains(QLatin1Char('\r')) &&
+           !command.contains(QChar(0));
+}
+
+/// The name and command of one entry, trimmed, or false with @p error.
+bool hostAppFields(const QJsonValue& value, QString* name, QString* command, QString* error)
+{
+    const QJsonObject in = value.toObject();
+    *name = in.value("name").toString().trimmed();
+    if (!value.isObject() || name->isEmpty() || name->size() > AppSettings::kHostAppNameMax) {
+        if (error)
+            *error = QStringLiteral("each app needs a name of 1 to %1 characters")
+                         .arg(AppSettings::kHostAppNameMax);
+        return false;
+    }
+    if (!hostAppCommand(in.value("command"), command)) {
+        if (error)
+            *error = QStringLiteral("\"%1\" needs a command of 1 to %2 characters, on one line")
+                         .arg(*name)
+                         .arg(AppSettings::kHostAppCommandMax);
+        return false;
+    }
+    return true;
+}
+
+/// One stored entry, cleaned, or an empty object when it is not valid.
+QJsonObject storedHostApp(const QJsonValue& value)
+{
+    QString name, command;
+    if (!hostAppFields(value, &name, &command, nullptr)) return {};
+    const QJsonObject in = value.toObject();
+    const QString id = in.value("id").toString();
+    const int appId = in.value("app_id").toInt();
+    if (!validHostAppId(id) || appId < 1100) return {};
+    QJsonObject out{{"id", id}, {"app_id", appId}, {"name", name}, {"command", command}};
+    QString quit;
+    if (hostAppCommand(in.value("quit_command"), &quit)) out["quit_command"] = quit;
+    const QString source = in.value("source").toString();
+    out["source"] = hostAppSources().contains(source) ? source : QStringLiteral("user");
+    static const QRegularExpression hash(QStringLiteral("^[0-9a-f]{16,64}$"));
+    const QString image = in.value("image").toString();
+    if (hash.match(image).hasMatch()) out["image"] = image;
+    return out;
+}
+
+QJsonArray storedHostApps(const QJsonObject& obj)
+{
+    QJsonArray out;
+    QSet<int> ids;
+    for (const QJsonValue& v : obj.value("host_apps").toArray()) {
+        const QJsonObject entry = storedHostApp(v);
+        if (entry.isEmpty() || out.size() >= AppSettings::kHostAppsMax) continue;
+        // Two cards under one id would open the same program: the first wins.
+        if (ids.contains(entry.value("app_id").toInt())) continue;
+        ids.insert(entry.value("app_id").toInt());
+        out.append(entry);
+    }
+    return out;
+}
+
+/// The next card id to hand out: past the counter and past every entry's.
+int nextHostAppId(const QJsonObject& obj, const QJsonArray& apps)
+{
+    int next = (std::max)(obj.value("host_apps_next_id").toInt(), AppSettings::kHostAppIdFirst);
+    for (const QJsonValue& v : apps)
+        next = (std::max)(next, v.toObject().value("app_id").toInt() + 1);
+    return next;
+}
+
+/// A new entry for the launcher @p detected, numbered from @p obj's counter
+/// (moved on), or an empty object when @p detected is not one.
+QJsonObject detectedHostApp(const QJsonObject& detected, QJsonObject& obj, const QJsonArray& apps)
+{
+    QString name, command;
+    const QString source = detected.value("source").toString();
+    if (!hostAppFields(detected, &name, &command, nullptr) || source == QLatin1String("user") ||
+        !hostAppSources().contains(source))
+        return {};
+    const int appId = nextHostAppId(obj, apps);
+    obj["host_apps_next_id"] = appId + 1;
+    QJsonObject entry{{"id", newHostAppId()},
+                      {"app_id", appId},
+                      {"name", name},
+                      {"command", command},
+                      {"source", source}};
+    QString quit;
+    if (hostAppCommand(detected.value("quit_command"), &quit)) entry["quit_command"] = quit;
+    return entry;
+}
+
+bool hasSource(const QJsonArray& apps, const QString& source)
+{
+    for (const QJsonValue& v : apps)
+        if (v.toObject().value("source").toString() == source) return true;
+    return false;
+}
+
+QStringList dismissedSources(const QJsonObject& obj)
+{
+    QStringList out;
+    for (const QJsonValue& v : obj.value("host_apps_dismissed").toArray())
+        if (hostAppSources().contains(v.toString()) && !out.contains(v.toString()))
+            out.append(v.toString());
+    return out;
+}
+
+} // namespace
+
+QJsonArray AppSettings::hostApps() const
+{
+    return storedHostApps(readAll());
+}
+
+QJsonObject AppSettings::hostApp(int appId) const
+{
+    if (appId <= 0) return {};
+    for (const QJsonValue& v : hostApps())
+        if (v.toObject().value("app_id").toInt() == appId) return v.toObject();
+    return {};
+}
+
+bool AppSettings::setHostApps(const QJsonArray& apps, QString* error, QStringList* removed)
+{
+    if (apps.size() > kHostAppsMax) {
+        if (error) *error = QStringLiteral("%1 apps at most").arg(kHostAppsMax);
+        return false;
+    }
+    QJsonObject obj = readAll();
+    const QJsonArray before = storedHostApps(obj);
+    QHash<QString, QJsonObject> known;
+    for (const QJsonValue& v : before)
+        known.insert(v.toObject().value("id").toString(), v.toObject());
+
+    QJsonArray checked;
+    QSet<QString> kept;
+    for (const QJsonValue& v : apps) {
+        QString name, command;
+        if (!hostAppFields(v, &name, &command, error)) return false;
+        const QString id = v.toObject().value("id").toString();
+        QJsonObject entry;
+        if (known.contains(id) && !kept.contains(id)) {
+            // The server's own fields stay as they were: only the name and
+            // the command are the page's to change.
+            entry = known.value(id);
+        } else {
+            const int appId = nextHostAppId(obj, before);
+            obj["host_apps_next_id"] = appId + 1;
+            entry = QJsonObject{{"id", newHostAppId()}, {"app_id", appId}, {"source", "user"}};
+        }
+        entry["name"] = name;
+        entry["command"] = command;
+        kept.insert(entry.value("id").toString());
+        checked.append(entry);
+    }
+
+    QStringList dismissed = dismissedSources(obj);
+    for (const QJsonValue& v : before) {
+        const QJsonObject entry = v.toObject();
+        const QString id = entry.value("id").toString();
+        if (kept.contains(id)) continue;
+        if (removed) removed->append(id);
+        // A launcher's card the owner removed stays removed: no later version
+        // seeds it again.
+        const QString source = entry.value("source").toString();
+        if (source != QLatin1String("user") && !dismissed.contains(source) &&
+            !hasSource(checked, source))
+            dismissed.append(source);
+    }
+    obj["host_apps"] = checked;
+    obj["host_apps_dismissed"] = QJsonArray::fromStringList(dismissed);
+    writeAll(obj);
+    return true;
+}
+
+bool AppSettings::setHostAppImage(const QString& id, const QString& hash)
+{
+    QJsonObject obj = readAll();
+    QJsonArray apps = storedHostApps(obj);
+    for (int i = 0; i < apps.size(); ++i) {
+        QJsonObject entry = apps.at(i).toObject();
+        if (entry.value("id").toString() != id) continue;
+        if (hash.isEmpty())
+            entry.remove("image");
+        else
+            entry["image"] = hash;
+        apps[i] = entry;
+        obj["host_apps"] = apps;
+        writeAll(obj);
+        return true;
+    }
+    return false;
+}
+
+QStringList AppSettings::hostAppsDismissed() const
+{
+    return dismissedSources(readAll());
+}
+
+QJsonObject AppSettings::restoreHostApp(const QJsonObject& detected, QString* error)
+{
+    QJsonObject obj = readAll();
+    QJsonArray apps = storedHostApps(obj);
+    const QString source = detected.value("source").toString();
+    if (hasSource(apps, source)) {
+        if (error) *error = QStringLiteral("that app is already on the host");
+        return {};
+    }
+    if (apps.size() >= kHostAppsMax) {
+        if (error) *error = QStringLiteral("%1 apps at most").arg(kHostAppsMax);
+        return {};
+    }
+    const QJsonObject entry = detectedHostApp(detected, obj, apps);
+    if (entry.isEmpty()) {
+        if (error) *error = QStringLiteral("that launcher is not one this PC has");
+        return {};
+    }
+    apps.append(entry);
+    QStringList dismissed = dismissedSources(obj);
+    dismissed.removeAll(source);
+    obj["host_apps"] = apps;
+    obj["host_apps_dismissed"] = QJsonArray::fromStringList(dismissed);
+    writeAll(obj);
+    return entry;
+}
+
+bool AppSettings::seedHostApps(const QJsonArray& detected, const QString& version,
+                               QJsonArray* added)
+{
+    QJsonObject obj = readAll();
+    if (obj.value("host_apps_seeded_version").toString() == version) return false;
+    QJsonArray apps = storedHostApps(obj);
+    const QStringList dismissed = dismissedSources(obj);
+    for (const QJsonValue& v : detected) {
+        const QString source = v.toObject().value("source").toString();
+        if (hasSource(apps, source) || dismissed.contains(source) || apps.size() >= kHostAppsMax)
+            continue;
+        const QJsonObject entry = detectedHostApp(v.toObject(), obj, apps);
+        if (entry.isEmpty()) continue;
+        apps.append(entry);
+        if (added) added->append(entry);
+    }
+    obj["host_apps"] = apps;
+    obj["host_apps_seeded_version"] = version;
+    writeAll(obj);
+    return true;
+}
+
+void AppSettings::migrateHostApps()
+{
+    QJsonObject obj = readAll();
+    bool changed = false;
+    QJsonArray apps = obj.value("host_apps").toArray();
+    if (obj.contains("gamescope_apps")) {
+        // 1100 + rank was the card's id in the betas: kept, so a grid cached
+        // by a browser still opens the same program.
+        const QJsonArray old = obj.value("gamescope_apps").toArray();
+        for (int i = 0; i < old.size() && i < kHostAppsMax; ++i) {
+            QString name, command;
+            if (!hostAppFields(old.at(i), &name, &command, nullptr)) continue;
+            apps.append(QJsonObject{{"id", newHostAppId()},
+                                    {"app_id", 1100 + i},
+                                    {"name", name},
+                                    {"command", command},
+                                    {"source", "user"}});
+        }
+        obj.remove("gamescope_apps");
+        Logger::info(QStringLiteral("settings.json: %1 gamescope app(s) moved to host_apps")
+                         .arg(old.size()));
+        changed = true;
+    }
+    // An entry written in by hand, without the server's fields: given them.
+    for (int i = 0; i < apps.size(); ++i) {
+        QJsonObject entry = apps.at(i).toObject();
+        if (!entry.contains("name")) continue;
+        bool fixed = false;
+        if (!validHostAppId(entry.value("id").toString())) {
+            entry["id"] = newHostAppId();
+            fixed = true;
+        }
+        if (entry.value("app_id").toInt() < 1100) {
+            const int appId = nextHostAppId(obj, apps);
+            obj["host_apps_next_id"] = appId + 1;
+            entry["app_id"] = appId;
+            fixed = true;
+        }
+        if (fixed) {
+            apps[i] = entry;
+            changed = true;
+        }
+    }
+    if (!changed) return;
+    obj["host_apps"] = apps;
+    writeAll(obj);
+}
+
+QString AppSettings::hostAppImagesDir() const
+{
+    return QFileInfo(m_FilePath).absolutePath() + QStringLiteral("/host-app-images");
+}
+
 // ── Video enhancement ───────────────────────────────────────────────────────
 
 QString AppSettings::videoEnhancement() const
@@ -1060,6 +1747,19 @@ void AppSettings::setRemoteAdminEnabled(bool enabled)
 {
     QJsonObject obj = readAll();
     obj["remote_admin_enabled"] = enabled;
+    writeAll(obj);
+}
+
+bool AppSettings::remoteAdminInternet() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("remote_admin_internet").toBool(false);
+}
+
+void AppSettings::setRemoteAdminInternet(bool enabled)
+{
+    QJsonObject obj = readAll();
+    obj["remote_admin_internet"] = enabled;
     writeAll(obj);
 }
 

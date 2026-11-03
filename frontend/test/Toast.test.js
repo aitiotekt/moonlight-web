@@ -76,6 +76,26 @@ describe('Toast', () => {
         expect(document.querySelectorAll('.toast').length).toBe(0);
     });
 
+    it('keeps a sticky toast until clicked, past the visible limit', () => {
+        const offer = Toast.info('offer', { sticky: true, action: { label: 'Go', onClick() {} } });
+        for (let i = 0; i < 7; i++) Toast.info('t' + i);
+        vi.advanceTimersByTime(60000);
+        const left = document.querySelectorAll('.toast');
+        expect(left.length).toBe(1);
+        expect(left[0].classList.contains('toast-sticky')).toBe(true);
+        left[0].dispatchEvent(new window.MouseEvent('click'));
+        vi.advanceTimersByTime(300);
+        expect(document.querySelectorAll('.toast').length).toBe(0);
+        offer.dismiss(); // already gone: no throw
+    });
+
+    it('hands back a way to dismiss a toast early', () => {
+        const toast = Toast.show('x', 'info', { sticky: true });
+        toast.dismiss();
+        vi.advanceTimersByTime(300);
+        expect(document.querySelectorAll('.toast').length).toBe(0);
+    });
+
     it('renders an action button that runs its callback and dismisses', () => {
         const onClick = vi.fn();
         Toast.show('advice', 'warning', { action: { label: 'Never again', onClick } });

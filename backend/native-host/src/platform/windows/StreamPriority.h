@@ -18,6 +18,7 @@
 #pragma once
 
 #include <d3d11.h>
+#include <d3d12.h>
 #include <windows.h>
 
 namespace mw::native {
@@ -39,12 +40,17 @@ namespace mw::native {
 /// GPU scheduling. The converter's shaders share the GPU's queue with the
 /// game being streamed; a game that keeps it full makes every capture wait
 /// its turn, and that is a frame late or a frame dropped. The process is put
-/// in the HIGH scheduling class and each of its devices at the top thread
-/// priority, which is what Sunshine does too. REALTIME is never asked for: it
-/// needs SeIncreaseBasePriorityPrivilege, which a non-elevated token does not
-/// carry, and under hardware-accelerated scheduling it can starve the desktop
-/// itself. The encoder is fixed-function and has its own engine; this is
-/// about the shaders in front of it. MW_GPU_PRIORITY=normal skips it.
+/// in the REALTIME scheduling class where the token can have it — the SYSTEM
+/// or elevated worker, whose SeIncreaseBasePriorityPrivilege is switched on
+/// for it — and HIGH otherwise or when refused, which is what Sunshine asks;
+/// each of its devices goes to the top thread priority. Under a real game on
+/// the encoder's GPU, REALTIME took the encode p99 from 10-16 ms to 3 ms and
+/// no desktop stall was seen. The encoder is fixed-function and has its own
+/// engine; this is about the shaders in front of it. MW_GPU_PRIORITY=normal
+/// skips all of it; MW_GPU_PRIORITY=high (a bench switch) stops at HIGH.
+/// Whether the GPU schedules itself (HAGS) is logged per device,
+/// since it decides what a class means. MW_CPU_PRIORITY=high (a bench switch
+/// too) raises the process's CPU class.
 ///
 /// Staying awake. A viewer watching without touching anything sends no input,
 /// and the machine would sleep or blank its screen under the stream — which
@@ -57,8 +63,13 @@ public:
     StreamPriority(const StreamPriority&) = delete;
     StreamPriority& operator=(const StreamPriority&) = delete;
 
-    /// For the session's life: the process-wide opt-outs (applied once per
-    /// process, they are harmless when idle) and the power request.
+    /// The process-wide part, once per process and harmless when idle: out of
+    /// EcoQoS, the GPU scheduling class. Before the session makes any D3D12
+    /// queue: a queue asks its priority from the class (queuePriority) when
+    /// it is made, and keeps it.
+    static void engageProcess();
+
+    /// For the session's life: engageProcess() and the power request.
     void engage();
 
     /// Drops the power request. Idempotent.
@@ -66,6 +77,27 @@ public:
 
     /// Each device the pipeline draws on, as it is (re)built.
     static void raiseDevice(ID3D11Device* device, const char* role);
+
+    /// The GPU scheduling class engage() obtained for the process. Unknown
+    /// before the first engage(); LeftAlone under MW_GPU_PRIORITY=normal.
+    enum class GpuClass
+    {
+        Unknown,
+        LeftAlone,
+        Normal,
+        AboveNormal,
+        High,
+        Realtime,
+    };
+    static GpuClass grantedClass();
+    static const char* toString(GpuClass gpuClass);
+
+    /// What a D3D12 queue of the pipeline asks for under that class:
+    /// GLOBAL_REALTIME where the process has REALTIME (the same privilege
+    /// grants both), NORMAL where scheduling was left alone on purpose, and
+    /// HIGH otherwise — HIGH asks nothing of the token. A D3D11 device has no
+    /// queue to give a priority to; SetGPUThreadPriority is its equivalent.
+    static D3D12_COMMAND_QUEUE_PRIORITY queuePriority();
 
 private:
     HANDLE m_PowerRequest = nullptr;

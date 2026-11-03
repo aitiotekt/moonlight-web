@@ -18,6 +18,12 @@
         <meta name="apple-mobile-web-app-title" content="MoonlightWeb" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta name="theme-color" content="#05080b" />
+        <!-- The first file the page asks for, and owing nothing to the module
+             graph: if a file of it never arrives, it reloads once, then says so
+             (js/bootWatch.js). First, because a browser opens at most six
+             connections to a host: once six files hang, every later request
+             waits behind them, and a watchdog asked for last never arrives. -->
+        <script async src="/js/bootWatch.js?v=__MW_VERSION__"></script>
         <link rel="manifest" href="/manifest.webmanifest" />
         <link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png" />
         <!-- Cyberpunk-style display + mono fonts, served from this machine.
@@ -45,6 +51,7 @@
         <link rel="stylesheet" href="/css/views/login.css?v=__MW_VERSION__" />
         <link rel="stylesheet" href="/css/views/admin.css?v=__MW_VERSION__" />
         <link rel="stylesheet" href="/css/views/share.css?v=__MW_VERSION__" />
+        <link rel="stylesheet" href="/css/views/gamepad.css?v=__MW_VERSION__" />
         <link rel="stylesheet" href="/css/stream.css?v=__MW_VERSION__" />
         <link rel="stylesheet" href="/css/securing.css?v=__MW_VERSION__" />
         <link rel="icon" href="/assets/favicon.ico" type="image/x-icon" />
@@ -66,10 +73,29 @@
                          Settings for an authenticated user, Server Settings only
                          for someone who can actually reach the admin page. The
                          shell paints long before that answer arrives, so a
-                         visible default flashes buttons a guest never gets. -->
+                         visible default flashes buttons a guest never gets.
+                         On a phone the three are icons; wider, each carries
+                         its name (.header-btn-label). -->
+                    <!-- Buy me a coffee — from the 10th good session on
+                         (util/supportNudge.js). The logo is put in by
+                         _initNavButtons(): one copy of it, in bmcLogo.js. -->
+                    <a
+                        class="btn btn-neutral header-btn-bmc"
+                        id="btn-bmc"
+                        href="https://buymeacoffee.com/brunoocto"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        hidden
+                        title="Support MoonlightWeb"
+                        aria-label="Buy me a coffee"
+                        data-i18n-attr="title:support.tooltip, aria-label:support.action"
+                    >
+                        <span class="header-btn-bmc-logo"></span>
+                        <span class="header-btn-label header-btn-bmc-full"></span>
+                    </a>
                     <!-- Server Settings (localhost only) -->
                     <button
-                        class="btn-icon"
+                        class="btn-icon has-label"
                         id="btn-admin"
                         style="display: none"
                         title="Server Settings"
@@ -89,10 +115,11 @@
                                 d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"
                             />
                         </svg>
+                        <span class="header-btn-label" data-i18n="header.adminLabel">Admin</span>
                     </button>
                     <!-- Streaming Settings -->
                     <button
-                        class="btn-icon"
+                        class="btn-icon has-label"
                         id="btn-settings"
                         style="display: none"
                         title="Streaming Settings"
@@ -109,6 +136,9 @@
                                 d="M19 9a1 1 0 10-2 0v2h-1a1 1 0 100 2h1v3a1 1 0 102 0v-3h1a1 1 0 100-2h-1V9z"
                             />
                         </svg>
+                        <span class="header-btn-label" data-i18n="header.settingsLabel"
+                            >Settings</span
+                        >
                     </button>
                 </div>
             </header>

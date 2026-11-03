@@ -27,6 +27,8 @@ vi.mock('../js/api/BackendClient.js', () => ({
         shareDeactivate: vi.fn(async () => ({})),
         shareTtl: vi.fn(async () => ({})),
         shareRename: vi.fn(async () => ({})),
+        shareFeedHeight: vi.fn(async (height) => ({ feed_height: height })),
+        shareLinkAddress: vi.fn(async (host, id) => ({ link_address: id })),
     },
 }));
 // No locale is loaded in the TNR: render the key so the assertions can name it.
@@ -123,7 +125,58 @@ describe('ShareBoard', () => {
         expect(BackendClient.sharePermissions).toHaveBeenCalledWith(2, {
             gamepad: false,
             keyboardMouse: true,
+            hid: false,
         });
+    });
+
+    it('offers the HID box only with the gamepad, and sends it', async () => {
+        await openBoard([slot(2, { state: 'shared' }), slot(3), slot(4)]);
+        const gamepad = rowFor(2).querySelector('.share-perm-gamepad');
+        const hid = rowFor(2).querySelector('.share-perm-hid');
+        // A wheel sent as itself is a game controller: no gamepad, no box.
+        expect(hid.disabled).toBe(true);
+        expect(hid.checked).toBe(false);
+
+        gamepad.checked = true;
+        gamepad.dispatchEvent(new Event('change'));
+        expect(hid.disabled).toBe(false);
+        hid.checked = true;
+        hid.dispatchEvent(new Event('change'));
+        await vi.waitFor(() =>
+            expect(BackendClient.sharePermissions).toHaveBeenLastCalledWith(2, {
+                gamepad: true,
+                keyboardMouse: false,
+                hid: true,
+            }),
+        );
+
+        // Taking the gamepad back takes the wheel with it.
+        gamepad.checked = false;
+        gamepad.dispatchEvent(new Event('change'));
+        expect(hid.checked).toBe(false);
+        expect(hid.disabled).toBe(true);
+        await vi.waitFor(() =>
+            expect(BackendClient.sharePermissions).toHaveBeenLastCalledWith(2, {
+                gamepad: false,
+                keyboardMouse: false,
+                hid: false,
+            }),
+        );
+    });
+
+    it('paints a granted HID box from the server', async () => {
+        await openBoard([
+            slot(2, {
+                state: 'shared',
+                permissions: { gamepad: true, keyboardMouse: false, hid: true },
+                access_level: 'gamer',
+            }),
+            slot(3),
+            slot(4),
+        ]);
+        const hid = rowFor(2).querySelector('.share-perm-hid');
+        expect(hid.checked).toBe(true);
+        expect(hid.disabled).toBe(false);
     });
 
     it('records an idle row’s choice at once, so the poll cannot undo it', async () => {
@@ -139,6 +192,7 @@ describe('ShareBoard', () => {
             expect(BackendClient.sharePermissions).toHaveBeenCalledWith(2, {
                 gamepad: true,
                 keyboardMouse: false,
+                hid: false,
             }),
         );
     });
@@ -421,9 +475,153 @@ describe('ShareBoard', () => {
             expect(reachOf(2).dataset.reach).toBe('lanOnly');
         });
 
+        // Issue #41: the owner's own domain, or the name they opened the board
+        // on, reaches this PC without the rendezvous line. Whether it answers
+        // is not something the board can see, so it claims nothing.
+        it.each(['domain', 'direct'])(
+            'says nothing about a %s link, even with no line out',
+            async (where) => {
+                BackendClient.shareCredentials.mockResolvedValue({
+                    available: true,
+                    url: 'https://moonlight.example.org/p/tok',
+                    pin: '482917',
+                    reach: where,
+                    local_only: false,
+                });
+                await openBoard([live(), slot(3), slot(4)], undefined, { remote_reachable: false });
+                expect(reachOf(2)).toBeNull();
+            },
+        );
+
         it('says nothing on a row that was never opened', async () => {
             await openBoard([slot(2), slot(3), slot(4)], undefined, { remote_reachable: false });
             expect(reachOf(2)).toBeNull();
+        });
+    });
+
+    describe('lets the owner pick the address a link carries', () => {
+        const menu = () => document.querySelector('.share-address-select');
+        const detailFor = (n) => document.querySelector(`.share-brow-detail[data-slot="${n}"]`);
+        const networks = [
+            { id: 'auto' },
+            { id: 'lan', kind: 'lan', address: '192.168.1.66', adapter: 'vEthernet (LAN)' },
+            { id: 'tailscale', kind: 'tailscale', address: '100.116.41.43', adapter: 'Tailscale' },
+        ];
+        const tailscaleCreds = {
+            available: true,
+            url: 'https://100.116.41.43:8443/p/tok',
+            pin: '482917',
+            reach: 'tailscale',
+            local_only: true,
+        };
+
+        beforeEach(() => {
+            BackendClient.shareCredentials.mockResolvedValue({
+                available: true,
+                url: 'https://x/p/tok',
+                pin: '482917',
+                reach: 'public',
+                local_only: false,
+            });
+        });
+
+        it('offers no menu when Automatic is the only choice', async () => {
+            await openBoard([slot(2), slot(3), slot(4)], undefined, {
+                link_addresses: [{ id: 'auto' }],
+                link_address: 'auto',
+            });
+            expect(menu()).toBeNull();
+        });
+
+        it('lists the networks, with the pick of this host selected', async () => {
+            await openBoard([slot(2), slot(3), slot(4)], undefined, {
+                link_addresses: networks,
+                link_address: 'tailscale',
+            });
+            expect([...menu().options].map((o) => o.value)).toEqual(['auto', 'lan', 'tailscale']);
+            expect(menu().value).toBe('tailscale');
+        });
+
+        it("offers the owner's own domain first, under its name", async () => {
+            await openBoard([slot(2), slot(3), slot(4)], undefined, {
+                link_addresses: [
+                    networks[0],
+                    { id: 'domain', kind: 'domain', address: 'moonlight.example.org', adapter: '' },
+                    ...networks.slice(1),
+                ],
+                link_address: 'domain',
+            });
+            expect([...menu().options].map((o) => o.value)).toEqual([
+                'auto',
+                'domain',
+                'lan',
+                'tailscale',
+            ]);
+            expect(menu().value).toBe('domain');
+            expect(menu().options[1].textContent).toContain('sharing.linkAddressDomain');
+        });
+
+        it('stores the pick for this host and reads the live link again', async () => {
+            await openBoard([slot(2, { state: 'shared' }), slot(3), slot(4)], undefined, {
+                link_addresses: networks,
+                link_address: 'auto',
+            });
+            BackendClient.shareCredentials.mockClear();
+            BackendClient.shareCredentials.mockResolvedValue(tailscaleCreds);
+            menu().value = 'tailscale';
+            menu().dispatchEvent(new Event('change'));
+            await vi.waitFor(() => expect(BackendClient.shareCredentials).toHaveBeenCalledWith(2));
+            expect(BackendClient.shareLinkAddress).toHaveBeenCalledWith('h', 'tailscale');
+            // The token and the PIN stay; only the address in front of them moved.
+            await vi.waitFor(() =>
+                expect(detailFor(2).querySelector('.share-link-input').value).toBe(
+                    'https://100.116.41.43:8443/p/tok',
+                ),
+            );
+        });
+
+        it('says a Tailscale link is for the tailnet, with the direct-path hint', async () => {
+            BackendClient.shareCredentials.mockResolvedValue(tailscaleCreds);
+            await openBoard([slot(2, { state: 'shared' }), slot(3), slot(4)], undefined, {
+                link_addresses: networks,
+                link_address: 'tailscale',
+            });
+            const reach = detailFor(2).querySelector('.share-reach[data-reach]');
+            expect(reach.dataset.reach).toBe('reachTailscale');
+            expect(detailFor(2).querySelector('.share-tailscale-hint').textContent).toContain(
+                'sharing.tailscaleHint',
+            );
+        });
+
+        it('shows the hint on no other link', async () => {
+            BackendClient.shareCredentials.mockResolvedValue({
+                available: true,
+                url: 'https://192.168.1.66:8443/p/tok',
+                pin: '482917',
+                reach: 'lan',
+                local_only: true,
+            });
+            await openBoard([slot(2, { state: 'shared' }), slot(3), slot(4)], undefined, {
+                link_addresses: networks,
+                link_address: 'lan',
+            });
+            // Pinned to the LAN on purpose: no nudge towards internet access.
+            expect(detailFor(2).querySelector('.share-reach').dataset.reach).toBe('reachLan');
+            expect(detailFor(2).querySelector('.share-tailscale-hint')).toBeNull();
+        });
+
+        it('keeps a pick whose network is gone, and says so', async () => {
+            await openBoard([slot(2), slot(3), slot(4)], undefined, {
+                link_addresses: networks.slice(0, 2),
+                link_address: 'tailscale',
+                link_address_missing: true,
+            });
+            const picked = [...menu().options].find((o) => o.selected);
+            expect(picked.value).toBe('tailscale');
+            expect(picked.disabled).toBe(true);
+            expect(
+                document.querySelector('.share-board-address .is-warning').textContent,
+            ).toContain('sharing.linkAddressMissing');
         });
     });
 
@@ -454,5 +652,51 @@ describe('ShareBoard', () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+    // A native host's guests watch one picture: its height is one choice for
+    // the whole board, never a row's (two rows, two heights, one stream).
+    it('offers one picture height for every guest on a native host', async () => {
+        await openBoard([slot(2), slot(3), slot(4)], undefined, {
+            feed_height: 1080,
+            owner_height: true,
+            shared_feed: true,
+        });
+        expect(BackendClient.getShareStatus).toHaveBeenCalledWith('h');
+        const buttons = document.querySelectorAll('.share-board-feed .share-feed-btn');
+        expect([...buttons].map((b) => b.textContent)).toEqual(['720p', '1080p', '1440p']);
+        expect(document.querySelector('.share-feed-btn.is-selected').textContent).toBe('1080p');
+        // Only one, above the rows: no row carries a height of its own.
+        expect(document.querySelectorAll('.share-board-feed').length).toBe(1);
+        expect(document.querySelector('.share-player .share-feed-btn')).toBeNull();
+        expect(document.querySelector('.share-board-feed').textContent).toContain(
+            'sharing.feedHintShared',
+        );
+
+        buttons[0].dispatchEvent(new Event('click'));
+        await vi.waitFor(() => expect(BackendClient.shareFeedHeight).toHaveBeenCalledWith(720));
+        await vi.waitFor(() =>
+            expect(document.querySelector('.share-feed-btn.is-selected').textContent).toBe('720p'),
+        );
+    });
+
+    it('puts the height back when the backend refuses it', async () => {
+        await openBoard([slot(2), slot(3), slot(4)], undefined, {
+            feed_height: 1080,
+            owner_height: true,
+        });
+        BackendClient.shareFeedHeight.mockRejectedValueOnce(new Error('400'));
+        document.querySelectorAll('.share-feed-btn')[2].dispatchEvent(new Event('click'));
+        await vi.waitFor(() => expect(BackendClient.shareFeedHeight).toHaveBeenCalledWith(1440));
+        await vi.waitFor(() =>
+            expect(document.querySelector('.share-feed-btn.is-selected').textContent).toBe('1080p'),
+        );
+    });
+
+    it('leaves the height to each guest elsewhere', async () => {
+        await openBoard([slot(2), slot(3), slot(4)], undefined, {
+            feed_height: 1080,
+            owner_height: false,
+        });
+        expect(document.querySelector('.share-board-feed')).toBeNull();
     });
 });

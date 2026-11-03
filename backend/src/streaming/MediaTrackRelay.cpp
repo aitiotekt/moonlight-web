@@ -18,6 +18,7 @@
 #include "MediaTrackRelay.h"
 #include "ClipboardBridge.h"
 #include "InputMessageCodec.h"
+#include "PacketMarking.h"
 #include "IMediaEngine.h"
 #include "NativeMediaEngine.h"
 #include "ExitNotice.h"
@@ -81,6 +82,34 @@ MediaTrackRelay::MediaTrackRelay(IMediaEngine* engine, QObject* parent)
         } catch (const std::exception&) {}
     });
 
+    // What the host's OS asked of a recreated HID device — see DataChannelRelay.
+    connect(m_Shim, &IMediaEngine::hidRequest, this,
+            [this](int slot, int kind, int reportId, QByteArray data) {
+                if (m_Stopping.load() || !m_InputDc) return;
+                static const char* const kKinds[] = {"output", "getfeature", "setfeature"};
+                QJsonObject m;
+                m["type"] = "hidrequest";
+                m["slot"] = slot;
+                m["kind"] = QLatin1String(kKinds[qBound(0, kind, 2)]);
+                m["reportId"] = reportId;
+                m["data"] = QString::fromLatin1(data.toBase64());
+                QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
+                try {
+                    m_InputDc->send(std::string(j.constData(), j.size()));
+                } catch (const std::exception&) {}
+            });
+
+    // Force feedback a game asked of a recreated wheel, for the page to play on
+    // the real one. Reliable and ordered like the rest of this channel: an
+    // effect's start must never overtake its parameters.
+    connect(m_Shim, &IMediaEngine::hidFfb, this, [this](QJsonObject m) {
+        if (m_Stopping.load() || !m_InputDc) return;
+        const QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
+        try {
+            m_InputDc->send(std::string(j.constData(), j.size()));
+        } catch (const std::exception&) {}
+    });
+
     // The input gate (native host) — see DataChannelRelay for the message.
     connect(m_Shim, &IMediaEngine::inputGateChanged, this,
             [this](bool blocked, QString reason, QString window) {
@@ -115,6 +144,18 @@ MediaTrackRelay::MediaTrackRelay(IMediaEngine* engine, QObject* parent)
                     m_InputDc->send(std::string(j.constData(), j.size()));
                 } catch (const std::exception&) {}
             });
+
+    // The guests' shared feed changes codec (native host) — see DataChannelRelay.
+    connect(m_Shim, &IMediaEngine::sharedFeedCodecChanged, this, [this](QString codec) {
+        if (m_Stopping.load() || !m_InputDc) return;
+        QJsonObject m;
+        m["type"] = "feedcodec";
+        m["codec"] = codec;
+        QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
+        try {
+            m_InputDc->send(std::string(j.constData(), j.size()));
+        } catch (const std::exception&) {}
+    });
 
     // The mouse pointer's shape when the browser draws it (native host, desktop
     // mode) — same message as DataChannelRelay's, same reasoning there. The
@@ -216,6 +257,7 @@ bool MediaTrackRelay::setRemoteDescription(const std::string& sdp)
     }
     try {
         m_Pc->setRemoteDescription(rtc::Description(sdp));
+        logMicAnswer(sdp, "[MediaTrackRelay]");
         qInfo() << "[MediaTrackRelay] Remote description set — starting ICE timeout ("
                 << m_IceTimeoutMs << "ms)";
         if (m_IceCheckTimer) {
@@ -244,6 +286,7 @@ void MediaTrackRelay::setupPeerConnection(const rtc::Configuration& config)
 {
     qInfo() << "[MediaTrackRelay] Creating PeerConnection (media mode)";
 
+    PacketMarking::apply();
     m_Pc = std::make_shared<rtc::PeerConnection>(config);
 
     // --- Local description callback ---
@@ -393,8 +436,14 @@ void MediaTrackRelay::createTracksAndChannels()
     // MONO Opus decoder and downmixes the stereo Sunshine stream (L+R)/2, which
     // plays ~-6 dB quieter than moonlight-qt and loses the stereo image.
     {
-        auto audioDesc = rtc::Description::Audio("audio", rtc::Description::Direction::SendOnly);
-        audioDesc.addOpusCodec(111, "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1");
+        // Sendrecv for the viewer's microphone (RelayBase::setMicUplink), and
+        // for the bench's silent carrier (PacketMarking::carrierOffered).
+        const bool carrier = PacketMarking::carrierOffered();
+        const bool sendRecv = carrier || m_Mic;
+        auto audioDesc =
+            rtc::Description::Audio("audio", sendRecv ? rtc::Description::Direction::SendRecv
+                                                      : rtc::Description::Direction::SendOnly);
+        audioDesc.addOpusCodec(111, micOpusFmtp());
 
         // Declared before addTrack for the same reason as the video SSRC above:
         // without it the audio NACK responder below never sees a NACK either.
@@ -411,6 +460,13 @@ void MediaTrackRelay::createTracksAndChannels()
             // RTP packet (complements Opus FEC/PLC) with a small history buffer.
             packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(64));
             m_AudioTrack->setMediaHandler(packetizer);
+            if (m_Mic) {
+                wireMicUplink(*m_AudioTrack, "[MediaTrackRelay]");
+            } else if (carrier) {
+                // The carrier's packets carry nothing: dropped as they come.
+                m_AudioTrack->onMessage([](rtc::message_variant) {});
+                qInfo() << "[MediaTrackRelay] Audio offered sendrecv (MW_DSCP_CARRIER bench key)";
+            }
 
             m_AudioTrack->onOpen([this]() { qInfo() << "[MediaTrackRelay] Audio Track open"; });
             m_AudioTrack->onClosed([this]() { qInfo() << "[MediaTrackRelay] Audio Track closed"; });
@@ -444,6 +500,9 @@ void MediaTrackRelay::createTracksAndChannels()
                     } catch (const std::exception&) {}
                 }
 
+                sendHidCaps();
+                sendInputCaps(); // see DataChannelRelay
+
                 // Start periodic stats timer on the relay's own thread: this
                 // callback runs on a libdatachannel thread and QTimer::start()
                 // must be invoked from the timer's owning thread (otherwise Qt
@@ -467,6 +526,34 @@ void MediaTrackRelay::createTracksAndChannels()
                     QMetaObject::invokeMethod(
                         this, [this, text]() { onInputMessage(text); }, Qt::QueuedConnection);
                 }
+            });
+        }
+    }
+
+    // ── HID DataChannel (the HID passthrough's input reports) ─────────────
+    // See DataChannelRelay. Handled on the relay thread like this relay's
+    // input, which is where the policy and the engine are safe to touch.
+    {
+        rtc::DataChannelInit hidConfig;
+        hidConfig.negotiated = true;
+        hidConfig.id = 4;
+        hidConfig.reliability.unordered = true;
+        hidConfig.reliability.maxRetransmits = 0;
+        m_HidDc = m_Pc->createDataChannel("hid", hidConfig);
+        if (m_HidDc) {
+            m_HidDc->onMessage([this](const std::variant<rtc::binary, rtc::string>& msg) {
+                if (!std::holds_alternative<rtc::binary>(msg)) return;
+                const rtc::binary& b = std::get<rtc::binary>(msg);
+                QByteArray frame(reinterpret_cast<const char*>(b.data()),
+                                 static_cast<int>(b.size()));
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, frame]() {
+                        if (m_Stopping.load() || !m_InputPolicy.hid) return;
+                        m_Shim->hidInput(reinterpret_cast<const uint8_t*>(frame.constData()),
+                                         static_cast<size_t>(frame.size()));
+                    },
+                    Qt::QueuedConnection);
             });
         }
     }
@@ -711,8 +798,25 @@ void MediaTrackRelay::onAudioSample(const QByteArray& data)
 void MediaTrackRelay::onShimConnectionTerminated(int errorCode)
 {
     qInfo() << "[MediaTrackRelay] Shim connection terminated, code=" << errorCode;
+    // Graceful termination: the host ended the stream on purpose, typically
+    // because the app was closed there. Say so before the channels drop, or
+    // the browser reads the close as a connection error. Any other code is
+    // the host side failing (Sunshine crashed, its encoder hung the GPU, the
+    // native engine died): the browser link is fine, so say which side went.
+    sendExitNotice(errorCode == ML_ERROR_GRACEFUL_TERMINATION ? "host-ended" : "host-lost");
     if (!m_Stopping.exchange(true)) {
         m_Connected = false;
+        emit sessionEnded();
+    }
+}
+
+void MediaTrackRelay::endFromSignaling()
+{
+    // No exit notice: there is no channel to the page yet, only the signalling
+    // socket, which is the side that gave up.
+    if (!m_Stopping.exchange(true)) {
+        m_Connected = false;
+        if (m_IceCheckTimer) m_IceCheckTimer->stop();
         emit sessionEnded();
     }
 }
@@ -752,23 +856,15 @@ void MediaTrackRelay::onInputMessage(const std::string& message)
 
     if (type == "keydown" || type == "keyup") {
         bool down = (type == "keydown");
-        const InputMsg::KeyPlan plan = InputMsg::resolveKey(msg, m_Shim->keyboardMode());
-        InputMsg::logKey(msg, m_Shim->keyboardMode(), plan, down);
-        if (plan.isText()) {
-            m_Shim->sendKeyChar(plan.text, down, InputMsg::modifierMask(msg));
-        } else {
-            // `hold`: a movement key the client wants kept down through a brief
-            // stall instead of released at the short grace period (see the shim).
-            m_Shim->sendKeyEvent(plan.keyCode, down, InputMsg::modifierMask(msg), plan.flags,
-                                 msg["hold"].toBool(false));
-        }
+        InputMsg::sendKey(*m_Shim, msg, down);
     } else if (type == "inputstate") {
         // Client heartbeat: its authoritative held-input state, sent while (and
         // only while) something is held. Re-presses whatever the watchdog
-        // released during a stall but the user is genuinely still holding.
-        m_Shim->syncHeldInputs(InputMsg::parseHeldKeys(msg, m_Shim->keyboardMode()),
-                               static_cast<quint32>(msg["buttons"].toInt(0)),
-                               msg["buttonsHold"].toBool(false));
+        // released during a stall but the user is genuinely still holding —
+        // filtered by the guest's policy, or a viewer could press keys with it.
+        const InputMsg::HeldState held = InputMsg::readHeldState(
+            msg, m_Shim->keyboardMode(), m_Shim->layoutFidelity(), m_InputPolicy);
+        m_Shim->syncHeldInputs(held.keys, held.buttons, held.buttonsHold);
     } else if (type == "mousemove") {
         // Absolute mouse position (non-gaming mode)
         if (msg.contains("x") && msg.contains("y") && msg.contains("referenceWidth") &&
@@ -797,12 +893,28 @@ void MediaTrackRelay::onInputMessage(const std::string& message)
     } else if (type == "secureattention") {
         // Ctrl+Alt+Suppr: the one combination a browser can never deliver — the
         // OS running the viewer eats it first — so it arrives as a message of
-        // its own, from a button. Whether it reaches the host's secure desktop
+        // its own, from the touch keyboard bar (Ctrl and Alt down, then Del).
+        // Whether it reaches the host's secure desktop
         // depends on the host (IMediaEngine::sendSecureAttention).
         m_Shim->sendSecureAttention();
     } else if (type == "textinput") {
-        // Virtual/soft keyboard text (UTF-8) — forwarded as a text event.
-        m_Shim->sendUtf8Text(msg["text"].toString());
+        // Virtual/soft keyboard text: as text, or as US keys on a host that
+        // cannot type text without an input method (InputMsg::planText).
+        // What was left to that input method is named back to the page, which
+        // says once why it may not arrive.
+        const QString viaIme = InputMsg::sendText(*m_Shim, msg["text"].toString());
+        if (!viaIme.isEmpty() && m_InputDc && !m_Stopping.load()) {
+            QJsonObject m;
+            m["type"] = "textviaime";
+            m["text"] = viaIme;
+            const QByteArray json = QJsonDocument(m).toJson(QJsonDocument::Compact);
+            try {
+                m_InputDc->send(std::string(json.constData(), json.size()));
+            } catch (const std::exception& e) {
+                if (!m_Stopping.load())
+                    qWarning() << "[MediaTrackRelay] textviaime send error:" << e.what();
+            }
+        }
     } else if (type == "locksync") {
         // Align the host's toggle locks (Num/Caps/Scroll) with the client's,
         // sent once per session on the browser's first real keyboard event.
@@ -909,6 +1021,27 @@ void MediaTrackRelay::onInputMessage(const std::string& message)
         // and not an empty state.
         m_Shim->sendControllerRemoval(static_cast<uint8_t>(msg["index"].toInt(0)),
                                       static_cast<uint16_t>(msg["mask"].toInt(0)));
+    } else if (type == "hidattach") {
+        // See DataChannelRelay.
+        const int slot = msg["slot"].toInt(-1);
+        const QString why = (slot < 0 || slot > 7) ? QStringLiteral("slot out of range")
+                                                   : m_Shim->hidAttach(slot, msg);
+        QJsonObject r{{QStringLiteral("type"), QStringLiteral("hidattached")},
+                      {QStringLiteral("slot"), slot},
+                      {QStringLiteral("ok"), why.isEmpty()},
+                      {QStringLiteral("why"), why}};
+        const QByteArray j = QJsonDocument(r).toJson(QJsonDocument::Compact);
+        try {
+            if (m_InputDc) m_InputDc->send(std::string(j.constData(), j.size()));
+        } catch (const std::exception&) {}
+        if (why.isEmpty()) m_Shim->hidAttached(slot);
+    } else if (type == "hiddetach") {
+        m_Shim->hidDetach(msg["slot"].toInt(-1));
+    } else if (type == "hidreply") {
+        // The real device's answer to an hidrequest (a HID++ reply under
+        // Linux): one report, at most the 63 bytes of HID++'s longest.
+        const QByteArray data = QByteArray::fromBase64(msg["data"].toString().toLatin1()).left(64);
+        m_Shim->hidReply(msg["slot"].toInt(-1), msg["reportId"].toInt(-1), data);
     } else {
         qWarning() << "[MediaTrackRelay] Unknown input type:" << type;
     }
@@ -1012,6 +1145,36 @@ void MediaTrackRelay::sendExitNotice(const char* type)
     }
 }
 
+void MediaTrackRelay::sendHidCaps()
+{
+    if (!m_InputDc || !m_InputDc->isOpen() || !m_Shim || m_Stopping.load()) return;
+    const QJsonObject caps = hidCapsMessage(m_InputPolicy, *m_Shim);
+    const QByteArray j = QJsonDocument(caps).toJson(QJsonDocument::Compact);
+    try {
+        m_InputDc->send(std::string(j.constData(), j.size()));
+    } catch (const std::exception&) {}
+}
+
+void MediaTrackRelay::sendInputCaps()
+{
+    if (!m_InputDc || !m_InputDc->isOpen() || m_Stopping.load()) return;
+    const QByteArray j = inputCapsMessage(m_InputPolicy);
+    try {
+        m_InputDc->send(std::string(j.constData(), j.size()));
+    } catch (const std::exception&) {}
+}
+
+void MediaTrackRelay::onHidPolicyChanged()
+{
+    // On the relay thread, where the hid channel's reports and the page's
+    // hidattach are handled too.
+    if (!m_Shim) return;
+    if (!m_InputPolicy.hid)
+        for (int slot = 0; slot < kHidSlots; ++slot)
+            m_Shim->hidDetach(slot);
+    sendHidCaps();
+}
+
 void MediaTrackRelay::stop()
 {
     // Marshal onto the relay's session thread when called cross-thread (main:
@@ -1031,6 +1194,9 @@ void MediaTrackRelay::stop()
     }
 
     qInfo() << "[MediaTrackRelay::stop] ENTER, frameCount=" << m_FrameCount;
+
+    // The microphone's device first: nothing more will come for it.
+    stopMic();
 
     // Stop timers
     if (m_IceCheckTimer) {
@@ -1067,6 +1233,7 @@ void MediaTrackRelay::stop()
     };
 
     closeDc(m_InputDc, "input");
+    closeDc(m_HidDc, "hid");
 
     // Close the audio track under the audio send lock, so an in-flight audio
     // sendFrame finishes before the track is destroyed.

@@ -243,6 +243,25 @@ void run_input_watchdog_tests()
         CHECK_EQ(wire.padsZeroed.value(0), short(2));
     }
 
+    // ── A press of a held key is a repeat, and says so ──────────────────────
+    // The GameStream engine drops it: Wolf's inputtino piles every one into
+    // the list its repeat thread walks, and a key stuck down on the host.
+    {
+        FakeWire wire;
+        InputWatchdog wd(wire.sink());
+        CHECK(!wd.noteKey(key('A'), true));
+        CHECK(wd.noteKey(key('A'), true));
+        CHECK(wd.noteKey(key('A', true), true));
+        CHECK(!wd.noteKey(key('B'), true)); // another key is no repeat of A
+        CHECK(!wd.noteKey(key('A'), false));
+        CHECK(!wd.noteKey(key('A'), false)); // a release is never one
+        CHECK(!wd.noteKey(key('A'), true));
+
+        // Released by the watchdog: the next press goes out again.
+        wd.release(true);
+        CHECK(!wd.noteKey(key('A'), true));
+    }
+
     // ── At rest is loose on purpose ─────────────────────────────────────────
     CHECK(InputWatchdog::padAtRest(0, 0, 0, 4095, -4095, 0, 0));
     CHECK(!InputWatchdog::padAtRest(0, 0, 0, 4096, 0, 0, 0));

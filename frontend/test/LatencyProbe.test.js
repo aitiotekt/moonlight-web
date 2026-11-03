@@ -261,7 +261,9 @@ describe('LatencyProbe.run', () => {
         await Promise.resolve();
     }
 
-    function makeProbe(flagAt) {
+    // The click's random wait for a phase (PHASE_JITTER_MS) is left out, so
+    // that a test sees its click leave at once; one test checks the wait.
+    function makeProbe(flagAt, phaseJitterMs = 0) {
         const results = [];
         const sendClick = vi.fn();
         const showMark = vi.fn();
@@ -271,6 +273,7 @@ describe('LatencyProbe.run', () => {
             showMark,
             requestFrameEvents: null,
             results,
+            phaseJitterMs,
         });
         // Flag visible from `flagAt` ms after the click was sent, for 100 ms.
         let clickAt = null;
@@ -297,6 +300,58 @@ describe('LatencyProbe.run', () => {
         expect(entry.reason).toBeNull();
         expect(typeof entry.ts).toBe('number');
         expect(results).toEqual([entry]);
+    });
+
+    it("splits a click with the host's answer to its stamp, before or after the flag", async () => {
+        for (const answerFirst of [true, false]) {
+            const results = [];
+            let reply = null;
+            const sendClick = vi.fn();
+            const uplink = {
+                stamp: vi.fn((t0, cb) => {
+                    reply = cb;
+                    return 7;
+                }),
+                hold: vi.fn(),
+                release: vi.fn(),
+            };
+            const probe = new LatencyProbe({
+                source: () => ({}),
+                sendClick,
+                results,
+                uplink,
+                phaseJitterMs: 0,
+            });
+            let clickAt = null;
+            sendClick.mockImplementation(() => {
+                clickAt = now;
+            });
+            probe._sample = () => clickAt !== null && now - clickAt >= 48 && now - clickAt < 148;
+            const p = probe.measureOnce();
+            expect(sendClick).toHaveBeenCalledWith(7);
+            if (answerFirst) reply({ upMs: 20.5, hostInMs: 0.5, rttMs: 30 });
+            for (let i = 0; i < 10; i++) await tick(8);
+            const entry = await p;
+            if (!answerFirst) reply({ upMs: 20.5, hostInMs: 0.5, rttMs: 30 });
+            expect(entry.latencyMs).toBe(48);
+            expect(entry.upMs).toBe(20.5);
+            expect(entry.hostInMs).toBe(0.5);
+            expect(entry.restMs).toBe(27);
+            expect(results[0]).toBe(entry);
+        }
+    });
+
+    it('sends each click at a random phase, up to PHASE_JITTER_MS late', async () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0.6);
+        const { probe, sendClick } = makeProbe(30, 25);
+        const p = probe.measureOnce();
+        await vi.advanceTimersByTimeAsync(14);
+        expect(sendClick).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(sendClick).toHaveBeenCalledTimes(1);
+        for (let i = 0; i < 6; i++) await tick(8);
+        const entry = await p;
+        expect(entry.ok).toBe(true);
     });
 
     it('drops the sample when the flag never shows within the timeout', async () => {
@@ -345,6 +400,7 @@ describe('LatencyProbe.run', () => {
             sendClick: vi.fn(),
             samplePixels: () => grey,
             describeSource: () => 'canvas2d 1920x1080',
+            phaseJitterMs: 0,
         });
         const p = probe.measureOnce();
         for (let i = 0; i < 30; i++) await tick(10);
@@ -363,6 +419,52 @@ describe('LatencyProbe.run', () => {
         expect(entry.ok).toBe(true);
         expect(entry.saw).toBeUndefined();
         expect(entry.via).toBeUndefined();
+    });
+
+    it("dates the flag from the renderer's draw, not from the end of its read", async () => {
+        // The read is a GPU round trip of a few ms (09/10/2026, 780M): the
+        // probe must not count its own cost in the click.
+        const flag = px([0, 0, 255], [255, 255, 255], [255, 0, 0]);
+        const grey = px([140, 140, 140], [140, 140, 140], [140, 140, 140]);
+        let shown = grey;
+        let drawnAt = 500; // a read from before the click
+        const probe = new LatencyProbe({
+            source: () => ({}),
+            sendClick: vi.fn(),
+            samplePixels: () => shown,
+            pixelsDrawnAt: () => drawnAt,
+            phaseJitterMs: 0,
+        });
+        const p = probe.measureOnce();
+        await tick(10);
+        // A frame drawn 22 ms after the click, read and seen 5 ms later.
+        shown = flag;
+        drawnAt = now + 12;
+        now += 17;
+        probe.onFramePresented();
+        const entry = await p;
+        expect(entry.ok).toBe(true);
+        expect(entry.latencyMs).toBe(22);
+    });
+
+    it("keeps the moment it saw the flag when the renderer's stamp is stale", async () => {
+        const flag = px([0, 0, 255], [255, 255, 255], [255, 0, 0]);
+        const grey = px([140, 140, 140], [140, 140, 140], [140, 140, 140]);
+        let shown = grey;
+        const probe = new LatencyProbe({
+            source: () => ({}),
+            sendClick: vi.fn(),
+            samplePixels: () => shown,
+            pixelsDrawnAt: () => 500,
+            phaseJitterMs: 0,
+        });
+        const p = probe.measureOnce();
+        await tick(10);
+        shown = flag;
+        now += 20;
+        probe.onFramePresented();
+        const entry = await p;
+        expect(entry.latencyMs).toBe(30);
     });
 
     it('records nothing usable when there is no picture to sample', async () => {

@@ -19,6 +19,7 @@
 
 #include "IStreamBackend.h"
 
+#include <QJsonObject>
 #include <QString>
 
 /**
@@ -98,6 +99,14 @@ public:
     /// Zero when the engine is unavailable, which is then the truth.
     static int codecModeSupport();
 
+    /// Whether this machine can code a session in PyroWave, the intra-only
+    /// wavelet codec of a wired LAN (docs/design/ultra-lan-poc.md §6.43): a
+    /// Windows host whose GPU has a D3D12 route (NVENC, AMF or oneVPL), where
+    /// its encoder runs. Never Linux or macOS. Announced on the host's card
+    /// (nativeDisplay.pyrowave), so a browser's Settings can offer the codec
+    /// before any stream.
+    static bool pyrowaveSupported();
+
     /// "<hostname> — MoonlightWeb Host".
     static QString hostDisplayName();
 
@@ -106,6 +115,70 @@ public:
     /// turns the display on first (VirtualDisplayJob); the last stream's end
     /// turns it off.
     static int virtualDisplayAppId();
+
+    /// Whether @p gpu may be chosen to draw the virtual display: empty (the
+    /// driver's own choice), or the name of a GPU this machine has now, on a
+    /// machine with several, while the driver's settings file is ours to write
+    /// — the same test that puts the choice on the display's card.
+    static bool virtualDisplayGpuChoosable(const QString& gpu);
+
+    /// The display an app id stands for, on this machine now, by its
+    /// DisplayInfo::key — or empty with @p error saying why (the virtual
+    /// display is off, the display was unplugged, native streaming is
+    /// unavailable). The server answers it for a worker — a stream's, for a
+    /// display card (LaunchRequest::displayKey), and the guests' shared feed,
+    /// which shows the owner's display: the worker, SYSTEM's maybe, does not
+    /// read the settings file the display cards are numbered in.
+    static QString displayKeyForApp(int appId, QString* error);
+    /// The display id of the display @p key names (displayKeyForApp), in the
+    /// worker's own probe, or -1 with @p error.
+    static int displayForKey(const QString& key, QString* error);
+    /// Whether @p appId is a display's card — numbered in the settings
+    /// (AppSettings::displayAppIds), unlike the virtual display's and the
+    /// owner's apps'.
+    static bool isDisplayCard(int appId);
+    /// Whether @p appId is the card of one of the owner's apps
+    /// (AppSettings::hostApps), whether or not the app is still there.
+    static bool isHostAppCard(int appId);
+    /// The display our virtual display took the primary role from, by its
+    /// DisplayInfo::key, as turning it on recorded it in the settings
+    /// (VirtualDisplayJob) — or empty. The server reads it for a worker
+    /// (LaunchRequest::previousPrimary).
+    static QString previousPrimary();
+
+    /// Where the owner's apps (AppSettings::hostApps) open, the same for all
+    /// of them on a given machine: in a gamescope of their own (Linux, when
+    /// it is usable), else on "MoonlightWeb Virtual Display" (turned on at
+    /// the client's size and made primary, as its own card does), else on
+    /// this PC's primary display.
+    enum class HostAppScreen
+    {
+        Gamescope,
+        Virtual,
+        Primary
+    };
+    static HostAppScreen hostAppScreen();
+    /// "gamescope", "virtual" or "primary", for the card and the admin page.
+    static QString toString(HostAppScreen screen);
+
+    /// The owner's app whose card is @p appId (AppSettings::hostApp), or an
+    /// empty object for a display's card.
+    static QJsonObject hostAppFor(int appId);
+
+    /// The command the server opens on the desktop once a stream of @p appId
+    /// is up (HostAppLauncher), or empty: a display's card, or an app that
+    /// runs in its own gamescope, which the session starts itself.
+    static QString desktopCommandFor(int appId);
+
+    /// Whether a stream of @p appId streams "MoonlightWeb Virtual Display":
+    /// its own card, or an app's card when apps open there. Such a stream
+    /// turns the display on at its /start and lets it go at its end.
+    static bool usesVirtualDisplay(int appId);
+
+    /// Whether @p appId is one of the owner's apps that runs in gamescope (a
+    /// Linux native host where gamescope is usable), and which: its name and
+    /// command, as the session runs them.
+    static bool gamescopeAppFor(int appId, QString* name, QString* command);
 
     NativeHostBackend() = default;
 

@@ -10,7 +10,7 @@ CMake is the **single canonical build system** (qmake was removed 2026-06-28). P
 
 ```bash
 git clone https://github.com/linckosz/moonlight-web.git && cd moonlight-web
-git submodule update --init --recursive     # moonlight-common-c, qmdnsengine, libdatachannel, miniupnp
+git submodule update --init --recursive     # moonlight-common-c, qmdnsengine, libdatachannel, miniupnp, opus, openh264
 
 # Windows (MSVC): detects VS 2022 + Qt, configures Ninja, builds Release
 cmd //c backend/build_msvc.bat
@@ -24,7 +24,7 @@ build/MoonlightWeb          # Windows: build\MoonlightWeb.exe → open https://l
 
 Both convenience scripts (`backend/build_msvc.bat`, `backend/build.sh`) auto-init the submodules on first run, locate Qt (override with `QTDIR` / `CMAKE_PREFIX_PATH`) and drop the binary in `build/` — the same layout CI uses.
 
-Toolchain: CMake ≥ 3.21, Ninja, **Qt 6.11** (Core, Network, **WebSockets**), C++17, Node.js 22 (frontend tooling only). Windows: VS 2022 (MSVC v143); OpenSSL 3 is **vendored** in `backend/libs/windows/`. `-DCMAKE_PREFIX_PATH=<Qt kit>` if Qt isn't found. CMake emits `compile_commands.json` for clangd.
+Toolchain: CMake ≥ 3.21, Ninja, **Qt 6.11** (Core, Network, **WebSockets**), C++17, Node.js 22 (frontend tooling only). Windows: VS 2022 (MSVC v143); OpenSSL 3 is **vendored** in `backend/libs/windows/` for x64 and ARM64 (made by `scripts/build-openssl-windows.ps1`, see `docs/design/openssl-windows.md`). `-DCMAKE_PREFIX_PATH=<Qt kit>` if Qt isn't found. CMake emits `compile_commands.json` for clangd.
 
 `backend/CMakeLists.txt` also:
 
@@ -74,24 +74,23 @@ Manual dispatch or a `workflow_call` from CI → per-platform packaging. It has 
 - **setup** job computes the version (feeds `MW_VERSION`): the tag when the run's ref is a `v*` tag, otherwise `<last v* tag>.g<3-char sha>-dev` or `-stg` depending on the `channel` input, plus `label` for the artifact names (`v<version>` on a tag, the bare version otherwise). It also exports `pkg_version`, the same string with `-` → `.`, because rpm rejects dashes in `Version` — the Linux job uses that one throughout.
 - The same job picks the **edition** (feeds `MW_EDITION`): `prod` on a `v*` tag and on `channel=staging`, `dev` on every other run, and exports `app` (`MoonlightWeb` / `MoonlightWebDev`) and `pkg` (`moonlightweb` / `moonlightweb-dev`), from which every file, artifact, bundle and package name is derived. A DEV installer installs beside the release instead of over it — see [Installers §9.4bis](09-Installers-and-Packaging.md#94bis-editions--prod-and-dev-side-by-side). The tag-only publishing jobs below only ever see PROD.
 - Publishing to the GitHub Release only happens on a `refs/tags/` ref; every other run stops at the workflow artifacts.
-- **windows** (x64 + arm64): build → archive **PDB symbols** as an artifact → stage bundle → `windeployqt` + Qt OpenSSL TLS plugin + OpenSSL DLLs (vcpkg on arm64) → **SignPath** signs `MoonlightWeb.exe` → **Inno Setup** installer → SignPath signs the installer. Each signed file overwrites the unsigned one in place; the two `unsigned-*` artifacts exist only because SignPath reads its input from the artifact store (1-day retention). See [Installers §9.1](09-Installers-and-Packaging.md).
+- **windows** (x64 + arm64): build → archive **PDB symbols** as an artifact → stage bundle → `windeployqt` + Qt OpenSSL TLS plugin + the vendored OpenSSL DLLs → **smoke test** (the packaged app starts, answers `/api/health` over HTTPS, `--status` makes a TLS connection, still alive 10 s later; ARM64 also checks its prologues with `scripts/check-arm64-chkstk.ps1`) → **SignPath** signs `MoonlightWeb.exe` → **Inno Setup** installer → SignPath signs the installer. Each signed file overwrites the unsigned one in place; the two `unsigned-*` artifacts exist only because SignPath reads its input from the artifact store (1-day retention). See [Installers §9.1](09-Installers-and-Packaging.md).
 - **linux**: build → security TNR (`ctest`) → linuxdeploy **AppDir** (+ Wayland plugins best-effort) → **AppImage** → `make-packages.sh` → **.deb + .rpm** (AppStream metainfo included).
-- **macos** (arm64, macos-15): build → security TNR (`ctest`) → assemble `.app` → `macdeployqt` + ad-hoc sign → **interactive `.pkg`** via `build-pkg.sh`.
+- **macos** (arm64, macos-15): build → security TNR (`ctest`) → assemble `.app` → `macdeployqt` + signature (a stable certificate from `MACOS_SIGN_P12`, ad hoc when it is unset) → **interactive `.pkg`** via `build-pkg.sh`.
 
-Artifact naming is what `UpdateChecker` matches per-platform (`MoonlightWeb-installer-<v>-win-<arch>.exe`, `moonlightweb-<v>-linux-x64.{deb,rpm}`, AppImage, `moonlightweb-macos-arm64.pkg`).
+Artifact naming is what `UpdateChecker` matches per-platform (`MoonlightWeb-installer-<v>-win-<arch>.exe`, `moonlightweb-<v>-linux-x64.{deb,rpm}`, `moonlightweb-<v>-x86_64.AppImage`, `moonlightweb-<v>-macos-arm64.pkg`).
 
 ### Publishing jobs (tag-only)
 
-Four jobs run **after** the packaging matrix and only on a `refs/tags/` ref — each publishes to a service outside this repository, so it must never advertise a version with no release behind it. All of them consume the artifact the packaging job just uploaded rather than re-downloading the release asset, which may not be visible yet.
+Three jobs run **after** the packaging matrix and only on a `refs/tags/` ref — each publishes to a service outside this repository, so it must never advertise a version with no release behind it. All of them consume the artifact the packaging job just uploaded rather than re-downloading the release asset, which may not be visible yet.
 
 | Job | Needs | What it publishes |
 |---|---|---|
 | `homebrew` | `macos` | Renders `backend/packaging/homebrew/moonlightweb.rb` (version + sha256 of the built pkg) and pushes it to `linckosz/homebrew-tap` as `Casks/moonlightweb.rb`. |
-| `linux-repo` | `linux` | Imports the GPG key, runs `make-repo.sh`, uploads the signed APT+DNF tree with `upload-pages-artifact`. |
-| `linux-repo-deploy` | `linux-repo` | `deploy-pages`. A separate job because a job may declare only **one** environment, and `linux-repo` needs `MoonlightWeb` for the key while deployment needs `github-pages`. `concurrency: pages` with `cancel-in-progress: false` — a release must never land half-published. |
+| `linux-repo` | `linux` | Imports the GPG key, runs `make-repo.sh`, and attaches the signed APT+DNF tree to the release as `moonlightweb-repo-<version>.tar.gz`, which `deploy-packages.sh` ships to `packages.{domain}` by hand. |
 | `aur` | `linux` | Renders `PKGBUILD` + `.SRCINFO` from one substitution pass and pushes to `ssh://aur@aur.archlinux.org/moonlightweb-bin.git`; the commit is skipped when nothing changed, so re-running a tag build is idempotent. |
 
-**A called workflow can never exceed the caller's token.** Every permission scope any job in `release.yml` requests — `contents` for the release assets, `pages` for `configure-pages`/`upload-pages-artifact`, `id-token` for the OIDC token `deploy-pages` exchanges — must also be granted by the `package` job in `ci.yml`. The check runs when the run starts, so a missing scope fails the whole pipeline with **`startup_failure`** before a single step executes, and with no per-job log to read.
+**A called workflow can never exceed the caller's token.** Every permission scope any job in `release.yml` requests — `contents` for the release assets — must also be granted by the `package` job in `ci.yml`. The check runs when the run starts, so a missing scope fails the whole pipeline with **`startup_failure`** before a single step executes, and with no per-job log to read.
 
 **Neither a missing credential nor a rejected one fails a release.** Every publishing step is gated on a `steps.*.outputs.enabled` flag computed by a first step that emits a `::warning` when its secret is unset — the release ships, minus that channel. (The `secrets` context is unavailable in a job-level `if:`, hence the step-plus-output pattern rather than a job condition.) The steps that actually reach a third party — the two SignPath requests, the tap push, the AUR push — additionally carry `continue-on-error: true` and are followed by a step that annotates the run when `outcome` is not `success`. By the time any of them runs the assets are already on the Release, so a refused token leaves that channel stale rather than turning a good release red. The SignPath swaps are gated on the request's `outcome`, so a failed signature leaves the unsigned file in place instead of a half-signed bundle.
 
@@ -101,8 +100,9 @@ Four jobs run **after** the packaging matrix and only on a `refs/tags/` ref — 
 | `HOMEBREW_TAP_TOKEN` (PAT with Contents:write on the tap — `GITHUB_TOKEN` is scoped to this repo) | The cask stays on the previous version. |
 | `GPG_PRIVATE_KEY` (passphrase-less repository signing key) | No APT/DNF repository is built or deployed. |
 | `AUR_SSH_KEY` | `moonlightweb-bin` stays on the previous version. |
+| `MACOS_SIGN_P12`, `MACOS_SIGN_PASSWORD` | The Mac app is signed ad hoc, so every update re-asks Screen Recording and Accessibility. |
 
-`github-pages` is created by GitHub on the first deployment and defaults to *"deployments from the default branch only"* — `linux-repo-deploy` runs on a **tag** ref, so it needs a `v*` rule of type *tag* under Settings → Environments → `github-pages` → Deployment branches and tags (or *No restriction*). Symptom when it is missing: `Branch "refs/tags/vX.Y.Z" is not allowed to deploy to github-pages due to environment protection rules` — add the rule and re-run the job; the release assets are already published at that point.
+`github-pages` is created by GitHub on the first deployment and defaults to *"deployments from the default branch only"* — `pages.yml` deploys the bootstrap from a **tag** ref, so it needs a `v*` rule (and a `srv-*` one) of type *tag* under Settings → Environments → `github-pages` → Deployment branches and tags (or *No restriction*). Symptom when it is missing: `Branch "refs/tags/vX.Y.Z" is not allowed to deploy to github-pages due to environment protection rules` — add the rule and re-run the job.
 
 The Windows crash minidumps (`crashes/*.dmp`) are symbolized with the archived PDBs + Qt PDBs via `cdb`.
 
@@ -146,7 +146,7 @@ A lightweight in-repo framework (`test_framework.h`) + suites: `AppSettings`, `A
 
 ### What is intentionally *not* unit-tested
 
-The streaming pipeline (relays, shim, WebRTC) is validated end-to-end — `docs/testing.md` describes the approach, and `scripts/run-tests.sh` is the PR gate. Manual E2E remains the reference for transport changes (multiple browsers/devices/networks).
+The streaming pipeline (relays, shim, WebRTC) is validated end-to-end — `scripts/run-tests.sh` is the PR gate. Manual E2E remains the reference for transport changes (multiple browsers/devices/networks).
 
 ## 11.5 Code quality conventions
 

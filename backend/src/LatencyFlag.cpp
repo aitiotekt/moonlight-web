@@ -16,10 +16,13 @@
  */
 
 #include "LatencyFlag.h"
+#include "LatencyBeep.h"
 
 #include <QtGlobal>
 #include <QDebug>
+#include <QRegularExpression>
 #include <QString>
+#include <QStringList>
 
 // Windows lives here; macOS is LatencyFlagMac.mm and X11 is LatencyFlagX11.cpp,
 // each added to the target only on its own platform (see CMakeLists.txt, which
@@ -44,8 +47,10 @@
 #if MW_LATENCY_FLAG_WINDOWS
 
 #include <windows.h>
+#include <dwmapi.h>
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -68,6 +73,64 @@ std::atomic<DWORD> g_ThreadId{0};
 std::vector<HWND> g_Windows;
 UINT_PTR g_HideTimer = 0;
 HHOOK g_Hook = nullptr;
+// The beep (LatencyBeep.h, MW_LATENCY_FLAG_SOUND): with every click's flag,
+// or on its own clock with a flag every kTickMs. Off unless the bench asks.
+LatencyBeep::Mode g_SoundMode = LatencyBeep::Mode::Off;
+UINT_PTR g_TickTimer = 0;
+constexpr UINT kTickMs = 500;
+
+long long steadyNowUs()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// When the hook last saw an injected press, on the same clock: the message
+// that raises the flag waits in this thread's queue, and the log says how long.
+std::atomic<long long> g_HookUs{0};
+
+// The bench's flag trace (MW_LATENCY_FLAG_TRACE=1, plan « attente » A0): after
+// each flag, DwmFlush — back when DWM has composed what was outstanding,
+// the flag with it — then DWM's own timing. dwmapi is loaded here rather than
+// linked: nothing else in the server wants it.
+bool g_Trace = false;
+using DwmFlushFn = HRESULT(WINAPI*)();
+using DwmTimingFn = HRESULT(WINAPI*)(HWND, DWM_TIMING_INFO*);
+DwmFlushFn g_DwmFlush = nullptr;
+DwmTimingFn g_DwmTiming = nullptr;
+
+// A QueryPerformanceCounter value on steadyNowUs()'s scale (MSVC's
+// steady_clock is that counter, from zero).
+long long qpcToSteadyUs(long long qpc)
+{
+    LARGE_INTEGER f = {};
+    ::QueryPerformanceFrequency(&f);
+    const long long freq = f.QuadPart > 0 ? f.QuadPart : 1;
+    return (qpc / freq) * 1000000 + ((qpc % freq) * 1000000) / freq;
+}
+
+void traceComposition()
+{
+    if (!g_DwmFlush) return;
+    const HRESULT flushed = g_DwmFlush();
+    const long long flushedUs = steadyNowUs();
+    DWM_TIMING_INFO t = {};
+    t.cbSize = sizeof(t);
+    if (!g_DwmTiming || FAILED(g_DwmTiming(nullptr, &t))) {
+        qInfo() << "[LatencyFlag] trace: flushed at steady" << flushedUs << "us"
+                << (SUCCEEDED(flushed) ? "" : "(DwmFlush failed)") << "— no DWM timing";
+        return;
+    }
+    qInfo().noquote() << QStringLiteral("[LatencyFlag] trace: flushed at steady %1 us%2; DWM "
+                                        "vblank %3 us, period %4 us, composed %5 us, frame %6")
+                             .arg(flushedUs)
+                             .arg(SUCCEEDED(flushed) ? QString() : QStringLiteral(" (failed)"))
+                             .arg(qpcToSteadyUs(static_cast<long long>(t.qpcVBlank)))
+                             .arg(qpcToSteadyUs(static_cast<long long>(t.qpcRefreshPeriod)))
+                             .arg(qpcToSteadyUs(static_cast<long long>(t.qpcCompose)))
+                             .arg(static_cast<qulonglong>(t.cFrame));
+}
 
 // Runs on the overlay thread, synchronously inside Windows' input delivery: do
 // the least possible here and hand the work to the message loop. Windows
@@ -79,14 +142,19 @@ LRESULT CALLBACK mouseHookProc(int code, WPARAM wParam, LPARAM lParam)
         const auto* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         const bool injected = info && (info->flags & LLMHF_INJECTED);
         // One line per injected click, so a run can be matched against the
-        // browser's table (and a hook that never fires shows as silence).
+        // browser's table (and a hook that never fires shows as silence) —
+        // written by the message loop, not here: a log line is a lock and a
+        // file write, and this hook sits inside the delivery of the very click
+        // being measured. The point rides the message.
         // Under the SAME guard as the post, deliberately: a line that says
         // "injected click" while g_Windows is empty claims a flag was raised
         // when none exists, and sends whoever reads it hunting the pipeline
         // instead of the overlay. Silence in both directions, or nothing.
         if (injected && !g_Windows.empty()) {
-            PostMessageW(g_Windows.front(), kMsgClick, 0, 0);
-            qInfo() << "[LatencyFlag] injected click at" << info->pt.x << "," << info->pt.y;
+            g_HookUs.store(steadyNowUs(), std::memory_order_relaxed);
+            PostMessageW(g_Windows.front(), kMsgClick,
+                         static_cast<WPARAM>(static_cast<LONG_PTR>(info->pt.x)),
+                         static_cast<LPARAM>(info->pt.y));
         } else if (injected) {
             qWarning() << "[LatencyFlag] injected click at" << info->pt.x << "," << info->pt.y
                        << "but no flag window exists — nothing was raised";
@@ -139,13 +207,27 @@ void hideAll()
 LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
-    case kMsgClick:
+    case kMsgClick: {
         showAll();
+        if (g_SoundMode == LatencyBeep::Mode::Click) LatencyBeep::beep();
+        // When the flag went up, on the steady clock the relay stamps frames
+        // with (QueryPerformanceCounter, shared by every process): a pass joins
+        // it to the frame that first showed it (plan Wi-Fi W1).
+        // The hook's own moment comes first in the line, before "shown":
+        // scripts/bench/wifi/flagpath.py reads the latter by its words.
+        const long long shownUs = steadyNowUs();
+        qInfo() << "[LatencyFlag] injected click at"
+                << static_cast<int>(static_cast<LONG_PTR>(wParam)) << ","
+                << static_cast<int>(lParam) << "— hooked at steady"
+                << g_HookUs.load(std::memory_order_relaxed) << "us, shown at steady" << shownUs
+                << "us";
+        if (g_Trace) traceComposition();
         // A second click inside the window restarts the countdown. The timer
         // belongs to the thread, not to a window: the windows are rebuilt
         // under it when a monitor comes or goes.
         g_HideTimer = SetTimer(nullptr, g_HideTimer, LatencyFlag::kShowMs, nullptr);
         return 0;
+    }
     case WM_DISPLAYCHANGE:
         // A virtual display driver arriving or leaving moves every rectangle
         // we computed. Rebuilding destroys this window, so it cannot happen
@@ -163,9 +245,21 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 BOOL CALLBACK addMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM lParam)
 {
-    MONITORINFO mi = {};
+    MONITORINFOEXW mi = {};
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfoW(monitor, &mi)) return TRUE;
+    // A screen showing the measuring client itself (see LatencyFlag.h): a
+    // topmost flag over its desynchronized canvas stalls it ~200 ms.
+    const QString device = QString::fromWCharArray(mi.szDevice);
+    const QStringList skip =
+        qEnvironmentVariable("MW_LATENCY_FLAG_SKIP")
+            .split(QRegularExpression(QStringLiteral("[;,\\s]+")), Qt::SkipEmptyParts);
+    // "*": no screen at all — the flag armed, so the probe still runs, and
+    // something else draws it (tools/click-target, plan « attente » A1).
+    if (skip.contains(device, Qt::CaseInsensitive) || skip.contains(QStringLiteral("*"))) {
+        qInfo() << "[LatencyFlag] no flag on" << device << "(MW_LATENCY_FLAG_SKIP)";
+        return TRUE;
+    }
 
     // The monitor's own rectangle in virtual-desktop coordinates: the flag is
     // the same fraction of every screen, so the browser needs no handshake to
@@ -195,9 +289,10 @@ BOOL CALLBACK addMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM lParam)
 
     auto* description = reinterpret_cast<std::wstring*>(lParam);
     description->append(description->empty() ? L"" : L", ");
-    description->append(std::to_wstring(w) + L"x" + std::to_wstring(h) + L" at " +
-                        std::to_wstring(x) + L"," + std::to_wstring(y) + L" on a " +
-                        std::to_wstring(mw) + L"x" + std::to_wstring(mh) + L" screen");
+    description->append(std::wstring(mi.szDevice) + L" " + std::to_wstring(w) + L"x" +
+                        std::to_wstring(h) + L" at " + std::to_wstring(x) + L"," +
+                        std::to_wstring(y) + L" on a " + std::to_wstring(mw) + L"x" +
+                        std::to_wstring(mh) + L" screen");
     return TRUE;
 }
 
@@ -264,12 +359,48 @@ void overlayThread()
         return;
     }
 
+    g_Trace = qEnvironmentVariableIntValue("MW_LATENCY_FLAG_TRACE") == 1;
+    if (g_Trace) {
+        if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) {
+            g_DwmFlush = reinterpret_cast<DwmFlushFn>(GetProcAddress(dwm, "DwmFlush"));
+            g_DwmTiming =
+                reinterpret_cast<DwmTimingFn>(GetProcAddress(dwm, "DwmGetCompositionTimingInfo"));
+        }
+        qWarning() << "[LatencyFlag] bench trace on (MW_LATENCY_FLAG_TRACE=1): each flag waits "
+                      "for DWM's next composition and logs its timing"
+                   << (g_DwmFlush ? "" : "— but dwmapi did not load");
+    }
+
+    g_SoundMode = LatencyBeep::modeFromEnvironment();
+    if (g_SoundMode != LatencyBeep::Mode::Off) {
+        if (!LatencyBeep::start()) {
+            g_SoundMode = LatencyBeep::Mode::Off;
+        } else if (g_SoundMode == LatencyBeep::Mode::Tick) {
+            g_TickTimer = SetTimer(nullptr, 0, kTickMs, nullptr);
+            qInfo() << "[LatencyFlag] tick: a beep and a flag every" << kTickMs << "ms";
+        } else {
+            qInfo() << "[LatencyFlag] a beep with every injected click's flag";
+        }
+    }
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         // Thread messages carry no window: the hide timer and the rebuild
         // request are handled here rather than in a wndProc, because both of
         // them outlive the windows they act on.
         if (msg.hwnd == nullptr) {
+            if (msg.message == WM_TIMER && g_TickTimer && msg.wParam == g_TickTimer) {
+                // The beep's own clock: beep and flag together, no click.
+                showAll();
+                LatencyBeep::beep();
+                qInfo() << "[LatencyFlag] tick — shown at steady"
+                        << std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count()
+                        << "us";
+                g_HideTimer = SetTimer(nullptr, g_HideTimer, LatencyFlag::kShowMs, nullptr);
+                continue;
+            }
             if (msg.message == WM_TIMER && msg.wParam == g_HideTimer) {
                 KillTimer(nullptr, g_HideTimer);
                 g_HideTimer = 0;
@@ -287,6 +418,12 @@ void overlayThread()
 
     UnhookWindowsHookEx(g_Hook);
     g_Hook = nullptr;
+    if (g_TickTimer) {
+        KillTimer(nullptr, g_TickTimer);
+        g_TickTimer = 0;
+    }
+    if (g_SoundMode != LatencyBeep::Mode::Off) LatencyBeep::stop();
+    g_SoundMode = LatencyBeep::Mode::Off;
     if (g_HideTimer) {
         KillTimer(nullptr, g_HideTimer);
         g_HideTimer = 0;

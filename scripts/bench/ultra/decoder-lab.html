@@ -1,0 +1,868 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>PyroWave decoder lab</title>
+  </head>
+  <body>
+    <pre id="log"></pre>
+    <script type="module">
+      // The browser PyroWave decoder against the reference one (POC Ultra, U3.4).
+      // Served by serve_lab.py; driven by decoder_lab.py over CDP.
+      //   ?clip=text-1080p&mbps=170&ref=0x10de&frames=60&timing=200
+      // Decodes the oracle's stream (<clip>-<mbps>-<ref>.pwv), compares every frame
+      // with the oracle's own decode (max code difference, PSNR) and with the source
+      // clip, then times the GPU decode of one frame `timing` times. The result is
+      // left in window.__labResult. &api=webgl2 runs the WebGL2 fallback instead.
+      // WebGPU only: &idwt=2|1 an older inverse wavelet shader (they give the
+      // values of 3, the default, more slowly), &fp16=0 every plane in f32
+      // (the default keeps the two finest levels in FP16), &cmp=1 the planes
+      // and the 8-bit frame against the first shader's in f32 (or against
+      // &cmpidwt=, &cmpfp16=1), &split=1 each stage timed alone, &bw=1 the
+      // GPU's memory bandwidth, &present=1 the product's presentation checked
+      // once, then timed. &post=<url> POSTs the result there too (a browser
+      // with no DevTools protocol, like Safari: safari_lab.py).
+      import { PyroWaveDecoder } from "/frontend/js/stream/ultra/PyroWaveDecoder.js";
+
+      const q = new URLSearchParams(location.search);
+      const clip = q.get("clip") || "text-1080p";
+      const mbps = q.get("mbps") || "170";
+      const ref = q.get("ref") || "0x10de";
+      const maxFrames = Number(q.get("frames") || 60);
+      const timing = Number(q.get("timing") || 200);
+      // Some stages alone in the timed loop: dequant, idwt or pack, or
+      // several joined by "+" (dequant+idwt: the player's decode pass; an
+      // unescaped "+" comes as a space).
+      const stagesArg = (q.get("stages") || "").trim();
+      const stages = /[\s+]/.test(stagesArg)
+        ? stagesArg.split(/[\s+]+/)
+        : stagesArg || undefined;
+      // Untimed decodes in the same submission before the timed one, so an
+      // idle GPU has its clocks up: a frame stream keeps it busy too.
+      const warm = Number(q.get("warm") || 0);
+      // By slices (WebGPU): each frame fed in this many pieces cut anywhere,
+      // one submission each, as UltraPlayer does on the audio road; the timed
+      // loop then times what the last piece leaves, and every piece's pass
+      // (their sum: the decode by slices, against a whole frame's).
+      const slices = Number(q.get("slices") || 0);
+      // The inverse wavelet's shader (PyroWaveDecoder's idwt option).
+      const idwt = Number(q.get("idwt") || 3);
+      // The two finest levels in FP16 (PyroWaveDecoder's fp16 option).
+      const fp16 = q.get("fp16") !== "0";
+      // What &cmp=1 compares with: by default shader 1 in f32, else
+      // &cmpidwt=, &cmpfp16=1 (the same options as above).
+      const cmpOpts = {
+        idwt: Number(q.get("cmpidwt") || 1),
+        fp16: q.get("cmpfp16") === "1",
+      };
+      // The timed loop with each stage in a pass of its own, each timed:
+      // dequant, every level of the inverse wavelet, pack.
+      const split = q.get("split") === "1";
+      // Each frame's planes (as f32) and 8-bit frame against those of
+      // shader 1 in f32, the same frame decoded whole: the largest
+      // differences (the shaders do the same arithmetic, FP16 rounds).
+      const cmp = q.get("cmp") === "1";
+      // The GPU's memory bandwidth, copying then writing 64 MiB.
+      const bw = q.get("bw") === "1";
+      const out = document.getElementById("log");
+      const log = (s) => {
+        out.textContent += s + "\n";
+      };
+
+      async function bytes(url) {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`${url}: ${r.status}`);
+        return new Uint8Array(await r.arrayBuffer());
+      }
+
+      // Y4M 8-bit 4:2:0 frames, as views into the file.
+      function y4mFrames(buf, w, h) {
+        const frames = [];
+        let pos = buf.indexOf(10) + 1;
+        const size = (w * h * 3) / 2;
+        while (pos < buf.length) {
+          pos = buf.indexOf(10, pos) + 1; // "FRAME\n"
+          frames.push(buf.subarray(pos, pos + size));
+          pos += size;
+        }
+        return frames;
+      }
+
+      function compare(a, b, ySize) {
+        let maxDiff = 0;
+        let se = 0;
+        for (let i = 0; i < ySize; i++) {
+          const d = a[i] - b[i];
+          if (d > maxDiff) maxDiff = d;
+          else if (-d > maxDiff) maxDiff = -d;
+          se += d * d;
+        }
+        let maxDiffC = 0;
+        let maxDiffCAt = -1;
+        let badC = 0;
+        for (let i = ySize; i < a.length; i++) {
+          const d = Math.abs(a[i] - b[i]);
+          if (d > 2) badC++;
+          if (d > maxDiffC) {
+            maxDiffC = d;
+            maxDiffCAt = i - ySize;
+          }
+        }
+        const psnr = se === 0 ? 99 : 10 * Math.log10((255 * 255 * ySize) / se);
+        return { maxDiff, maxDiffC, maxDiffCAt, badC, psnr };
+      }
+
+      const pct = (arr, p) => {
+        const s = [...arr].sort((x, y) => x - y);
+        return s[Math.min(s.length - 1, Math.floor(p * s.length))];
+      };
+
+      async function run() {
+        const adapter = await navigator.gpu.requestAdapter({
+          powerPreference: q.get("power") || "high-performance",
+        });
+        const info = adapter.info || {};
+        const hasTs = adapter.features.has("timestamp-query");
+        const device = await adapter.requestDevice({
+          requiredFeatures: hasTs ? ["timestamp-query"] : [],
+          requiredLimits: {
+            maxStorageBufferBindingSize:
+              adapter.limits.maxStorageBufferBindingSize,
+            maxBufferSize: adapter.limits.maxBufferSize,
+          },
+        });
+        const errors = [];
+        device.onuncapturederror = (e) => errors.push(e.error.message);
+        log(
+          `adapter: ${info.vendor} ${info.architecture} ${info.description || ""} ts=${hasTs}`,
+        );
+
+        const pwv = await bytes(`/corpus/${clip}-${mbps}-${ref}.pwv`);
+        const dv = new DataView(pwv.buffer);
+        const w = dv.getUint32(4, true);
+        const h = dv.getUint32(8, true);
+        const nFrames = Math.min(dv.getUint32(20, true), maxFrames);
+        const oracle = y4mFrames(
+          await bytes(`/corpus/${clip}-${mbps}-${ref}-dec.y4m`),
+          w,
+          h,
+        );
+        const source = y4mFrames(await bytes(`/corpus/${clip}.y4m`), w, h);
+
+        // Frames as packet lists.
+        const frames = [];
+        let pos = 24;
+        for (let f = 0; f < nFrames; f++) {
+          const n = dv.getUint32(pos, true);
+          pos += 4;
+          const packets = [];
+          for (let k = 0; k < n; k++) {
+            const size = dv.getUint32(pos, true);
+            packets.push(pwv.subarray(pos + 4, pos + 4 + size));
+            pos += 4 + size;
+          }
+          frames.push(packets);
+        }
+
+        const dec = new PyroWaveDecoder(device, w, h, { idwt, fp16 });
+        const packedSize = (w * h * 3) / 2;
+        const readback = device.createBuffer({
+          size: dec.packedBuf.size,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        // The planes (Y, Cb, Cr) of both decoders and the reference's 8-bit
+        // frame, read back.
+        const ref1 = cmp ? new PyroWaveDecoder(device, w, h, cmpOpts) : null;
+        const ranges = ref1 ? [dec.planesRange(), ref1.planesRange()] : null;
+        const mapped = (size) =>
+          device.createBuffer({
+            size,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          });
+        const planeRead = ref1 ? ranges.map((r) => mapped(r.size)) : null;
+        const ref1Read = ref1 ? mapped(ref1.packedBuf.size) : null;
+        let planeDiff = 0;
+        let codeDiff = 0;
+        let codesOff = 0;
+
+        // A frame's blocks back to back in our host's send order (the
+        // reference encoder's corpus comes in index order), cut in `n`
+        // pieces at byte offsets that fall inside blocks.
+        const pieces = (packets, n) => {
+          const all = dec.toSendOrder(packets);
+          const cuts = [];
+          for (let k = 0; k < n; k++)
+            cuts.push(
+              all.subarray(
+                Math.floor((all.length * k) / n),
+                Math.floor((all.length * (k + 1)) / n),
+              ),
+            );
+          return cuts;
+        };
+        // Feeds pieces as UltraPlayer does (the cut tail of a block kept for
+        // the next piece), submitting each but the last, which is recorded
+        // into `last` (and timed by `tw`). stamp(k), when given, times piece
+        // k's pass instead (the last one's too); `passed` gets the pieces
+        // that had a pass.
+        const bySlices = (cuts, last, tw, stamp, passed) => {
+          dec.clear();
+          dec.startSlices();
+          let carry = null;
+          let ready = false;
+          for (let k = 0; k < cuts.length; k++) {
+            let data = cuts[k];
+            if (carry) {
+              data = new Uint8Array(carry.length + cuts[k].length);
+              data.set(carry);
+              data.set(cuts[k], carry.length);
+            }
+            const used = dec.pushPiece(data);
+            if (used < 0) throw new Error(`piece ${k}: malformed`);
+            carry = used < data.length ? data.slice(used) : null;
+            if (k < cuts.length - 1) {
+              const enc = device.createCommandEncoder();
+              if (dec.decodeSlice(enc, false, stamp?.(k))) {
+                device.queue.submit([enc.finish()]);
+                passed?.push(k);
+              }
+            } else {
+              if (carry) throw new Error("the last piece ends inside a block");
+              ready = dec.isReady();
+              dec.decodeSlice(last, true, stamp ? stamp(k) : tw);
+              passed?.push(k);
+            }
+          }
+          return ready;
+        };
+
+        const perFrame = [];
+        for (let f = 0; f < frames.length; f++) {
+          const enc = device.createCommandEncoder();
+          let ready;
+          if (slices > 0) {
+            ready = bySlices(pieces(frames[f], slices), enc);
+            dec.decode(enc, undefined, "pack");
+          } else {
+            for (const p of frames[f]) {
+              if (!dec.pushPacket(p))
+                throw new Error(`frame ${f}: malformed packet`);
+            }
+            ready = dec.isReady();
+            dec.decode(enc);
+          }
+          enc.copyBufferToBuffer(
+            dec.packedBuf,
+            0,
+            readback,
+            0,
+            dec.packedBuf.size,
+          );
+          if (ref1) {
+            ref1.clear();
+            for (const p of frames[f]) ref1.pushPacket(p);
+            ref1.decode(enc);
+            [dec, ref1].forEach((x, k) =>
+              enc.copyBufferToBuffer(
+                x.coefBuf,
+                ranges[k].offset,
+                planeRead[k],
+                0,
+                ranges[k].size,
+              ),
+            );
+            enc.copyBufferToBuffer(
+              ref1.packedBuf,
+              0,
+              ref1Read,
+              0,
+              ref1.packedBuf.size,
+            );
+          }
+          device.queue.submit([enc.finish()]);
+          await readback.mapAsync(GPUMapMode.READ);
+          const got = new Uint8Array(readback.getMappedRange()).slice(
+            0,
+            packedSize,
+          );
+          readback.unmap();
+          if (ref1) {
+            const reads = [...planeRead, ref1Read];
+            await Promise.all(reads.map((b) => b.mapAsync(GPUMapMode.READ)));
+            const a = dec.planesF32(planeRead[0].getMappedRange());
+            const b = ref1.planesF32(planeRead[1].getMappedRange());
+            for (let i = 0; i < a.length; i++) {
+              const d = Math.abs(a[i] - b[i]);
+              if (d > planeDiff) planeDiff = d;
+            }
+            const r8 = new Uint8Array(ref1Read.getMappedRange(), 0, packedSize);
+            for (let i = 0; i < packedSize; i++) {
+              const d = Math.abs(got[i] - r8[i]);
+              if (d) {
+                codesOff++;
+                if (d > codeDiff) codeDiff = d;
+              }
+            }
+            reads.forEach((x) => x.unmap());
+          }
+          const vsOracle = compare(got, oracle[f], w * h);
+          const vsSource = compare(got, source[f], w * h);
+          perFrame.push({
+            frame: f,
+            ready,
+            maxDiff: vsOracle.maxDiff,
+            maxDiffC: vsOracle.maxDiffC,
+            maxDiffCAt: vsOracle.maxDiffCAt,
+            badC: vsOracle.badC,
+            psnrVsOracle: vsOracle.psnr,
+            psnrVsSource: vsSource.psnr,
+          });
+        }
+
+        // The product's presentation path, checked once: the last frame drawn
+        // by present() into a WebGPU OffscreenCanvas, made a VideoFrame, drawn
+        // on a Canvas2D, against the same conversion done here on the oracle's
+        // decode of that frame (BT.709 limited).
+        let presentMaxDiff = null;
+        let presentGpuMs = null;
+        if (q.get("present") === "1") {
+          const off = new OffscreenCanvas(w, h);
+          const gctx = off.getContext("webgpu");
+          gctx.configure({ device, format: "rgba8unorm", alphaMode: "opaque" });
+          dec.decodedThisSeq = false;
+          const enc = device.createCommandEncoder();
+          dec.decode(enc);
+          dec.present(enc, gctx, true);
+          device.queue.submit([enc.finish()]);
+          await device.queue.onSubmittedWorkDone();
+          const vf = new VideoFrame(off, { timestamp: 0 });
+          const c2 = new OffscreenCanvas(w, h);
+          const ctx2 = c2.getContext("2d");
+          ctx2.drawImage(vf, 0, 0);
+          vf.close();
+          const px = ctx2.getImageData(0, 0, w, h).data;
+          const ref = oracle[frames.length - 1];
+          const cw = w / 2;
+          const cOff = w * h;
+          const crOff = cOff + cw * (h / 2);
+          const clamp = (v) => Math.min(255, Math.max(0, v));
+          let maxDiff = 0;
+          for (let y = 0; y < h; y += 7) {
+            for (let x = 0; x < w; x += 7) {
+              const yy = (ref[y * w + x] - 16) / 219;
+              const ci = (y >> 1) * cw + (x >> 1);
+              const cb = (ref[cOff + ci] - 128) / 224;
+              const cr = (ref[crOff + ci] - 128) / 224;
+              const rgb = [
+                yy + 1.5748 * cr,
+                yy - 0.1873 * cb - 0.4681 * cr,
+                yy + 1.8556 * cb,
+              ].map((v) => clamp(Math.round(v * 255)));
+              const at = (y * w + x) * 4;
+              for (let k = 0; k < 3; k++)
+                maxDiff = Math.max(maxDiff, Math.abs(px[at + k] - rgb[k]));
+            }
+          }
+          presentMaxDiff = maxDiff;
+          log(`present: max RGB diff ${maxDiff} (sampled 1 px in 49)`);
+
+          // Its GPU time, the same frame drawn again and again.
+          if (hasTs && timing > 0) {
+            const qs = device.createQuerySet({ type: "timestamp", count: 2 });
+            const resolve = device.createBuffer({
+              size: 16,
+              usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+            });
+            const tsRead = device.createBuffer({
+              size: 16,
+              usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            });
+            const ms = [];
+            for (let i = 0; i < timing; i++) {
+              const enc = device.createCommandEncoder();
+              dec.present(enc, gctx, true, {
+                querySet: qs,
+                beginningOfPassWriteIndex: 0,
+                endOfPassWriteIndex: 1,
+              });
+              enc.resolveQuerySet(qs, 0, 2, resolve, 0);
+              enc.copyBufferToBuffer(resolve, 0, tsRead, 0, 16);
+              device.queue.submit([enc.finish()]);
+              await tsRead.mapAsync(GPUMapMode.READ);
+              const t = new BigUint64Array(tsRead.getMappedRange());
+              const x = Number(BigInt.asIntN(64, t[1] - t[0])) / 1e6;
+              if (x > 0 && x < 1000) ms.push(x);
+              tsRead.unmap();
+            }
+            if (ms.length)
+              presentGpuMs = { p50: pct(ms, 0.5), p99: pct(ms, 0.99) };
+          }
+        }
+
+        // GPU time of each stage alone, the same frame again and again.
+        let splitMs = null;
+        if (hasTs && timing > 0 && split) {
+          const names = dec.splitStages();
+          const n = 2 * names.length;
+          const qs = device.createQuerySet({ type: "timestamp", count: n });
+          const resolve = device.createBuffer({
+            size: n * 8,
+            usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+          });
+          const tsRead = device.createBuffer({
+            size: n * 8,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          });
+          const per = Object.fromEntries(
+            [...names, "span"].map((s) => [s, []]),
+          );
+          for (let i = 0; i < timing; i++) {
+            const enc = device.createCommandEncoder();
+            for (let k = 0; k < warm; k++) {
+              dec.decodedThisSeq = false;
+              dec.decode(enc);
+            }
+            dec.decodedThisSeq = false;
+            dec.decodeSplit(enc, (stage) => {
+              const k = names.indexOf(stage);
+              return {
+                querySet: qs,
+                beginningOfPassWriteIndex: 2 * k,
+                endOfPassWriteIndex: 2 * k + 1,
+              };
+            });
+            enc.resolveQuerySet(qs, 0, n, resolve, 0);
+            enc.copyBufferToBuffer(resolve, 0, tsRead, 0, n * 8);
+            device.queue.submit([enc.finish()]);
+            await tsRead.mapAsync(GPUMapMode.READ);
+            const t = new BigUint64Array(tsRead.getMappedRange());
+            const ms = (a, b) => Number(BigInt.asIntN(64, t[b] - t[a])) / 1e6;
+            const all = names.map((s, k) => ms(2 * k, 2 * k + 1));
+            const span = ms(0, n - 1);
+            // A pair out of order (the Arc's wrapped values) drops the run.
+            if (all.every((x) => x >= 0 && x < 1000) && span > 0) {
+              names.forEach((s, k) => per[s].push(all[k]));
+              per.span.push(span);
+            }
+            tsRead.unmap();
+          }
+          splitMs = Object.fromEntries(
+            Object.entries(per).map(([s, xs]) => [
+              s,
+              xs.length
+                ? { p50: pct(xs, 0.5), p99: pct(xs, 0.99), n: xs.length }
+                : null,
+            ]),
+          );
+        }
+
+        // Memory bandwidth: a compute pass copying 64 MiB to another
+        // buffer, then one writing 64 MiB.
+        let bandwidth = null;
+        if (hasTs && bw) {
+          const n = 1 << 22; // vec4f
+          const code = `
+            @group(0) @binding(0) var<storage, read> src: array<vec4f>;
+            @group(0) @binding(1) var<storage, read_write> dst: array<vec4f>;
+            @compute @workgroup_size(256)
+            fn copy(@builtin(global_invocation_id) id: vec3u) { dst[id.x] = src[id.x]; }
+            @compute @workgroup_size(256)
+            fn fill(@builtin(global_invocation_id) id: vec3u) { dst[id.x] = vec4f(f32(id.x)); }`;
+          const module = device.createShaderModule({ code });
+          const pipe = (entryPoint) =>
+            device.createComputePipeline({
+              layout: "auto",
+              compute: { module, entryPoint },
+            });
+          const S = GPUBufferUsage.STORAGE;
+          const a = device.createBuffer({ size: n * 16, usage: S });
+          const b = device.createBuffer({ size: n * 16, usage: S });
+          const qs = device.createQuerySet({ type: "timestamp", count: 2 });
+          const resolve = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+          });
+          const tsRead = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          });
+          const timeIt = async (p, src, dst, bytes) => {
+            const bind = device.createBindGroup({
+              layout: p.getBindGroupLayout(0),
+              entries: [
+                ...(p === fillPipe
+                  ? []
+                  : [{ binding: 0, resource: { buffer: src } }]),
+                { binding: 1, resource: { buffer: dst } },
+              ],
+            });
+            const gbs = [];
+            for (let i = 0; i < 20; i++) {
+              const enc = device.createCommandEncoder();
+              const pass = enc.beginComputePass({
+                timestampWrites: {
+                  querySet: qs,
+                  beginningOfPassWriteIndex: 0,
+                  endOfPassWriteIndex: 1,
+                },
+              });
+              pass.setPipeline(p);
+              pass.setBindGroup(0, bind);
+              pass.dispatchWorkgroups(n / 256);
+              pass.end();
+              enc.resolveQuerySet(qs, 0, 2, resolve, 0);
+              enc.copyBufferToBuffer(resolve, 0, tsRead, 0, 16);
+              device.queue.submit([enc.finish()]);
+              await tsRead.mapAsync(GPUMapMode.READ);
+              const t = new BigUint64Array(tsRead.getMappedRange());
+              const ms = Number(BigInt.asIntN(64, t[1] - t[0])) / 1e6;
+              if (ms > 0) gbs.push(bytes / ms / 1e6);
+              tsRead.unmap();
+            }
+            return gbs.length ? pct(gbs, 0.5) : null;
+          };
+          const fillPipe = pipe("fill");
+          const copyPipe = pipe("copy");
+          await timeIt(fillPipe, null, a, n * 16);
+          bandwidth = {
+            copyGBs: await timeIt(copyPipe, a, b, 2 * n * 16),
+            writeGBs: await timeIt(fillPipe, null, b, n * 16),
+          };
+          log(
+            `bandwidth: copy ${bandwidth.copyGBs?.toFixed(1)} GB/s (read + write), write ${bandwidth.writeGBs?.toFixed(1)} GB/s`,
+          );
+        }
+
+        // GPU time of the decode, the same frame again and again. By slices:
+        // what the last piece leaves, and every piece's pass (a pair each):
+        // their sum, and the span from the first one's start to the end.
+        let gpuMs = [];
+        const piecesSum = [];
+        const piecesSpan = [];
+        let badTimestamps = 0;
+        if (hasTs && timing > 0 && !split) {
+          const n = slices > 0 ? 2 * slices : 2;
+          const qs = device.createQuerySet({ type: "timestamp", count: n });
+          const resolve = device.createBuffer({
+            size: n * 8,
+            usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+          });
+          const tsRead = device.createBuffer({
+            size: n * 8,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          });
+          const lastCuts =
+            slices > 0 ? pieces(frames[frames.length - 1], slices) : null;
+          const stamp = (k) => ({
+            querySet: qs,
+            beginningOfPassWriteIndex: 2 * k,
+            endOfPassWriteIndex: 2 * k + 1,
+          });
+          for (let i = 0; i < timing; i++) {
+            dec.decodedThisSeq = false;
+            const enc = device.createCommandEncoder();
+            // (Not by slices: its pieces go before this submission, and the
+            // dispatch offset they write would be the warm decodes' too.)
+            for (let k = 0; k < (lastCuts ? 0 : warm); k++) {
+              dec.decode(enc, undefined, stages);
+              dec.decodedThisSeq = false;
+            }
+            const passed = [];
+            if (lastCuts) bySlices(lastCuts, enc, undefined, stamp, passed);
+            else dec.decode(enc, stamp(0), stages);
+            enc.resolveQuerySet(qs, 0, n, resolve, 0);
+            enc.copyBufferToBuffer(resolve, 0, tsRead, 0, n * 8);
+            device.queue.submit([enc.finish()]);
+            await tsRead.mapAsync(GPUMapMode.READ);
+            const t = new BigUint64Array(tsRead.getMappedRange());
+            const span = (a, b) => Number(BigInt.asIntN(64, t[b] - t[a])) / 1e6;
+            // The Arc sometimes returns an end before its start (a wrapped
+            // value): such a run is dropped and counted.
+            const ok = (x) => x > 0 && x < 1000;
+            if (lastCuts) {
+              const each = passed.map((k) => span(2 * k, 2 * k + 1));
+              const last = slices - 1;
+              const whole = span(2 * passed[0], 2 * last + 1);
+              if (each.every(ok) && ok(whole)) {
+                gpuMs.push(each[each.length - 1]);
+                piecesSum.push(each.reduce((a, b) => a + b, 0));
+                piecesSpan.push(whole);
+              } else badTimestamps++;
+            } else {
+              const x = span(0, 1);
+              if (ok(x)) gpuMs.push(x);
+              else badTimestamps++;
+            }
+            tsRead.unmap();
+          }
+        }
+        const q50 = (xs) =>
+          xs.length ? { p50: pct(xs, 0.5), p99: pct(xs, 0.99) } : null;
+
+        const res = {
+          clip,
+          mbps,
+          ref,
+          stages: stagesArg || "all",
+          warm,
+          slices,
+          piecesSumMs: q50(piecesSum),
+          piecesSpanMs: q50(piecesSpan),
+          idwt: dec.idwtVersion,
+          fp16: dec.fp16,
+          split: splitMs,
+          cmpWith: ref1 ? { idwt: ref1.idwtVersion, fp16: ref1.fp16 } : null,
+          planeDiff: ref1 ? planeDiff : null,
+          codeDiff: ref1 ? codeDiff : null,
+          codesOffPct: ref1
+            ? (100 * codesOff) / (packedSize * perFrame.length)
+            : null,
+          bandwidth,
+          width: w,
+          height: h,
+          frames: perFrame.length,
+          adapter:
+            `${info.vendor} ${info.architecture} ${info.description || ""}`.trim(),
+          maxDiff: Math.max(...perFrame.map((x) => x.maxDiff)),
+          maxDiffC: Math.max(...perFrame.map((x) => x.maxDiffC)),
+          minPsnrVsOracle: Math.min(...perFrame.map((x) => x.psnrVsOracle)),
+          meanPsnrVsSource:
+            perFrame.reduce((a, x) => a + x.psnrVsSource, 0) / perFrame.length,
+          allReady: perFrame.every((x) => x.ready),
+          gpuMs: gpuMs.length
+            ? {
+                p50: pct(gpuMs, 0.5),
+                p99: pct(gpuMs, 0.99),
+                min: Math.min(...gpuMs),
+                dropped: badTimestamps,
+              }
+            : null,
+          errors,
+          presentMaxDiff,
+          presentGpuMs,
+          perFrame,
+        };
+        log(JSON.stringify({ ...res, perFrame: undefined }));
+        return res;
+      }
+
+      // The WebGL2 fallback (?api=webgl2): the same checks against the oracle,
+      // the present path read back from its canvas, and the decode timed by
+      // wall clock (a 1-pixel read-back waits for it) and, when the browser
+      // has it, by EXT_disjoint_timer_query_webgl2.
+      async function runGL() {
+        const { PyroWaveDecoderGL, glDecoderSupported } =
+          await import("/frontend/js/stream/ultra/PyroWaveDecoderGL.js");
+        const pwv = await bytes(`/corpus/${clip}-${mbps}-${ref}.pwv`);
+        const dv = new DataView(pwv.buffer);
+        const w = dv.getUint32(4, true);
+        const h = dv.getUint32(8, true);
+        const nFrames = Math.min(dv.getUint32(20, true), maxFrames);
+        const oracle = y4mFrames(
+          await bytes(`/corpus/${clip}-${mbps}-${ref}-dec.y4m`),
+          w,
+          h,
+        );
+        const source = y4mFrames(await bytes(`/corpus/${clip}.y4m`), w, h);
+        const frames = [];
+        let pos = 24;
+        for (let f = 0; f < nFrames; f++) {
+          const n = dv.getUint32(pos, true);
+          pos += 4;
+          const packets = [];
+          for (let k = 0; k < n; k++) {
+            const size = dv.getUint32(pos, true);
+            packets.push(pwv.subarray(pos + 4, pos + 4 + size));
+            pos += 4 + size;
+          }
+          frames.push(packets);
+        }
+
+        const canvas = new OffscreenCanvas(w, h);
+        const gl = canvas.getContext("webgl2", {
+          antialias: false,
+          depth: false,
+          alpha: false,
+          preserveDrawingBuffer: true,
+        });
+        if (!glDecoderSupported(gl))
+          throw new Error("no WebGL2 with float targets");
+        const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+        const adapter =
+          "webgl2 " +
+          (dbg
+            ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+            : gl.getParameter(gl.RENDERER));
+        log(`adapter: ${adapter}`);
+        const dec = new PyroWaveDecoderGL(gl, w, h);
+        const errors = [];
+        const glErr = (where) => {
+          const e = gl.getError();
+          if (e) errors.push(`${where}: GL error 0x${e.toString(16)}`);
+        };
+
+        const perFrame = [];
+        for (let f = 0; f < frames.length; f++) {
+          for (const p of frames[f]) {
+            if (!dec.pushPacket(p))
+              throw new Error(`frame ${f}: malformed packet`);
+          }
+          const ready = dec.isReady();
+          dec.decode();
+          const got = dec.readPlanes();
+          glErr(`frame ${f}`);
+          const vsOracle = compare(got, oracle[f], w * h);
+          const vsSource = compare(got, source[f], w * h);
+          perFrame.push({
+            frame: f,
+            ready,
+            maxDiff: vsOracle.maxDiff,
+            maxDiffC: vsOracle.maxDiffC,
+            maxDiffCAt: vsOracle.maxDiffCAt,
+            badC: vsOracle.badC,
+            psnrVsOracle: vsOracle.psnr,
+            psnrVsSource: vsSource.psnr,
+          });
+        }
+
+        let presentMaxDiff = null;
+        if (q.get("present") === "1") {
+          dec.present(true);
+          const px = new Uint8Array(w * h * 4);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+          glErr("present");
+          const ref = oracle[frames.length - 1];
+          const cw = w / 2;
+          const cOff = w * h;
+          const crOff = cOff + cw * (h / 2);
+          const clamp = (v) => Math.min(255, Math.max(0, v));
+          let maxDiff = 0;
+          for (let y = 0; y < h; y += 7) {
+            for (let x = 0; x < w; x += 7) {
+              const yy = (ref[y * w + x] - 16) / 219;
+              const ci = (y >> 1) * cw + (x >> 1);
+              const cb = (ref[cOff + ci] - 128) / 224;
+              const cr = (ref[crOff + ci] - 128) / 224;
+              const rgb = [
+                yy + 1.5748 * cr,
+                yy - 0.1873 * cb - 0.4681 * cr,
+                yy + 1.8556 * cb,
+              ].map((v) => clamp(Math.round(v * 255)));
+              // GL rows run bottom up.
+              const at = ((h - 1 - y) * w + x) * 4;
+              for (let k = 0; k < 3; k++)
+                maxDiff = Math.max(maxDiff, Math.abs(px[at + k] - rgb[k]));
+            }
+          }
+          presentMaxDiff = maxDiff;
+          log(`present: max RGB diff ${maxDiff} (sampled 1 px in 49)`);
+        }
+
+        // The last frame decoded again and again, then presented.
+        const px1 = new Uint8Array(4);
+        const sync = () =>
+          gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px1);
+        const wallMs = [];
+        for (let i = 0; i < timing; i++) {
+          const t0 = performance.now();
+          dec.decodedThisSeq = false;
+          dec.decode();
+          dec.present(true);
+          sync();
+          wallMs.push(performance.now() - t0);
+        }
+        glErr("wall");
+        const tq = gl.getExtension("EXT_disjoint_timer_query_webgl2");
+        const gpuMs = [];
+        let badTimestamps = 0;
+        if (tq) {
+          for (let i = 0; i < Math.min(timing, 50); i++) {
+            const qy = gl.createQuery();
+            dec.decodedThisSeq = false;
+            gl.beginQuery(tq.TIME_ELAPSED_EXT, qy);
+            dec.decode();
+            gl.endQuery(tq.TIME_ELAPSED_EXT);
+            sync();
+            for (
+              let k = 0;
+              k < 100 && !gl.getQueryParameter(qy, gl.QUERY_RESULT_AVAILABLE);
+              k++
+            )
+              await new Promise((r) => setTimeout(r, 2));
+            if (
+              gl.getQueryParameter(qy, gl.QUERY_RESULT_AVAILABLE) &&
+              !gl.getParameter(tq.GPU_DISJOINT_EXT)
+            )
+              gpuMs.push(gl.getQueryParameter(qy, gl.QUERY_RESULT) / 1e6);
+            else badTimestamps++;
+            gl.deleteQuery(qy);
+            // Reading the timer raises INVALID_OPERATION in Chrome (ANGLE on
+            // D3D11 and SwiftShader alike, cause not found) while its values
+            // come right: dropped here, not counted as a decode error.
+            gl.getError();
+          }
+        }
+        glErr("timing");
+
+        const res = {
+          clip,
+          mbps,
+          ref,
+          stages: "all",
+          warm,
+          width: w,
+          height: h,
+          frames: perFrame.length,
+          adapter,
+          maxDiff: Math.max(...perFrame.map((x) => x.maxDiff)),
+          maxDiffC: Math.max(...perFrame.map((x) => x.maxDiffC)),
+          minPsnrVsOracle: Math.min(...perFrame.map((x) => x.psnrVsOracle)),
+          meanPsnrVsSource:
+            perFrame.reduce((a, x) => a + x.psnrVsSource, 0) / perFrame.length,
+          allReady: perFrame.every((x) => x.ready),
+          gpuMs: gpuMs.length
+            ? {
+                p50: pct(gpuMs, 0.5),
+                p99: pct(gpuMs, 0.99),
+                min: Math.min(...gpuMs),
+                dropped: badTimestamps,
+              }
+            : null,
+          wallMs: wallMs.length
+            ? {
+                p50: pct(wallMs, 0.5),
+                p99: pct(wallMs, 0.99),
+                min: Math.min(...wallMs),
+              }
+            : null,
+          errors,
+          presentMaxDiff,
+          perFrame,
+        };
+        dec.destroy();
+        log(JSON.stringify({ ...res, perFrame: undefined }));
+        return res;
+      }
+
+      window.__labResult = (q.get("api") === "webgl2" ? runGL() : run()).catch(
+        (e) => {
+          // On screen too: a phone has no DevTools to read it from.
+          log(`error: ${(e && e.stack) || e}`);
+          return { error: String((e && e.stack) || e) };
+        },
+      );
+      window.__labResult.then((r) => {
+        window.__labDone = r;
+        // &post=<url>: a browser nothing drives (Safari) sends its result to
+        // the lab's server (safari_lab.py), with the page's own query.
+        if (q.get("post"))
+          fetch(q.get("post"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: location.search, ua: navigator.userAgent, result: r }),
+          }).catch(() => {});
+      });
+    </script>
+  </body>
+</html>

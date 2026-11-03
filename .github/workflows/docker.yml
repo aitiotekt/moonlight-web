@@ -73,6 +73,15 @@ on:
         description: "Push the image to GHCR (leave off to only check it builds)"
         type: boolean
         default: false
+      # The one way a manual run reaches the PUBLIC package: rebuild the image
+      # of a release whose tag run could not publish it (v0.4.0: the Dockerfile
+      # lacked git). The sources are the tag's, the Dockerfile and .dockerignore
+      # this run's own, so the binary is the release's and nothing about the
+      # GitHub release — its assets, its download counts, its tag — moves.
+      release_tag:
+        description: "Republish the public image of this existing v* tag (empty = a normal manual run)"
+        type: string
+        default: ""
 
 # GHCR authenticates with the run's own GITHUB_TOKEN — no PAT, no secret to
 # rotate. `packages: write` is what lets it push, `contents: read` is the
@@ -117,19 +126,62 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             slug: arm64
+    # The commit the image is built from, for the merge job's sha- tag: on a
+    # release_tag run it is the tag's, not this run's.
+    outputs:
+      rev: ${{ steps.rev.outputs.short }}
+      newest: ${{ steps.newest.outputs.newest }}
     steps:
+      - name: Check the release tag
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::release_tag must look like v1.2.3, got '$TAG'"; exit 1; }
+
       - uses: actions/checkout@v5
         with:
+          ref: ${{ inputs.release_tag || '' }}
           submodules: recursive # moonlight-common-c, libdatachannel, miniupnpc, qmdnsengine
           fetch-depth: 0 # `git describe` needs the last v* tag
+
+      # `latest` follows a tag only when it is the newest release: a fix pushed
+      # on an older line, or an older one republished, must not move every
+      # `latest` user back to it.
+      - id: newest
+        if: ${{ inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          newest=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+          if [ "$newest" = "$TAG" ]; then
+            echo "newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "newest=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is not the newest release ($newest): \`latest\` stays where it is"
+          fi
+
+      # The tag's sources, this run's recipe: the fix the tag missed.
+      - name: Take the Dockerfile from this run's commit
+        if: ${{ inputs.release_tag != '' }}
+        run: git checkout "$GITHUB_SHA" -- Dockerfile .dockerignore
+
+      - id: rev
+        run: |
+          echo "full=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
       # Same version string the installers carry (release.yml `setup.ver`):
       # a v* tag ships 1.2.3, anything else <last tag>.g<3-char sha>. Baked into
       # the binary, so `moonlightweb --version` inside the container names the
       # exact commit the image came from.
       - id: ver
+        env:
+          TAG: ${{ inputs.release_tag }}
         run: |
-          if [ "$GITHUB_REF" != "${GITHUB_REF#refs/tags/v}" ]; then
+          if [ -n "$TAG" ]; then
+            v="${TAG#v}"
+          elif [ "$GITHUB_REF" != "${GITHUB_REF#refs/tags/v}" ]; then
             v="${GITHUB_REF_NAME#v}"
           else
             tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo v0.2.1)
@@ -140,14 +192,17 @@ jobs:
       # Which package this run writes to, decided in one place so the build and
       # the merge job cannot disagree. A manual run always goes to the private
       # -dev package: that is what makes "test the real image" safe to do on any
-      # branch, at any time, without a user ever seeing it.
+      # branch, at any time, without a user ever seeing it. The exception is a
+      # release_tag run, which republishes a release and so goes public.
       #
       # ghcr.io rejects an upper-case path and a fork's owner may well have one,
       # so ${...@L} lower-cases it rather than hoping.
       - id: img
+        env:
+          TAG: ${{ inputs.release_tag }}
         run: |
           name="${GITHUB_REPOSITORY@L}"
-          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ -z "$TAG" ]; then
             name="$name-dev"
           fi
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -156,7 +211,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
-        if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+        if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish || inputs.release_tag != '') }}
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -183,13 +238,13 @@ jobs:
             org.opencontainers.image.description=Sunshine game-streaming server for the browser
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.ver.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.full }}
             org.opencontainers.image.licenses=GPL-3.0-or-later
           # `type=cacheonly` builds the image and throws it away — that is
           # what a pull_request run and an unticked `publish` dispatch do, so a
           # "does it still build?" check never reaches the registry.
           outputs: >-
-            ${{ (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish))
+            ${{ (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish || inputs.release_tag != ''))
                 && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, steps.img.outputs.name)
                 || 'type=cacheonly' }}
           # Per-architecture cache scope: one shared scope would have the two
@@ -200,7 +255,7 @@ jobs:
       # The digest is the whole payload: an empty file named after it is all the
       # merge job needs to reference this architecture's image.
       - name: Export digest
-        if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+        if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish || inputs.release_tag != '') }}
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
@@ -208,7 +263,7 @@ jobs:
           touch "/tmp/digests/${DIGEST#sha256:}"
 
       - uses: actions/upload-artifact@v6
-        if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+        if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish || inputs.release_tag != '') }}
         with:
           name: digest-${{ matrix.slug }}
           path: /tmp/digests/*
@@ -219,7 +274,7 @@ jobs:
   merge:
     name: Publish manifest
     needs: build
-    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish || inputs.release_tag != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -231,9 +286,11 @@ jobs:
 
       # Must reach the same verdict as the build job's step of the same name.
       - id: img
+        env:
+          TAG: ${{ inputs.release_tag }}
         run: |
           name="${GITHUB_REPOSITORY@L}"
-          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ -z "$TAG" ]; then
             name="$name-dev"
           fi
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -248,17 +305,20 @@ jobs:
 
       # `latest` exists only in the public package and only on a release tag.
       # A manual run is in the -dev package by then, where `dev` is the moving
-      # pointer and the sha- tag is the permanent one.
+      # pointer and the sha- tag is the permanent one. A release_tag run tags
+      # like the release's own tag run would have: the semver value is the
+      # input (empty elsewhere, so the ref decides), and the sha- tag names the
+      # tag's commit, which the build job reports.
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ steps.img.outputs.name }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}
-            type=raw,value=dev,enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=sha
+            type=semver,pattern={{version}},value=${{ inputs.release_tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.release_tag }}
+            type=raw,value=latest,enable=${{ ((startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch') || inputs.release_tag != '') && needs.build.outputs.newest == 'true' }}
+            type=raw,value=dev,enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_tag == '' }}
+            type=raw,value=sha-${{ needs.build.outputs.rev }}
 
       - name: Create and push manifest list
         working-directory: /tmp/digests

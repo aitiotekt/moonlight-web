@@ -56,10 +56,13 @@ public:
                         const std::string& protocol = "UDP");
 
     // Check if a port mapping already exists on the IGD.
-    // Returns true if a mapping exists; internalClient and internalPort are set.
+    // Returns true if a mapping exists; internalClient and internalPort are set,
+    // and leaseDuration when given: the seconds left as the router reports them
+    // ("0" permanent, empty when it leaves the field out).
     // Returns false if no mapping exists or the IGD is not available.
     bool getExistingPortMapping(uint16_t externalPort, const std::string& protocol,
-                                std::string& internalClient, std::string& internalPort);
+                                std::string& internalClient, std::string& internalPort,
+                                std::string* leaseDuration = nullptr);
 
     // Remove a port mapping. protocol must match the original mapping.
     bool removePortMapping(uint16_t externalPort, const std::string& protocol = "UDP");
@@ -68,7 +71,7 @@ public:
     // Returns empty string on failure or if no IGD is available.
     std::string getExternalIPAddress();
 
-    // Get the local IP address of the IGD gateway.
+    // Get the IGD gateway's address on the LAN (its control URL's host).
     QHostAddress gatewayAddress() const { return m_GatewayAddr; }
 
     // Get the LAN IP address of this host on the IGD-facing interface.

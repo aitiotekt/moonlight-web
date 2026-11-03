@@ -7,11 +7,16 @@
 #include "mw/native/NativeHost.h"
 
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <string>
 #include <thread>
+
+#if defined(MW_NATIVE_MACOS)
+#include <CoreGraphics/CoreGraphics.h>
+#endif
 
 using namespace mw::native;
 
@@ -27,6 +32,36 @@ using namespace mw::native;
 namespace {
 
 #if defined(MW_NATIVE_MACOS)
+/// Whether the main display lists a mode "Match my screen" could switch to,
+/// by the session's own rule (MacSession applyClientMode): @p width x @p height
+/// exactly, or a smaller one of the same shape, in pixels, usable for the
+/// desktop, and not the mode it is in. A CI runner's paravirtual 1024x768
+/// display lists 4:3 modes only, none of a 16:10 client's shape.
+bool mainDisplayListsMatchingMode(int width, int height)
+{
+    const CGDirectDisplayID id = CGMainDisplayID();
+    CGDisplayModeRef current = CGDisplayCopyDisplayMode(id);
+    const size_t curW = current ? CGDisplayModeGetPixelWidth(current) : 0;
+    const size_t curH = current ? CGDisplayModeGetPixelHeight(current) : 0;
+    if (current) CGDisplayModeRelease(current);
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(id, nullptr);
+    if (!modes) return false;
+    const double wantAspect = static_cast<double>(width) / height;
+    bool found = false;
+    for (CFIndex i = 0; i < CFArrayGetCount(modes) && !found; ++i) {
+        auto mode =
+            static_cast<CGDisplayModeRef>(const_cast<void*>(CFArrayGetValueAtIndex(modes, i)));
+        if (!CGDisplayModeIsUsableForDesktopGUI(mode)) continue;
+        const size_t w = CGDisplayModeGetPixelWidth(mode), h = CGDisplayModeGetPixelHeight(mode);
+        if (w == 0 || h == 0 || (w == curW && h == curH)) continue;
+        if (w > static_cast<size_t>(width) || h > static_cast<size_t>(height)) continue;
+        const double aspect = static_cast<double>(w) / h;
+        found = std::abs(aspect - wantAspect) / wantAspect <= 0.005;
+    }
+    CFRelease(modes);
+    return found;
+}
+
 void runOne(const Capabilities& caps, const DisplayInfo& display, Codec codec, const char* path)
 {
     SessionConfig config;
@@ -180,6 +215,66 @@ void run_mac_session_tests()
     for (Codec codec : gpu->codecs) {
         if (codec == Codec::H264) runOne(caps, *display, codec, "/tmp/bench-mac-session.h264");
         if (codec == Codec::Hevc) runOne(caps, *display, codec, "/tmp/bench-mac-session.h265");
+    }
+
+    // "Match my screen": the display put in the client's mode for the session
+    // and given its own back at stop(). 2560x1600 is asked — a MacBook client's
+    // own size, which a Retina panel lists both 1:1 and HiDPI — or 1920x1200
+    // where the display is already there. (Half the display's pixels was tried
+    // first: a 3024x1964 panel lists nothing below 1920 wide.)
+    SECTION("macOS — \"Match my screen\" changes the display's mode, and puts it back");
+    {
+        const int wasW = display->width, wasH = display->height;
+        SessionConfig config;
+        config.displayId = display->id;
+        config.fps = 60;
+        config.bitrateKbps = 20000;
+        config.clientCodecs = {gpu->codecs.front()};
+        config.fitRequestedBox = true;
+        config.matchClientDisplay = true;
+        config.allowUpscale = true;
+        const bool at2560 = wasW == 2560 && wasH == 1600;
+        config.requestedWidth = at2560 ? 1920 : 2560;
+        config.requestedHeight = at2560 ? 1200 : 1600;
+        config.width = config.requestedWidth;
+        config.height = config.requestedHeight;
+        config.fallbackWidth = config.requestedWidth;
+        config.fallbackHeight = config.requestedHeight;
+        if (!display->primary ||
+            !mainDisplayListsMatchingMode(config.requestedWidth, config.requestedHeight)) {
+            std::fprintf(stderr, "  skipped: the display lists no mode of the client's shape\n");
+            return;
+        }
+        std::string error;
+        std::unique_ptr<Session> session = NativeHost::createSession(
+            config, [](const EncodedFrame&) {}, nullptr, nullptr, nullptr, nullptr, error);
+        CHECK(session != nullptr);
+        if (session && session->start(error)) {
+            const SessionInfo& info = session->info();
+            std::fprintf(stderr,
+                         "  asked %dx%d of a %dx%d display: display now %dx%d, frame %dx%d\n",
+                         config.requestedWidth, config.requestedHeight, wasW, wasH,
+                         info.displayWidth, info.displayHeight, info.width, info.height);
+            CHECK(info.displayWidth != wasW || info.displayHeight != wasH);
+            CHECK(info.displayWidth <= config.requestedWidth);
+            CHECK(info.displayHeight <= config.requestedHeight);
+            // The frame is the display's new mode, pixel for pixel — not a box
+            // shaped to the mode the display had before.
+            CHECK_EQ(info.width, info.displayWidth);
+            CHECK_EQ(info.height, info.displayHeight);
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            session->stop();
+            const Capabilities after = NativeHost::probe();
+            for (const DisplayInfo& d : after.displays)
+                if (d.id == display->id) {
+                    std::fprintf(stderr, "  after stop: %dx%d\n", d.width, d.height);
+                    CHECK_EQ(d.width, wasW);
+                    CHECK_EQ(d.height, wasH);
+                }
+        } else {
+            std::fprintf(stderr, "  start failed: %s\n", error.c_str());
+            CHECK(false);
+        }
     }
 #endif
 }

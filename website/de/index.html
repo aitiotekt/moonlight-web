@@ -1,0 +1,1041 @@
+<!DOCTYPE html>
+<!-- Generated from /index.html and _i18n/de/index.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>MoonlightWeb — Moonlight Web-Client: dein Gaming-PC im Browser</title>
+<meta name="description" content="MoonlightWeb ist ein Moonlight Web-Client: Streame deinen Gaming-PC in jeden Browser — bis 4K HDR, 240 fps, unter 20 ms im WLAN. Gratis, Open Source, ohne Installation.">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#05080d">
+<!-- Open Graph -->
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="MoonlightWeb — Moonlight Web-Client: dein Gaming-PC im Browser">
+<meta property="og:description" content="MoonlightWeb ist ein Moonlight Web-Client: Streame deinen Gaming-PC in jeden Browser — bis 4K HDR, 240 fps, unter 20 ms im WLAN. Gratis, Open Source, ohne Installation.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://moonlightweb.top/de/">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<meta property="og:locale" content="de_DE">
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="MoonlightWeb — Moonlight Web-Client: dein Gaming-PC im Browser">
+<meta name="twitter:description" content="MoonlightWeb ist ein Moonlight Web-Client: Streame deinen Gaming-PC in jeden Browser — bis 4K HDR, 240 fps, unter 20 ms im WLAN. Gratis, Open Source, ohne Installation.">
+<meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/de/">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/">
+<!-- /i18n:alternates -->
+<!-- Favicon shown in Google Search: a square icon that is a multiple of 48px
+     (Google's requirement). favicon.ico now carries a 48px layer, and icon-48
+     is the exact recommended size. -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<!-- Privacy-friendly, cookieless analytics (self-hosted Umami on stats.{domain}).
+     data-website-id: paste the UUID shown in the Umami dashboard after you create
+     the "MoonlightWeb" website there (Settings → Websites). data-domains keeps it
+     from recording localhost / preview builds. Harmless if Umami is offline. -->
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<!-- WebSite structured data: tells Google the site name to show above the
+     result (the line next to the favicon) — "MoonlightWeb" instead of the
+     bare domain. https://developers.google.com/search/docs/appearance/site-names -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "MoonlightWeb",
+  "alternateName": "MoonlightWeb — Your gaming PC, in any browser",
+  "url": "https://moonlightweb.top/de/"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "MoonlightWeb",
+  "url": "https://moonlightweb.top/de/",
+  "image": "https://moonlightweb.top/assets/desktop.jpg",
+  "description": "A 100% web game-streaming client. Installed on the gaming PC, it captures and encodes that PC itself, with no Sunshine or other streaming server to set up. Stream your PC games to any device with a browser — up to 4K HDR, 240 fps, under 20 ms Wi-Fi latency. Nothing to install on the client, just a URL.",
+  "applicationCategory": "GameApplication",
+  "operatingSystem": "Windows, macOS, Linux",
+  "softwareRequirements": "MoonlightWeb installed on the gaming PC (it captures and encodes that PC itself; no Sunshine needed); any modern browser as client (Chrome, Edge, Safari, Firefox)",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "license": "https://www.gnu.org/licenses/gpl-3.0.html",
+  "downloadUrl": "https://github.com/linckosz/moonlight-web/releases",
+  "author": { "@type": "Person", "name": "Bruno Martin" },
+  "featureList": [
+    "Game streaming in the browser, no client install",
+    "Its own capture and hardware encode engine (NVENC, AMF, Quick Sync, VA-API, VideoToolbox) on Windows, Linux and macOS: no Sunshine needed",
+    "Up to 4K HDR at up to 240 fps (H264, HEVC, AV1)",
+    "Under 20 ms latency over Wi-Fi (WebRTC UDP)",
+    "GPU Video Enhancement: MoonlightWeb's own upscaler, in WebGL2 or WebGPU",
+    "Keyboard, mouse, touch trackpad, Xbox and PlayStation gamepads with rumble",
+    "Racing wheels with force feedback, flight sticks and RC radios (EdgeTX, OpenTX), sent to the game as themselves",
+    "Also pairs with Sunshine, Apollo, Wolf and MultiSeat hosts",
+    "mDNS auto-discovery of gaming PCs, PIN pairing",
+    "Direct peer-to-peer WebRTC streams; opt-in Internet access",
+    "Session sharing: invite up to 3 players into one running game, local co-op from anywhere"
+  ]
+}
+</script>
+<!-- Shared header/footer styling -->
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<style>
+  :root{
+    --bg:#05080d;
+    --bg-2:#0a0f16;
+    --panel:#0c131d;
+    --panel-2:#101a26;
+    --line:#1b2a3a;
+    --line-glow:rgba(25,211,255,.35);
+    --txt:#e8f1f8;
+    --muted:#8fa6bb;
+    --cyan:#19d3ff;
+    --yellow:#f5d90a;
+    --green:#41cd52;
+    --magenta:#ff2e88;
+    /* Title gradient: cyan → cyberpunk magenta */
+    --grad-a:#19d3ff;
+    --grad-b:var(--magenta);
+    --grad:linear-gradient(96deg,var(--grad-a) 0%,var(--grad-b) 100%);
+    --radius:14px;
+    --maxw:1160px;
+    --mono:ui-monospace,"Cascadia Code","SF Mono",Consolas,monospace;
+    /* cyberpunk cut corner used by panels */
+    --cut:16px;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  html{height:100%}
+  body{
+    margin:0; color:var(--txt);
+    /* Page scroll lives in #scroll (below the header), like the app's
+       #main-content — so the scrollbar never runs alongside the header. */
+    height:100vh; height:100dvh; overflow:hidden;
+    display:flex; flex-direction:column;
+    /* Same page background as the app (frontend/css/tokens.css --app-bg) */
+    background:
+      radial-gradient(1100px 760px at 85% -12%, rgba(252,238,10,.10) 0%, transparent 52%),
+      radial-gradient(900px 720px at -5% 108%, rgba(255,42,109,.10) 0%, transparent 50%),
+      radial-gradient(700px 600px at 50% 50%, rgba(0,229,255,.05) 0%, transparent 60%),
+      linear-gradient(168deg,#080c11 0%,#05080b 72%);
+    background-attachment:fixed;
+    background-color:#05080b;
+    font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{background:rgba(25,211,255,.35); color:#fff}
+  :focus-visible{outline:2px solid var(--cyan); outline-offset:2px}
+
+  /* Scroll container — cyberpunk neon scrollbar */
+  #scroll{
+    flex:1; min-height:0; overflow-y:auto; overflow-x:hidden;
+    scroll-behavior:smooth;
+    scrollbar-width:thin;                       /* Firefox */
+    scrollbar-color:var(--cyan) #0a0f16;
+  }
+  #scroll::-webkit-scrollbar{width:10px}
+  #scroll::-webkit-scrollbar-track{
+    background:#070b11;
+    border-left:1px solid var(--line);
+  }
+  #scroll::-webkit-scrollbar-thumb{
+    background:linear-gradient(180deg,#7ee7ff,var(--cyan) 30%,#0b6f8f);
+    border:2px solid #070b11;                   /* inset the neon bar */
+    border-radius:3px;
+    box-shadow:0 0 6px rgba(25,211,255,.55);
+  }
+  #scroll::-webkit-scrollbar-thumb:hover{
+    background:linear-gradient(180deg,#b9f1ff,#3fdcff 30%,#128ab0);
+    box-shadow:0 0 10px rgba(25,211,255,.8);
+  }
+  body.lb-open #scroll{overflow:hidden}
+  /* Cyberpunk atmosphere: faint tech grid + CRT scanlines — same as the app
+     (frontend/css/base.css body::before / body::after) */
+  body::before{
+    content:""; position:fixed; inset:0; z-index:-2; pointer-events:none;
+    /* Grid lines + a soft yellow light halo UNDER them (same geometry as the
+       app's --app-bg bloom): the light visually reveals the grid. */
+    background-image:
+      linear-gradient(rgba(0,229,255,.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,229,255,.04) 1px, transparent 1px),
+      radial-gradient(1100px 760px at 85% -12%, rgba(252,238,10,.12) 0%, transparent 52%);
+    background-size:44px 44px, 44px 44px, 100% 100%;
+    mask-image:radial-gradient(120% 120% at 50% 0%, #000 30%, transparent 80%);
+    -webkit-mask-image:radial-gradient(120% 120% at 50% 0%, #000 30%, transparent 80%);
+  }
+  body::after{
+    content:""; position:fixed; inset:0; z-index:-2; pointer-events:none;
+    background:repeating-linear-gradient(
+      to bottom,
+      rgba(0,0,0,0) 0,
+      rgba(0,0,0,0) 2px,
+      rgba(0,0,0,.16) 3px);
+  }
+  a{color:var(--cyan); text-decoration:none}
+  a:hover{text-decoration:underline}
+  img{max-width:100%; height:auto; display:block}
+  svg{display:block}
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 24px}
+  h1,h2,h3{line-height:1.12; margin:0 0 .4em; letter-spacing:-.3px}
+  .muted{color:var(--muted)}
+
+  /* Cyberpunk panel: cut corner top-right + hairline */
+  .cyb{
+    background:linear-gradient(180deg,var(--panel-2),var(--panel));
+    border:1px solid var(--line);
+    clip-path:polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
+    position:relative;
+  }
+  .cyb::before{ /* neon notch on the cut corner */
+    content:""; position:absolute; top:0; right:0; width:var(--cut); height:var(--cut);
+    background:linear-gradient(135deg, transparent 45%, var(--line-glow) 50%, transparent 55%);
+    pointer-events:none;
+  }
+
+  /* Kickers — mono overlines like the in-app section titles */
+  .kicker{
+    font:700 .78rem/1 var(--mono); letter-spacing:.22em; text-transform:uppercase;
+    color:var(--cyan); display:inline-flex; align-items:center; gap:.6em; margin-bottom:1rem;
+  }
+  .kicker::before{content:""; width:22px; height:2px; background:linear-gradient(90deg,var(--cyan),transparent)}
+  .kicker.yellow{color:var(--yellow)}
+  .kicker.yellow::before{background:linear-gradient(90deg,var(--yellow),transparent)}
+
+  /* Buttons — base .btn + .btn-primary live in assets/chrome.css (shared with
+     the header CTA and the sub-pages). These two variants are landing-only. */
+  .btn-ghost{border-color:var(--line); color:var(--txt); background:rgba(16,26,38,.7)}
+  .btn-yellow{background:var(--yellow); color:#171303}
+  @media(hover:hover){
+    .btn-ghost:hover{border-color:var(--line-glow); color:var(--cyan); text-decoration:none; transform:translateY(-1px)}
+    .btn-yellow:hover{filter:brightness(1.08); text-decoration:none; transform:translateY(-1px)}
+  }
+
+  /* Header + footer chrome now live in assets/chrome.css (shared, single source). */
+
+  /* ───── Hero ───── */
+  .hero{padding:88px 0 30px; text-align:center; position:relative}
+  .hero h1{font-size:clamp(2.3rem,6vw,4rem); font-weight:800; letter-spacing:-1.5px}
+  .hero h1 .grad{
+    background:var(--grad);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  .hero p.lead{font-size:clamp(1.05rem,2.1vw,1.28rem); color:var(--muted); max-width:640px; margin:1.2rem auto 2rem}
+  .hero p.lead strong{color:var(--txt); font-weight:600}
+  .cta{display:flex; gap:14px; justify-content:center; flex-wrap:wrap}
+  .cta-hero .btn{min-width:230px; justify-content:center}
+
+  /* HUD stat strip — a wink at the in-app stats overlay.
+     Grid + 1px gaps over a line-coloured background = separators that always align. */
+  .hud{
+    display:grid; grid-template-columns:repeat(5,1fr); gap:1px;
+    margin:2.6rem auto 0; max-width:860px;
+    border:1px solid var(--line); background:var(--line); overflow:hidden;
+    clip-path:polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
+  }
+  .hud > div{padding:.95rem .5rem; text-align:center; font-family:var(--mono); background:rgba(10,15,22,.92)}
+  .hud .k{display:block; font-size:.6rem; letter-spacing:.18em; color:var(--muted); text-transform:uppercase; white-space:nowrap}
+  .hud .n{font-size:1.18rem; font-weight:700; color:var(--grad-a); white-space:nowrap}
+  /* Alternate the two title colours across the stat strip */
+  .hud > div:nth-child(even) .n{color:var(--grad-b)}
+  @media(max-width:760px){
+    .hud{grid-template-columns:repeat(2,1fr)}
+    .hud > div:last-child{grid-column:1 / -1}
+  }
+
+  .hero-shot{position:relative; margin:3.4rem auto 0; max-width:980px}
+  .hero-shot::before{
+    content:""; position:absolute; inset:-8% -12% -4%; z-index:-1;
+    background:radial-gradient(60% 55% at 50% 40%, rgba(25,211,255,.22), transparent 70%);
+    filter:blur(12px);
+  }
+  .shot{
+    border:1px solid var(--line); border-radius:var(--radius); overflow:hidden;
+    box-shadow:0 0 0 1px rgba(25,211,255,.08), 0 40px 90px -30px rgba(0,0,0,.9);
+    display:block; width:100%;
+  }
+
+  /* ───── Sections ───── */
+  section{padding:88px 0}
+  .sec-head{text-align:center; max-width:720px; margin:0 auto 3.2rem}
+  .sec-head h2{font-size:clamp(1.7rem,3.6vw,2.5rem); font-weight:800;
+    background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent;}
+  .sec-head p{color:var(--muted); margin:0}
+
+  /* Feature cards */
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(255px,1fr)); gap:16px}
+  .card{padding:24px 22px; transition:.2s}
+  .card .ico{font-size:1.5rem; margin-bottom:.5rem}
+  .card h3{font-size:1.05rem; margin-bottom:.3rem}
+  .card p{color:var(--muted); margin:0; font-size:.93rem}
+  @media(hover:hover){
+    .card:hover{border-color:var(--line-glow); transform:translateY(-4px); box-shadow:0 18px 40px -20px rgba(25,211,255,.25)}
+  }
+  .pad-art{width:100%; max-width:225px; margin:0 auto .8rem; filter:drop-shadow(0 0 12px rgba(25,211,255,.25))}
+
+  /* ───── Showcase (zigzag) ───── */
+  .show{display:grid; grid-template-columns:1fr 1fr; gap:56px; align-items:center; padding:54px 0}
+  .show.rev .txt{order:2} .show.rev .media{order:1}
+  .show .txt h3{font-size:clamp(1.5rem,2.8vw,2rem); font-weight:800; margin-bottom:.6rem}
+  .show .txt p{color:var(--muted); margin:0 0 1.1rem}
+  .show ul{list-style:none; margin:0; padding:0; color:var(--muted); font-size:.95rem}
+  .show ul li{padding:.34rem 0 .34rem 1.5rem; position:relative}
+  .show ul li::before{content:"▸"; position:absolute; left:0; color:var(--cyan); font-family:var(--mono)}
+  .show ul li strong{color:var(--txt); font-weight:600}
+  @media(max-width:880px){
+    .show{grid-template-columns:1fr; gap:30px; padding:40px 0}
+    .show.rev .txt{order:1} .show.rev .media{order:2}
+  }
+
+  .media{position:relative}
+  .media .glow{position:absolute; inset:-10%; z-index:-1; filter:blur(14px); pointer-events:none}
+  .media img.shot{cursor:zoom-in}
+  .media figcaption{color:var(--muted); font:.78rem var(--mono); letter-spacing:.06em; margin-top:.7rem; text-align:center}
+  .media figcaption::before{content:"// "; color:var(--cyan)}
+  figure{margin:0}
+
+  /* Cropped admin shot (source has dead space on the right) */
+  .crop-admin{aspect-ratio:13/9; object-fit:cover; object-position:left top}
+  /* App library shot */
+  .crop-home{aspect-ratio:4/3; object-fit:cover; object-position:center top}
+
+  /* Phone bezel for portrait screenshots */
+  .phone{
+    width:min(280px,72vw); margin:0 auto; padding:12px 12px 16px;
+    background:#0d1117; border:1px solid #2a3646; border-radius:40px;
+    box-shadow:0 0 0 1px rgba(25,211,255,.12), 0 34px 70px -24px rgba(0,0,0,.95);
+    position:relative;
+  }
+  .phone::before{
+    content:""; position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    width:88px; height:22px; background:#0d1117; border-radius:0 0 14px 14px; z-index:2;
+  }
+  .phone img{border-radius:28px; cursor:zoom-in}
+
+  /* Duo composition: desktop settings + advanced phone overlap */
+  .duo{position:relative; padding-bottom:40px}
+  .duo .phone{
+    width:min(190px,42%); position:absolute; right:-6px; bottom:0;
+    padding:8px 8px 10px; border-radius:26px;
+  }
+  .duo .phone::before{width:56px; height:14px; top:8px; border-radius:0 0 9px 9px}
+  .duo .phone img{border-radius:18px}
+  .duo > img.shot{width:88%}
+
+  /* ───── Before / After comparator ───── */
+  .ba{
+    position:relative; overflow:hidden; border-radius:var(--radius);
+    border:1px solid var(--line); aspect-ratio:814/984; max-width:460px; margin:0 auto;
+    box-shadow:0 0 0 1px rgba(245,217,10,.10), 0 34px 80px -30px rgba(0,0,0,.9);
+    touch-action:none; user-select:none; cursor:ew-resize;
+  }
+  .ba img{position:absolute; inset:0; width:100%; height:100%; object-fit:cover; pointer-events:none}
+  .ba .after{clip-path:inset(0 0 0 50%)}
+  .ba .bar{
+    position:absolute; top:0; bottom:0; left:50%; width:2px; margin-left:-1px;
+    background:var(--yellow); box-shadow:0 0 14px rgba(245,217,10,.8); pointer-events:none;
+  }
+  .ba .knob{
+    position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    width:44px; height:44px; border-radius:50%; background:#171303; border:2px solid var(--yellow);
+    display:grid; place-items:center; color:var(--yellow); font:700 .9rem var(--mono);
+    box-shadow:0 4px 18px rgba(0,0,0,.6); pointer-events:none;
+  }
+  .ba .tag{
+    position:absolute; top:12px; padding:.3rem .65rem; border-radius:6px;
+    font:700 .68rem var(--mono); letter-spacing:.1em; pointer-events:none;
+    background:rgba(5,8,13,.8); backdrop-filter:blur(4px);
+  }
+  .ba .tag.l{left:12px; color:var(--muted); border:1px solid var(--line)}
+  .ba .tag.r{right:12px; color:var(--yellow); border:1px solid rgba(245,217,10,.4)}
+  .ba input[type=range]{
+    position:absolute; inset:0; width:100%; height:100%; opacity:0; margin:0; cursor:ew-resize;
+  }
+
+  /* ───── Steps ───── */
+  .steps{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; counter-reset:s}
+  .step{padding:26px 22px}
+  .step::after{
+    counter-increment:s; content:"0" counter(s);
+    position:absolute; top:14px; right:18px;
+    font:800 1.6rem var(--mono); color:rgba(25,211,255,.16); letter-spacing:.05em;
+  }
+  .step h3{font-size:1.05rem}
+  .step p{color:var(--muted); margin:0; font-size:.93rem}
+  .step code{font-family:var(--mono); color:var(--cyan); font-size:.85em}
+
+  /* Under the hood chips */
+  .chips{display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-top:1.8rem}
+  .chip{
+    font:600 .8rem var(--mono); letter-spacing:.04em; color:var(--muted);
+    border:1px solid var(--line); padding:.45rem .9rem; border-radius:999px;
+    background:rgba(12,19,29,.7);
+  }
+
+  /* ───── Download ───── */
+  .dl-main{display:flex; flex-direction:column; align-items:center; gap:.9rem; margin-bottom:2.6rem}
+  .dl-main .btn{font-size:1.1rem; padding:1rem 2.2rem}
+  .dl-meta{font:.78rem var(--mono); letter-spacing:.05em; color:var(--muted); min-height:1.2em; text-align:center}
+  .dl-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:16px; max-width:900px; margin:0 auto}
+  .dl-card{padding:24px 22px; text-align:center; transition:.2s}
+  .dl-card .os{width:38px; height:38px; margin:0 auto .7rem; fill:var(--txt); opacity:.92}
+  .dl-card h3{font-size:1.02rem; margin-bottom:.2rem}
+  .dl-card p{color:var(--muted); font-size:.85rem; margin:0 0 .9rem}
+  .dl-card .fmt{display:flex; gap:8px; justify-content:center; flex-wrap:wrap}
+  .dl-card .fmt a{
+    font:600 .78rem var(--mono); color:var(--cyan); border:1px solid var(--line);
+    padding:.35rem .75rem; border-radius:7px; transition:.15s;
+  }
+  /* Package-manager install commands. Click-to-copy: the exact string lives in
+     data-copy, so a line too long for the card still copies whole. */
+  .dl-card .cmds{margin-top:1rem; text-align:left}
+  .dl-card .cmd-lbl{
+    font:600 .66rem var(--mono); letter-spacing:.1em; text-transform:uppercase;
+    color:var(--muted); margin:0 0 .3rem;
+  }
+  .dl-card .cmd + .cmd-lbl{margin-top:.7rem}
+  .dl-card .cmd{
+    display:flex; align-items:center; gap:.55rem; width:100%; cursor:pointer;
+    font:.72rem/1.4 var(--mono); color:var(--txt); text-align:left;
+    background:rgba(12,19,29,.75); border:1px solid var(--line);
+    border-radius:7px; padding:.5rem .6rem; transition:.15s;
+  }
+  /* The command scrolls inside the card instead of widening it. */
+  .dl-card .cmd span{flex:1; min-width:0; overflow-x:auto; white-space:nowrap; scrollbar-width:none}
+  .dl-card .cmd span::-webkit-scrollbar{display:none}
+  .dl-card .cmd svg{width:13px; height:13px; flex:none; fill:var(--muted)}
+  .dl-card .cmd .ico-ok{display:none}
+  .dl-card .cmd.ok{border-color:var(--cyan); color:var(--cyan)}
+  .dl-card .cmd.ok svg{fill:var(--cyan)}
+  .dl-card .cmd.ok .ico-copy{display:none}
+  .dl-card .cmd.ok .ico-ok{display:block}
+  .dl-card .cmd-note{margin:.55rem 0 0; font-size:.74rem}
+  .dl-card .cmd-note a{color:var(--muted)}
+  .dl-card .dl-guide{margin:.9rem 0 0; font-size:.82rem}
+  .dl-card .dl-guide a{color:var(--cyan); text-decoration:none}
+  .dl-card .dl-guide a:hover{text-decoration:underline}
+  .dl-card .cmd-note a:hover{color:var(--cyan)}
+  @media(hover:hover){
+    .dl-card:hover{border-color:var(--line-glow); transform:translateY(-3px)}
+    .dl-card:hover .os{fill:var(--cyan)}
+    .dl-card .fmt a:hover{border-color:var(--line-glow); text-decoration:none; background:rgba(25,211,255,.08)}
+    .dl-card .cmd:hover{border-color:var(--line-glow); background:rgba(25,211,255,.07)}
+    .dl-card .cmd:hover svg{fill:var(--cyan)}
+  }
+
+  /* ───── CTA band ───── */
+  .band{
+    text-align:center; padding:64px 28px; --cut:26px;
+    background:
+      radial-gradient(640px 320px at 50% -30%, rgba(25,211,255,.16), transparent 60%),
+      radial-gradient(500px 280px at 85% 120%, rgba(255,46,136,.10), transparent 60%),
+      linear-gradient(180deg,var(--panel-2),var(--panel));
+  }
+  .band h2{font-size:clamp(1.8rem,4vw,2.6rem); font-weight:800;
+    background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent}
+  .band p{color:var(--muted); max-width:560px; margin:0 auto 1.8rem}
+
+  /* Lightbox */
+  #lb{position:fixed; inset:0; background:rgba(3,5,9,.94); display:none; place-items:center; z-index:100; cursor:zoom-out; padding:20px}
+  #lb.on{display:grid}
+  #lb img{max-width:96vw; max-height:92vh; border-radius:10px; box-shadow:0 20px 60px rgba(0,0,0,.7)}
+
+  /* ───── Hero flow: PC → Internet → Laptop ───── */
+  .flow{
+    display:grid; width:max-content; margin:26px auto 0;
+    grid-template-columns:auto auto auto; grid-template-rows:auto auto;
+    align-items:center; justify-items:center;
+    column-gap:clamp(4px,1.4vw,16px); row-gap:10px;
+  }
+  .flow img{height:auto; display:block; filter:drop-shadow(0 10px 22px rgba(0,0,0,.55))}
+  .flow-pc{grid-column:1; grid-row:1; width:clamp(60px,8.5vw,92px)}
+  .flow-laptop-wrap{grid-column:3; grid-row:1; position:relative; width:clamp(96px,14vw,150px); justify-self:center}
+  .flow-laptop{width:100%}
+  /* Controller resting in front of the laptop's bottom-right corner (slight overlap). */
+  .flow-pad{position:absolute; right:-9%; bottom:-9%; width:54%; z-index:2}
+  .flow-mid{
+    grid-column:2; grid-row:1; width:clamp(86px,13vw,170px);
+    display:flex; flex-direction:column; align-items:center; gap:8px;
+  }
+  .flow-label{
+    font-weight:800; letter-spacing:.5px; color:var(--cyan);
+    font-size:clamp(.78rem,1.5vw,1.05rem); text-shadow:0 0 14px rgba(25,211,255,.45);
+  }
+  .flow-conn{display:flex; align-items:center; width:100%}
+  .flow-line{
+    flex:1 1 auto; height:6px; border-radius:4px;
+    background:repeating-linear-gradient(90deg,var(--cyan) 0 14px,transparent 14px 24px);
+    filter:drop-shadow(0 0 5px rgba(25,211,255,.5));
+  }
+  .flow-head{
+    width:0; height:0; margin-left:2px; flex:0 0 auto;
+    border-top:10px solid transparent; border-bottom:10px solid transparent;
+    border-left:14px solid var(--cyan);
+    filter:drop-shadow(0 0 5px rgba(25,211,255,.5));
+  }
+  .flow-cap{
+    margin:0; text-align:center; line-height:1.3; max-width:17ch;
+    font:600 clamp(.6rem,1.05vw,.8rem) var(--mono); letter-spacing:.02em; color:var(--muted);
+  }
+  .cap-pc{grid-column:1; grid-row:2}
+  .cap-laptop{grid-column:3; grid-row:2}
+  .flow-cap span{display:block}
+  @media(max-width:620px){
+    .flow{column-gap:3px; row-gap:7px}
+    .flow-pc{width:clamp(50px,15vw,80px)}
+    .flow-laptop-wrap{width:clamp(82px,24vw,130px)}
+    .flow-mid{width:clamp(60px,19vw,120px)}
+    .flow-label{font-size:clamp(.68rem,3vw,.95rem)}
+    .flow-line{height:5px; background:repeating-linear-gradient(90deg,var(--cyan) 0 10px,transparent 10px 18px)}
+    .flow-head{border-top:8px solid transparent; border-bottom:8px solid transparent; border-left:11px solid var(--cyan)}
+    .flow-cap{font-size:clamp(.54rem,2.3vw,.72rem); max-width:13ch}
+  }
+
+  /* Scroll reveal */
+  .reveal{opacity:0; transform:translateY(22px); transition:opacity .6s ease, transform .6s ease}
+  .reveal.in{opacity:1; transform:none}
+  @media (prefers-reduced-motion: reduce){
+    .reveal{opacity:1; transform:none; transition:none}
+    #scroll{scroll-behavior:auto}
+  }
+</style>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/de/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/de/" data-nav="home" aria-current="page">Start</a><a href="/de/guides/" data-nav="guides">Anleitungen</a><a href="/de/faq.html" data-nav="faq">FAQ</a><a href="/de/contact.html" data-nav="contact">Kontakt</a><a href="/de/server-access/" data-nav="connect">Verbinden</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/">English</option><option value="fr" data-href="/fr/">Français</option><option value="de" data-href="/de/" selected>Deutsch</option><option value="zh" data-href="/zh/" lang="zh">中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<div id="scroll">
+<main>
+<!-- ═════ HERO ═════ -->
+<section class="hero" aria-label="Introduction">
+  <div class="wrap">
+    <span class="kicker" data-i18n="hero.kicker">100% Web · Open Source · selbst gehostet</span>
+    <h1 data-i18n-html="hero.h1">Dein Gaming‑PC.<br><span class="grad">Gestreamt in jeden Browser.</span></h1>
+    <p class="lead" data-i18n-html="hero.lead">MoonlightWeb streamt deinen Gaming‑PC auf jedes Gerät mit Browser — Smartphone, Tablet, Laptop, TV.<br><strong>Kostenlos und Open Source. Auf dem Client nichts zu installieren. Nur eine URL.</strong></p>
+    <div class="cta cta-hero">
+      <a class="btn btn-primary" href="#download" data-i18n="hero.cta1" data-umami-event="download-cta" data-umami-event-loc="hero">Kostenlos herunterladen</a>
+      <a class="btn btn-yellow" href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="hero"><span data-bmc-full-logo></span><span class="sr-only" data-i18n="hero.cta2">Spendier mir einen Kaffee</span></a>
+    </div>
+
+    <div class="flow reveal" aria-label="Your gaming PC streams over the Internet to any browser">
+      <img class="flow-pc" src="/assets/pc.png" width="299" height="445" loading="lazy"
+           alt="Gaming PC tower with RGB fans and a GPU">
+      <div class="flow-mid" aria-hidden="true">
+        <span class="flow-label">Internet</span>
+        <div class="flow-conn"><span class="flow-line"></span><span class="flow-head"></span></div>
+      </div>
+      <span class="flow-laptop-wrap">
+        <img class="flow-laptop" src="/assets/laptop.png" width="379" height="378" loading="lazy"
+             alt="Laptop running a game in the browser">
+        <!-- Game controller in slight overlap on the laptop's bottom-right corner —
+             hints that you also control the remote PC (real ~1.7:1 pad proportions). -->
+        <img class="flow-pad" src="/assets/gamepad.svg" width="260" height="150" loading="lazy"
+             alt="" aria-hidden="true">
+      </span>
+      <p class="flow-cap cap-pc" data-i18n-html="flow.pc"><span>MoonlightWeb</span></p>
+      <p class="flow-cap cap-laptop" data-i18n-html="flow.laptop"><span>Nur Browser</span></p>
+    </div>
+
+    <div class="hud reveal" aria-label="Key performance numbers">
+      <div><span class="k" data-i18n="hud.k1">WLAN‑Latenz</span><span class="n">&lt;20ms</span></div>
+      <div><span class="k" data-i18n="hud.k2">Auflösung</span><span class="n">4K HDR</span></div>
+      <div><span class="k" data-i18n="hud.k3">Bildrate</span><span class="n" data-i18n="hud.v3">bis zu 240fps</span></div>
+      <div><span class="k" data-i18n="hud.k4">Codecs</span><span class="n">H264·HEVC·AV1</span></div>
+      <div><span class="k" data-i18n="hud.k5">Client‑Installation</span><span class="n">0 MB</span></div>
+    </div>
+
+    <div class="hero-shot reveal">
+      <img class="shot" src="/assets/desktop.jpg" width="2560" height="1440" alt="Full Windows desktop streamed inside Chrome with the MoonlightWeb live stats overlay" loading="eager" fetchpriority="high">
+    </div>
+  </div>
+</section>
+
+<!-- ═════ FEATURES ═════ -->
+<section id="features" aria-label="Features">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="kicker" data-i18n="feat.kicker">Funktionen</span>
+      <h2 data-i18n-html="feat.h2">Gebaut wie ein nativer Client.<br>Ausgeliefert wie eine Webseite.</h2>
+      <p data-i18n="feat.p">Alles, was du von einem ernsthaften Game‑Streaming‑Client erwartest — komplett im Browser.</p>
+    </div>
+    <div class="grid">
+      <div class="card cyb reveal"><div class="ico">⚡</div><h3 data-i18n="card1.h3">Latenz auf Konsolenniveau</h3><p data-i18n="card1.p">WebRTC‑Transport über UDP mit adaptiver Staukontrolle — unter 20 ms im WLAN. Spiel schnelle Shooter, keine Diashows.</p></div>
+      <div class="card cyb reveal"><div class="ico">🎬</div><h3 data-i18n="card2.h3">Bis zu 4K HDR, 240 fps</h3><p data-i18n="card2.p">H264, HEVC und AV1, hardwaredekodiert über WebCodecs. Echtes HDR auf HDR‑Displays.</p></div>
+      <div class="card cyb reveal"><div class="ico">🪄</div><h3 data-i18n="card3.h3">Videoverbesserung</h3><p data-i18n-html="card3.p">GPU‑Upscaling und ‑Schärfung (MoonlightWebs eigener Upscaler) in WebGL2 oder WebGPU. Streame in 720p, sieh fast 1440p.</p></div>
+      <div class="card cyb reveal"><div class="ico">🔊</div><h3 data-i18n="card4.h3">Opus‑Stereo‑Sound</h3><p data-i18n="card4.p">Im Browser dekodiert, mit adaptivem Jitter‑Buffer. Bleibt synchron, selbst in wackligem WLAN.</p></div>
+      <div class="card cyb reveal">
+        <svg class="pad-art" viewBox="0 0 260 150" role="img" aria-label="Xbox controller">
+          <path d="M65 25 C85 15 175 15 195 25 C220 33 236 62 240 92 C243 117 231 132 216 129 C200 126 194 106 184 97 C174 88 86 88 76 97 C66 106 60 126 44 129 C29 132 17 117 20 92 C24 62 40 33 65 25 Z"
+                fill="#0b1420" stroke="#19d3ff" stroke-width="2" stroke-opacity=".8"/>
+          <!-- Xbox guide button -->
+          <circle cx="130" cy="34" r="9" fill="rgba(25,211,255,.14)" stroke="#19d3ff" stroke-width="1.6"/>
+          <circle cx="130" cy="34" r="3.4" fill="#19d3ff"/>
+          <!-- left stick -->
+          <circle cx="78" cy="52" r="15" fill="#0f1a28" stroke="#19d3ff" stroke-width="1.6" stroke-opacity=".7"/>
+          <circle cx="78" cy="52" r="9" fill="#101c2b" stroke="#19d3ff" stroke-width="1.4"/>
+          <!-- view / menu -->
+          <circle cx="110" cy="55" r="4.4" fill="#0f1a28" stroke="#8fa6bb" stroke-width="1.2"/>
+          <circle cx="150" cy="55" r="4.4" fill="#0f1a28" stroke="#8fa6bb" stroke-width="1.2"/>
+          <!-- ABXY -->
+          <circle cx="182" cy="39" r="6.5" fill="rgba(245,217,10,.15)" stroke="#f5d90a" stroke-width="1.6"/>
+          <circle cx="168" cy="52" r="6.5" fill="rgba(25,211,255,.15)"  stroke="#19d3ff" stroke-width="1.6"/>
+          <circle cx="196" cy="52" r="6.5" fill="rgba(255,46,136,.15)"  stroke="#ff2e88" stroke-width="1.6"/>
+          <circle cx="182" cy="65" r="6.5" fill="rgba(65,205,82,.15)"   stroke="#41cd52" stroke-width="1.6"/>
+          <!-- d-pad -->
+          <path d="M97 68 H109 V78 H119 V90 H109 V100 H97 V90 H87 V78 H97 Z"
+                fill="#0f1a28" stroke="#19d3ff" stroke-width="1.4" stroke-opacity=".7"/>
+          <!-- right stick -->
+          <circle cx="152" cy="84" r="14" fill="#0f1a28" stroke="#19d3ff" stroke-width="1.6" stroke-opacity=".7"/>
+          <circle cx="152" cy="84" r="8.4" fill="#101c2b" stroke="#19d3ff" stroke-width="1.4"/>
+        </svg>
+        <h3 data-i18n="card5.h3">Jede Eingabe, volle Vibration</h3><p data-i18n-html="card5.p">Tastatur, Maus mit Pointer‑Lock, Touch‑Trackpad, virtuelle Tastatur, Xbox‑ &amp; PlayStation‑Controller mit Vibration — und <a href="/de/controllers.html">Lenkräder, Flugsticks und RC‑Fernsteuerungen</a>.</p>
+      </div>
+      <div class="card cyb reveal"><div class="ico">🔎</div><h3 data-i18n="card6.h3">Erkennung ohne Konfiguration</h3><p data-i18n="card6.p">Deine Gaming‑PCs tauchen automatisch per mDNS auf. Kopplung per PIN, mehrere Hosts, dauerhafte Sitzungen.</p></div>
+      <div class="card cyb reveal"><div class="ico">🌍</div><h3 data-i18n="card7.h3">Von Grund auf Peer‑to‑Peer</h3><p data-i18n="card7.p">Der Stream geht direkt von deinem PC zu deinem Browser — keine Cloud dazwischen. Ein Fernzugriffslink erreicht deinen PC von überall, ohne einen einzigen Web‑Port freizugeben.</p></div>
+      <div class="card cyb reveal"><div class="ico">🛟</div><h3 data-i18n="card8.h3">Lässt dich nie hängen</h3><p data-i18n="card8.p">Automatischer Transport‑Fallback (UDP → TCP) kommt durch restriktive Netzwerke, weiterhin direkt, nie über ein Relay.</p></div>
+      <div class="card cyb reveal"><div class="ico">👥</div><h3 data-i18n="card9.h3">Koop für bis zu 4 Spieler</h3><p data-i18n="card9.p">Lade bis zu drei Freunde in das Spiel ein, das schon auf deinem PC läuft — vier Spieler in einer Sitzung. Ein Spielstand, ein Bildschirm pro Person: Sie spielen von ihrem eigenen Gerät, mit ihrem eigenen Gamepad, als säßen sie neben dir.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═════ SHOWCASE ═════ -->
+<section id="showcase" style="padding-top:40px" aria-label="Showcase">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="kicker" data-i18n="show.kicker">Einblicke</span>
+      <h2 data-i18n="show.h2">Sieh es in Aktion</h2>
+      <p data-i18n="show.p">Derselbe PC, dieselben Spiele — auf jedem Bildschirm im Haus (und darüber hinaus).</p>
+    </div>
+
+    <!-- 01 · Library -->
+    <div class="show">
+      <div class="txt reveal">
+        <span class="kicker" data-i18n="s1.kicker">01 · Entdecken</span>
+        <h3 data-i18n-html="s1.h3">Alle deine PCs.<br>Eine URL.</h3>
+        <p data-i18n="s1.p">Öffne die Seite, und deine Gaming‑Rechner sind schon da — im LAN gefunden, sortiert, gemerkt.</p>
+        <ul>
+          <li data-i18n-html="s1.li1"><strong>Automatische Erkennung per mDNS</strong> — keine IP‑Suche, Hosts tauchen einfach auf</li>
+          <li data-i18n-html="s1.li2"><strong>Kopplung per PIN</strong> — sicherer Handshake in Sekunden</li>
+          <li data-i18n-html="s1.li3"><strong>Mehrere Hosts</strong> — Desktop, Wohnzimmer‑PC, Homeserver</li>
+        </ul>
+      </div>
+      <figure class="media reveal">
+        <div class="glow" style="background:radial-gradient(55% 55% at 50% 50%, rgba(25,211,255,.16), transparent 70%)"></div>
+        <img class="shot crop-home" src="/assets/home.jpg" width="1191" height="876" alt="MoonlightWeb app library — gaming PCs discovered automatically, ready to pair" loading="lazy">
+        <figcaption data-i18n="s1.cap">APP‑BIBLIOTHEK — per mDNS gefundene Hosts, einen Klick von der Kopplung entfernt</figcaption>
+      </figure>
+    </div>
+
+    <!-- 02 · Mobile -->
+    <div class="show rev">
+      <div class="txt reveal">
+        <span class="kicker" data-i18n="s2.kicker">02 · Mobil spielen</span>
+        <h3 data-i18n-html="s2.h3">Ein Gaming‑Handheld,<br>versteckt in deiner Tasche.</h3>
+        <p data-i18n="s2.p">Dein Smartphone wird zum vollwertigen Client: Multitouch‑Trackpad, native virtuelle Tastatur mit Sondertasten, Gamepad‑Support — bis zu 120 fps bei &lt;20 ms WLAN‑Latenz.</p>
+        <ul>
+          <li data-i18n-html="s2.li1"><strong>Touch‑Trackpad</strong> — 1 Finger zielt, 2 scrollen und zoomen, Tippen klickt</li>
+          <li data-i18n-html="s2.li2"><strong>Echte Tastatureingaben</strong> — Win, Esc, Strg, Pfeiltasten… alles da</li>
+          <li data-i18n-html="s2.li3"><strong>Nichts aus dem App Store</strong> — Safari oder Chrome reicht</li>
+        </ul>
+      </div>
+      <figure class="media reveal">
+        <div class="glow" style="background:radial-gradient(50% 50% at 50% 50%, rgba(255,46,136,.14), transparent 70%)"></div>
+        <div class="phone"><img src="/assets/mobile.jpg" width="1170" height="2532" alt="iPhone streaming a PC game in Chrome with the virtual keyboard open" loading="lazy"></div>
+        <figcaption>iPhone · Chrome</figcaption>
+      </figure>
+    </div>
+
+    <!-- 03 · Enhance -->
+    <div class="show">
+      <div class="txt reveal">
+        <span class="kicker yellow" data-i18n="s3.kicker">03 · Verbessern</span>
+        <h3 data-i18n-html="s3.h3">Leicht streamen.<br>Scharf anzeigen.</h3>
+        <p data-i18n-html="s3.p">Die Videoverbesserung skaliert und schärft den Stream auf der GPU deines Geräts — WebGL2 oder WebGPU mit <a href="/mwsr/">MWSR (MoonlightWeb Super Resolution)</a>, MoonlightWebs eigenem Upscaler. Streame in 720p über 4G und genieß ein gestochen scharfes Bild auf einem 1440p‑Display.</p>
+        <ul>
+          <li data-i18n-html="s3.li1"><strong>Weniger Bandbreite, mehr Details</strong> — ideal im Mobilfunknetz und im Hotel‑WLAN</li>
+          <li data-i18n-html="s3.li2"><strong>Läuft auf dem Client</strong> — null Zusatzlast für den Gaming‑PC</li>
+          <li data-i18n-html="s3.li3"><strong>Zieh den Regler</strong> — 720p‑Stream vs. verbesserte Ausgabe →</li>
+        </ul>
+      </div>
+      <figure class="media reveal">
+        <div class="glow" style="background:radial-gradient(50% 50% at 50% 50%, rgba(245,217,10,.12), transparent 70%)"></div>
+        <div class="ba" id="ba">
+          <img class="before" src="/assets/enhance_before.jpg" width="814" height="984" alt="Original 720p game stream, zoomed on a character's face">
+          <img class="after" src="/assets/enhance_after.jpg" width="814" height="984" alt="Same frame after Video Super Resolution upscaling to 1440p">
+          <span class="tag l" data-i18n="s3.tagl">720p‑STREAM</span>
+          <span class="tag r" data-i18n="s3.tagr">VERBESSERT ▸ 1440p</span>
+          <div class="bar"></div>
+          <div class="knob">◂▸</div>
+          <input type="range" min="0" max="100" value="50" aria-label="Compare original and enhanced image">
+        </div>
+        <figcaption data-i18n="s3.cap">Prince of Persia — in 720p gestreamt, in 1440p angezeigt</figcaption>
+      </figure>
+    </div>
+
+    <!-- 04 · Tune -->
+    <div class="show rev">
+      <div class="txt reveal">
+        <span class="kicker" data-i18n="s4.kicker">04 · Feintuning</span>
+        <h3 data-i18n-html="s4.h3">Einstellen und vergessen.<br>Oder alles anpassen.</h3>
+        <p data-i18n="s4.p">Sinnvolle Standardwerte mit automatischer Bitrate ab Werk — und ein komplettes Profi‑Panel, wenn du die volle Kontrolle willst, am Desktop wie am Smartphone.</p>
+        <ul>
+          <li data-i18n-html="s4.li1"><strong>Auflösung, FPS, Bitrate</strong> — automatisch abgestimmt, jederzeit änderbar</li>
+          <li data-i18n-html="s4.li2"><strong>HDR &amp; 4:4:4‑Chroma</strong> — für Pixel‑Puristen</li>
+          <li data-i18n-html="s4.li3"><strong>Codec‑Wahl</strong> — Optionen, die dein Browser nicht dekodieren kann, sind einfach ausgegraut</li>
+        </ul>
+      </div>
+      <figure class="media reveal">
+        <div class="glow" style="background:radial-gradient(55% 55% at 45% 50%, rgba(25,211,255,.14), transparent 70%)"></div>
+        <div class="duo">
+          <img class="shot" src="/assets/settings.jpg" width="1374" height="982" alt="MoonlightWeb streaming settings — resolution, frame rate, HDR, bitrate" loading="lazy">
+          <div class="phone"><img src="/assets/advanced.jpg" width="1170" height="2532" alt="Advanced options on mobile — Video Enhancement, codec, 4:4:4 chroma" loading="lazy"></div>
+        </div>
+        <figcaption data-i18n="s4.cap">Streaming‑Einstellungen &amp; erweiterte Optionen</figcaption>
+      </figure>
+    </div>
+
+    <!-- 05 · Go global -->
+    <div class="show">
+      <div class="txt reveal">
+        <span class="kicker" data-i18n="s5.kicker">05 · Weltweit spielen</span>
+        <h3 data-i18n-html="s5.h3">Heute LAN‑Party.<br>Morgen Hotelzimmer.</h3>
+        <p data-i18n="s5.p">Spiel unterwegs, ohne deinen PC einer Cloud anzuvertrauen: Der Stream ist eine direkte Peer‑to‑Peer‑WebRTC‑Verbindung zwischen deinem Browser und deinem Rechner. Ein Fernzugriffslink — ohne öffentliche Subdomain, ohne offene Web‑Ports — erreicht ihn von überall.</p>
+        <ul>
+          <li data-i18n-html="s5.li1"><strong>Direktes Peer‑to‑Peer</strong> — dein Browser verbindet sich direkt mit deinem PC</li>
+          <li data-i18n-html="s5.li2"><strong>Nichts veröffentlicht</strong> — kein öffentlicher DNS‑Eintrag, Web‑Ports bleiben zu</li>
+          <li data-i18n-html="s5.li3"><strong>Selbst gehostet</strong> — deine Spiele landen nie in fremden Clouds</li>
+        </ul>
+      </div>
+      <figure class="media reveal">
+        <div class="glow" style="background:radial-gradient(55% 55% at 55% 50%, rgba(65,205,82,.13), transparent 70%)"></div>
+        <img class="shot crop-admin" src="/assets/admin.jpg" width="1817" height="1225" alt="MoonlightWeb admin page — one-click Internet access with public URL, and local access" loading="lazy">
+        <figcaption data-i18n="s5.cap">ADMIN — Internetzugriff mit einem Klick aktiviert</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ═════ HOW ═════ -->
+<section id="how" aria-label="How it works">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="kicker" data-i18n="how.kicker">Erste Schritte</span>
+      <h2 data-i18n="how.h2">Spielen aus der Ferne ist jetzt einfach</h2>
+      <p data-i18n="how.p">Drei Schritte, ein Installer, null Netzwerk‑Hausaufgaben.</p>
+    </div>
+    <div class="steps">
+      <div class="step cyb reveal"><h3 data-i18n="step1.h3">Installieren</h3><p data-i18n="step1.p">Ein Installer auf dem Gaming‑PC: Er nimmt diesen PC selbst auf und kodiert ihn, ohne Sunshine oder einen zweiten Streaming‑Server. Der Assistent richtet alles ein — inklusive Internetzugriff — und hinterlässt ein Symbol im Infobereich. Auf den Geräten, von denen aus du spielst, musst du nichts installieren.</p></div>
+      <div class="step cyb reveal"><h3 data-i18n="step2.h3">Koppeln</h3><p data-i18n="step2.p">Öffne die Seite auf einem beliebigen Gerät: Dein PC ist schon aufgelistet. Gib die angezeigte PIN ein, ein einziges Mal. Ab jetzt ist das Gerät dauerhaft vertrauenswürdig.</p></div>
+      <div class="step cyb reveal"><h3 data-i18n="step3.h3">Spiel aus der Ferne!</h3><p data-i18n="step3.p">Dein privater Link funktioniert überall — im Hotel‑WLAN, auf dem Sofa eines Freundes, über 4G. Wähl ein Spiel oder den ganzen Desktop, Gamepad in die Hand, los geht’s.</p></div>
+    </div>
+
+    <p class="muted reveal" style="text-align:center; max-width:760px; margin:3rem auto 0" data-i18n-html="how.under">Unter der Haube: Ein C++/Qt‑Server nimmt den Gaming‑PC selbst auf, übergibt jedes Bild direkt an seinen GPU‑Encoder (NVENC, AMF, Quick Sync, VA‑API, VideoToolbox) und dann per WebRTC an den Browser — mit automatischem Fallback von UDP auf TCP. Du nutzt schon Sunshine, Apollo oder Wolf? Er bindet <code style="font-family:var(--mono); color:var(--cyan)">moonlight‑common‑c</code> ein, um sich auch mit diesen Hosts zu koppeln. Dekodiert wird mit WebCodecs, gerendert mit WebGL2 oder WebGPU, der Ton läuft im WebRTC-Player des Browsers.</p>
+    <div class="chips reveal">
+      <span class="chip">C++17 · Qt 6</span><span class="chip">WebRTC</span><span class="chip">WebCodecs</span>
+      <span class="chip">WebGPU</span><span class="chip">AudioWorklet</span><span class="chip">Opus</span>
+      <span class="chip">Windows · Linux · macOS</span>
+    </div>
+  </div>
+</section>
+
+<!-- ═════ DOWNLOAD ═════ -->
+<section id="download" style="padding-top:20px" aria-label="Download">
+  <div class="wrap">
+    <div class="sec-head reveal">
+      <span class="kicker" data-i18n="dl.kicker">Download</span>
+      <h2 data-i18n="dl.h2">Hol dir den Server. Bring die Spiele mit.</h2>
+      <p data-i18n="dl.p">Ein Download, nur auf dem Gaming‑PC. Alle anderen Geräte öffnen einfach einen Browser.</p>
+    </div>
+    <div class="dl-main reveal">
+      <a class="btn btn-primary" id="dl-btn" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-loc="main">⬇ Download MoonlightWeb</a>
+      <span class="dl-meta" id="dl-meta">Latest release on GitHub</span>
+      <!-- Linux only: which package the button resolved to, and where the others are. -->
+      <span class="dl-meta" id="dl-hint" style="margin-top:-.55rem; min-height:0"></span>
+    </div>
+    <div class="dl-grid">
+      <div class="dl-card cyb reveal">
+        <svg class="os" viewBox="0 0 24 24" role="img" aria-label="Windows logo"><path d="M0 3.449 9.75 2.1v9.451H0zM10.949 1.949 24 0v11.4H10.949zM0 12.6h9.75v9.451L0 20.699zM10.949 12.6H24V24l-13.051-1.801z"/></svg>
+        <h3>Windows</h3>
+        <p data-i18n="dl.win">Geführter Installer — alles wird im Assistenten eingerichtet, Internetzugriff inklusive.</p>
+        <div class="fmt">
+          <a data-asset="win-x64" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="win-x64">x64 .exe</a>
+          <a data-asset="win-arm64" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="win-arm64">arm64 .exe</a>
+        </div>
+        <p class="dl-guide"><a href="/de/guides/windows.html" data-i18n="dl.windows.guide" data-umami-event="guide" data-umami-event-loc="dl-windows">Installationsanleitung Schritt für Schritt →</a></p>
+      </div>
+      <div class="dl-card cyb reveal">
+        <svg class="os" viewBox="0 0 24 24" role="img" aria-label="Apple logo"><path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/></svg>
+        <h3>macOS</h3>
+        <p data-i18n="dl.mac">Installer für Apple Silicon mit geführtem Einrichtungsassistenten.</p>
+        <div class="fmt">
+          <a data-asset="mac" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="mac">arm64 .pkg</a>
+        </div>
+        <p class="dl-guide"><a href="/de/guides/macos.html" data-i18n="dl.macos.guide" data-umami-event="guide" data-umami-event-loc="dl-macos">Installationsanleitung Schritt für Schritt →</a></p>
+        <!-- Unnotarized .pkg: a browser download trips Gatekeeper, and both of
+             these install the very same file without the prompt. Homebrew comes
+             first — it is the one that also brings `brew upgrade` along. -->
+        <div class="cmds">
+          <p class="cmd-lbl" data-i18n="dl.mac.brew">Homebrew</p>
+          <button class="cmd" type="button" data-copy="brew install --cask linckosz/tap/moonlightweb" data-umami-event="copy-command" data-umami-event-cmd="brew"><span>brew install --cask linckosz/tap/moonlightweb</span><svg class="ico-copy" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg><svg class="ico-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg></button>
+          <p class="cmd-lbl" data-i18n="dl.mac.curl">Terminal</p>
+          <button class="cmd" type="button" data-copy="curl -fsSL https://moonlightweb.top/install.sh | bash" data-umami-event="copy-command" data-umami-event-cmd="mac-curl"><span>curl -fsSL https://moonlightweb.top/install.sh | bash</span><svg class="ico-copy" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg><svg class="ico-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg></button>
+        </div>
+      </div>
+      <div class="dl-card cyb reveal">
+        <svg class="os" viewBox="0 0 24 24" role="img" aria-label="Linux Tux logo"><path d="M12.504 0c-.155 0-.315.008-.48.021-4.226.333-3.105 4.807-3.17 6.298-.076 1.092-.3 1.953-1.05 3.02-.885 1.051-2.127 2.75-2.716 4.521-.278.832-.41 1.684-.287 2.489a.424.424 0 00-.11.135c-.26.268-.45.6-.663.839-.199.199-.485.267-.797.4-.313.136-.658.269-.864.68-.09.189-.136.394-.132.602 0 .199.027.4.055.536.058.399.116.728.04.97-.249.68-.28 1.145-.106 1.484.174.334.535.47.94.601.81.2 1.91.135 2.774.6.926.466 1.866.67 2.616.47.526-.116.97-.464 1.208-.946.587-.003 1.23-.269 2.26-.334.699-.058 1.574.267 2.577.2.025.134.063.198.114.333l.003.003c.391.778 1.113 1.132 1.884 1.071.771-.06 1.592-.536 2.257-1.306.631-.765 1.683-1.084 2.378-1.503.348-.199.629-.469.649-.853.023-.4-.2-.811-.714-1.376v-.097l-.003-.003c-.17-.2-.25-.535-.338-.926-.085-.401-.182-.786-.492-1.046h-.003c-.059-.054-.123-.067-.188-.135a.357.357 0 00-.19-.064c.431-1.278.264-2.55-.173-3.694-.533-1.41-1.465-2.638-2.175-3.483-.796-1.005-1.576-1.957-1.56-3.368.026-2.152.236-6.133-3.544-6.139zm.529 3.405h.013c.213 0 .396.062.584.198.19.135.33.332.438.533.105.259.158.459.166.724 0-.02.006-.04.006-.06v.105a.086.086 0 01-.004-.021l-.004-.024a1.807 1.807 0 01-.15.706.953.953 0 01-.213.335.71.71 0 00-.088-.042c-.104-.045-.198-.064-.284-.133a1.312 1.312 0 00-.22-.066c.05-.06.146-.133.183-.198.053-.128.082-.264.088-.402v-.02a1.21 1.21 0 00-.061-.4c-.045-.134-.101-.2-.183-.333-.084-.066-.167-.132-.267-.132h-.016c-.093 0-.176.03-.262.132a.8.8 0 00-.205.334 1.18 1.18 0 00-.09.4v.019c.002.089.008.179.02.267-.193-.067-.438-.135-.607-.202a1.635 1.635 0 01-.018-.2v-.02a1.772 1.772 0 01.15-.768c.082-.22.232-.406.43-.533a.985.985 0 01.594-.2zm-2.962.059h.036c.142 0 .27.048.399.135.146.129.264.288.344.465.09.199.14.4.153.667v.004c.007.134.006.2-.002.266v.08c-.03.007-.056.018-.083.024-.152.055-.274.135-.393.2.012-.09.013-.18.003-.267v-.015c-.012-.133-.04-.2-.082-.333a.613.613 0 00-.166-.267.248.248 0 00-.183-.064h-.021c-.071.006-.13.04-.186.132a.552.552 0 00-.12.27.944.944 0 00-.023.33v.015c.012.135.037.2.08.334.046.134.098.2.166.268.01.009.02.018.034.024-.07.057-.117.07-.176.136a.304.304 0 01-.131.068 2.62 2.62 0 01-.275-.402 1.772 1.772 0 01-.155-.667 1.759 1.759 0 01.08-.668 1.43 1.43 0 01.283-.535c.128-.133.26-.2.418-.2zm1.37 1.706c.332 0 .733.065 1.216.399.293.2.523.269 1.052.468h.003c.255.136.405.266.478.399v-.131a.571.571 0 01.016.47c-.123.31-.516.643-1.063.842v.002c-.268.135-.501.333-.775.465-.276.135-.588.292-1.012.267a1.139 1.139 0 01-.448-.067 3.566 3.566 0 01-.322-.198c-.195-.135-.363-.332-.612-.465v-.005h-.005c-.4-.246-.616-.512-.686-.71-.07-.268-.005-.47.193-.6.224-.135.38-.271.483-.336.104-.074.143-.102.176-.131h.002v-.003c.169-.202.436-.47.839-.601.139-.036.294-.065.466-.065zm2.8 2.142c.358 1.417 1.196 3.475 1.735 4.473.286.534.855 1.659 1.102 3.024.156-.005.33.018.513.064.646-1.671-.546-3.467-1.089-3.966-.22-.2-.232-.335-.123-.335.59.534 1.365 1.572 1.646 2.757.13.535.16 1.104.021 1.67.067.028.135.06.205.067 1.032.534 1.413.938 1.23 1.537v-.043c-.06-.003-.12 0-.18 0h-.016c.151-.467-.182-.825-1.065-1.224-.915-.4-1.646-.336-1.77.465-.008.043-.013.066-.018.135-.068.023-.139.053-.209.064-.43.268-.662.669-.793 1.187-.13.533-.17 1.156-.205 1.869v.003c-.02.334-.17.838-.319 1.35-1.5 1.072-3.58 1.538-5.348.334a2.645 2.645 0 00-.402-.533 1.45 1.45 0 00-.275-.333c.182 0 .338-.03.465-.067a.615.615 0 00.314-.334c.108-.267 0-.697-.345-1.163-.345-.467-.931-.995-1.788-1.521-.63-.4-.986-.87-1.15-1.396-.165-.534-.143-1.085-.015-1.645.245-1.07.873-2.11 1.274-2.763.107-.065.037.135-.408.974-.396.751-1.14 2.497-.122 3.854a8.123 8.123 0 01.647-2.876c.564-1.278 1.743-3.504 1.836-5.268.048.036.217.135.289.202.218.133.38.333.59.465.21.201.477.335.876.335.039.003.075.006.11.006.412 0 .73-.134.997-.268.29-.134.52-.334.74-.4h.005c.467-.135.835-.402 1.044-.7zm2.185 8.958c.037.6.343 1.245.882 1.377.588.134 1.434-.333 1.791-.765l.211-.01c.315-.007.577.01.847.268l.003.003c.208.199.305.53.391.876.085.4.154.78.409 1.066.486.527.645.906.636 1.14l.003-.007v.018l-.003-.012c-.015.262-.185.396-.498.595-.63.401-1.746.712-2.457 1.57-.618.737-1.37 1.14-2.036 1.191-.664.053-1.237-.2-1.574-.898l-.005-.003c-.21-.4-.12-1.025.056-1.69.176-.668.428-1.344.463-1.897.037-.714.076-1.335.195-1.814.12-.465.308-.797.641-.984l.045-.022zm-10.814.049h.01c.053 0 .105.005.157.014.376.055.706.333 1.023.752l.91 1.664.003.003c.243.533.754 1.064 1.189 1.637.434.598.77 1.131.729 1.57v.006c-.057.744-.48 1.148-1.125 1.294-.645.135-1.52.002-2.395-.464-.968-.536-2.118-.469-2.857-.602-.369-.066-.61-.2-.723-.4-.11-.2-.113-.602.123-1.23v-.004l.002-.003c.117-.334.03-.752-.027-1.118-.055-.401-.083-.71.043-.94.16-.334.396-.4.69-.533.294-.135.64-.202.915-.47h.002v-.002c.256-.268.445-.601.668-.838.19-.201.38-.336.663-.336zm7.159-9.074c-.435.201-.945.535-1.488.535-.542 0-.97-.267-1.28-.466-.154-.134-.28-.268-.373-.335-.164-.134-.144-.333-.074-.333.109.016.129.134.199.2.096.066.215.2.36.333.292.2.68.467 1.167.467.485 0 1.053-.267 1.398-.466.195-.135.445-.334.648-.467.156-.136.149-.267.279-.267.128.016.034.134-.147.332a8.097 8.097 0 01-.69.468zm-1.082-1.583V5.64c-.006-.02.013-.042.029-.05.074-.043.18-.027.26.004.063 0 .16.067.15.135-.006.049-.085.066-.135.066-.055 0-.092-.043-.141-.068-.052-.018-.146-.008-.163-.065zm-.551 0c-.02.058-.113.049-.166.066-.047.025-.086.068-.14.068-.05 0-.13-.02-.136-.068-.01-.066.088-.133.15-.133.08-.031.184-.047.259-.005.019.009.036.03.03.05v.02h.003z"/></svg>
+        <h3>Linux</h3>
+        <p data-i18n="dl.linux">.deb für Debian &amp; Ubuntu, .rpm für Fedora &amp; openSUSE, das AUR für Arch, AppImage für SteamOS &amp; den Rest.</p>
+        <div class="fmt">
+          <a data-asset="linux-deb" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="linux-deb">.deb</a>
+          <a data-asset="linux-rpm" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="linux-rpm">.rpm</a>
+          <a data-asset="linux-appimage" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-asset="linux-appimage">.AppImage</a>
+        </div>
+        <p class="dl-guide"><a href="/de/guides/linux.html" data-i18n="dl.linux.guide" data-umami-event="guide" data-umami-event-loc="dl-linux">Installationsanleitung Schritt für Schritt →</a></p>
+        <!-- A downloaded package never updates itself. The signed apt/dnf
+             repositories do, and put the app in the software centre. One recipe
+             covers all of them — install.sh detects apt, dnf, zypper and yum,
+             and falls back to the AppImage on SteamOS and the immutable ones.
+             Arch is the only genuinely different command: no repository there,
+             the AUR is the native path. -->
+        <div class="cmds">
+          <p class="cmd-lbl" data-i18n="dl.linux.repo">Debian · Ubuntu · Fedora · openSUSE</p>
+          <button class="cmd" type="button" data-copy="curl -fsSL https://moonlightweb.top/install.sh | bash" data-umami-event="copy-command" data-umami-event-cmd="linux-curl"><span>curl -fsSL https://moonlightweb.top/install.sh | bash</span><svg class="ico-copy" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg><svg class="ico-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg></button>
+          <p class="cmd-lbl" data-i18n="dl.linux.aur">Arch · Manjaro (AUR)</p>
+          <button class="cmd" type="button" data-copy="paru -S moonlightweb-bin" data-umami-event="copy-command" data-umami-event-cmd="linux-aur"><span>paru -S moonlightweb-bin</span><svg class="ico-copy" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg><svg class="ico-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg></button>
+          <p class="cmd-lbl" data-i18n="dl.linux.docker">Docker</p>
+          <button class="cmd" type="button" data-copy="docker pull ghcr.io/linckosz/moonlight-web" data-umami-event="copy-command" data-umami-event-cmd="linux-docker"><span>docker pull ghcr.io/linckosz/moonlight-web</span><svg class="ico-copy" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg><svg class="ico-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg></button>
+          <!-- The repository has to be registered before `apt install moonlightweb`
+               works, and that recipe is four lines — too much for a one-line .cmd
+               button, so it stays in the guide. -->
+          <p class="cmd-note"><a href="/de/guides/linux.html#one-line-install" data-i18n="dl.linux.manual" data-umami-event="guide" data-umami-event-loc="dl-linux">Lieber apt/dnf von Hand? →</a></p>
+        </div>
+      </div>
+    </div>
+    <p class="muted reveal" style="text-align:center; font-size:.88rem; margin-top:1.6rem" data-i18n-html="dl.foot">Du spielst auf <a href="/de/play/iphone-ipad.html">Smartphone oder Tablet</a>, <a href="/de/play/chromebook.html">Chromebook</a> oder <a href="/de/play/tv.html">TV</a>? Nichts herunterzuladen — der Client ist dein Browser. <a href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-loc="all-releases">Alle Releases →</a></p>
+  </div>
+</section>
+
+<!-- ═════ CTA ═════ -->
+<section style="padding-top:20px" aria-label="Call to action">
+  <div class="wrap">
+    <div class="band cyb reveal">
+      <span class="kicker" data-i18n="cta.kicker">Kostenlos &amp; Open Source</span>
+      <h2 data-i18n="cta.h2">Drück Play in deiner eigenen Cloud.</h2>
+      <p data-i18n="cta.p">GPL‑3.0, selbst gehostet, keine Konten, keine Abos. Entwickelt von einem langjährigen Mitwirkenden im Moonlight‑Ökosystem. Ein freiwilliges Trinkgeld — der Preis eines Kaffees — hilft, die gemeinsame DNS‑Domain online zu halten. ☕</p>
+      <div class="cta">
+        <a class="btn btn-primary" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-i18n="cta.btn1" data-umami-event="github" data-umami-event-loc="cta">⭐ Star auf GitHub</a>
+        <a class="btn btn-yellow" href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="cta"><span data-bmc-full-logo></span><span class="sr-only" data-i18n="cta.btn2">Spendier mir einen Kaffee</span></a>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/de/">Start</a> · <a href="/de/guides/">Anleitungen</a> · <a href="/de/faq.html">FAQ</a> · <a href="/de/contact.html">Kontakt</a> · <a href="/de/server-access/">Verbinden</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>Kaffee</span></a></span><span class="foot-play">Spielen auf: <a href="/de/play/chromebook.html">Chromebook</a> · <a href="/de/play/iphone-ipad.html">iPhone und iPad</a> · <a href="/de/play/tv.html">TV</a> · <a href="/de/sunshine-web-client.html">Web-Client für Sunshine</a> · <a href="/de/browser-game-streaming.html">Warum ein Browser-Client</a></span></div></footer>
+</div><!-- /#scroll -->
+
+<div id="lb"><img alt=""></div>
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+<script>
+  // Lightbox for screenshots.
+  const lb = document.getElementById('lb'), lbImg = lb.querySelector('img');
+  document.querySelectorAll('.media img.shot, .phone img, .hero-shot img').forEach(img=>{
+    img.style.cursor = 'zoom-in';
+    img.addEventListener('click',()=>{ lbImg.src = img.src; lbImg.alt = img.alt; lb.classList.add('on'); document.body.classList.add('lb-open'); });
+  });
+  const closeLb = () => { lb.classList.remove('on'); document.body.classList.remove('lb-open'); };
+  lb.addEventListener('click', closeLb);
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeLb(); });
+
+  // Before/after comparator — the range input drives the clip position.
+  const ba = document.getElementById('ba');
+  if (ba){
+    const after = ba.querySelector('.after'), bar = ba.querySelector('.bar'),
+          knob = ba.querySelector('.knob'), range = ba.querySelector('input');
+    const setPos = p => {
+      after.style.clipPath = `inset(0 0 0 ${p}%)`;
+      bar.style.left = knob.style.left = p + '%';
+    };
+    range.addEventListener('input', ()=> setPos(range.value));
+    setPos(50);
+  }
+
+  // Download section — resolve the latest GitHub release asset for this platform.
+  // Button + meta text follow the page language (<html lang>). Any failure
+  // (offline, rate-limit, no release yet) keeps the /releases fallback links.
+  (async () => {
+    const REPO = 'linckosz/moonlight-web';
+    const btn = document.getElementById('dl-btn'), meta = document.getElementById('dl-meta'),
+          hint = document.getElementById('dl-hint');
+    const ua = navigator.userAgent;
+    let os = null;
+    if (/Android|iPhone|iPad|iPod/i.test(ua) || navigator.maxTouchPoints > 2 && /Mac/.test(ua)) os = 'mobile';
+    else if (/Windows/i.test(ua)) os = 'win';
+    else if (/Mac/i.test(ua)) os = 'mac';
+    else if (/Linux|X11/i.test(ua)) os = 'linux';
+    // Linux package family. The UA rarely names the distro (Firefox does on
+    // Ubuntu/Fedora, Chrome never), so the fallback is .deb: it covers the
+    // Debian family — by far the biggest desktop share — and it installs by
+    // double-click. The AppImage is NOT a safe default: it needs chmod +x
+    // (without it GNOME just offers to "search for software") and FUSE 2,
+    // which Ubuntu >= 22.04 no longer ships.
+    const pkg = /Fedora|Red Hat|CentOS|Rocky|Alma|SUSE|Nobara/i.test(ua) ? 'rpm'
+              : /Arch|Manjaro|EndeavourOS|SteamOS|Bazzite/i.test(ua) ? 'appimage'
+              : 'deb';
+    let arch = 'x64';
+    try {
+      const hints = await navigator.userAgentData?.getHighEntropyValues?.(['architecture']);
+      if (/arm/i.test(hints?.architecture || '')) arch = 'arm64';
+    } catch {}
+
+    // Localised copy for the dynamic button + meta line.
+    const T = {
+      en: {
+        base: '⬇ Download MoonlightWeb',
+        os: {win:'⬇ Download for Windows', mac:'⬇ Download for macOS', linux:'⬇ Download for Linux'},
+        latest: 'Latest release on GitHub',
+        mobile: 'On this device, just open the URL of your server — the download goes on the gaming PC.',
+        all: t => `${t} — all downloads on GitHub`,
+        hint: {
+          deb: 'Debian · Ubuntu · Mint · Pop!_OS — other distros: .rpm or .AppImage below',
+          rpm: 'Fedora · RHEL · openSUSE — other distros: .deb or .AppImage below',
+          appimage: 'Portable — run chmod +x first. Debian/Ubuntu: prefer the .deb below',
+        },
+      },
+      fr: {
+        base: '⬇ Télécharger MoonlightWeb',
+        os: {win:'⬇ Télécharger pour Windows', mac:'⬇ Télécharger pour macOS', linux:'⬇ Télécharger pour Linux'},
+        latest: 'Dernière version sur GitHub',
+        mobile: 'Sur cet appareil, ouvrez simplement l’URL de votre serveur — le téléchargement se fait sur le PC gamer.',
+        all: t => `${t} — tous les téléchargements sur GitHub`,
+        hint: {
+          deb: 'Debian · Ubuntu · Mint · Pop!_OS — autres distros : .rpm ou .AppImage ci‑dessous',
+          rpm: 'Fedora · RHEL · openSUSE — autres distros : .deb ou .AppImage ci‑dessous',
+          appimage: 'Portable — faites d’abord chmod +x. Debian/Ubuntu : préférez le .deb ci‑dessous',
+        },
+      },
+      de: {
+        base: '⬇ MoonlightWeb herunterladen',
+        os: {win:'⬇ Für Windows herunterladen', mac:'⬇ Für macOS herunterladen', linux:'⬇ Für Linux herunterladen'},
+        latest: 'Neueste Version auf GitHub',
+        mobile: 'Auf diesem Gerät öffnest du einfach die URL deines Servers — der Download gehört auf den Gaming-PC.',
+        all: t => `${t} — alle Downloads auf GitHub`,
+        hint: {
+          deb: 'Debian · Ubuntu · Mint · Pop!_OS — andere Distros: .rpm oder .AppImage unten',
+          rpm: 'Fedora · RHEL · openSUSE — andere Distros: .deb oder .AppImage unten',
+          appimage: 'Portabel — zuerst chmod +x ausführen. Debian/Ubuntu: lieber die .deb unten',
+        },
+      },
+      zh: {
+        base: '⬇ 下载 MoonlightWeb',
+        os: {win:'⬇ 下载 Windows 版', mac:'⬇ 下载 macOS 版', linux:'⬇ 下载 Linux 版'},
+        latest: 'GitHub 上的最新版本',
+        mobile: '在本设备上，只需打开你服务器的 URL——下载在游戏 PC 上进行。',
+        all: t => `${t} — 全部下载见 GitHub`,
+        hint: {
+          deb: 'Debian · Ubuntu · Mint · Pop!_OS — 其他发行版：下方的 .rpm 或 .AppImage',
+          rpm: 'Fedora · RHEL · openSUSE — 其他发行版：下方的 .deb 或 .AppImage',
+          appimage: '便携版——请先执行 chmod +x。Debian/Ubuntu：建议用下方的 .deb',
+        },
+      },
+    };
+    let best = null, rel = null;                       // filled once the fetch resolves
+    const render = () => {
+      const L = T[document.documentElement.lang] || T.en;
+      btn.textContent = (os && L.os[os]) || L.base;
+      if (best && rel) meta.textContent = `${rel.tag_name} · ${best.name} · ${(best.size / 1048576).toFixed(0)} MB`;
+      else if (os === 'mobile') meta.textContent = L.mobile;
+      else if (rel) meta.textContent = L.all(rel.tag_name);
+      else meta.textContent = L.latest;
+      hint.textContent = os === 'linux' ? L.hint[pkg] : '';
+      hint.hidden = !hint.textContent;                 // no empty flex row elsewhere
+    };
+    render();
+
+    try {
+      const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`);
+      if (!r.ok) throw new Error(r.status);
+      rel = await r.json();
+      const find = re => (rel.assets || []).find(a => re.test(a.name));
+      // Asset names produced by .github/workflows/release.yml (version-stamped,
+      // matched here by their platform/arch/extension suffix):
+      //   MoonlightWeb-installer-<ver>-win-{x64,arm64}.exe
+      //   moonlightweb-<ver>-linux-x64.{deb,rpm}, moonlightweb-<ver>-x86_64.AppImage
+      //   moonlightweb-<ver>-macos-arm64.pkg
+      const assets = {
+        'win-x64': find(/win-x64\.exe$/i),
+        'win-arm64': find(/win-arm64\.exe$/i),
+        'mac': find(/\.pkg$/i),
+        'linux-deb': find(/\.deb$/i),
+        'linux-rpm': find(/\.rpm$/i),
+        'linux-appimage': find(/\.appimage$/i),
+      };
+      document.querySelectorAll('[data-asset]').forEach(a => {
+        const m = assets[a.dataset.asset];
+        if (m) a.href = m.browser_download_url;
+      });
+      best = {
+        win: assets[`win-${arch}`] || assets['win-x64'],
+        mac: assets.mac,
+        linux: assets[`linux-${pkg}`] || assets['linux-deb'],
+      }[os] || null;
+      if (best) btn.href = best.browser_download_url;
+    } catch { /* keep the /releases fallback */ }
+    render();
+  })();
+
+  // Click-to-copy on the install commands. The button holds an icon, so the
+  // command is read from data-copy rather than the DOM — and stays exact even
+  // though the visible line scrolls inside the card.
+  (() => {
+    const L10N = {
+      en: {copy:'Copy this command', ok:'Copied'},
+      fr: {copy:'Copier cette commande', ok:'Copié'},
+      de: {copy:'Diesen Befehl kopieren', ok:'Kopiert'},
+      zh: {copy:'复制此命令', ok:'已复制'},
+    };
+    const btns = document.querySelectorAll('.cmd[data-copy]');
+    const label = () => {
+      const L = L10N[document.documentElement.lang] || L10N.en;
+      btns.forEach(b => b.setAttribute('aria-label',
+        `${b.classList.contains('ok') ? L.ok : L.copy}: ${b.dataset.copy}`));
+    };
+    label();
+    btns.forEach(b => b.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(b.dataset.copy);
+      } catch {
+        // The clipboard API needs a secure context and a permission that can be
+        // refused; selecting the text leaves the user one Ctrl-C away.
+        const r = document.createRange(); r.selectNodeContents(b.querySelector('span'));
+        const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+        return;
+      }
+      b.classList.add('ok'); label();
+      clearTimeout(b._ok);
+      b._ok = setTimeout(() => { b.classList.remove('ok'); label(); }, 1600);
+    }));
+  })();
+
+  // Scroll reveal (skipped if reduced motion).
+  if (!matchMedia('(prefers-reduced-motion: reduce)').matches && 'IntersectionObserver' in window){
+    const io = new IntersectionObserver(entries=>{
+      entries.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); } });
+    },{threshold:.12, rootMargin:'0px 0px -40px'});
+    document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+  } else {
+    document.querySelectorAll('.reveal').forEach(el=>el.classList.add('in'));
+  }
+</script>
+</body>
+</html>

@@ -19,6 +19,8 @@
  * MoonlightWeb — REST API client
  */
 
+import { t } from '../i18n/i18n.js';
+
 /**
  * Ride out a gap instead of asking the host for a keyframe. **The A/B switch.**
  *
@@ -46,6 +48,12 @@
  * A Sunshine, Apollo or Wolf host is completely unaffected: nothing here can
  * change how a remote host's encoder recovers.
  *
+ * Never asked for on an Apple platform: VideoToolbox fails on the very delta
+ * the bargain sends it (see decoderRidesOutGaps). The host then encodes without
+ * a wave and recovers the classic way — deltas dropped while the link is stuck,
+ * a keyframe once it drains — which costs that platform one keyframe per stall
+ * instead of a decoder error, a new decoder and the same keyframe.
+ *
  * ── Why it is a switch and not just a default ───────────────────────────────
  *
  * Because which one looks better is a judgement, not a fact. Frozen-then-clean
@@ -68,8 +76,16 @@ const RIDE_OUT_LOSS = true;
  */
 
 import { loadOrCreateIdentity, rememberHostIdentity } from '../util/pairingCrypto.js';
-import { resolveTearing } from '../util/BrowserDetect.js';
+import {
+    CANVAS_TEARING_IS_REAL,
+    decoderRidesOutGaps,
+    decoderTakesReferenceRepairs,
+    mwsrMapWanted,
+    resolveTearing,
+} from '../util/BrowserDetect.js';
 import { currentRefreshMilliHz } from '../util/RefreshRate.js';
+import { canCropFrames } from '../stream/FrameCrop.js';
+import { STREAM_STATE_TIMEOUT_MS } from '../stream/CrashRelaunch.js';
 
 export class BackendClient {
     /** Cached promise for the per-run admin key (see _adminKey). */
@@ -174,10 +190,26 @@ export class BackendClient {
         throw error;
     }
 
+    /**
+     * The body of an answer that said OK. Not JSON means something other than
+     * our API answered — a page from a proxy, a server restarting or mid-update,
+     * the app shell itself — and the browser's own parse error ("Unexpected
+     * token '<'") tells the user nothing, so say it in their words.
+     */
+    static async _json(resp) {
+        try {
+            return await resp.json();
+        } catch (_) {
+            const e = /** @type {BackendError} */ (new Error(t('appError.serverUnreadable')));
+            e.statusCode = resp.status;
+            throw e;
+        }
+    }
+
     static async get(path) {
         const resp = await fetch(path);
         if (!resp.ok) return this._handleError(resp, path);
-        return resp.json();
+        return this._json(resp);
     }
 
     static async post(path, body = {}, { timeoutMs = 0, _retried = false } = {}) {
@@ -210,7 +242,7 @@ export class BackendClient {
                     return this.post(path, body, { timeoutMs, _retried: true });
             }
             if (!resp.ok) return this._handleError(resp, path);
-            return resp.json();
+            return this._json(resp);
         } catch (err) {
             if (err && err.name === 'AbortError') {
                 const e = /** @type {BackendError} */ (new Error('server_timeout'));
@@ -232,7 +264,7 @@ export class BackendClient {
 
         const resp = await fetch(path, { method: 'DELETE', headers });
         if (!resp.ok) return this._handleError(resp, path);
-        return resp.json();
+        return this._json(resp);
     }
 
     static async getHosts() {
@@ -259,6 +291,11 @@ export class BackendClient {
      *  list said `restartSupported`; anywhere else the server answers 501. */
     static async restartHost(uuid) {
         return this.post(`/api/hosts/${uuid}/restart`, {}, { timeoutMs: 30000 });
+    }
+    /** The GPU that draws the native host's virtual display from its next
+     *  start, by name; '' gives the choice back to the driver. Admin only. */
+    static async setVirtualDisplayGpu(uuid, gpu) {
+        return this.post(`/api/hosts/${encodeURIComponent(uuid)}/virtual-display-gpu`, { gpu });
     }
     static async startPairing(hostId) {
         return this.post(`/api/hosts/${hostId}/pair/start`);
@@ -358,13 +395,28 @@ export class BackendClient {
             {
                 appId,
                 client_uniqueid: this.clientUniqueId(),
-                ride_out_loss: RIDE_OUT_LOSS,
+                ride_out_loss: RIDE_OUT_LOSS && decoderRidesOutGaps(),
+                // False only on a device whose decoder fell silent under the
+                // encoder's reference repairs (decoderTakesReferenceRepairs).
+                ref_invalidation: decoderTakesReferenceRepairs(),
+                // The view cuts a decoded frame to the size the host announces
+                // (stream/FrameCrop.js): the native host may then pad an AV1
+                // frame past the picture instead of shrinking the picture.
+                crops_to_frame: canCropFrames(),
                 // This screen's measured refresh and whether frames wait for
                 // its vsync (tearing off). The native host runs a vsync client
                 // at a divisor of its refresh so frames land on its grid — see
                 // util/RefreshRate.js. Other hosts ignore both.
                 client_refresh_mhz: currentRefreshMilliHz(),
                 client_vsync: !resolveTearing(streamingSettings),
+                // And whether that tearing is real (Chromium on Windows): the
+                // native host then sends every picture for a moment after a
+                // press. Other hosts ignore it.
+                client_tearing_real: CANVAS_TEARING_IS_REAL,
+                // MWSR's sharpness by zone: the native host's frames then
+                // carry their grid (stream/MwsrZoneBlock.js). A lab key for
+                // now (mwsrMapWanted); other hosts ignore it.
+                mwsr_map: mwsrMapWanted(),
                 ...streamingSettings,
             },
             // Fail fast if the backend hangs/crashes instead of waiting for the
@@ -378,6 +430,43 @@ export class BackendClient {
             // backend kept going, and the next attempt hit the very same wall.
             { timeoutMs: 25000 },
         );
+    }
+    /**
+     * How the stream this page knows as @p streamId ended, asked once its
+     * link went (stream/CrashRelaunch.js): "crashed", "live", "ended",
+     * "stopped" — and "unknown" for anything else, a late answer included,
+     * which ends the stream as it always has.
+     * @returns {Promise<string>}
+     */
+    static async streamState(hostId, streamId) {
+        return this._streamState(
+            `/api/hosts/${hostId}/stream-state?stream=${encodeURIComponent(streamId)}`,
+        );
+    }
+    /** The same, for a guest: their invitation's cookie names the slot. */
+    static async playerStreamState(streamId) {
+        return this._streamState(
+            `/api/share/player/stream-state?stream=${encodeURIComponent(streamId)}`,
+        );
+    }
+    static async _streamState(path) {
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = controller
+            ? setTimeout(() => controller.abort(), STREAM_STATE_TIMEOUT_MS)
+            : 0;
+        try {
+            const resp = await fetch(path, {
+                cache: 'no-store',
+                signal: controller ? controller.signal : undefined,
+            });
+            if (!resp.ok) return 'unknown';
+            const body = await resp.json();
+            return typeof body.state === 'string' ? body.state : 'unknown';
+        } catch (_) {
+            return 'unknown';
+        } finally {
+            clearTimeout(timer);
+        }
     }
     static async quitApp(hostId, extra = {}) {
         // Fail fast if the backend is dead — don't wait 30s for a /quit that'll
@@ -396,16 +485,79 @@ export class BackendClient {
      * quitApp above needs a live view to name its slot and uniqueid; this is
      * the way out when there is none left.
      */
+    /**
+     * Which app the host runs right now (`currentGameId`, 0 = none), asked of
+     * the host rather than read from the last poll. Asked before a launch on a
+     * host whose app outlives the stream: another app running is the viewer's
+     * call, and it has to be made before /start takes the host over.
+     */
+    static async getRunningApp(hostId) {
+        // Bounded: the answer only refines a launch, it must never hold one up
+        // for the browser's own timeout. Aborted → the caller launches anyway
+        // and the server still refuses to join the wrong app.
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), 6000) : null;
+        try {
+            // This device's own, where each device has a seat (MultiSeat).
+            const device = encodeURIComponent(this.clientUniqueId());
+            const resp = await fetch(`/api/hosts/${hostId}/running-app?client_uniqueid=${device}`, {
+                signal: controller ? controller.signal : undefined,
+            });
+            if (!resp.ok) return this._handleError(resp, 'running-app');
+            return this._json(resp);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
     static async stopHostSession(hostId) {
-        return this.post(`/api/hosts/${hostId}/stop-session`, {}, { timeoutMs: 15000 });
+        // The device: where each device has its own seat (MultiSeat), Quit is
+        // this device's seat's. Ignored by every other host. 40 s: the host
+        // answers once the app is gone, after its own exit timeout.
+        return this.post(
+            `/api/hosts/${hostId}/stop-session`,
+            { client_uniqueid: this.clientUniqueId() },
+            { timeoutMs: 40000 },
+        );
     }
 
     // ── Session sharing ────────────────────────────────────────────────────
     // Owner side: the rows of the sharing board. Any authenticated user may
     // share; no admin key involved.
 
-    static async getShareStatus() {
-        return this.get('/api/share/status');
+    /**
+     * The rows of the sharing board, and the guests' picture height for the
+     * host it was opened on (`feed_height`, with `owner_height` when that host
+     * is one whose guests get the owner's height, `shared_feed` when they share
+     * one stream of it). Without a host, the one being streamed.
+     * @param {string} [hostUuid]
+     */
+    static async getShareStatus(hostUuid) {
+        return this.get(
+            hostUuid
+                ? `/api/share/status?host=${encodeURIComponent(hostUuid)}`
+                : '/api/share/status',
+        );
+    }
+    /**
+     * The guests' picture height — 720, 1080 or 1440 — for every guest at once.
+     * A shared stream already running is resized; its guests follow.
+     * @param {number} height
+     */
+    static async shareFeedHeight(height) {
+        return this.post('/api/share/feed', { height });
+    }
+    /**
+     * The address a host's guest links carry: `auto`, `lan`, `tailscale` or
+     * `iface:<adapter>`, kept per host. Live shares keep their token and PIN.
+     * @param {string} hostUuid
+     * @param {string} linkAddress
+     */
+    static async shareLinkAddress(hostUuid, linkAddress) {
+        return this.post('/api/share/link-address', {
+            host_uuid: hostUuid,
+            link_address: linkAddress,
+        });
     }
     /**
      * Open a player row: mint a fresh link + PIN, revoking the previous pair.
@@ -456,13 +608,40 @@ export class BackendClient {
         return this.post('/api/share/player/pin', { token, pin });
     }
     /** @param {string} [aspect] "W:H" override; omitted, the backend reuses the
-     *  ratio the owner's session settled on for that host. */
-    static async playerJoin(token, height, aspect) {
+     *  ratio the owner's session settled on for that host.
+     *  @param {number} [transportIndex] rung of the transport chain to try; a
+     *  later rung replaces the guest's own failed one.
+     *  @param {string} [codec] 'h264' after this browser failed to decode the
+     *  codec the backend picked; omitted, the backend picks.
+     *  @param {boolean} [udpBlocked] this browser's STUN probe got no answer:
+     *  the backend skips the UDP rungs for an internet guest. */
+    static async playerJoin(
+        token,
+        height,
+        aspect,
+        transportIndex = 0,
+        codec,
+        udpBlocked,
+        reconnectOf,
+    ) {
         const body = aspect ? { token, height, aspect } : { token, height };
+        if (transportIndex > 0) body.transport_index = transportIndex;
+        if (codec) body.codec = codec;
+        if (udpBlocked) body.udp_blocked = true;
+        // Back after the worker of that stream crashed (stream/CrashRelaunch.js).
+        if (reconnectOf) body.reconnect_of = reconnectOf;
+        // As launchApp's: a guest's browser decodes through a gap too, and a
+        // native host then gives their stream the owner's refresh wave.
+        body.ride_out_loss = RIDE_OUT_LOSS && decoderRidesOutGaps();
         return this.post('/api/share/player/join', body, { timeoutMs: 25000 });
     }
     static async playerLeave() {
         return this.post('/api/share/player/leave', {}, { timeoutMs: 5000 });
+    }
+    /** Who watches the host this guest's invitation leads to: {self, owner,
+     *  players: [{slot, name}]} (issue #47). */
+    static async playerPresence() {
+        return this.get('/api/share/player/presence');
     }
 
     // Open macOS' Screen Recording privacy pane on the host so the user can
@@ -569,6 +748,10 @@ export class BackendClient {
         // The one place that can say so. Everything else the application does is
         // downstream of this answer.
         if (status.authenticated || status.is_localhost) this._hadSession = true;
+        // Booth mode (--noadmin): the views read it here rather than each asking.
+        this.adminLocked = status.admin_locked === true;
+        // share_in_booth_mode (issue #40): the booth still offers Share.
+        this.boothShare = this.adminLocked && status.booth_share === true;
         return status;
     }
     /** End this browser's own session and clear its cookie. Works from anywhere
@@ -590,8 +773,9 @@ export class BackendClient {
      * The shortcut runs in a storage apart from the browser it was added from, so
      * it arrives with no cookie and no pairing key. The key stands in for the PIN
      * that browser already gave, and — like a PIN login — this is where the
-     * shortcut's own MW-BIND-v1 key is registered. The answer carries the
-     * machines that browser knew, for the header's menu.
+     * shortcut's own MW-BIND-v1 key is registered. The answer may carry a list
+     * of machines kept by a version before v0.4.1, for the header's menu; that
+     * list is no longer sent.
      */
     static async redeemHomeScreenKey(key, machineName) {
         const identity = await loadOrCreateIdentity();
@@ -606,76 +790,16 @@ export class BackendClient {
         this._hadSession = true;
         return resp;
     }
-    /** Hand the host the machines this browser knows, kept beside this session
-     *  for a home-screen shortcut made from it. */
-    static async shareInstancesForHomeScreen(instances) {
-        return this.post('/api/auth/home-screen/instances', { instances });
-    }
 
-    /**
-     * One POST on a connection to ANOTHER machine (tunnelBridge.openSideTunnel),
-     * answered like post(): the JSON body, or an error carrying the status.
-     * Not through fetch(): the service worker would send it to this page's
-     * own machine.
-     */
-    static async _postAt(fetchAt, path, body) {
-        const resp = await fetchAt(path, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        let data = null;
-        try {
-            data = await resp.json();
-        } catch {
-            /* no body, or not JSON */
-        }
-        if (!resp.ok) {
-            const err = new Error(data?.error || `HTTP ${resp.status}`);
-            err.statusCode = resp.status;
-            throw err;
-        }
-        return data;
-    }
-
-    /**
-     * The key a home-screen shortcut would open the machine at the far end of
-     * @p fetchAt with, given the machines this browser knows for its menu.
-     * Refused when this browser has no remembered session there.
-     */
-    static async askHomeScreenKeyAt(fetchAt, instances) {
-        await this._postAt(fetchAt, '/api/auth/home-screen/instances', { instances });
-        const resp = await this._postAt(fetchAt, '/api/auth/home-screen/key', {});
-        const key = resp?.key;
-        if (typeof key !== 'string' || !key) throw new Error('no key in the answer');
-        return key;
-    }
-
-    /**
-     * redeemHomeScreenKey() for a machine other than this page's own, over a
-     * connection to it: the pairing identity registered is the one this
-     * browser will present to THAT machine, and its host identity is kept
-     * under that machine's name.
-     */
-    static async redeemHomeScreenKeyAt(fetchAt, hostId, key, machineName) {
-        const identity = await loadOrCreateIdentity({ forHost: hostId });
-        const resp = await this._postAt(fetchAt, '/api/auth/home-screen', {
-            key,
-            machine_name: machineName,
-            public_key: identity?.publicKeyBase64 || undefined,
-        });
-        if (resp?.host_public_key) {
-            await rememberHostIdentity(resp.host_public_key, resp.host_id, { forHost: hostId });
-        }
-        return resp;
-    }
-    /** Spend the remote admin password to give this (already authenticated,
-     *  LAN) session the same admin access the host machine has. */
+    /** Spend the remote admin password to give this (already authenticated)
+     *  session the same admin access the host machine has — from the LAN, or
+     *  from the internet through the rendezvous when the owner allowed it. */
     static async adminUnlock(password) {
         return this.post('/api/auth/admin-unlock', { password });
     }
     /** Change the remote admin password and/or turn remote administration on
-     *  and off. Body may carry either or both of {password, enabled}. */
+     *  and off, from the LAN and from the internet. Body may carry any of
+     *  {password, enabled, internet}. */
     static async saveRemoteAdmin(body) {
         return this.post('/api/admin/password', body);
     }
@@ -785,6 +909,41 @@ export class BackendClient {
         return this.post('/api/admin/settings', settings);
     }
 
+    // ── Logs archive (Admin → Advanced) ─────────────────────────────────────────
+
+    /** Start building the .zip; answers with its progress. 409 while one runs. */
+    static async startLogArchive() {
+        return this.post('/api/logs/archive');
+    }
+    static async getLogArchiveStatus() {
+        return this.get('/api/logs/archive');
+    }
+    /**
+     * The finished .zip, read as it arrives so the page can show how far it is.
+     * @param {(received: number, total: number) => void} onProgress
+     * @returns {Promise<Blob>}
+     */
+    static async downloadLogArchive(onProgress) {
+        const path = '/api/logs/archive/download';
+        const resp = await fetch(path, { cache: 'no-store' });
+        if (!resp.ok) return this._handleError(resp, path);
+        const total = Number(resp.headers.get('Content-Length')) || 0;
+        // No length (a proxy that re-chunks it) or no stream: all at once.
+        if (!total || !resp.body) return resp.blob();
+        const reader = resp.body.getReader();
+        /** @type {Uint8Array[]} */
+        const parts = [];
+        let received = 0;
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            parts.push(value);
+            received += value.length;
+            onProgress(received, total);
+        }
+        return new Blob(parts, { type: 'application/zip' });
+    }
+
     // ── Streaming Settings ───────────────────────────────────────────────────────
 
     static async getStreamingSettings() {
@@ -792,6 +951,33 @@ export class BackendClient {
     }
     static async saveStreamingSettings(settings) {
         return this.post('/api/settings/streaming', settings);
+    }
+
+    // ── The native host's apps (host administrator only) ─────────────────────
+    // Each answer is the whole section's state: {supported, max, screen, apps,
+    // detected}.
+
+    static async getHostApps() {
+        return this.get('/api/host-apps');
+    }
+    /** @param {{id?: string, name: string, command: string}[]} apps the whole list */
+    static async saveHostApps(apps) {
+        return this.post('/api/host-apps', { apps });
+    }
+    /** @param {string} source a launcher found on this PC whose card was removed */
+    static async restoreHostApp(source) {
+        return this.post('/api/host-apps/restore', { source });
+    }
+    /**
+     * @param {string} id
+     * @param {string} png the image, a PNG in base64
+     */
+    static async setHostAppImage(id, png) {
+        return this.post(`/api/host-apps/${encodeURIComponent(id)}/image`, { png });
+    }
+    /** @param {string} id */
+    static async removeHostAppImage(id) {
+        return this.del(`/api/host-apps/${encodeURIComponent(id)}/image`);
     }
 
     // ── First-run setup wizard (localhost only) ──────────────────────────────

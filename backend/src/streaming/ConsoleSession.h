@@ -28,7 +28,8 @@
 /**
  * The interactive desktop, seen from a process that may not be on it.
  *
- * MoonlightWeb's standard installation is a Windows service (NSSM, session 0).
+ * MoonlightWeb's server runs as a logon task in the user's session now; an
+ * installation that had the Windows service (NSSM, session 0) keeps it.
  * Session 0 has no desktop anybody looks at: DXGI Desktop Duplication has
  * nothing to duplicate there, SendInput reaches no window, and the native
  * engine's own probe says so in one line ("no interactive desktop session").
@@ -118,6 +119,13 @@ QString elevatedWorkerTaskName();
 /// the user's ordinary level.
 bool elevatedWorkerAvailable();
 
+/// Starts @p program on the console desktop as the user logged on there, with
+/// their ordinary (filtered) token and their environment, and lets it go: the
+/// way a session-0 service opens something the user would have opened
+/// themselves (HostAppLauncher). Needs SeTcbPrivilege, as every launch from
+/// the service does. Windows only.
+bool startAsConsoleUser(const QString& program, const QStringList& args, QString* error);
+
 /// Full image path of the process @p pid, or empty when Windows will not say.
 /// PROCESS_QUERY_LIMITED_INFORMATION is granted across integrity levels, so
 /// this reads an elevated — or SYSTEM — process of ours too.
@@ -135,6 +143,11 @@ bool isThisExecutable(const QString& image);
 /// Win32 both — so the worker reads and writes them exactly as it would the
 /// pipes of a QProcess parent. Must run before anything touches std::cin.
 bool attachWorkerPipes(const QString& base, QString* error);
+
+/// The server process attachWorkerPipes() checked: this executable, the one
+/// the worker's recreated devices go back to between two streams
+/// (HidParkingTransfer). 0 in any other process, or before the pipes.
+quint32 workerServerPid();
 
 } // namespace ConsoleSession
 

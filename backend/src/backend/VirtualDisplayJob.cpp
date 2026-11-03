@@ -28,10 +28,23 @@
 #include <QFile>
 #include <QProcess>
 
+#ifdef Q_OS_WIN
+#include "common/DetachedProcess.h"
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 
 constexpr int kHelperTimeoutMs = 2 * 60 * 1000;
 constexpr int kPollIntervalMs = 250;
+/// How long a start waits for the elevated task's last run to end, and how
+/// often it looks (VirtualDisplayJob::runTask).
+constexpr int kTaskBusyMs = 10 * 1000;
+constexpr int kTaskBusyPollMs = 50;
 /// How long the OS may take to bring an in-process display online.
 constexpr int kOnlineTimeoutMs = 15 * 1000;
 /// The grace between the last stream's end and the display going off: long
@@ -53,6 +66,20 @@ const char* stateName(VirtualDisplayJob::State s)
     case VirtualDisplayJob::State::Failed: return "failed";
     }
     return "idle";
+}
+
+/// The last run's verdict taken away before the next run starts, so that a
+/// poll can only read the verdict of the run it waits for. False when the
+/// file stays (still open somewhere): no run may start then, or it would be
+/// answered by its predecessor.
+bool discardResult()
+{
+    const QString path = VirtualDisplay::resultPath();
+    if (QFile::remove(path) || !QFile::exists(path)) return true;
+    Logger::warning(QStringLiteral("[vdisplay] %1 cannot be removed — the next run's verdict "
+                                   "could not be told from the last one's")
+                        .arg(path));
+    return false;
 }
 
 /// The helper's verdict is its last stdout line; anything before it is noise.
@@ -87,9 +114,25 @@ VirtualDisplayJob::VirtualDisplayJob(QObject* parent)
         fail(QStringLiteral("The elevated helper did not answer in time"));
     });
     m_Release.setSingleShot(true);
-    m_Release.setInterval(kReleaseGraceMs);
     connect(&m_Release, &QTimer::timeout, this, [this]() {
+        // A take-over on the tile (another device) asks for the display —
+        // cancelling the grace — BEFORE the stream it replaces is torn down,
+        // and that teardown starts the grace again: without this, the display
+        // went off four seconds into the new stream.
+        if (m_InUse && m_InUse()) {
+            Logger::info(QStringLiteral("[vdisplay] still streamed — stays on"));
+            return;
+        }
         Logger::info(QStringLiteral("[vdisplay] no stream left on the virtual display"));
+        if (m_BeforeRelease && m_BeforeRelease()) {
+            // What was opened there is closing: off once it is gone, unless
+            // a stream came back in the meantime.
+            QTimer::singleShot(kCloseSettleMs, this, [this]() {
+                if (m_InUse && m_InUse()) return;
+                deactivate(nullptr);
+            });
+            return;
+        }
         deactivate(nullptr);
     });
 }
@@ -119,10 +162,17 @@ QJsonObject VirtualDisplayJob::statusJson() const
 
 // ── Entry points ────────────────────────────────────────────────────────────
 
-void VirtualDisplayJob::activate(int width, int height, int refresh, Callback cb)
+void VirtualDisplayJob::activate(int width, int height, int refreshMilliHz, bool hdr, Callback cb)
 {
     m_Release.stop();
+    // Linux: the stream's own portal session makes the display, at the
+    // client's size, when the worker starts. Nothing to do first.
+    if (VirtualDisplay::livesInStream()) {
+        if (cb) cb(true, QString());
+        return;
+    }
     VirtualDisplay::normaliseMode(width, height);
+    int refresh = refreshMilliHz;
     VirtualDisplay::normaliseRate(refresh);
     // Already on and seen by the engine: nothing to wait for. (A running
     // operation is asked first — its outcome is what the caller wants.)
@@ -144,12 +194,44 @@ void VirtualDisplayJob::activate(int width, int height, int refresh, Callback cb
         // vouch for: after a restart it knows none, and the operation runs
         // again.
         if (st.active && (width == 0 || (width == m_ActiveWidth && height == m_ActiveHeight)) &&
-            (refresh == 0 || refresh == m_ActiveRefresh)) {
+            (refresh == 0 || refresh == m_ActiveRefresh) && hdr == m_ActiveHdr) {
             if (cb) cb(true, QString());
             return;
         }
     }
-    enqueue(Action::Activate, width, height, refresh, std::move(cb));
+    enqueue(Action::Activate, width, height, refresh, hdr, std::move(cb));
+}
+
+void VirtualDisplayJob::activateIfOff(int width, int height, int refreshMilliHz, Callback cb)
+{
+    m_Release.stop();
+    if (VirtualDisplay::livesInStream()) {
+        if (cb) cb(true, QString());
+        return;
+    }
+    // On its way on, in whatever mode: that operation's outcome is the
+    // answer. (One on its way off is followed by this one.)
+    const bool lastIsActivate = m_Queue.isEmpty()
+                                    ? running() && m_Request.action == Action::Activate
+                                    : m_Queue.last().action == Action::Activate;
+    if (lastIsActivate) {
+        if (!cb) return;
+        if (m_Queue.isEmpty()) {
+            m_Callbacks.append(std::move(cb));
+            return;
+        }
+        Callback prev = m_Queue.last().cb;
+        m_Queue.last().cb = [prev, cb](bool ok, const QString& err) {
+            if (prev) prev(ok, err);
+            cb(ok, err);
+        };
+        return;
+    }
+    if (!running() && m_Queue.isEmpty() && VirtualDisplay::probe().active) {
+        if (cb) cb(true, QString());
+        return;
+    }
+    activate(width, height, refreshMilliHz, false, std::move(cb));
 }
 
 void VirtualDisplayJob::deactivate(Callback cb)
@@ -163,26 +245,40 @@ void VirtualDisplayJob::deactivate(Callback cb)
             return;
         }
     }
-    enqueue(Action::Deactivate, 0, 0, 0, std::move(cb));
+    enqueue(Action::Deactivate, 0, 0, 0, false, std::move(cb));
 }
 
-void VirtualDisplayJob::releaseSoon()
+void VirtualDisplayJob::releaseSoon(int graceMs)
 {
-    m_Release.start();
+    // Linux: it went with the stream's portal session — what was opened on
+    // it is closed now, with nothing left to turn off.
+    if (VirtualDisplay::livesInStream()) {
+        if (m_BeforeRelease && !(m_InUse && m_InUse())) m_BeforeRelease();
+        return;
+    }
+    const int ms = qMax(graceMs, kReleaseGraceMs);
+    if (m_Release.isActive() && m_Release.remainingTime() > ms) return;
+    m_Release.start(ms);
 }
 
-void VirtualDisplayJob::enqueue(Action action, int width, int height, int refresh, Callback cb)
+void VirtualDisplayJob::enqueue(Action action, int width, int height, int refreshMilliHz, bool hdr,
+                                Callback cb)
 {
     // The same verb AND the same mode as the running or last queued
     // operation: join it. A different mode is a different operation, and it
     // waits its turn rather than riding on one that will not deliver it.
-    if (running() && m_Request.action == action && m_Request.width == width &&
-        m_Request.height == height && m_Request.refresh == refresh && m_Queue.isEmpty()) {
+    // While a mode falls back, the caller's own one is what it is running.
+    const VirtualDisplay::Request& runningAsked =
+        m_AskedBeforeFallback ? *m_AskedBeforeFallback : m_Request;
+    if (running() && runningAsked.action == action && runningAsked.width == width &&
+        runningAsked.height == height && runningAsked.refreshMilliHz == refreshMilliHz &&
+        runningAsked.hdr == hdr && m_Queue.isEmpty()) {
         if (cb) m_Callbacks.append(std::move(cb));
         return;
     }
     if (!m_Queue.isEmpty() && m_Queue.last().action == action && m_Queue.last().width == width &&
-        m_Queue.last().height == height && m_Queue.last().refresh == refresh) {
+        m_Queue.last().height == height && m_Queue.last().refreshMilliHz == refreshMilliHz &&
+        m_Queue.last().hdr == hdr) {
         if (cb) {
             Callback prev = m_Queue.last().cb;
             m_Queue.last().cb = [prev, cb](bool ok, const QString& err) {
@@ -192,7 +288,7 @@ void VirtualDisplayJob::enqueue(Action action, int width, int height, int refres
         }
         return;
     }
-    m_Queue.append(Pending{action, width, height, refresh, std::move(cb)});
+    m_Queue.append(Pending{action, width, height, refreshMilliHz, hdr, std::move(cb)});
     if (!running()) startNext();
 }
 
@@ -204,7 +300,13 @@ void VirtualDisplayJob::startNext()
     m_Request.action = next.action;
     m_Request.width = next.width;
     m_Request.height = next.height;
-    m_Request.refresh = next.refresh;
+    m_Request.refreshMilliHz = next.refreshMilliHz;
+    m_Request.hdr = next.hdr;
+    m_Request.exclusive =
+        next.action == Action::Activate && AppSettings().virtualDisplayExclusive();
+    // The GPU the owner chose on the display's card, read as each activation
+    // starts like the choice above: the next stream follows a change.
+    if (next.action == Action::Activate) m_Request.gpu = AppSettings().virtualDisplayGpu();
     m_Callbacks.clear();
     if (next.cb) m_Callbacks.append(std::move(next.cb));
     m_Error.clear();
@@ -214,6 +316,7 @@ void VirtualDisplayJob::startNext()
     m_HelperOut.clear();
     m_NextStages.clear();
     m_InProcessResult.reset();
+    m_AskedBeforeFallback.reset();
 
     const VirtualDisplay::Status st = VirtualDisplay::probe();
     if (!st.supported) {
@@ -234,7 +337,10 @@ void VirtualDisplayJob::startNext()
         return;
     }
     // Leftovers of an interrupted attempt would be acted on as-is otherwise.
-    QFile::remove(VirtualDisplay::resultPath());
+    if (!discardResult()) {
+        fail(QStringLiteral("The virtual display's last verdict cannot be removed"));
+        return;
+    }
     QFile::remove(VirtualDisplay::requestPath());
     dispatch();
 }
@@ -250,6 +356,30 @@ void VirtualDisplayJob::settle(bool ok, const QString& error)
 
 void VirtualDisplayJob::fail(const QString& error)
 {
+    // A display that did not come up at the client's mode is asked again
+    // closer to the default one, which always comes up: the stream then runs
+    // at that mode instead of failing to launch. The helper has already
+    // switched the node back off and taken the client's mode out of the list.
+    // Its verdict goes first: the next run must be answered by its own.
+    if (const auto next = VirtualDisplay::fallbackTowardsDefault(m_Request, error);
+        next && discardResult()) {
+        if (!m_AskedBeforeFallback) m_AskedBeforeFallback = m_Request;
+        Logger::warning(QStringLiteral("[vdisplay] %1x%2@%3 did not come up — trying %4x%5@%6")
+                            .arg(m_Request.width)
+                            .arg(m_Request.height)
+                            .arg(VirtualDisplay::rateText(m_Request.refreshMilliHz))
+                            .arg(next->width)
+                            .arg(next->height)
+                            .arg(VirtualDisplay::rateText(next->refreshMilliHz)));
+        m_Poll.stop();
+        m_Deadline.stop();
+        m_Request = *next;
+        m_HelperOut.clear();
+        m_NextStages.clear();
+        QFile::remove(VirtualDisplay::requestPath());
+        dispatch();
+        return;
+    }
     m_Error = error;
     m_FinishedAt = QDateTime::currentDateTimeUtc();
     m_Poll.stop();
@@ -276,17 +406,41 @@ void VirtualDisplayJob::succeed(const VirtualDisplay::Result& res)
             rec["width"] = m_Request.width;
             rec["height"] = m_Request.height;
         }
-        if (m_Request.refresh > 0) rec["refresh"] = m_Request.refresh;
+        if (m_Request.refreshMilliHz > 0) rec["refresh_mhz"] = m_Request.refreshMilliHz;
         settings.setVirtualDisplay(rec);
-        m_ActiveWidth = m_Request.width;
-        m_ActiveHeight = m_Request.height;
-        m_ActiveRefresh = m_Request.refresh;
+        // After a fallback, the mode the caller asked for is remembered as
+        // answered: the next launch asking it again joins the display as it
+        // is, instead of waiting on the same refusal before the same fallback.
+        const VirtualDisplay::Request& asked =
+            m_AskedBeforeFallback ? *m_AskedBeforeFallback : m_Request;
+        m_ActiveWidth = asked.width;
+        m_ActiveHeight = asked.height;
+        m_ActiveRefresh = asked.refreshMilliHz;
+        m_ActiveHdr = asked.hdr;
+        if (m_Request.exclusive) startGuard();
     } else if (m_Request.action == Action::Deactivate) {
         settings.clearVirtualDisplay();
         m_ActiveWidth = m_ActiveHeight = m_ActiveRefresh = 0;
+        m_ActiveHdr = false;
     }
     setState(State::Done);
     settle(true, QString());
+}
+
+void VirtualDisplayJob::startGuard()
+{
+#ifdef Q_OS_WIN
+    // A service has no desktop to put a layout back on, and its supervisor
+    // restarts it; a server in the user's session may simply die.
+    if (!qEnvironmentVariableIsEmpty("MW_SERVICE")) return;
+    FILETIME c{}, e{}, k{}, u{};
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return;
+    const quint64 created = (quint64(c.dwHighDateTime) << 32) | quint64(c.dwLowDateTime);
+    const QString server = QStringLiteral("%1:%2").arg(GetCurrentProcessId()).arg(created);
+    if (!mw::startDetached(QCoreApplication::applicationFilePath(),
+                           {VirtualDisplay::guardArgument(), server}))
+        Logger::warning(QStringLiteral("[vdisplay] the guard of the other displays did not start"));
+#endif
 }
 
 // ── Reaching the helper ─────────────────────────────────────────────────────
@@ -384,6 +538,29 @@ void VirtualDisplayJob::runTask()
     // The installer's trigger-less elevated task: started by name, it runs our
     // exe with --vdisplay-apply as this user, elevated, hidden. Its result
     // reaches us through the result file — there is no stdout to read.
+    //
+    // The helper writes that file and only then exits, and the task ignores a
+    // start while its last run is still going: a run asked for in that gap —
+    // the next mode of a client whose screen changed twice, a fallback — was
+    // lost, schtasks said it had started it, and the job waited two minutes
+    // for nothing (15/10/2026, a black screen on the client). The last run is
+    // let go first; a run still going after kTaskBusyMs is no longer one
+    // ending, and the start is tried all the same.
+    if (VirtualDisplay::elevatedTaskRunning()) {
+        if (!m_TaskBusySince.isValid()) {
+            m_TaskBusySince.start();
+            Logger::info(QStringLiteral("[vdisplay] the task's last run is still ending — "
+                                        "waiting for it"));
+        }
+        if (m_TaskBusySince.elapsed() < kTaskBusyMs) {
+            QTimer::singleShot(kTaskBusyPollMs, this, [this]() { runTask(); });
+            return;
+        }
+        Logger::warning(QStringLiteral("[vdisplay] the task still runs after %1 ms — started "
+                                       "anyway")
+                            .arg(kTaskBusyMs));
+    }
+    m_TaskBusySince.invalidate();
     QProcess* proc = new QProcess(this);
     connect(proc, &QProcess::finished, this, [this, proc](int code, QProcess::ExitStatus status) {
         proc->deleteLater();
@@ -473,10 +650,9 @@ void VirtualDisplayJob::pollResult()
         handleResult(res);
         return;
     }
-    QFile f(VirtualDisplay::resultPath());
-    if (!f.open(QIODevice::ReadOnly)) return;
-    const auto res = VirtualDisplay::parseResult(f.readAll());
-    if (!res) return; // still being written
+    // Read and closed before it is acted on: the fallback deletes it.
+    const auto res = VirtualDisplay::readResult(VirtualDisplay::resultPath());
+    if (!res) return; // not there yet, or still being written
     m_Poll.stop();
     m_Deadline.stop();
     handleResult(*res);

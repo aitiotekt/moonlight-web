@@ -18,6 +18,7 @@
 #include "RouterPortAllocator.h"
 #include "RouterPortPools.h"
 #include "UPNPClient.h"
+#include "common/Edition.h"
 #include "common/Logger.h"
 #include "server/AppSettings.h"
 
@@ -48,14 +49,19 @@ public:
                                         description.toStdString(), protocol.toStdString());
     }
 
-    bool owner(uint16_t externalPort, const QString& protocol, QString& client) override
+    bool owner(uint16_t externalPort, const QString& protocol, QString& client,
+               int& leaseLeft) override
     {
         std::string who;
         std::string internalPort;
+        std::string lease;
         if (!m_Client->getExistingPortMapping(externalPort, protocol.toStdString(), who,
-                                              internalPort))
+                                              internalPort, &lease))
             return false;
         client = QString::fromStdString(who);
+        bool number = false;
+        const int seconds = QString::fromStdString(lease).trimmed().toInt(&number);
+        leaseLeft = number && seconds >= 0 ? seconds : -1;
         return true;
     }
 
@@ -122,11 +128,13 @@ public:
         auto upnp = std::make_unique<UPNPClient>();
         if (!upnp->discover(2000)) {
             QMetaObject::invokeMethod(
-                m_Owner, [o = m_Owner]() { o->onDiscovered(false, {}, {}); }, Qt::QueuedConnection);
+                m_Owner, [o = m_Owner]() { o->onDiscovered(false, {}, {}, {}); },
+                Qt::QueuedConnection);
             return;
         }
         const QString publicIp = QString::fromStdString(upnp->getExternalIPAddress());
         const QString lan = QString::fromStdString(upnp->lanAddress());
+        const QString gateway = upnp->gatewayAddress().toString();
         m_Upnp = std::move(upnp);
         m_Gateway = std::make_unique<UpnpGatewayAdapter>(m_Upnp.get());
         m_Core = std::make_unique<RouterPortCore>(*m_Gateway, &portIsFree);
@@ -137,7 +145,10 @@ public:
         m_Renew->start(mw::routerports::kRenewIntervalMs);
 
         QMetaObject::invokeMethod(
-            m_Owner, [o = m_Owner, publicIp, lan]() { o->onDiscovered(true, publicIp, lan); },
+            m_Owner,
+            [o = m_Owner, publicIp, lan, gateway]() {
+                o->onDiscovered(true, publicIp, lan, gateway);
+            },
             Qt::QueuedConnection);
     }
 
@@ -160,6 +171,20 @@ public:
         if (lost.isEmpty()) return;
         QMetaObject::invokeMethod(
             m_Owner, [o = m_Owner, lost]() { o->onRenewed(lost); }, Qt::QueuedConnection);
+    }
+
+    void renew(uint16_t externalPort)
+    {
+        if (!m_Core) return;
+        const QList<RouterPortCore::Lost> lost = m_Core->renew(externalPort);
+        if (lost.isEmpty()) return;
+        QMetaObject::invokeMethod(
+            m_Owner, [o = m_Owner, lost]() { o->onRenewed(lost); }, Qt::QueuedConnection);
+    }
+
+    void release(const RouterPortCore::Claim& claim)
+    {
+        if (m_Core) m_Core->release(claim);
     }
 
     void releaseAll()
@@ -203,7 +228,27 @@ void RouterPortAllocator::ensureStarted()
 {
     if (m_State != GatewayState::Unknown) return;
     if (!enabled()) return;
+    startWorker();
+}
 
+void RouterPortAllocator::discover()
+{
+    if (mw::edition::lanOnly()) return;
+    if (m_State == GatewayState::Unknown) {
+        startWorker();
+        return;
+    }
+    if (m_State != GatewayState::Missing) return;
+    // Asked again: the worker keeps no client after a miss, so start() looks
+    // for the router afresh.
+    m_State = GatewayState::Discovering;
+    const QString previousLan = m_Settings->routerLanIp();
+    QMetaObject::invokeMethod(
+        m_Worker, [w = m_Worker, previousLan]() { w->start(previousLan); }, Qt::QueuedConnection);
+}
+
+void RouterPortAllocator::startWorker()
+{
     m_State = GatewayState::Discovering;
     m_Thread = new QThread(this);
     m_Thread->setObjectName(QStringLiteral("mw-upnp"));
@@ -217,24 +262,58 @@ void RouterPortAllocator::ensureStarted()
         m_Worker, [w = m_Worker, previousLan]() { w->start(previousLan); }, Qt::QueuedConnection);
 }
 
-void RouterPortAllocator::onDiscovered(bool ok, const QString& publicIp, const QString& lanIp)
+void RouterPortAllocator::onDiscovered(bool ok, const QString& publicIp, const QString& lanIp,
+                                       const QString& gateway)
 {
     if (!ok) {
         m_State = GatewayState::Missing;
-        Logger::info(QStringLiteral("[UPNP] No IGD — tunnel connections will rely on their "
-                                    "reflexive address, streams on STUN alone"));
+        if (m_Misses == 0)
+            Logger::info(QStringLiteral("[UPNP] No IGD — tunnel connections will rely on their "
+                                        "reflexive address, streams on STUN alone; looking "
+                                        "again in the background"));
+        ++m_Misses;
+        scheduleRediscovery();
         emit gatewayMissing();
         return;
     }
+    if (m_Misses > 0)
+        Logger::info(QStringLiteral("[UPNP] Gateway answered after %1 missed discover%2")
+                         .arg(m_Misses)
+                         .arg(m_Misses == 1 ? QStringLiteral("y") : QStringLiteral("ies")));
+    m_Misses = 0;
     m_State = GatewayState::Ready;
     m_PublicIp = publicIp;
     m_LanIp = lanIp;
+    m_GatewayAddress = gateway;
     Logger::info(QStringLiteral("[UPNP] Gateway found, public %1, this host %2")
                      .arg(publicIp.isEmpty() ? QStringLiteral("(unknown)") : publicIp, lanIp));
     // The address the remembered ports will have been obtained under, from
     // now on. The worker already took the previous one for the reclaim rule.
     m_Settings->setRouterLanIp(lanIp);
     emit gatewayReady(publicIp);
+}
+
+void RouterPortAllocator::scheduleRediscovery()
+{
+    if (!m_Rediscover) {
+        m_Rediscover = new QTimer(this);
+        m_Rediscover->setSingleShot(true);
+        connect(m_Rediscover, &QTimer::timeout, this, [this]() {
+            if (m_State != GatewayState::Missing) return;
+            // Turned off since: the router is not to be touched, but the
+            // switch may come back on, so keep the next look booked.
+            if (!m_Settings->upnpEnabled()) {
+                scheduleRediscovery();
+                return;
+            }
+            discover();
+        });
+    }
+    // 30 s, 1, 2, 4, 8 min, then every 10. A claim arriving while one runs
+    // queues behind it on the worker, as behind the first discovery.
+    const int shift = qMin(m_Misses - 1, 5);
+    m_Rediscover->start(qMin(mw::routerports::kRediscoverFirstMs << qMax(shift, 0),
+                             mw::routerports::kRediscoverMaxMs));
 }
 
 quint64 RouterPortAllocator::submit(RouterPortCore::Request request, QObject* context,
@@ -282,15 +361,17 @@ void RouterPortAllocator::deliver(quint64 token, const Claim& claim, const QStri
 
 void RouterPortAllocator::claimTunnelPort(QObject* context, Callback callback)
 {
-    RouterPortCore::Request request;
-    request.purpose = Purpose::Tunnel;
-    for (const quint16 p : m_Settings->rememberedTunnelPorts())
-        request.remembered.append(p);
-    for (const uint16_t p : mw::routerports::kTunnelPreferred)
-        request.preferred.append(p);
-    request.poolBegin = mw::routerports::kTunnelPoolBegin;
-    request.poolEnd = mw::routerports::kTunnelPoolEnd;
-    request.description = QStringLiteral("MoonlightWeb tunnel");
+    // A DEV identity walks its own block only (RouterPortPools.h), and forgets
+    // what it remembers from before it had one.
+    const bool dev = mw::edition::isDev();
+    QList<uint16_t> remembered;
+    for (const quint16 p : m_Settings->rememberedTunnelPorts()) {
+        if (RouterPortCore::tunnelPortAllowed(dev, p))
+            remembered.append(p);
+        else
+            m_Settings->forgetTunnelPort(p);
+    }
+    RouterPortCore::Request request = RouterPortCore::tunnelRequest(dev, remembered);
 
     const QString why = refusal();
     if (!why.isEmpty()) {
@@ -312,9 +393,12 @@ void RouterPortAllocator::claimMediaPort(int slot, uint16_t internalPort, QObjec
         return;
     }
 
-    // Held from an earlier stream on this slot: no round trip, no wait.
+    // Held from an earlier stream on this slot: no round trip, no wait. The
+    // entry is written again behind the answer: the router may have lost it
+    // meanwhile (rebooted, or a lease run out while this machine slept).
     if (const auto held = heldMediaPort(slot)) {
         answerLater(Purpose::Media, slot, context, std::move(callback), *held, {});
+        recheck(held->external);
         return;
     }
 
@@ -322,7 +406,13 @@ void RouterPortAllocator::claimMediaPort(int slot, uint16_t internalPort, QObjec
     request.purpose = Purpose::Media;
     request.slot = slot;
     request.internalPort = internalPort;
-    if (const quint16 remembered = m_Settings->rememberedMediaPort(slot))
+    // Up to 0.3.0 the slot's own number was 48010 + slot, and that is what a
+    // host upgraded from it remembers: asking for it again would keep the old
+    // number on the router, pointed at the new block. Asked for from scratch.
+    const quint16 remembered = m_Settings->rememberedMediaPort(slot);
+    if (remembered >= 48010 && remembered <= 48033)
+        m_Settings->forgetMediaPort(slot);
+    else if (remembered)
         request.remembered.append(remembered);
     request.preferred.append(internalPort);
     request.poolBegin = mw::routerports::kMediaPoolBegin;
@@ -330,6 +420,33 @@ void RouterPortAllocator::claimMediaPort(int slot, uint16_t internalPort, QObjec
     request.description = QStringLiteral("MoonlightWeb media slot %1").arg(slot);
 
     submit(std::move(request), context, std::move(callback));
+}
+
+void RouterPortAllocator::renewNow()
+{
+    if (m_State != GatewayState::Ready || !enabled()) return;
+    Logger::info(QStringLiteral("[UPNP] Renewing every held hole now"));
+    QMetaObject::invokeMethod(m_Worker, [w = m_Worker]() { w->renew(); }, Qt::QueuedConnection);
+}
+
+void RouterPortAllocator::recheck(uint16_t externalPort)
+{
+    if (m_State != GatewayState::Ready || !enabled()) return;
+    QMetaObject::invokeMethod(
+        m_Worker, [w = m_Worker, externalPort]() { w->renew(externalPort); }, Qt::QueuedConnection);
+}
+
+void RouterPortAllocator::releaseMediaPort(int slot)
+{
+    const auto held = heldMediaPort(slot);
+    if (!held) return;
+    const Claim claim = *held;
+    m_Held.removeAll(claim);
+    QMetaObject::invokeMethod(
+        m_Worker, [w = m_Worker, claim]() { w->release(claim); }, Qt::QueuedConnection);
+    Logger::info(QStringLiteral("[UPNP] %1: released %2")
+                     .arg(purposeName(Purpose::Media, slot))
+                     .arg(claim.external));
 }
 
 void RouterPortAllocator::onClaimed(quint64 token, const RouterPortCore::Result& result)

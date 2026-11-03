@@ -45,6 +45,12 @@
  *                (what a camera filming the client screen would see)
  *   ok         — false when the sample must be discarded (timeout, flag
  *                already up before the click, no picture to sample)
+ * and, when the stream gave the probe an InputUplink (stream/InputUplink.js)
+ * and the host answered the click's stamp:
+ *   upMs       — click sent → arrived on the host (the way up)
+ *   hostInMs   — arrived → injected
+ *   restMs     — latencyMs minus both: flag, capture, encode, the way down,
+ *                decode, draw
  *
  * The grey mark: a small circle at the pointer, painted for exactly one frame
  * at the click, so a slow-motion camera can pair the client's click with the
@@ -60,6 +66,16 @@ export const FLAG_REGION = Object.freeze({ left: 0.44, right: 0.56, top: 0.0, bo
 
 /** Past this, the flag is assumed lost (network hiccup) and the sample dropped. */
 export const FLAG_TIMEOUT_MS = 200;
+
+/**
+ * A click waits up to this long, at random, before it leaves. It would leave
+ * right after a picture was sampled, and pictures come at the host's refresh:
+ * every click then reaches the host at the same phase of that refresh, and a
+ * wait that depends on the phase is measured at that one phase only
+ * (09/10/2026, a Linux host's screen at 60 Hz: nine clicks in ten 1.5-2 ms
+ * before its vblank). A refresh at 40 Hz or faster is covered whole.
+ */
+const PHASE_JITTER_MS = 25;
 
 /** Output surface is scaled into this many columns × rows for sampling. */
 const SAMPLE_W = 100;
@@ -154,8 +170,9 @@ export class LatencyProbe {
      * @param {() => (CanvasImageSource|null)} deps.source — the element that
      *        shows the stream right now (the canvas, or the <video> on the
      *        media-track path). Read at every sample: it can switch mid-session.
-     * @param {() => void} deps.sendClick — send a left button press + release
-     *        to the host, exactly as a real click would go.
+     * @param {(stamp: number|null) => void} deps.sendClick — send a left button
+     *        press + release to the host, exactly as a real click would go;
+     *        @p stamp, when not null, rides on the press (see InputUplink).
      * @param {(() => void)|null} [deps.showMark] paint the grey circle for
      *        one frame. Optional: a headless test has no DOM.
      * @param {((ms: number) => void)|null} [deps.requestFrameEvents] ask the
@@ -169,9 +186,17 @@ export class LatencyProbe {
      *        canvas; `null` = armed but no frame drawn yet; else 12 RGBA values.
      * @param {((on: boolean) => void)|null} [deps.setProbing] arm/disarm that
      *        renderer-side read around each measurement.
+     * @param {(() => (number|null))|null} [deps.pixelsDrawnAt] when the frame
+     *        those pixels were read from went to the canvas (performance.now(),
+     *        VideoRenderer.probeDrawnAt). A flag is dated from there rather
+     *        than from the moment it was seen, which comes after the read.
      * @param {(() => string)|null} [deps.describeSource] what is being
      *        sampled, for a failed measurement to name (renderer kind and
      *        surface size). Never called while nothing is being measured.
+     * @param {import('./InputUplink.js').InputUplink|null} [deps.uplink] splits
+     *        each click into its way up and the rest (plan radios, T7).
+     * @param {number} [deps.phaseJitterMs] how long a click may wait at random
+     *        before it leaves (PHASE_JITTER_MS); 0 sends it at once.
      */
     constructor({
         source,
@@ -181,8 +206,18 @@ export class LatencyProbe {
         results = [],
         samplePixels = null,
         setProbing = null,
+        pixelsDrawnAt = null,
         describeSource = null,
+        uplink = null,
+        phaseJitterMs = PHASE_JITTER_MS,
     }) {
+        this._phaseJitterMs = phaseJitterMs;
+        this._pixelsDrawnAt = pixelsDrawnAt;
+        /** When the frame of the last renderer read was drawn, or null. */
+        this._lastDrawnAt = null;
+        this._uplink = uplink;
+        /** Host answers by click ts, for an entry recorded after its answer. */
+        this._splits = new Map();
         this._source = source;
         this._sendClick = sendClick;
         this._showMark = showMark;
@@ -197,6 +232,8 @@ export class LatencyProbe {
         /** @type {null | {t0: number, ts: number, tMark: number, resolve: Function, timer: any, raf: number}} */
         this._pending = null;
         this._running = false;
+        /** How long a click waits for its flag; run() may lengthen it. */
+        this._timeoutMs = FLAG_TIMEOUT_MS;
         this._canvas = null;
         this._ctx = null;
     }
@@ -211,19 +248,26 @@ export class LatencyProbe {
      * with the entries of this run (they are also appended to `results`).
      * A run already in progress is left alone — its promise is returned.
      */
-    async run(clicks = 3, spacingMs = 2000) {
+    async run(clicks = 3, spacingMs = 2000, { timeoutMs = FLAG_TIMEOUT_MS } = {}) {
         if (this._running) {
             console.warn('[LatencyProbe] a run is already in progress');
             return this._runPromise;
         }
         this._running = true;
         this._stopped = false;
+        // A longer wait, for a run that wants to SEE the slow clicks: at the
+        // default 200 ms a flag that arrives at 230 ms is a "timeout", and the
+        // slow tail and the lost flags cannot be told apart (25/09/2026).
+        this._timeoutMs = timeoutMs > 0 ? timeoutMs : FLAG_TIMEOUT_MS;
         this._runPromise = this._runInner(clicks, spacingMs);
+        if (this._uplink) this._uplink.hold();
         try {
             return await this._runPromise;
         } finally {
+            if (this._uplink) this._uplink.release();
             this._running = false;
             this._runPromise = null;
+            this._timeoutMs = FLAG_TIMEOUT_MS;
         }
     }
 
@@ -245,6 +289,17 @@ export class LatencyProbe {
                 (dropped ? ` · ${dropped} dropped` : '') +
                 ' — see mwLatencyResults',
         );
+        const up = summarize(
+            entries.filter((e) => e.ok && typeof e.upMs === 'number').map((e) => e.upMs),
+        );
+        const rest = summarize(
+            entries.filter((e) => e.ok && typeof e.restMs === 'number').map((e) => e.restMs),
+        );
+        if (up.n)
+            console.log(
+                `[LatencyProbe] split of ${up.n} click(s): up median ${up.median.toFixed(1)} ms ` +
+                    `(p90 ${up.p90.toFixed(1)}) · rest median ${rest.n ? rest.median.toFixed(1) : '?'} ms`,
+            );
         // Every click dropped: say what was under the probe rather than
         // leaving the table to be opened. This is the case that used to be
         // unreadable — see describePixels.
@@ -289,12 +344,17 @@ export class LatencyProbe {
                 return this._record(null, null, null, false, 'flag already up');
             }
         }
+        if (this._phaseJitterMs > 0)
+            await new Promise((r) => setTimeout(r, Math.random() * this._phaseJitterMs));
 
         return new Promise((resolve) => {
             const t0 = performance.now();
             const ts = Math.round((performance.timeOrigin + t0) * 1000);
             this._pending = { t0, ts, tMark: t0, resolve, timer: null, raf: 0 };
-            this._sendClick();
+            const stamp = this._uplink
+                ? this._uplink.stamp(t0, (split) => this._noteSplit(ts, split))
+                : null;
+            this._sendClick(stamp);
             if (this._showMark) this._showMark();
             // The mark is painted in the next frame: stamp it from there so
             // fromMarkMs is what a camera on the client screen would count.
@@ -302,7 +362,8 @@ export class LatencyProbe {
                 if (this._pending && this._pending.ts === ts)
                     this._pending.tMark = performance.now();
             });
-            if (this._requestFrameEvents) this._requestFrameEvents(FLAG_TIMEOUT_MS + 50);
+            const timeoutMs = this._timeoutMs || FLAG_TIMEOUT_MS;
+            if (this._requestFrameEvents) this._requestFrameEvents(timeoutMs + 50);
             // rAF polling is the floor: the presented-frame hooks sample sooner
             // (right after a draw, or a <video> frame callback) when they fire.
             const tick = () => {
@@ -311,7 +372,7 @@ export class LatencyProbe {
                 if (this._pending) this._pending.raf = requestAnimationFrame(tick);
             };
             this._pending.raf = requestAnimationFrame(tick);
-            this._pending.timer = setTimeout(() => this._finish(null, 'timeout'), FLAG_TIMEOUT_MS);
+            this._pending.timer = setTimeout(() => this._finish(null, 'timeout'), timeoutMs);
             this._armVideoCallback();
         });
     }
@@ -338,8 +399,12 @@ export class LatencyProbe {
         const now = performance.now();
         const hit = this._sample();
         if (hit) {
-            this._finish(now, null);
-        } else if (now - p.t0 > FLAG_TIMEOUT_MS) {
+            // The frame's own draw, when the renderer read it: the read, a
+            // GPU round trip of a few ms, is the probe's cost, not the
+            // stream's. A stamp from before the click is not this frame's.
+            const at = this._lastVia === 'renderer' ? this._lastDrawnAt : null;
+            this._finish(typeof at === 'number' && at >= p.t0 && at <= now ? at : now, null);
+        } else if (now - p.t0 > (this._timeoutMs || FLAG_TIMEOUT_MS)) {
             this._finish(null, 'timeout');
         }
     }
@@ -355,6 +420,30 @@ export class LatencyProbe {
         p.resolve(
             this._record(p.ts, ok ? tHit - p.t0 : null, ok ? tHit - p.tMark : null, ok, reason),
         );
+    }
+
+    /** The host's answer to a click's stamp, before or after its entry exists. */
+    _noteSplit(ts, split) {
+        this._splits.set(ts, split);
+        while (this._splits.size > 64) this._splits.delete(this._splits.keys().next().value);
+        for (let i = this.results.length - 1; i >= 0 && i >= this.results.length - 64; i--) {
+            if (this.results[i].ts === ts) {
+                this._applySplit(this.results[i]);
+                return;
+            }
+        }
+    }
+
+    _applySplit(entry) {
+        const split = this._splits.get(entry.ts);
+        if (!split) return;
+        const r3 = (v) => (typeof v === 'number' ? Math.round(v * 1000) / 1000 : null);
+        entry.upMs = r3(split.upMs);
+        entry.hostInMs = r3(split.hostInMs);
+        entry.restMs =
+            typeof entry.latencyMs === 'number' && typeof split.upMs === 'number'
+                ? r3(entry.latencyMs - split.upMs - (split.hostInMs || 0))
+                : null;
     }
 
     _record(ts, latencyMs, fromMarkMs, ok, reason) {
@@ -374,6 +463,7 @@ export class LatencyProbe {
                 (this._lastVia || 'nothing sampled') +
                 (this._describeSource ? ' · ' + this._describeSource() : '');
         }
+        this._applySplit(entry);
         this.results.push(entry);
         return entry;
     }
@@ -392,6 +482,7 @@ export class LatencyProbe {
             if (px !== undefined) {
                 this._lastPx = px;
                 this._lastVia = 'renderer';
+                this._lastDrawnAt = this._pixelsDrawnAt ? this._pixelsDrawnAt() : null;
                 return looksLikeFlag(px);
             }
         }

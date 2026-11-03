@@ -311,6 +311,29 @@ body.streaming-active::after {
     border: 1px solid rgba(255, 255, 255, 0.15);
 }
 
+/* The eye test's split screen (a lab key): its view, over the line between the
+   halves at the bottom, so that it hides as much of either. Above the input
+   layer (50), whose presses go to the host. */
+.stream-mwsr-split {
+    position: absolute;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+    background: rgba(0, 0, 0, 0.7);
+    color: #fff;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0.6;
+}
+
+.stream-mwsr-split:hover {
+    opacity: 1;
+}
+
 /* The host is dropping our presses (an administrator window has focus there).
    A strip, not a dialog: the way out is to click elsewhere on the picture. */
 .stream-input-gate {
@@ -339,6 +362,7 @@ body.streaming-active::after {
    this takes it back, so nothing else about the picture changes. Sized for a
    thumb: it is pressed on a phone, one-handed, by someone already stuck. */
 .stream-input-gate-release {
+    /* By choice: under the text, and shown whenever the strip is (both reasons). */
     display: block;
     margin: 8px auto 0;
     pointer-events: auto;
@@ -510,6 +534,11 @@ body.streaming-active::after {
        never overlaps the resolution line (top-right of the stats). */
     padding: 8px 24px 8px 12px;
     min-width: 168px;
+    /* Never wider than the screen it is on, its 10px margin on either side
+       kept: on a phone the open breakdown ran off the right edge. */
+    max-width: calc(
+        100vw - max(10px, env(safe-area-inset-left)) - max(10px, env(safe-area-inset-right))
+    );
     font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
     line-height: 1.45;
     color: rgba(255, 255, 255, 0.7);
@@ -539,8 +568,7 @@ body.streaming-active::after {
     align-items: center;
     gap: 8px;
     border-radius: 8px;
-    /* Extra right padding reserves room for the absolute × close button. */
-    padding: 5px 24px 5px 11px;
+    padding: 5px 11px;
     font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
     font-size: 10.5px;
     white-space: nowrap;
@@ -567,6 +595,14 @@ body.streaming-active::after {
 }
 .stream-gaming-overlay.visible {
     display: flex;
+}
+/* Over the picture it only passes through (issue #28): a few seconds on
+   arrival, then gone — and out of the way of the clicks under it. Not while it
+   is being dragged, which is the one time someone is plainly looking at it. */
+.stream-gaming-overlay.visible.faded:not(.dragging) {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.8s ease;
 }
 .stream-gaming-overlay.dragging {
     cursor: grabbing;
@@ -595,7 +631,7 @@ body.streaming-active::after {
     color: rgba(255, 255, 255, 0.8);
 }
 
-/* ── Overlay × close button (stats + gaming-mode cards) ─────────────────────── */
+/* ── Overlay × close button (stats card) ─────────────────────── */
 .overlay-close-btn {
     position: absolute;
     top: 2px;
@@ -620,6 +656,25 @@ body.streaming-active::after {
 .overlay-close-btn:hover {
     color: #fff;
     background: rgba(255, 255, 255, 0.12);
+}
+/* A finger needs a target the size of a fingertip, not of a 16px glyph: on a
+   phone the × kept missing and the tap dragged the card instead. The hit area
+   grows past the card's corner rather than into its numbers; the glyph grows
+   a little, the card barely. A mouse keeps the small one. */
+@media (pointer: coarse) {
+    .stream-stats-overlay {
+        padding-right: 32px;
+    }
+    .overlay-close-btn {
+        top: -6px;
+        right: -6px;
+        width: 40px;
+        height: 40px;
+        font-size: 22px;
+        line-height: 40px;
+        border-radius: 10px;
+        color: rgba(255, 255, 255, 0.6);
+    }
 }
 
 /* The 60-second history strip, drawn under the card's numbers when the latency
@@ -716,6 +771,24 @@ body.streaming-active::after {
     color: rgba(240, 192, 64, 0.75);
 }
 
+/* A phone in portrait: the open breakdown is wider than the screen on one line
+   per row ("Screen (compositor + scan-out)" beside "not measured, ~½–1
+   refresh"), and the card stops at the screen's width. So the words wrap
+   instead, labels at least half the card, values right-aligned against their
+   column. A wider screen keeps every row on one line. */
+@media (max-width: 600px) {
+    .stats-row,
+    .stats-latency-detail {
+        white-space: normal;
+    }
+    .stats-row .stats-value {
+        text-align: right;
+    }
+    .stats-latency-detail {
+        grid-template-columns: minmax(50%, 1fr) auto;
+    }
+}
+
 /* Pipeline observations, revealed with the latency breakdown. One dense
    free-form line rather than labelled rows: it is a diagnostic trace (the same
    text goes to the console), so it wraps instead of forcing the card wider. */
@@ -800,6 +873,27 @@ body.streaming-active::after {
     margin-bottom: 0;
     z-index: 1;
     opacity: 0.8;
+}
+
+/* The host's stream worker crashed and the stream starts again: the last
+   frame stays, under a veil that says so, with the loader centred over it
+   (on the bare surround when there was no frame to keep). */
+#stream-relaunch-loader.is-reconnecting .relaunch-freeze-frame {
+    filter: brightness(0.45);
+}
+
+#stream-relaunch-loader.is-reconnecting .startup-loader {
+    z-index: 1;
+}
+
+#stream-relaunch-loader .relaunch-reconnecting {
+    position: relative;
+    z-index: 1;
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+    color: rgba(255, 255, 255, 0.95);
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 
 .startup-step {
@@ -950,6 +1044,107 @@ body.streaming-active::after {
     color: rgba(255, 255, 255, 0.85);
 }
 
+/* ── Stream volume (issue #29) ─────────────────────────────────────────────
+   Left of the Fullscreen button, in the same pill. At rest only the speaker
+   shows; hovering (or tabbing into) it slides the level out to the LEFT — the
+   control is anchored by its right edge (translate -100%, left set by
+   StreamView._positionGamingOverlay), so opening it never nudges the
+   Fullscreen button under the cursor. Open, it may reach over the brand and
+   the version badge on a narrow window, so it is opaque (the header's #111
+   under the same white tint) and sits above them, never see-through. */
+.stream-volume {
+    position: absolute;
+    z-index: 2;
+    top: 50%;
+    transform: translate(-100%, -50%);
+    display: inline-flex;
+    align-items: center;
+    height: 30px;
+    background: linear-gradient(rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.06)) #111;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    color: rgba(255, 255, 255, 0.65);
+    transition:
+        background 0.2s,
+        border-color 0.2s;
+}
+.stream-volume[hidden] {
+    display: none;
+}
+.stream-volume:hover,
+.stream-volume:focus-within {
+    background: linear-gradient(rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.12)) #111;
+    border-color: rgba(255, 255, 255, 0.3);
+    box-shadow: 0 0 0 6px #111;
+}
+.stream-volume-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 28px;
+    padding: 0;
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 16px;
+    cursor: pointer;
+}
+.stream-volume:hover .stream-volume-btn,
+.stream-volume-btn:focus-visible {
+    color: #fff;
+}
+/* Muted: the speaker says so in the colour the rest of the app uses for "off". */
+.stream-volume.is-muted .stream-volume-btn {
+    color: var(--c-danger-text, #ff6b8b);
+}
+.stream-volume-slider {
+    width: 0;
+    height: 4px;
+    margin: 0;
+    opacity: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    /* Filled up to the level, the rest is track. */
+    background: linear-gradient(
+        to right,
+        rgba(255, 255, 255, 0.85) 0,
+        rgba(255, 255, 255, 0.85) var(--level, 100%),
+        rgba(255, 255, 255, 0.18) var(--level, 100%)
+    );
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+    transition:
+        width 0.18s ease,
+        margin 0.18s ease,
+        opacity 0.18s ease;
+}
+.stream-volume:hover .stream-volume-slider,
+.stream-volume:focus-within .stream-volume-slider {
+    width: 84px;
+    margin: 0 4px 0 12px;
+    opacity: 1;
+}
+.stream-volume-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #fff;
+    border: none;
+    box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.35);
+}
+.stream-volume-slider::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #fff;
+    border: none;
+    box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.35);
+}
+
 /* ── On-screen keyboard toggle (touch devices) ─────────────────────────── */
 .btn-stream-kbd {
     /* In the header flex flow on the right (left of Stop), so it never sits
@@ -972,6 +1167,10 @@ body.streaming-active::after {
     white-space: nowrap;
     user-select: none;
 }
+/* inline-flex above outranks the browser's own [hidden] handling. */
+.btn-stream-kbd[hidden] {
+    display: none;
+}
 .btn-stream-kbd:hover {
     background: rgba(255, 255, 255, 0.12);
     color: #fff;
@@ -984,6 +1183,105 @@ body.streaming-active::after {
     background: var(--kbd-on);
     color: var(--kbd-on-edge);
     border-color: var(--kbd-on-edge);
+}
+
+/* Share guest's controller button (check / remap the pad): the keyboard
+   button's square, next to Leave. */
+.btn-stream-pad {
+    position: relative;
+    margin-right: 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 30px;
+    padding: 0;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    color: rgba(255, 255, 255, 0.65);
+    font-size: 20px;
+    cursor: pointer;
+    user-select: none;
+}
+.btn-stream-pad:hover {
+    background: var(--kbd-on);
+    color: var(--kbd-on-edge);
+    border-color: var(--kbd-on-edge);
+}
+.btn-stream-pad:active {
+    transform: scale(0.95);
+}
+/* The viewer's microphone (StreamView._mountMicButton): the pad button's
+   shape, struck through in the volume's "off" colour while muted or refused.
+   Docked (.is-docked), it sits right of the speaker, with the volume's own
+   size and anchoring — by its right edge, left set by
+   StreamView._positionGamingOverlay — so the two read as one sound group. */
+.btn-stream-mic.is-docked {
+    position: absolute;
+    top: 50%;
+    transform: translate(-100%, -50%);
+    width: 36px;
+    margin-right: 0;
+    font-size: 16px;
+}
+.btn-stream-mic.is-docked:active {
+    transform: translate(-100%, -50%) scale(0.95);
+}
+.btn-stream-mic.is-off {
+    color: var(--c-danger-text, #ff6b8b);
+}
+/* The owner's "Buy me a coffee" button (StreamView._mountSupportButton): the
+   official cup alone — white outline, yellow coffee — with no button around
+   it, first of the bar's right-hand controls; the wordmark or a frame would
+   draw the eye over a game. A phone held upright has no room for it; turned
+   sideways it goes first even ahead of the keyboard button, which otherwise
+   heads the bar on a touch screen. */
+.stream-support-btn {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 12px;
+    padding: 2px;
+    border: 0;
+    background: none;
+    color: #fff;
+    font-size: 20px;
+    cursor: pointer;
+    opacity: 0.85;
+    transition: opacity 0.15s ease;
+}
+.stream-support-btn:hover,
+.stream-support-btn:focus-visible {
+    opacity: 1;
+}
+/* With the mark hidden, put it ahead of the keyboard button too. */
+@media (max-width: 767px) {
+    .stream-header .stream-support-btn {
+        order: -1;
+    }
+}
+@media (max-width: 767px) and (orientation: portrait) {
+    .stream-header .stream-support-btn {
+        display: none;
+    }
+}
+/* A pad is connected that nothing maps: the button is where to fix it. */
+.btn-stream-pad.is-attention {
+    color: var(--kbd-on-edge);
+    border-color: var(--kbd-on-edge);
+    animation: stream-pad-attention 1.6s ease-in-out infinite;
+}
+@keyframes stream-pad-attention {
+    50% {
+        box-shadow: 0 0 10px rgba(0, 229, 255, 0.55);
+        background: var(--kbd-on);
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .btn-stream-pad.is-attention {
+        animation: none;
+        background: var(--kbd-on);
+    }
 }
 
 /* Hidden capture element: focusable (opens the soft keyboard) but invisible.
@@ -1015,7 +1313,7 @@ body.streaming-active::after {
     position: fixed;
     left: 0;
     right: 0;
-    bottom: 0; /* JS parks it just above the soft keyboard */
+    bottom: 0; /* JS parks it just above the soft keyboard, by its top */
     display: none;
     align-items: stretch;
     gap: 3px;
@@ -1029,6 +1327,48 @@ body.streaming-active::after {
 }
 .stream-kbd-toolbar.visible {
     display: flex;
+}
+/* The header's controls stay above the bar, as the Share menu does (300,
+   share.css): wherever a browser puts the bar, Stop and the keyboard toggle
+   can still be reached. */
+.btn-stream-kbd,
+.btn-stream-pad,
+.btn-stream-fs,
+.stream-volume,
+.stream-presence {
+    z-index: 300;
+}
+/* A guest's count of who is on the stream (SharePresence.GuestPresence): the
+   pad button's frame, wide enough for the people icon and the number. */
+.stream-presence {
+    position: relative;
+    margin-right: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 30px;
+    padding: 0 9px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    color: rgba(255, 255, 255, 0.75);
+    font-size: 16px;
+    cursor: default;
+    user-select: none;
+}
+.stream-presence[hidden] {
+    display: none;
+}
+.stream-presence-count {
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+.stream-quit-btn,
+.stream-console-btn,
+.stream-support-btn {
+    position: relative;
+    z-index: 300;
 }
 .stream-kbd-key {
     flex: 1 1 0;
@@ -1696,4 +2036,22 @@ body.streaming-active::after {
     font: 12px/1 sans-serif;
     cursor: help;
     vertical-align: middle;
+}
+
+/* ── The stream's own menu: a TV remote's long press of OK ─────────────────
+   One column, so Up and Down are all a remote needs; buttons a finger's
+   width tall, read from three metres away. */
+.stream-remote-menu-box {
+    width: min(360px, 100%);
+}
+.stream-remote-menu-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 16px;
+}
+.stream-remote-menu-actions .btn {
+    width: 100%;
+    padding: 14px 18px;
+    font-size: 1rem;
 }

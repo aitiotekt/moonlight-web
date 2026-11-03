@@ -19,11 +19,14 @@
 
 #include <QList>
 #include <QString>
+#include <QStringList>
+#include <QJsonArray>
 #include <QJsonObject>
 
 #include "../streaming/StreamConfig.h"
 
-// Persistent settings stored in QStandardPaths::AppDataLocation/settings.json.
+// Persistent settings stored in QStandardPaths::AppDataLocation/settings.json,
+// or in the file named by --config.
 //
 // This class provides a type-safe interface over the JSON settings file
 // and handles read/write synchronisation (single-threaded, synchronous I/O).
@@ -31,6 +34,17 @@ class AppSettings
 {
 public:
     explicit AppSettings();
+
+    // ── Settings file location (--config) ───────────────────────────────────
+
+    /// Point every AppSettings built from now on at this file instead of the
+    /// one in the data directory. Set once, from the command line, before the
+    /// first instance is built; an empty path restores the default. The path
+    /// is made absolute here: the children and the relaunches it is handed to
+    /// do not all start in this process's working directory.
+    static void setFileOverride(const QString& path);
+    /// The --config file, absolute, or empty when the default one is in use.
+    static QString fileOverride();
 
     // ── HTTP port ────────────────────────────────────────────────────────────
 
@@ -84,25 +98,116 @@ public:
 
     bool latencyFlagEnabled() const;
 
-    // ── Keyboard layout fidelity ──────────────────────────────────────────────
+    // ── Packet priority (DSCP) ────────────────────────────────────────────────
+    // Stored as JSON bool "packet_marking", DEFAULT true, set from the admin
+    // page (« Network priority »): the stream's packets leave in AF41, the
+    // Wi-Fi's video queue (streaming/PacketMarking.h). false marks nothing —
+    // for a house whose other devices suffer while a stream runs, or a network
+    // that mishandles marked packets. Read before each stream.
+    bool packetMarking() const;
+    void setPacketMarking(bool enabled);
+
+    // ── Passive ICE-TCP ───────────────────────────────────────────────────────
+    // Stored as JSON bool "ice_tcp_passive", DEFAULT true (since 0.4.1), file-only
+    // and seeded. With it, the TCP rungs of a stream and the entry link's tunnel
+    // also listen on their TCP port while their ICE checks run, so that a
+    // browser on a network that lets no UDP out has a pair to form: a browser
+    // only ever dials (docs/design/ice-tcp-passive.md). The listener lives only
+    // while the checks run, keeps nothing that has not authenticated with the
+    // session's ICE credentials, and bounds what an unknown peer can hold. On by
+    // default once a test from an office network streamed over it (26/10/2026);
+    // false keeps every TCP port closed. Read when each connection is built.
+    bool iceTcpPassive() const;
+    // A DEBUG switch for a bench, never for a user: JSON bool "debug_ice_drop_udp",
+    // DEFAULT false, typed into the file by hand. Nothing writes it, not even its
+    // default, and no API reads or sets it. With it, no UDP candidate crosses in
+    // either direction, on a stream or on the entry link's tunnel, and the UDP
+    // rungs leave every chain: passive ICE-TCP then carries everything from a
+    // network that lets UDP out (mw::ice::stripUdpCandidates). Read when each
+    // connection is built.
+    bool debugIceDropUdp() const;
+
+    // ── The guests' shared feed ───────────────────────────────────────────────
     //
-    // On: what the host types is the character the CLIENT's keyboard layout
-    // produced, whatever layout the host itself runs — an AZERTY viewer types
-    // "azerty" on a QWERTY host and reads "azerty". The mechanism, and what each
-    // kind of host can honour, is documented in InputMessageCodec.h.
+    // Whether the guests of this machine's native host watch ONE stream encoded
+    // once for all of them (plan « flux commun des invités »), rather than each
+    // a stream of their own. File-only (no UI, no write route): stored as JSON
+    // bool "shared_feed_enabled", DEFAULT true, read at each guest's join. The
+    // safety net beside the MW_SHARED_FEED=0 variable: false puts back the
+    // encoder per guest exactly as it was. Windows only for now, whatever it
+    // says (SharedFeed::enabled).
+
+    bool sharedFeedEnabled() const;
+
+    // ── Invited players and administrator windows ─────────────────────────────
     //
-    // Off: the historical behaviour of every Moonlight client — the key's
-    // physical POSITION is sent and the host's own layout decides the character.
+    // Whether an invited player (a share link) may drive the host's windows that
+    // run as administrator. Off, the native host drops their keyboard and mouse
+    // presses on such a window (the "policy" gate, InputGate in NativeHost.h);
+    // the owner's own sessions are never held back. On, the guest is let in like
+    // the owner — and since a SYSTEM worker reaches the secure desktop, that
+    // includes answering a UAC prompt and typing on the lock screen: whoever
+    // holds the link and its PIN, with keyboard or mouse ticked, is then an
+    // administrator of this PC. One switch, no levels: a guest who can drive an
+    // administrator console already is one, so nothing in between would protect
+    // anything. Only guests with keyboard or mouse are concerned; a gamepad is
+    // never gated.
     //
     // File-only setting (no UI, no write route): stored as JSON bool
-    // "keyboard_layout_fidelity", DEFAULT false, read at each stream start. A
-    // fresh installation keeps the historical behaviour because of one case: on
-    // a Sunshine host, a divergent key that is not a letter is typed as text and
-    // so carries no key state, which a game reading the raw keyboard cannot see.
-    // Turn it on and the characters are the viewer's own, at the cost of that
-    // key state on the keys the two layouts disagree about.
+    // "share_guests_admin_windows", DEFAULT false, seeded so it can be found,
+    // read when each guest's worker is launched. Explained to owners in the
+    // wiki, Security §6.4c.
 
-    bool keyboardLayoutFidelity() const;
+    bool shareGuestsAdminWindows() const;
+
+    // ── Sharing from a booth ──────────────────────────────────────────────────
+    //
+    // Whether booth mode (--noadmin) still lets the one streaming invite guests
+    // (issue #40). Off, the booth lets no new guest in. On, the share slots and
+    // a guest's PIN are let through again, and nothing else: no PIN login for a
+    // new device, no admin, the host list stays frozen.
+    //
+    // File-only setting (no UI, no write route): stored as JSON bool
+    // "share_in_booth_mode", DEFAULT false, seeded so it can be found, read once
+    // at startup. Explained to owners in the wiki, Security §6.2.2.
+
+    bool shareInBoothMode() const;
+
+    // ── Keyboard layout fidelity ──────────────────────────────────────────────
+    //
+    // When the host types the character the CLIENT's keyboard layout produced,
+    // whatever layout the host itself runs — an AZERTY viewer types "azerty" on
+    // a QWERTY host and reads "azerty" — and when it gets the key's physical
+    // POSITION instead, the host's own layout deciding the character, as every
+    // Moonlight client does. The mechanism, and what each kind of host can
+    // honour, is documented in InputMessageCodec.h.
+    //
+    //   "auto"   (default) the desktop mouse mode types the client's characters,
+    //            gaming mode plays by positions: movement keys and weapon slots
+    //            stay where they are, whatever the keyboard. Bruno's rule of
+    //            22/10/2026.
+    //   "always" the client's characters, gaming mode included.
+    //   "never"  positions everywhere.
+    //
+    // File-only setting (no UI, no write route), read at each stream start and
+    // handed to the stream worker in its config (a SYSTEM worker reads another
+    // profile's settings.json). It was a boolean until 0.4.0, seeded false
+    // since 19/09/2026 for a reason gone by then (Sunshine no longer types a
+    // non-letter as text), so a stored value cannot tell a choice from the
+    // seed: seedDocumentedDefaults() moves true to "always" and false to
+    // "auto". Anything else reads as "auto".
+
+    QString keyboardLayoutFidelity() const;
+
+    // ── This PC's keyboard layout for the touch keyboard ──────────────────────
+    // Stored as JSON bool "keyboard_host_layout", DEFAULT false, set from the
+    // admin page (« Use this PC's keyboard layout »), offered only when this
+    // machine names a layout and a host other than the native one runs here.
+    // On: a Sunshine or a Wolf on this machine, which can only type a phone's
+    // text by pressing keys, gets the keys this machine's layout puts each
+    // character on (issue #44). Read before each stream.
+    bool keyboardHostLayout() const;
+    void setKeyboardHostLayout(bool enabled);
 
     // ── Keyboard diagnostics ──────────────────────────────────────────────────
     //
@@ -117,10 +222,38 @@ public:
     // needs is a knob that invites being turned. Add "keyboard_debug": true by
     // hand, restart, type — the README says so. Default false.
     //
+    // Never on the secure desktop, whatever the file says: the lock screen's PIN
+    // and a UAC prompt's password are typed there, and since the SYSTEM worker
+    // reaches that desktop they would have been written down key by key
+    // (NativeHost::secureDesktopHasInput, InputMsg::setQuietProbe).
+    //
     // Read once at startup rather than per keystroke: a settings file re-read on
     // every key press would put disk I/O on the input path.
 
     bool keyboardDebug() const;
+
+    // ── The bench's engine knobs on a real session ────────────────────────────
+    //
+    // "native_tuning": the same `key=value,…` string as MW_NATIVE_TUNING (see
+    // NativeBench.h), read by the server at each stream start and handed to the
+    // session (a worker's through its config); the native engine takes it when
+    // the variable is absent. It is the way to give them to a SYSTEM worker,
+    // which would find neither: the launcher service builds its environment
+    // from SYSTEM's, and its own AppData is systemprofile's. File-only and never
+    // seeded, like keyboard_debug: an instrument for an A/B on an installed
+    // edition, logged loudly whenever it is in effect. Empty by default.
+
+    QString nativeTuning() const;
+
+    // "rtp_video": which codecs ride an RTP video track instead of the video
+    // DataChannel, per host type — `native:h264+hevc+av1+ultra;other:h264+hevc+av1`
+    // (POC Ultra U1.4; "ultra" is the bench's synthetic intra stream). The
+    // browser takes the frames off the track by Encoded Transform, before its
+    // own decoder, into the same decode path as the DataChannel's. Empty, or a
+    // codec not named: SCTP, as before. MW_RTP_VIDEO overrides it. File-only,
+    // read at each stream start.
+
+    QString rtpVideo() const;
 
     // ── Stream bitrate ────────────────────────────────────────────────────────
     //
@@ -217,6 +350,17 @@ public:
     bool streamNotifications() const;
     void setStreamNotifications(bool enabled);
 
+    // ── Diagnostic modes (admin page → Advanced) ────────────────────────────
+    //
+    // "debug_mode" and "verbose_logs", JSON bools, default false. What they do
+    // is described in common/RunFlags.h; --debug and --verbose switch the same
+    // modes on for one run without writing here.
+
+    bool debugMode() const;
+    void setDebugMode(bool enabled);
+    bool verboseLogs() const;
+    void setVerboseLogs(bool enabled);
+
     // ── Chroma 4:4:4 ───────────────────────────────────────────────────────────
     //
     // Whether full-resolution YUV 4:4:4 chroma is requested (vs the default
@@ -249,6 +393,15 @@ public:
     // Documented in the README (the JSON holds no comment keys).
 
     bool audioTimeStretch() const;
+
+    // ── The viewer's microphone ────────────────────────────────────────────────
+    //
+    // Which device it plays into (src/streaming/MicOutput.h). File-only, JSON
+    // string "mic_device": part of a playback device's name on Windows (say
+    // "CABLE-A Input"); empty or "auto", the default, takes a VB-CABLE first,
+    // then Steam's (src/streaming/MicCable.h), and never the default output.
+    // Ignored on Linux, which makes its own virtual source.
+    QString micDevice() const;
 
     /// Host each streaming session in a --stream-worker subprocess (enables two
     /// concurrent sessions). File-only kill switch, default true.
@@ -286,6 +439,42 @@ public:
     QJsonObject virtualDisplay() const;
     void setVirtualDisplay(const QJsonObject& record);
     void clearVirtualDisplay();
+
+    // Stored as JSON bool "virtual_display_exclusive", DEFAULT false, set from
+    // the admin page (Windows, the virtual display installed): every other
+    // display goes off while a stream runs on ours, and comes back on at its
+    // end (issue #39, VirtualDisplay::Request::exclusive). Read as each
+    // activation starts.
+    bool virtualDisplayExclusive() const;
+    void setVirtualDisplayExclusive(bool enabled);
+
+    // Stored as JSON string "virtual_display_gpu", DEFAULT "" (the driver's
+    // own choice), set from the virtual display's card on a PC with several
+    // GPUs: the GPU, by the name the OS gives it, that draws our virtual
+    // display (VirtualDisplay::Request::gpu). Read as each activation starts.
+    // Anything but a VirtualDisplay::validGpuName reads as "".
+    QString virtualDisplayGpu() const;
+    void setVirtualDisplayGpu(const QString& gpu);
+
+    // ── The native host's display cards ─────────────────────────────────────
+    //
+    // A card per display, whose id a grid fetched earlier sends back: it has
+    // to keep naming the same screen. An enumeration rank does not — on
+    // Windows our virtual display, made primary, goes first on its GPU and
+    // moves the others down one. So each screen keeps the id it got the
+    // first time it was seen. Key "display_app_ids": {"<DisplayInfo::key, in
+    // lower case>": card id}, file-only, state the server writes.
+
+    /// The card id of each display of @p keys (DisplayInfo::key): the one it
+    /// keeps. A screen seen for the first time gets @p firstIds' entry for
+    /// it — what its card was numbered before ids were kept — when that is
+    /// free, else the lowest free id below kDisplayAppIdEnd; with every id
+    /// taken, a screen not among @p keys gives its own up. Written down at
+    /// once. An empty key gets 0.
+    QList<int> displayAppIds(const QStringList& keys, const QList<int>& firstIds);
+    /// Display cards are numbered 1 to kDisplayAppIdEnd - 1; the virtual
+    /// display's card is kDisplayAppIdEnd (NativeHostBackend).
+    static constexpr int kDisplayAppIdEnd = 1000;
 
     // ── Update relay ──────────────────────────────────────────────────────────
     //
@@ -382,7 +571,9 @@ public:
     void setMetricsReporting(bool enabled);
 
     // Seed documented file-only default keys into settings.json if absent, so they
-    // are discoverable/editable in the file. Idempotent.
+    // are discoverable/editable in the file, and drop the keys nothing reads any
+    // more (native_video_codec: PyroWave is each browser's choice since 0.4.0).
+    // Idempotent.
     void seedDocumentedDefaults();
 
     // ── First-run setup ────────────────────────────────────────────────────────
@@ -413,7 +604,7 @@ public:
     //
     // Stored as JSON object "router_ports", file-only and NOT seeded — it is
     // state the allocator writes, not a preference:
-    //   {"lan_ip": "192.168.1.20", "tunnel": [3478, 3479], "media": {"0": 48010}}
+    //   {"lan_ip": "192.168.1.20", "tunnel": [3478, 3479], "media": {"0": 48550}}
     // A remembered port is retried first and forgotten the moment the router
     // says it belongs to another machine. The numbers survive a shutdown — the
     // mappings are removed, the memory is what makes the next start land on
@@ -475,8 +666,32 @@ public:
     // (no capability to read the scanout: an AppImage). Cleared on its own the
     // day the portal refuses it — a stale token is answered with a dialog, and
     // the fresh grant overwrites this one.
-    QString portalRestoreToken() const;
-    void setPortalRestoreToken(const QString& token);
+    //
+    // @p virtualDisplay: the grant for the portal's VIRTUAL source (the
+    // "virtual display" card on Linux) — a different consent from a monitor's,
+    // kept apart so neither overwrites the other.
+    QString portalRestoreToken(bool virtualDisplay = false) const;
+    void setPortalRestoreToken(const QString& token, bool virtualDisplay = false);
+
+    // ── Display rates the capture did not hold (vddmatch) ────────────────────
+    //
+    // The virtual display rates above 240 Hz this host's capture did not hold
+    // over a stream's dense content (the native engine's CaptureHold, plan
+    // glissade V): `vddmatch` keeps the display under them from the next
+    // stream on (VirtualDisplay::matchCapAfterRefusals) — the client's own
+    // rate where twice it was refused. Never a mode changed under a stream.
+    //
+    // Stored as "vdd_match_refused", an array of {gpu, milli_hz, version, at,
+    // count}, file-only. One entry per GPU and rate; an entry of another app
+    // version is dropped on the next refusal, and ignored before: an update
+    // tries again. `at` is when it was last refused (ms since the epoch) and
+    // `count` how many times in a row: the cap lasts
+    // VirtualDisplay::refusalHoldMs(count) from `at`, and a retry that holds
+    // removes the entry (D27, option B of 28/10/2026).
+    QJsonArray vddMatchRefused() const;
+    /// Returns the entry's count after this refusal, 0 when nothing was kept.
+    int addVddMatchRefusal(const QString& gpu, int milliHz, const QString& version, qint64 nowMs);
+    void clearVddMatchRefusal(const QString& gpu, int milliHz);
 
     // ── Instance name ────────────────────────────────────────────────────────
     //
@@ -533,6 +748,75 @@ public:
     /// Default: "auto".
     QString transportMode() const;
     void setTransportMode(const QString& mode);
+
+    /// The chain a native Windows session carries its pictures on, from the
+    /// capture to the encoder (plan pipeline-video-d3d12-v2, §3.3): "auto" —
+    /// the engine's table, measured GPU by GPU — "d3d11" or "d3d12". The
+    /// admin's "Advanced" choice. A D3D12 the session cannot build runs D3D11
+    /// and says why; ignored off Windows.
+    /// Default: "auto", which is also what a value the file holds that is not
+    /// one of the three reads as.
+    QString nativeVideoPipeline() const;
+    /// Stores one of the three names, in any case. False, with the file left
+    /// as it was, for anything else.
+    bool setNativeVideoPipeline(const QString& pipeline);
+
+    // ── The native host's apps ──────────────────────────────────────────────
+    //
+    // A card apiece beside the displays, each opening a program on this
+    // machine (Linux: in its own gamescope when it can, plan Idées Punktfunk,
+    // G5; elsewhere on the virtual display, or the primary one). Key
+    // "host_apps": [{"id", "app_id", "name", "command", "quit_command"?,
+    // "source", "image"?}], in the owner's order.
+    //  - id: a uuid, the entry's name for the page and its image file.
+    //  - app_id: the card's id, never reused (host_apps_next_id): a stale grid
+    //    can never open another program than the one it shows.
+    //  - source: "user", or the launcher found on this PC that seeded it
+    //    ("steam", "playnite"); a seeded entry the owner removes goes to
+    //    "host_apps_dismissed" and never comes back on its own.
+    //  - image: the hash of host-app-images/<id>.png, set by the server only.
+    // A command is the host owner's to write, never a viewer's: it runs as the
+    // user of this desktop.
+
+    /// The valid entries, in the owner's order. One the file holds that is
+    /// not valid is left out.
+    QJsonArray hostApps() const;
+    /// The entry whose card is @p appId, or an empty object.
+    QJsonObject hostApp(int appId) const;
+    /// Stores the list the admin page sends: name and command from @p apps,
+    /// an entry with a known "id" keeping its card id, source and image, one
+    /// without getting new ones. False with @p error, the file left as it was,
+    /// for anything not valid (16 entries at most, a name of 1 to 40
+    /// characters, a command of 1 to 1000 on one line). The ids of the entries
+    /// it dropped go to @p removed, so their images can go too; a seeded one
+    /// dropped is dismissed.
+    bool setHostApps(const QJsonArray& apps, QString* error, QStringList* removed = nullptr);
+    /// Records the image of entry @p id (the hash of its file), or none when
+    /// @p hash is empty. False when there is no such entry.
+    bool setHostAppImage(const QString& id, const QString& hash);
+    /// The sources the owner removed (host_apps_dismissed).
+    QStringList hostAppsDismissed() const;
+    /// Adds the launcher @p detected ({source, name, command, quit_command?})
+    /// found on this PC, at the owner's request: it leaves the dismissed list.
+    /// The new entry, or an empty object with @p error (already there, full).
+    QJsonObject restoreHostApp(const QJsonObject& detected, QString* error);
+    /// Adds each launcher of @p detected not listed yet nor dismissed, once
+    /// per version of this app (host_apps_seeded_version): the first start
+    /// after an install or an update. The entries it added go to @p added.
+    /// False, the file untouched, when this version has already seeded.
+    bool seedHostApps(const QJsonArray& detected, const QString& version, QJsonArray* added);
+    /// Moves the apps of 0.4.0's betas ("gamescope_apps", Linux) into
+    /// host_apps, each keeping its card id (1100 + its rank), and gives an id
+    /// to an entry edited in by hand without one. Idempotent; at startup.
+    void migrateHostApps();
+    /// Where the entries' images live: host-app-images/ beside this file.
+    QString hostAppImagesDir() const;
+    /// The limits setHostApps holds to, for the page that edits them.
+    static constexpr int kHostAppsMax = 16;
+    static constexpr int kHostAppNameMax = 40;
+    static constexpr int kHostAppCommandMax = 1000;
+    /// The first card id handed out; the betas' gamescope apps kept 1100-1115.
+    static constexpr int kHostAppIdFirst = 2000;
 
     // ── HMAC key for session tokens ──────────────────────────────────────────
 
@@ -599,6 +883,15 @@ public:
 
     /// Turn remote administration on or off.
     void setRemoteAdminEnabled(bool enabled);
+
+    /// Whether the password is also accepted from outside the LAN, through the
+    /// rendezvous tunnel only. Default: false — an operator who set a password
+    /// for the machines in the house never finds it facing the internet unless
+    /// they asked for exactly that.
+    bool remoteAdminInternet() const;
+
+    /// Open or close the internet side of the remote admin door.
+    void setRemoteAdminInternet(bool enabled);
 
     // ── Rendezvous identity (0.3.0+) ────────────────────────────────────────
     //

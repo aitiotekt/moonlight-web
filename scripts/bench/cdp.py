@@ -7,6 +7,8 @@
     settingsfile <path>   the same, JSON read from a file — use this from
                           PowerShell, which eats the quotes of an inline arg
     launch "Display 1"    click the tile whose text is that, by real coordinates
+    relaunch "<tile>" [hook.js]  reload, then launch that tile again at once
+                          (hook evaluated first) — see display-follow.ps1
     fullscreen            click the app's Fullscreen button
     exitfs                Ctrl+Alt+Shift+X
     stop                  click "Stop streaming"
@@ -66,8 +68,9 @@ def page_ws(port, connect_timeout=CONNECT_TIMEOUT):
 
 
 class Cdp:
-    def __init__(self, port):
+    def __init__(self, port, reply_timeout=REPLY_TIMEOUT):
         self.port = port
+        self.reply_timeout = reply_timeout
         self.ws = page_ws(port)
         self.n = 0
 
@@ -77,12 +80,12 @@ class Cdp:
         # Events for other subscriptions arrive on the same socket and are
         # skipped, so the deadline is on the WHOLE reply, not on one frame:
         # a chatty page must not be able to extend the wait indefinitely.
-        deadline = time.time() + REPLY_TIMEOUT
-        self.ws.settimeout(REPLY_TIMEOUT)
+        deadline = time.time() + self.reply_timeout
+        self.ws.settimeout(self.reply_timeout)
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
-                raise SystemExit(f"{method} did not answer in {REPLY_TIMEOUT}s on port "
+                raise SystemExit(f"{method} did not answer in {self.reply_timeout}s on port "
                                  f"{self.port} — the page or the DevTools endpoint is stuck")
             self.ws.settimeout(remaining)
             try:
@@ -199,11 +202,16 @@ STATS_JS = """(() => {
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--port", type=int, default=9333)
+    # An evaluation that is SUPPOSED to take long - a probe series of N clicks
+    # N x spacing apart - says so, rather than every call waiting longer: 20
+    # clicks 1.5 s apart are 30 s, exactly the default, and a series with a few
+    # slow clicks was reported as a stuck page (25/09/2026).
+    parser.add_argument("--timeout", type=float, default=REPLY_TIMEOUT)
     parser.add_argument("command")
     parser.add_argument("args", nargs="*")
     ns = parser.parse_args()
 
-    c = Cdp(ns.port)
+    c = Cdp(ns.port, ns.timeout)
     cmd, args = ns.command, ns.args
 
     if cmd == "settingsfile":
@@ -299,6 +307,58 @@ def main():
             print(json.dumps({"code": k["code"], "key": k["key"],
                               "shift": bool(k.get("shift")), "us": k.get("us", "")}))
             time.sleep(gap)
+    elif cmd == "relaunch":
+        # Reload the page and launch a tile again, in ONE DevTools session and
+        # as fast as the page allows. The Virtual Display outlives its last
+        # stream by 4 s and every activation makes it SDR again: a relaunch
+        # made of separate cdp.py calls (a Python start and a handshake each)
+        # took longer than that, and display-follow's HDR launch measured a
+        # display that had been remade.
+        tile = args[0]
+        hook = None
+        if len(args) > 1:
+            with open(args[1], encoding="utf-8") as f:
+                hook = f.read()
+        t0 = time.time()
+        end = t0 + 30
+        c.call("Page.reload")
+        while True:
+            if time.time() > end:
+                raise SystemExit(f"after a reload the tile {tile!r} never came back")
+            time.sleep(0.1)
+            try:
+                if c.eval(f"!!document.body && document.body.innerText.includes({json.dumps(tile)})"):
+                    break
+            except (RuntimeError, SystemExit):
+                continue  # the old document went away under the call
+        if hook:
+            c.eval(hook)
+        # The host cards keep arriving for a moment after the tile's text does,
+        # and every one of them moves it: a click at its first position landed
+        # on another host's app (25/09/2026, a Sunshine desktop instead of the
+        # Virtual Display). Clicked once it has held still.
+        where = (f"(() => {{ const e = [...document.querySelectorAll('*')].find(x => "
+                 f"x.children.length === 0 && x.textContent.trim() === {json.dumps(tile)}); "
+                 f"if (!e) return null; const r = e.getBoundingClientRect(); "
+                 f"return [Math.round(r.left), Math.round(r.top)]; }})()")
+        last = None
+        while time.time() < end:
+            pos = c.eval(where)
+            if pos and pos == last:
+                break
+            last = pos
+            time.sleep(0.25)
+        c.click_text(tile)
+        # The self-stream warning, when it comes up: answered on sight.
+        while time.time() < end:
+            if c.eval("!!document.querySelector('.self-stream-go')"):
+                c.click_text("Stream anyway")
+                break
+            if c.eval("!![...document.querySelectorAll('canvas, video')]"
+                      ".find(e => e.getBoundingClientRect().width > 0)"):
+                break
+            time.sleep(0.1)
+        print(json.dumps({"relaunchMs": round((time.time() - t0) * 1000)}))
     elif cmd == "eval":
         print(c.eval(args[0]))
     elif cmd == "evalfile":

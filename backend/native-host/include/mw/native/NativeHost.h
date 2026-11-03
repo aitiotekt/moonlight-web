@@ -20,8 +20,10 @@
 #include "AudioPacket.h"
 #include "Capabilities.h"
 #include "EncodedFrame.h"
+#include "FpsStep.h"
 #include "InputEvent.h"
 #include "LinkFeedback.h"
+#include "MouseKeys.h"
 #include "SessionConfig.h"
 
 #include <functional>
@@ -361,6 +363,104 @@ public:
     /// encoder's per-frame budget follows. Safe from any thread.
     virtual void setClientFpsCap(int fps) = 0;
 
+    /// How many frames wait at the client's decoder input, said the moment a
+    /// second one does and again when it is back to one (a `decodequeue`
+    /// message, frontend DecodeQueueSignal.js). Read only under the bench's
+    /// cadence=host-guarded, which skips presents while it is full (design
+    /// §33); every other cadence, and every platform but Windows, ignores it.
+    /// Safe from any thread.
+    virtual void setClientDecodeQueue(int /*depth*/) {}
+
+    /// Whether video waits outside the transport's own buffer right now —
+    /// asked by the capture loop at each picture, from its thread, so it must
+    /// be cheap and safe from any thread. Empty: never.
+    using LinkBusyProbe = std::function<bool()>;
+
+    /// The relay's view of its send queue, for the bench's linkhold= (plan
+    /// Wi-Fi W2 C): while @p probe answers true, a picture is held, not
+    /// encoded, and the freshest goes once it answers false — what the
+    /// host-guarded cadence does for the client's decoder, done for the link.
+    /// Every platform but Windows ignores it. Safe from any thread.
+    virtual void setLinkBusyProbe(LinkBusyProbe /*probe*/) {}
+
+    /// When the client's screen refreshes (a `vsyncgrid` message, frontend
+    /// VsyncGrid.js): every @p periodUs, one refresh at @p phaseUs on this
+    /// host's steady clock, a frame needing @p leadUs from being taken here to
+    /// being ready there; whether its canvas is @p tearing, whether its link
+    /// is @p steady enough to aim through, and the frames a second it takes
+    /// when frames go as they come (@p budgetFps). Read only under the bench's
+    /// cadence=deadline, which takes one picture per refresh that lead before
+    /// it, or sends each picture as it comes to a canvas that tears or over an
+    /// uneven link (DeadlineCadence.h); every other cadence, and every platform
+    /// but Windows, ignores it. Safe from any thread.
+    virtual void setClientVsyncGrid(double /*periodUs*/, int64_t /*phaseUs*/, int64_t /*leadUs*/,
+                                    bool /*tearing*/, bool /*steady*/, double /*budgetFps*/)
+    {}
+
+    /// What each pong tells the client about its grid.
+    struct VsyncGridStatus
+    {
+        /// The cadence would aim at a grid: the client should send one.
+        bool wanted = false;
+        /// The client's grid is being followed right now.
+        bool followed = false;
+        /// ...by aiming each picture at a refresh (vsync), not by sending each
+        /// as it comes (a canvas that tears, an uneven link).
+        bool aimed = false;
+        /// The host display's refresh period, µs; 0 when unknown.
+        int presentUs = 0;
+    };
+    /// Safe from any thread.
+    virtual VsyncGridStatus vsyncGridStatus() const { return {}; }
+
+    /// "Auto" with detection (an `fpsstep` message, frontend CadenceStepper.js):
+    /// the client asks for the stream to run at @p fps, above its own rate,
+    /// while it measures whether what it shows gets younger — or, with 0, to
+    /// come back to its own rate. Answered at once (FpsStep: applied, capped at
+    /// the display's refresh, or refused and why); the loop applies it between
+    /// two frames, and the bitrate does not move. Only the Windows engine steps;
+    /// elsewhere every step is refused and the stream keeps its cadence. Safe
+    /// from any thread.
+    virtual FpsStep setClientFpsStep(int fps)
+    {
+        FpsStep refused;
+        refused.askedFps = fps;
+        refused.why = "this platform keeps its cadence";
+        return refused;
+    }
+
+    /// What the client's detection reads of the cadence, once a second with
+    /// the stats: how fast the content changes, the stream's own rate, the
+    /// step in force. Zero-filled where nothing steps. Safe from any thread.
+    virtual CadenceStatus cadenceStatus() const { return {}; }
+
+    /// Whether the capture held its display over the session's dense content
+    /// (core/CaptureHold.h), for the server's `vddmatch`: a host that did not
+    /// hold a display at twice the client's rate gets the client's own from
+    /// the next stream on.
+    struct CaptureHoldStatus
+    {
+        /// Enough dense content to say anything.
+        bool judged = false;
+        /// Within every threshold; true when not judged.
+        bool held = true;
+        /// The captured display's refresh, mHz; 0 when unknown.
+        int displayMilliHz = 0;
+        /// The GPU that captured and encoded it.
+        std::string gpu;
+        int denseSeconds = 0;
+        /// Of the gate's calls, 0..1; -1 when the gate was never called.
+        double locked = -1;
+        double carried = 0;
+        double folded = 0;
+        double busy = 0;
+        /// The first threshold missed; empty when held.
+        std::string why;
+    };
+    /// Final once stop() returned; before, it says nothing. Only the Windows
+    /// engine judges.
+    virtual CaptureHoldStatus captureHold() const { return {}; }
+
     /// Where to hear that the viewer's input stopped reaching the host, or
     /// started again — see InputGate. Delivered on the thread that injects,
     /// i.e. the caller's own sendInput() thread, at most once per change.
@@ -392,6 +492,31 @@ public:
     /// calls it. Everywhere else this is accepted and ignored.
     virtual void setPortalGrantCallback(PortalGrantCallback callback) { (void)callback; }
 
+    /// Where to hear that the session turned Windows' Mouse Keys on, so that
+    /// the host draws its pointer although it has no pointing device, and
+    /// what it found before (MouseKeys.h) — or that it no longer holds them.
+    /// For whoever outlives the session's process: a process that dies
+    /// holding them cannot put them back, its parent can (restoreMouseKeys).
+    ///
+    /// Must be set before start(), which may already turn them on. Called on
+    /// the thread that called start(), then the capture thread, then the one
+    /// that calls stop(). Only the Windows engine calls it; elsewhere it is
+    /// accepted and ignored.
+    virtual void setMouseKeysCallback(MouseKeysCallback callback) { (void)callback; }
+
+    /// A session whose pictures come from elsewhere (SessionConfig::
+    /// videoSource External): the display now sits at this rectangle of the
+    /// host's desktop — its mode changed under the feed, which says so.
+    /// Absolute pointer positions land there from the next one. Safe from any
+    /// thread; ignored by a session that captures, whose own capture knows.
+    virtual void setExternalDesktop(int left, int top, int right, int bottom)
+    {
+        (void)left;
+        (void)top;
+        (void)right;
+        (void)bottom;
+    }
+
     /// Get the viewer out of a closed gate, when they cannot click their way
     /// out because the pointer itself is stuck.
     ///
@@ -414,11 +539,21 @@ public:
     /// window in the way, and minus any other elevated window, which cannot be
     /// restored for the same reason it could not be minimised alone.
     ///
+    /// The client offers it under the policy gate as well (an invited player
+    /// before an administrator window, 22/10/2026): the pointer works there,
+    /// but a game run as administrator that fills the screen leaves nothing
+    /// else to click. The same act, the owner's game minimised with the rest.
+    ///
     /// The gate is re-reported when it is over, so a viewer who is not touching
     /// anything still learns whether it worked. Returns false when the gate is
     /// not closed, and where the platform has no such thing — today, everywhere
     /// but Windows.
     virtual bool releaseInputBlock() { return false; }
+
+    /// The bench's click trace (EncoderTuning::clickTrace) as CSV text, empty
+    /// when it was not asked for or the platform has none. The engine writes
+    /// nothing to disk: the consumer puts it next to its log.
+    virtual std::string clickTraceCsv() const { return {}; }
 };
 
 /// Entry point to the engine.
@@ -477,6 +612,25 @@ public:
     /// through three platform sessions to reach the one place that can use it.
     static void setKeyboardDiagnostics(bool on);
     static bool keyboardDiagnostics();
+
+    /// How this process has Ctrl+Alt+Suppr pressed on its host (Windows).
+    /// Windows honours SendSAS from a service in session 0 only, which a
+    /// worker in the console session is not, SYSTEM as it may be: the host
+    /// application hands the press to its launcher service through @p sender,
+    /// which returns false with the reason in its argument. Unset, the engine
+    /// calls SendSAS itself. Either way, only a SYSTEM worker asks: it alone
+    /// can follow the screen that opens, and take the Esc that closes it.
+    static void setSecureAttentionSender(std::function<bool(std::string& error)> sender);
+
+    /// Whether the input is on a desktop other than the user's own: on Windows
+    /// the secure one, `Winlogon`, where the lock screen's PIN and the UAC
+    /// prompt's password are typed — or one this process cannot even read,
+    /// which from below SYSTEM is that same desktop. The keyboard diagnostics,
+    /// this module's and the input codec's, keep silent while it answers true:
+    /// what is typed there never belongs in a log, whatever a settings file
+    /// says. Asked live, on a key press, only when the diagnostics are on.
+    /// False on the other platforms.
+    static bool secureDesktopHasInput();
 
     /// Version of this module, independent of MoonlightWeb's — it may one day
     /// ship on its own.

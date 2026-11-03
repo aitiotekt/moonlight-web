@@ -14,7 +14,7 @@ Internet ─:53──────> [dnsdist] ──> pdns:5300         anti-ampl
 Internet ─:80/:443─> [caddy] ┬─ api.{domain} ──────> pdns:8081        direct PowerDNS API (compatibility)
                              ├─ dnsapi.{domain} ───> mw-proxy:8080 ─> pdns:8081   restricted API (0.2.0+)
                              ├─ updates.{domain} ──> mw-proxy:8080 ─> GitHub      release relay + version census (0.3.0+)
-                             ├─ metrics.{domain} ──> (not deployed — see Session census)
+                             ├─ metrics.{domain} ──> mw-proxy:8080 ─> umami   session census (0.3.0+)
                              ├─ packages.{domain} ─> /root/mw-packages   APT/DNF repo (0.3.0+, see deploy-packages.sh)
                              └─ stats.{domain} ────> umami:3000      analytics dashboard
                      [pdns]     (internal, non-root)  PowerDNS authoritative + REST API
@@ -243,10 +243,9 @@ used, so "is 720p still worth supporting?", "did AV1 take off?", "how long does
 a session actually last?" have no data behind them.
 
 `https://metrics.{MW_DOMAIN}` (`mw-proxy/session.go`, same container again, path
-`/v1/session`) is where that would be collected — **it is not deployed**. The
-code ships, instances know how to report to it, and nothing answers: there is no
-`metrics` A record and no site block for it in the Caddyfile. Read the rest of
-this section as a description of what turning it on would collect.
+`/v1/session`) is where that is collected. The stack serves the host (`pdns/init.sh`
+adds the A record, `caddy/Caddyfile.tmpl` the site); it counts nothing until a
+Umami website is named for it (steps 3-4 below).
 
 MoonlightWeb **0.3.0+** POSTs a small JSON body —
 with the same restricted key — when a stream first carries a picture, again when
@@ -263,9 +262,9 @@ matched against an allowlist or collapsed into a bucket before it goes anywhere
 — there is no free-text field at all — so a forged client can neither inject
 strings into the dashboard nor invent a million distinct rows.
 
-**Consent covers this too.** The same question asked at first launch governs
-both censuses: until it is answered nothing is reported, and withdrawing it in
-the admin page stops this one on the spot.
+**Who reports.** 0.3.0 reports only once its owner has said yes to the
+first-launch question. 0.3.1+ reports by default and says so in **Settings →
+Privacy**, where one switch stops both censuses on the spot.
 
 **It is never load-bearing.** The endpoint answers `204` whether or not it
 counts anything, a failed report is dropped without a retry, and no part of a
@@ -277,30 +276,19 @@ is its own host rather than another path on `updates.`.
 
 **Turning it on** — four steps, and the **order matters**: publish the name
 before Caddy is asked to certify it, or it will order a certificate for a name
-that does not resolve, fail, and retry forever.
+that does not resolve, fail, and retry forever. A fresh install does steps 1-2
+by itself; a zone created before them needs both by hand.
 
-1. Add the A record: `pdnsutil add-record {MW_DOMAIN} metrics A {MW_PUBLIC_IP}`
+1. The A record: `pdnsutil add-record {MW_DOMAIN} metrics A {MW_PUBLIC_IP}`
    then `pdnsutil rectify-zone {MW_DOMAIN}` (a DNSSEC zone serves nothing until
-   it is rectified). Check it resolves from outside before continuing.
-2. Add the site block to `caddy/Caddyfile.tmpl` — it belongs where the comment
-   marks its place, next to `updates.`:
-
-   ```
-   metrics.@MW_DOMAIN@ {
-   	@SITE_TLS_LINE@
-   	rate_limit {
-   		zone mw_metrics {
-   			key {remote_host}
-   			events 60
-   			window 1m
-   		}
-   	}
-   	reverse_proxy mw-proxy:8080
-   }
-   ```
-
-   Then `docker compose up -d --build caddy` — the template lives *in* the
-   image, so a restart alone changes nothing.
+   it is rectified) — or `docker compose restart pdns`, whose `ensure_a`
+   backfills it at the cost of a one-second DNS blip. Check it resolves from
+   outside before continuing.
+2. The site block `metrics.@MW_DOMAIN@` in `caddy/Caddyfile.tmpl`, next to
+   `updates.`. Deploying a tag that carries it rebuilds Caddy
+   (`deploy-prod.sh`); by hand it is `docker compose up -d --no-deps --build
+   caddy` — the template lives *in* the image, so a restart alone changes
+   nothing.
 3. In Umami, add a **third website**: name `MoonlightWeb sessions`, domain
    `metrics.{MW_DOMAIN}`. Its own website on purpose — there, "views" means
    "sessions started" and nothing else is mixed in.
@@ -491,7 +479,215 @@ cd ~
 
 Rolling back is the same two blocks with the previous tag. The script refuses
 a dirty tree, refuses to run outside `~/moonlight-web`, and asks nothing
-interactively — a prompt in the middle of a paste would eat the next line.
+interactively — a prompt in the middle of a paste would eat the next line. It
+reads nothing from its stdin either, so a script fed to `ssh box bash -s` can
+call it. Then check both families: see the end of "IPv6 on the Docker
+networks".
+
+**When Caddy restarts**, the order is: backup, checkout, build the images
+(everything still serving), stop `mw-rendezvous` (and staging's
+`mw-dev-rendezvous` if it runs), recreate Caddy, start the rendezvous again.
+Caddy closes the `stream.` WebSockets one by one; a browser's closing before
+its host's line would make a running rendezvous tell that host "the browser
+left", and the host would take down a tunnel a stream may still be using —
+on its own LAN too. Stopped first, the rendezvous says nothing. Both runs print
+the host lines online and the browsers connected (`/healthz` "online" and
+"sessions"; a rendezvous older than "sessions" leaves the browsers to Caddy's
+admin API); the apply counts again 20 s after, once hosts have reconnected.
+
+The rendezvous also holds back its "the browser left" to a host by
+`MW_RDV_CLOSE_DELAY_MS` (3 s by default), and drops it if the host's line goes
+in the meantime: an unplanned restart of Caddy — a Docker daemon restart, a
+reboot without the steps below — then cuts no tunnel either.
+Browser pages loaded before `srv-2026-10-14-b1` still lose their tunnel when
+the line drops, so pick a quiet moment.
+
+### Rebooting the VM
+
+Docker stops the containers in no useful order, so the same race applies. Stop
+the rendezvous by hand first — `unless-stopped` then keeps it down across the
+reboot, so start it again after:
+
+```bash
+cd ~/moonlight-web/deploy/powerdns
+docker compose stop mw-rendezvous
+docker stop mw-dev-rendezvous 2>/dev/null
+reboot
+# after the reboot:
+cd ~/moonlight-web/deploy/powerdns
+docker compose start mw-rendezvous
+docker start mw-dev-rendezvous 2>/dev/null
+docker compose ps
+```
+
+The same applies to restarting the Docker daemon by hand.
+
+### IPv6 on the Docker networks
+
+`mwnet` and `mw-edge` carry IPv6 (unique-local prefixes, MTU 1400 — the
+comment above `networks:` in `docker-compose.yml` says why). Without it, Docker
+still answers on `[::]:53/80/443`, but through its userland proxy, which
+reconnects to the container over IPv4: every IPv6 client would reach Caddy,
+the rendezvous and dnsdist as the bridge gateway, all of IPv6 in one
+rate-limit bucket. Requires Docker 27 or later; check with
+`docker network inspect mw-edge --format '{{.EnableIPv6}}'`.
+
+Docker cannot change a network's IPv6 or MTU in place, and `deploy-prod.sh`
+leaves networks alone, so the first tag that carries these settings is
+followed by one recreation of both networks. DNS and HTTPS stop for the
+half-minute it takes, and every held line drops and reconnects: pick a quiet
+moment.
+
+```bash
+# 1. the tag, read then applied as usual (it only checks the compose file out)
+cd ~/moonlight-web/deploy/powerdns
+./deploy-prod.sh srv-<date>
+./deploy-prod.sh srv-<date> --apply
+
+# 2. images first, while everything still serves
+docker compose pull dnsdist
+
+# 3. the rendezvous before anything else (same reason as a Caddy restart),
+#    then staging's Caddy: its endpoint on mw-edge would keep that network
+#    from being removed
+docker compose stop mw-rendezvous
+docker stop mw-dev-rendezvous 2>/dev/null
+docker stop mw-dev-caddy 2>/dev/null
+
+# 4. production down and up: containers and networks recreated from the
+#    images already there; volumes are kept (no -v)
+docker compose down
+docker compose up -d
+docker compose ps
+
+# 5. staging onto the new mw-edge: its Caddy must be RECREATED, a plain start
+#    looks for the network that no longer exists
+cd ~/moonlight-web-dev/deploy/powerdns
+docker compose up -d --no-deps --force-recreate caddy
+docker compose start mw-rendezvous
+docker compose ps
+cd ~
+
+# 6. check
+docker network inspect mw-edge powerdns_mwnet \
+  --format '{{.Name}} ipv6={{.EnableIPv6}} {{range .IPAM.Config}}{{.Subnet}} {{end}}'
+ip6tables -t nat -S DOCKER          # a DNAT each for 53/tcp, 53/udp, 80, 443
+ip -6 route show default            # still there (see below)
+```
+
+Creating an IPv6 network turns on `net.ipv6.conf.all.forwarding`, and a
+forwarding Linux stops listening to router advertisements. That is harmless
+here — the VM's IPv6 address and default route are static (netplan,
+`accept_ra` 0) — but on a box that learns its IPv6 route from RAs, set
+`net.ipv6.conf.<if>.accept_ra=2` first or the route expires an hour later.
+
+**Publishing the AAAA records** comes after, one name at a time, with a short
+TTL, by hand in the running pdns (`MW_PUBLIC_IP6` stays empty meanwhile):
+
+```bash
+cd ~/moonlight-web/deploy/powerdns
+D=$(grep ^MW_DOMAIN= .env | cut -d= -f2 | tr -d '[:space:]')
+docker compose exec -T pdns pdnsutil --config-dir=/etc/powerdns \
+  replace-rrset "$D" stream.dev AAAA 300 2001:db8::1 </dev/null      # your address
+docker compose exec -T pdns pdnsutil --config-dir=/etc/powerdns rectify-zone "$D" </dev/null
+```
+
+Once every name has one, setting `MW_PUBLIC_IP6` in `.env` makes `init.sh`
+keep them (it adds only the AAAA a name lacks). `ns1`/`ns2` also need an IPv6
+glue at the registrar: without it, a resolver that cannot reach the IPv4 glue
+cannot reach the zone at all, AAAA or not.
+
+Two cautions before a name gets its AAAA:
+
+- **`stream.` waits for hosts that race the families.** A host before v0.4.1
+  opens its line through Qt, which tries the addresses one after the other: on
+  a network whose IPv6 is configured but silently dropped, every
+  (re)connection would first lose 21 s (Windows) to 30 s (Linux). Browsers,
+  curl and Go race the families and are not affected. `stream.dev` has carried
+  an AAAA since 2026-10-20.
+- **A new AAAA can take an hour to be seen.** The zone's SOA minimum is
+  3600 s: a resolver that asked before the record existed keeps its "no such
+  record" answer that long.
+
+**After every deploy**, check both families, whether or not a name has its
+AAAA yet (`--resolve` picks the address). Any HTTP code passes — the name is
+served with its certificate; a curl error does not. From the box, then from a
+machine outside if one is at hand:
+
+```bash
+cd ~/moonlight-web/deploy/powerdns
+D=$(grep ^MW_DOMAIN= .env | cut -d= -f2 | tr -d '[:space:]')
+V4=$(grep ^MW_PUBLIC_IP= .env | cut -d= -f2 | tr -d '[:space:]')
+V6=2001:db8::1                                                    # your address
+for a in "$V4" "[$V6]"; do
+  for h in stream.$D stream.dev.$D; do
+    printf '%s via %s: ' "$h" "$a"
+    sh mw-rendezvous/smoke.sh "https://$h" --resolve "$h:443:$a" | tail -1
+  done
+  for h in $D www.$D api.$D dnsapi.$D updates.$D metrics.$D stats.$D packages.$D; do
+    printf '%-28s %-24s ' "$h" "$a"
+    curl -sS -o /dev/null -m 10 --resolve "$h:443:$a" -w '%{http_code}\n' "https://$h/"
+  done
+done
+cd ~
+```
+
+### Cold backup and restore
+
+`--apply` (here and in `deploy-packages.sh`) first runs `backup-prod.sh`, and
+deploys nothing if it fails. It writes one dated ZIP to `/root/mw-backups/`,
+`mw-prod-<UTC date>-<tag>.zip`, root only, and keeps the three newest. Inside:
+the whole `~/moonlight-web` (`.git`, `.env`, `.env.bak-*`, `certs/`),
+`/root/mw-packages`, the stack's docker volumes file by file (zone DB, Caddy's
+certificates, rendezvous claims, ownership store), Umami as a `pg_dump`, every
+DNS zone as text, ufw/fail2ban/sshd/docker settings and root's crontab, and a
+`MANIFEST.txt` (tag, commit, containers, image ids). Images are not in it: a
+rollback rebuilds them from the previous tag. Nothing is stopped while it runs.
+
+By hand, at any time (`--list` shows what is kept):
+
+```bash
+cd ~/moonlight-web/deploy/powerdns
+./backup-prod.sh
+cd ~
+```
+
+The first deploy of a tag that ships the script runs from a checkout that does
+not have it; `deploy-prod.sh` then takes it from the target tag. To take one
+before that deploy anyway:
+
+```bash
+git -C ~/moonlight-web fetch --tags origin
+git -C ~/moonlight-web show <tag>:deploy/powerdns/backup-prod.sh > /tmp/mw-backup-prod.sh
+bash /tmp/mw-backup-prod.sh
+```
+
+**Restore** — first try the ordinary rollback above (previous tag); restore
+from the ZIP only what that does not bring back. Unpack it next to production,
+never over it, and read `MANIFEST.txt`:
+
+```bash
+mkdir -p /root/restore && cd /root/restore
+python3 -m zipfile -e /root/mw-backups/mw-prod-<date>-<tag>.zip .
+cat MANIFEST.txt
+```
+
+Then, piece by piece, with the stack's services stopped only for the piece
+being restored (`docker compose stop <service>`, then `start`):
+
+- `.env` and the other untracked files: copy them from
+  `moonlight-web/deploy/powerdns/` into `~/moonlight-web/deploy/powerdns/`.
+- `mw-packages/`: `rsync -a --delete mw-packages/ /root/mw-packages/`.
+- A volume: `rsync -a --delete volumes/<name>/ "$(docker volume inspect -f '{{.Mountpoint}}' <name>)/"`.
+  ZIP keeps file modes, not owners: give the files back to the owner the live
+  volume had (`ls -ln` before overwriting it).
+- Umami: `docker compose exec -T umami-db psql -U umami -d umami < dumps/umami.sql`
+  into an emptied database (`dropdb`/`createdb` inside the container first).
+- A DNS zone: compare `dumps/zone-<name>.txt` with `pdnsutil list-zone`, and
+  put back only the records that differ (`pdnsutil` or the API).
+- `system/`: compare before copying; ufw and fail2ban need a reload after.
+
+Remove `/root/restore` afterwards: it holds `.env` and the database dump.
 
 ### Pointing a host at staging
 
@@ -521,12 +717,45 @@ carries its own version, in two layers — neither is the app version:
 
 Release order: server first (`deploy-prod.sh` on the tag), application second.
 
+### Official interfaces
+
+Every machine shares the `stream.` origin, so the entry page opens only the
+interface of a release, file for file (`bootstrap/v1/official.js`). Each
+release's list is `bootstrap/v1/interfaces/<version>.json`, the digest of
+every file an installed machine of that release serves, built from its tag by
+`scripts/interface-list.mjs`. CI rebuilds every list from its tag, and one
+whose release is not tagged yet from the commit itself, which is the one that
+will be tagged. The bootstrap watchdog compares them like the scripts.
+
+- **A release commit carries its own list**: on the commit that will be
+  tagged, `node scripts/interface-list.mjs build X.Y.Z --ref HEAD`, then commit
+  the file there. The tag's CI fails without it, before any package.
+- **Production serves the list before a machine installs the release**: run
+  `deploy-prod.sh vX.Y.Z --apply` right after pushing the tag, not after the
+  release is published. Once production enforces the check, the tag's CI
+  waits for `stream.` to serve the list (up to 45 minutes) and builds no
+  package until then; a machine that installs the release earlier is refused.
+- **Where it is enforced**: staging refuses a release whose files differ from
+  its list, and lets a build between releases through. Production refuses
+  from v0.4.1 (`PRODUCTION_ENFORCES`, in both `official.js` and `sw.js`); it
+  only reported in the browser console before.
+- **Builds between releases are refused by production**: CI's `staging`
+  channel (`x.y.z.gSHA-stg`) included. Point them at staging
+  (`MW_DOMAIN=dev.{MW_DOMAIN}`, above).
+- **The way back**, if a list turns genuine machines away: set
+  `PRODUCTION_ENFORCES` to false in both files on a commit over the running
+  tag, tag it `srv-<date>`, and deploy that tag. Only `bootstrap/` changes, so
+  nothing is rebuilt; the bootstrap is served `no-cache`, so every browser
+  reports instead of refusing on its next visit.
+
 ## Contents
 
 ```
 deploy/powerdns/
 ├── install.sh               # one-shot installer (Docker, security, firewall, up)
 ├── deploy-prod.sh           # PRODUCTION: move to a tag, rebuild only what it changed
+├── deploy-packages.sh       # PRODUCTION: put a release's APT/DNF tree in /root/mw-packages
+├── backup-prod.sh           # PRODUCTION: dated cold-backup ZIP, three kept, before every deploy
 ├── renew-certs.sh           # re-issue TLS certs once DNS delegation has propagated
 ├── docker-compose.yml       # PRODUCTION: dnsdist + pdns + mw-proxy + mw-rendezvous
 │                            #   + coturn + caddy + umami (+ umami-db)

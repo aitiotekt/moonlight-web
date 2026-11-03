@@ -16,6 +16,7 @@
  */
 
 import * as iosAudioUnlock from '../audio/iosAudioUnlock.js';
+import { closeHidChannel, createHidChannel, sendHidFrame } from '../hid/hidWire.js';
 import { armAudioPlayRetry } from '../util/audioAutoplay.js';
 import { forceOpusStereo } from '../util/SdpUtils.js';
 import { openSignalingSocket } from '../net/tunnelBridge.js';
@@ -26,10 +27,17 @@ import {
     verifyHostSignature,
     extractFingerprint,
     IDENTITY_REFUSED,
+    isBindRefusedClose,
 } from '../util/pairingCrypto.js';
 import { defaultIceServers } from './IceServers.js';
 import { isViewMessage } from './hostMessages.js';
 import { setAudioJitterBufferTarget } from '../util/AudioJitter.js';
+import {
+    armDscpCarrier,
+    dscpCarrierMode,
+    prepareDscpCarrier,
+    recvonlyExceptCarrier,
+} from '../util/DscpCarrier.js';
 
 /**
  * Describe a WebSocket close code for diagnostic logging.
@@ -105,6 +113,8 @@ export class WebRtcMedia {
         this.pc = null;
         this.dataChannels = { input: null };
         this.connected = false;
+        // A share-link guest, never paired: no MW-BIND hello (StreamView sets it).
+        this._unpairedGuest = false;
 
         // ICE config — populated dynamically by the host's ice-config message,
         // which is authoritative and may legitimately be an empty list (LAN).
@@ -128,6 +138,8 @@ export class WebRtcMedia {
         this.onTakeover = null; // () session taken over by another device
         this.onRevoked = null; // () this device's access was revoked by the admin
         this.onSessionEnded = null; // () the owner ended the session we were invited to
+        this.onHostEnded = null; // () the host ended the stream on purpose (app closed there)
+        this.onHostLost = null; // () the host side failed (Sunshine crashed, encoder died)
 
         // Stats
         this.stats = { framesReceived: 0, chunksReceived: 0, framesDropped: 0, framesAssembled: 0 };
@@ -139,6 +151,11 @@ export class WebRtcMedia {
         // Logging
         this._logCount = 0;
         this._frameLogCount = 0;
+
+        // The viewer's microphone (audio/MicUplink.js), when the host took it:
+        // it answers the same audio section sendrecv. Set by StreamView.
+        /** @type {import('../audio/MicUplink.js').MicUplink|null} */
+        this.mic = null;
 
         // Guard
         this._stopping = false;
@@ -216,6 +233,8 @@ export class WebRtcMedia {
             this._createPeerConnection();
             // MW-BIND-v1: announce our key and nonce. The host holds its SDP
             // offer until this arrives, since its signature covers the nonce.
+            // Not for a share-link guest: see WebRtcDataChannel.
+            if (this._unpairedGuest) return;
             beginHandshake().then((identity) => {
                 this._mwBind = identity;
                 if (identity) this._sendSignaling(helloMessage(identity));
@@ -278,7 +297,11 @@ export class WebRtcMedia {
                 }, this.WS_GRACE_PERIOD_MS);
             } else {
                 // Close code tells us what went wrong
-                if (evt.code === 1015) {
+                if (isBindRefusedClose(evt)) {
+                    // The host refused our key: final, like a refusal of its own
+                    // signature here (see IDENTITY_REFUSED).
+                    this._onError(IDENTITY_REFUSED);
+                } else if (evt.code === 1015) {
                     this._onError(
                         'Erreur de securite TLS. ' + "Verifiez la date et l'heure du systeme.",
                     );
@@ -299,6 +322,11 @@ export class WebRtcMedia {
             () => this._cleanupStaleFrames(),
             this.CLEANUP_INTERVAL_MS,
         );
+    }
+
+    /** One HID passthrough report frame; false when the channel is not open. */
+    sendHid(frame) {
+        return sendHidFrame(this._hidDc, frame);
     }
 
     /** Send JSON input message over the input DataChannel. */
@@ -355,6 +383,9 @@ export class WebRtcMedia {
             this._audioRetryCleanup();
             this._audioRetryCleanup = null;
         }
+
+        closeHidChannel(this._hidDc);
+        this._hidDc = null;
 
         // Close DataChannels
         for (const [label, dc] of Object.entries(this.dataChannels)) {
@@ -577,6 +608,9 @@ export class WebRtcMedia {
         this.dataChannels.input = this.pc.createDataChannel(this.DC_INPUT_LABEL, inputInit);
         this._setupDataChannel(this.DC_INPUT_LABEL, this.dataChannels.input);
 
+        // The HID passthrough's reports (DC#4, hid/hidWire.js), not waited for.
+        this._hidDc = createHidChannel(this.pc);
+
         console.log('[WebRtcMedia] DataChannels created (input=1; audio is an RTP track)');
     }
 
@@ -627,6 +661,10 @@ export class WebRtcMedia {
                         if (this.onRevoked) this.onRevoked();
                     } else if (msg.type === 'session-ended') {
                         if (this.onSessionEnded) this.onSessionEnded();
+                    } else if (msg.type === 'host-ended') {
+                        if (this.onHostEnded) this.onHostEnded();
+                    } else if (msg.type === 'host-lost') {
+                        if (this.onHostLost) this.onHostLost();
                     } else {
                         console.log('[WebRtcMedia] Input DC message:', msg);
                     }
@@ -758,6 +796,13 @@ export class WebRtcMedia {
             console.log('[WebRtcMedia] Remote description set (offer)');
             await this._flushPendingCandidates();
 
+            // The viewer's microphone, when the host offered to take it.
+            const micOn = this.mic ? this.mic.prepare(this.pc, sdp) : false;
+            // The bench's silent carrier (DscpCarrier.js), off by default; the
+            // microphone holds that sender when both are asked.
+            const carrier = micOn ? null : dscpCarrierMode();
+            prepareDscpCarrier(this.pc, carrier);
+
             // Create answer with receive-only constraints (lowest latency)
             const answer = await this.pc.createAnswer({
                 offerToReceiveVideo: true,
@@ -766,8 +811,9 @@ export class WebRtcMedia {
 
             // Apply low-latency SDP transformations before setLocalDescription
             let answerSdp = answer.sdp;
-            // Direction: receive only (client is viewer, never sends media)
-            answerSdp = answerSdp.replace(/a=sendrecv/g, 'a=recvonly');
+            // Direction: receive only (client is viewer, never sends media),
+            // but for the microphone and the bench's silent carrier
+            answerSdp = recvonlyExceptCarrier(answerSdp, micOn ? 'mic' : carrier);
             // Strip ULPFEC/RED (redundant FEC adds bandwidth & latency). Only the
             // FEC payload types' lines are removed — the video codec's fmtp
             // (packetization-mode/profile-level-id) is kept intact.
@@ -795,6 +841,9 @@ export class WebRtcMedia {
             });
             await this.pc.setLocalDescription(modifiedAnswer);
             console.log('[WebRtcMedia] Local description set (answer, low-latency), sending...');
+            armDscpCarrier(this.pc, carrier);
+            // Not awaited: a permission prompt must not hold the answer back.
+            if (micOn) this.mic.attach();
 
             // Send answer via signaling WS, signed when this browser is paired.
             const answerMsg = {

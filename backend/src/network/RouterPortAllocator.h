@@ -31,6 +31,7 @@
 
 class AppSettings;
 class QThread;
+class QTimer;
 
 /**
  * @brief Every hole this host opens in the router, from one place.
@@ -75,7 +76,8 @@ public:
         /// Discovery in progress; claims queue behind it.
         Discovering,
         Ready,
-        /// No IGD answered. Claims fail at once; nothing to wait for.
+        /// No IGD answered. Claims fail at once; nothing to wait for. Looked
+        /// for again later on its own — see scheduleRediscovery().
         Missing,
     };
 
@@ -91,9 +93,21 @@ public:
     /// rendezvous line-up and on every stream start.
     void ensureStarted();
 
+    /// Find the gateway without being allowed to map anything: the admin
+    /// page's "UPnP available", Internet Access's double-NAT check and the
+    /// operator's probe read it before any hole is asked for. The one
+    /// discovery of the process — nothing else looks for the router. Asks
+    /// again after a miss (a router that was off at start-up). Never on a
+    /// LAN-only edition.
+    void discover();
+
     GatewayState gatewayState() const { return m_State; }
     /// This host's address as the router reports it; empty until Ready.
     QString publicIp() const { return m_PublicIp; }
+    /// The gateway's own address and this host's address on its LAN; empty
+    /// until Ready.
+    QString gatewayAddress() const { return m_GatewayAddress; }
+    QString lanIp() const { return m_LanIp; }
 
     /// One tunnel hole from the corporate-friendly list, then the pool. The
     /// caller enforces its own cap; this only walks the router.
@@ -102,8 +116,27 @@ public:
     /// The router-side port for a stream slot. Answered without a round trip
     /// when the slot's hole is already held from an earlier session — the
     /// mapping outlives the stream so the next launch on the slot is instant
-    /// and a theft between sessions is still caught at renewal.
+    /// and a theft between sessions is still caught at renewal. The held
+    /// entry is rechecked behind that answer (recheck()).
     void claimMediaPort(int slot, uint16_t internalPort, QObject* context, Callback callback);
+
+    /// Renew every held hole now, as the half-hour timer does: the admin
+    /// page's Force refresh, so a router that dropped its table gets the
+    /// entries back without waiting for the timer.
+    void renewNow();
+
+    /// Renew one held hole now, without holding up whoever is about to use
+    /// it: a stream launched or a browser served on a hole held for hours.
+    /// The write lands in tens of milliseconds, long before their
+    /// connectivity checks give up. A hole found pointing elsewhere is
+    /// dropped and reported through portLost(), as at renewal.
+    void recheck(uint16_t externalPort);
+
+    /// Take a stream slot's hole off the router now instead of at exit. For
+    /// the invited players' slots, whose holes should not outlive the guest:
+    /// the owner's slots keep theirs, as described above. The number stays
+    /// remembered, so the next claim on the slot asks for the same one.
+    void releaseMediaPort(int slot);
 
     QList<Claim> heldTunnelPorts() const;
     std::optional<Claim> heldMediaPort(int slot) const;
@@ -132,7 +165,15 @@ private:
     };
 
     void deliver(quint64 token, const Claim& claim, const QString& why);
-    void onDiscovered(bool ok, const QString& publicIp, const QString& lanIp);
+    void onDiscovered(bool ok, const QString& publicIp, const QString& lanIp,
+                      const QString& gateway);
+    /// Spawn the worker thread and start a discovery on it.
+    void startWorker();
+    /// After a miss, look for the router again a little later, backing off
+    /// from half a minute to ten. A single miss used to stick until restart:
+    /// a host started at logon, before the network was up, or behind a router
+    /// that answered late once, showed "UPnP not available" all day.
+    void scheduleRediscovery();
     void onClaimed(quint64 token, const RouterPortCore::Result& result);
     void onRenewed(const QList<RouterPortCore::Lost>& lost);
     quint64 submit(RouterPortCore::Request request, QObject* context, Callback callback);
@@ -148,8 +189,13 @@ private:
     Worker* m_Worker = nullptr;
 
     GatewayState m_State = GatewayState::Unknown;
+    /// Discoveries missed in a row, for the back-off and for logging the
+    /// first miss only.
+    int m_Misses = 0;
+    QTimer* m_Rediscover = nullptr;
     QString m_PublicIp;
     QString m_LanIp;
+    QString m_GatewayAddress;
     /// Main-thread mirror of what the worker holds.
     QList<Claim> m_Held;
     QHash<quint64, Pending> m_Pending;

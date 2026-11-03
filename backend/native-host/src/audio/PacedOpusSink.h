@@ -52,13 +52,14 @@ class OpusEncoder;
 class PacedOpusSink
 {
 public:
-    explicit PacedOpusSink(AudioCallback onPacket);
+    /// `frameSamples`: 240 (5 ms, the product), 480 or 960 (`audioframe=`).
+    explicit PacedOpusSink(AudioCallback onPacket, int frameSamples = 240);
     ~PacedOpusSink();
     PacedOpusSink(const PacedOpusSink&) = delete;
     PacedOpusSink& operator=(const PacedOpusSink&) = delete;
 
-    /// Open the encoder and start the 5 ms thread. `describe` names the capture
-    /// in the session log ("ScreenCaptureKit, 48 kHz stereo").
+    /// Open the encoder and start the paced thread (one frame per period). `describe` names the
+    /// capture in the session log ("ScreenCaptureKit, 48 kHz stereo").
     bool start(const std::string& describe, std::string& error);
 
     /// Stop and join. Idempotent, and safe to call while a capture is still
@@ -77,6 +78,7 @@ private:
     void runLoop();
 
     AudioCallback m_OnPacket;
+    int m_FrameSamples;
     std::unique_ptr<OpusEncoder> m_Encoder;
     /// Guards the pacer, which is plain arithmetic with no locking of its own.
     std::mutex m_Mutex;

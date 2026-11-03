@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<!-- Generated from /guides/windows.html and _i18n/zh/guides/windows.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>在 Windows 上安装 MoonlightWeb — 把你的 PC 串流到任意浏览器</title>
+<meta name="description" content="分步指南：在你的 Windows 游戏 PC 上安装 MoonlightWeb 服务器，把游戏串流到任何带浏览器的设备——手机、平板、笔记本、电视。它自己捕获并编码这台 PC，向导里即可一键开启互联网访问。">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#05080d">
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="在 Windows 上安装 MoonlightWeb — 把你的 PC 串流到任意浏览器">
+<meta property="og:description" content="分步指南：在你的 Windows 游戏 PC 上安装 MoonlightWeb 服务器，把游戏串流到任何带浏览器的设备——手机、平板、笔记本、电视。它自己捕获并编码这台 PC，向导里即可一键开启互联网访问。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://moonlightweb.top/zh/guides/windows.html">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="在 Windows 上安装 MoonlightWeb — 把你的 PC 串流到任意浏览器">
+<meta name="twitter:description" content="分步指南：在你的 Windows 游戏 PC 上安装 MoonlightWeb 服务器，把游戏串流到任何带浏览器的设备——手机、平板、笔记本、电视。它自己捕获并编码这台 PC，向导里即可一键开启互联网访问。">
+<meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/zh/guides/windows.html">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/windows.html">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/windows.html">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/windows.html">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/windows.html">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/windows.html">
+<!-- /i18n:alternates -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<link rel="stylesheet" href="/assets/pages.css?v={{(fileStat `/assets/pages.css`).ModTime.Unix}}">
+<!-- Shared header/footer styling -->
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://moonlightweb.top/zh/"},
+        {"@type": "ListItem", "position": 2, "name": "Guides", "item": "https://moonlightweb.top/zh/guides/"},
+        {"@type": "ListItem", "position": 3, "name": "Install on Windows", "item": "https://moonlightweb.top/zh/guides/windows.html"}
+      ]
+    },
+    {
+      "@type": "HowTo",
+      "name": "Install MoonlightWeb on Windows and stream your PC to any browser",
+      "description": "Install the MoonlightWeb server on a Windows gaming PC — it captures and encodes that machine itself — and play from any device with a browser.",
+      "totalTime": "PT5M",
+      "estimatedCost": {"@type": "MonetaryAmount", "currency": "USD", "value": "0"},
+      "supply": [{"@type": "HowToSupply", "name": "Windows gaming PC (x64)"}],
+      "tool": [{"@type": "HowToTool", "name": "A modern browser on any client device (Chrome, Edge, Safari, Firefox)"}],
+      "step": [
+        {"@type": "HowToStep", "name": "Download the installer", "text": "Download the Windows installer (x64 or arm64 .exe) from the MoonlightWeb releases page.", "url": "https://moonlightweb.top/zh/guides/windows.html#step-download"},
+        {"@type": "HowToStep", "name": "Run the guided installer", "text": "Run the wizard on the gaming PC. It installs the gamepad and wheel drivers, offers one-click Internet access and the MoonlightWeb Virtual Display, and no second streaming server. A tray icon appears when the server is running.", "url": "https://moonlightweb.top/zh/guides/windows.html#step-install"},
+        {"@type": "HowToStep", "name": "Open a browser on any device", "text": "Go to https://localhost on the PC itself, or your LAN IP from another device on your network.", "url": "https://moonlightweb.top/zh/guides/windows.html#step-open"},
+        {"@type": "HowToStep", "name": "Your PC is already there", "text": "The gaming PC is listed straight away, with one card per screen — no pairing, no PIN. Other hosts on the network (Sunshine, Wolf, MultiSeat) are discovered too and pair with a PIN.", "url": "https://moonlightweb.top/zh/guides/windows.html#step-pair"},
+        {"@type": "HowToStep", "name": "Press play", "text": "Pick a game or the full desktop and play — up to 4K HDR, 240 fps, under 20 ms Wi-Fi latency.", "url": "https://moonlightweb.top/zh/guides/windows.html#step-play"}
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/zh/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/zh/" data-nav="home">首页</a><a href="/zh/guides/" data-nav="guides" aria-current="page">指南</a><a href="/zh/faq.html" data-nav="faq">常见问题</a><a href="/zh/contact.html" data-nav="contact">联系</a><a href="/zh/server-access/" data-nav="connect">连接主机</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/guides/windows.html">English</option><option value="fr" data-href="/fr/guides/windows.html">Français</option><option value="de" data-href="/de/guides/windows.html">Deutsch</option><option value="zh" data-href="/zh/guides/windows.html" lang="zh" selected>中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<main>
+<div class="wrap">
+  <nav class="crumbs" aria-label="Breadcrumb" data-i18n-html="crumbs"><a href="/zh/">首页</a> / <a href="/zh/guides/">指南</a> / Windows</nav>
+  <span class="kicker" data-i18n="kicker">安装指南 · Windows</span>
+  <h1 data-i18n="h1">把你的 Windows 游戏 PC 串流到任何浏览器</h1>
+  <p class="lead" data-i18n-html="lead">MoonlightWeb 是一个免费、开源（GPL-3.0）的服务器，把你的游戏主机串流到任何带浏览器的设备——手机、平板、笔记本、电视。<strong>在游戏 PC 上下载一次。其他任何设备都无需安装——只要一个网址。</strong></p>
+
+  <h2 data-i18n="need.h">你需要什么</h2>
+  <ul>
+    <li data-i18n="need.1">一台 Windows 10（2004+）或 11 的游戏 PC，配备支持硬件编码的 GPU——也就是运行你游戏的那台机器。要让它自己当主机需要 x64；arm64 版本也有，可作为你所配对主机的服务器使用。</li>
+    <li data-i18n-html="need.2"><strong>不需要别的。</strong>MoonlightWeb 自己捕获并编码这台 PC——无需再装第二个串流服务器。已经在别处跑着 Sunshine、Wolf 或 MultiSeat？那些机器可以在同一个页面里配对。</li>
+    <li data-i18n="need.3">任何带现代浏览器的设备都可作客户端：Chrome、Edge、Safari 或 Firefox。无需应用、无需下载、无需账户。</li>
+  </ul>
+
+  <h2 data-i18n="steps.h">逐步安装</h2>
+  <div class="gsteps">
+    <div class="gstep cyb" id="step-download">
+      <h3 data-i18n="step1.h">下载安装程序</h3>
+      <p data-i18n-html="step1.p">从<a href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener">发布页面</a>获取 Windows 安装程序——大多数 PC 用 <code>x64 .exe</code>，Windows-on-ARM 机器用 <code>arm64 .exe</code>。</p>
+    </div>
+    <div class="gstep cyb" id="step-install">
+      <h3 data-i18n="step2.h">运行向导式安装程序——在游戏 PC 上</h3>
+      <p data-i18n="step2.p1">向导会带你走完全部流程：静默安装手柄和方向盘驱动，询问是否允许互联网连接（远程串流会话，默认关闭），并提供 MoonlightWeb Virtual Display——一块供这台电脑串流的专属屏幕。别的都不用——无需配置第二个串流服务器。</p>
+      <p data-i18n="step2.p2">完成后，托盘中会出现一个图标——服务器已在运行。安装到此为止。</p>
+    </div>
+    <div class="gstep cyb" id="step-open">
+      <h3 data-i18n="step3.h">在任何设备上打开浏览器</h3>
+      <p data-i18n-html="step3.p">在 PC 本机上：<code>https://localhost</code>。从你网络上的其他设备：你的局域网 IP。要从网络之外游玩：启用互联网访问，应用便会给你一个直达这台机器的远程接入链接。你也可以使用自己的域名和证书。</p>
+    </div>
+    <div class="gstep cyb" id="step-pair">
+      <h3 data-i18n="step4.h">你的 PC 已经在那里</h3>
+      <p data-i18n="step4.p">这台机器一开始就列在那里，每块屏幕一张卡片——无需配对，也没有 PIN 码。你网络上的其他主机（Sunshine、Wolf、MultiSeat）会通过 mDNS 出现在旁边：那些只需配对一次——对于 Sunshine，在其网页中输入 MoonlightWeb 显示的 PIN 码——之后永久记住。</p>
+    </div>
+    <div class="gstep cyb" id="step-play">
+      <h3 data-i18n="step5.h">按下开始</h3>
+      <p data-i18n="step5.p">选择一块屏幕、一款游戏或完整桌面。全屏、手柄在手——最高 4K HDR、240 fps，Wi-Fi 下延迟低于 20 毫秒。</p>
+    </div>
+  </div>
+
+  <p style="text-align:center"><a class="btn btn-primary" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-loc="guide-windows" data-i18n="dl.btn">⬇ 下载 Windows 版</a></p>
+
+  <h2 data-i18n="tr.h">疑难解答</h2>
+  <h3 data-i18n="tr1.h">主机没有出现在浏览器里</h3>
+  <p data-i18n="tr1.p">请确保客户端设备与游戏 PC 处于同一网络，并且 Windows 防火墙仍允许 MoonlightWeb（安装程序会自行添加规则）。你也可以通过 IP 手动添加主机。</p>
+  <h3 data-i18n="tr2.h">HEVC 或 AV1 被置灰</h3>
+  <p data-i18n="tr2.p">你的浏览器无法硬件解码的编解码器选项会被自动禁用——这是正常的。H264 到处都能用；HEVC 和 AV1 是否可用取决于客户端设备的浏览器和 GPU。</p>
+  <h3 data-i18n="tr3.h">弱网络下串流卡顿</h3>
+  <p data-i18n-html="tr3.p">降低串流分辨率并启用 <strong>Video Enhancement（视频增强）</strong>：串流会在客户端 GPU 上放大并锐化（WebGL2 或 WebGPU 运行 MoonlightWeb 自研放大算法），于是 720p 串流看起来接近 1440p。</p>
+
+  <div class="note" data-i18n-html="note"><strong>网络受限？</strong>UDP 被屏蔽时，MoonlightWeb 会自动回退到 TCP，仍是直连，因此在大多数严格防火墙和恶劣的酒店 Wi-Fi 下也能继续工作。</div>
+
+  <h2 data-i18n="read.h">继续阅读</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/zh/faq.html"><strong data-i18n="x.faq.t">常见问题</strong><span data-i18n="x.faq.d">延迟、编解码器、安全、互联网远程游玩——所有常见问题。</span></a>
+    <a class="cyb" href="/zh/guides/macos.html"><strong data-i18n="x.mac.t">在 macOS 上安装</strong><span data-i18n="x.mac.d">Apple Silicon 指南，附 .pkg 安装程序。</span></a>
+    <a class="cyb" href="/zh/guides/linux.html"><strong data-i18n="x.lin.t">在 Linux 上安装</strong><span data-i18n="x.lin.d">.deb、.rpm 或便携 AppImage。</span></a>
+  </div>
+</div>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/zh/">首页</a> · <a href="/zh/guides/">指南</a> · <a href="/zh/faq.html">常见问题</a> · <a href="/zh/contact.html">联系</a> · <a href="/zh/server-access/">连接主机</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>咖啡</span></a></span><span class="foot-play">畅玩设备： <a href="/zh/play/chromebook.html">Chromebook</a> · <a href="/zh/play/iphone-ipad.html">iPhone 和 iPad</a> · <a href="/zh/play/tv.html">电视</a> · <a href="/zh/sunshine-web-client.html">Sunshine 网页客户端</a> · <a href="/zh/browser-game-streaming.html">为什么选择浏览器客户端</a></span></div></footer>
+
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+</body>
+</html>

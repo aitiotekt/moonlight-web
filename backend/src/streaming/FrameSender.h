@@ -17,6 +17,9 @@
 
 #pragma once
 
+#include "FrameChunks.h"
+#include "SendPacer.h"
+
 #include <QByteArray>
 #include <thread>
 #include <mutex>
@@ -117,13 +120,28 @@ public:
                           bool isKeyframe, uint32_t frameNumber = 0, FrameSentSink* sink = nullptr,
                           std::vector<uint32_t>* evicted = nullptr);
 
+    /// Byte 8 of the chunk header: bit 0 a keyframe, bit 1 a side block ahead
+    /// of the frame's bitstream — see FrameChunks.h, which cuts the chunks.
+    static constexpr uint8_t kFlagKeyframe = framechunks::kFlagKeyframe;
+    static constexpr uint8_t kFlagSideBlock = framechunks::kFlagSideBlock;
+
     // Cut one frame into wire chunks, header included, reading `data` once.
     // `data` is borrowed: it only has to stay valid until this returns, which
     // is what lets the native relay call it on the encoder's own buffer before
     // the encoder unlocks it. Same bytes, chunk for chunk, as the worker
     // produces for a queued QByteArray.
+    //
+    // `maxPayload` caps each chunk's payload (16,000 bytes, the most SCTP takes
+    // in one message, unless pacing wants smaller runs: the receiver joins the
+    // chunks whatever their size).
+    //
+    // `sideBlock`, when given, goes ahead of `data` as if one with it — the
+    // chunks cut across the two — and every chunk says so (kFlagSideBlock).
     static std::vector<Fragment> buildFragments(const uint8_t* data, size_t size, bool isKeyframe,
-                                                uint32_t frameId, uint32_t backendTs);
+                                                uint32_t frameId, uint32_t backendTs,
+                                                size_t maxPayload = kMaxPayloadSize,
+                                                const uint8_t* sideBlock = nullptr,
+                                                size_t sideBlockSize = 0);
 
     // Stop the worker thread and discard pending jobs. Idempotent; safe to call
     // from the relay's stop()/destructor.
@@ -131,6 +149,27 @@ public:
 
     // Diagnostic: number of delta frames dropped because the queue was full.
     uint64_t queueDropCount() const { return m_QueueDrops.load(std::memory_order_relaxed); }
+
+    /// The bench's pacing (`pace=`, SendPacer.h): chunks handed to the
+    /// DataChannel at @p bytesPerSecond at most, @p burstBytes back to back.
+    /// 0 switches it off. Taken up by the worker at its next frame.
+    void setPacing(int64_t bytesPerSecond, size_t burstBytes);
+
+    /// Options::maxQueuedDeltas, changed once the producer is known: a guest
+    /// of the shared feed takes its pictures from a pipe that can hand over
+    /// two or three at once, and those are not a link falling behind.
+    void setMaxQueuedDeltas(size_t deltas);
+
+    /// What pacing cost: frames sent, frames that waited at least once, the
+    /// time spent waiting in all, and the longest wait inside one frame.
+    struct PacingStats
+    {
+        uint64_t frames = 0;
+        uint64_t pacedFrames = 0;
+        int64_t waitedUs = 0;
+        int64_t maxFrameWaitUs = 0;
+    };
+    PacingStats pacingStats() const;
 
 private:
     struct Job
@@ -159,9 +198,10 @@ private:
 
     const Options m_Options;
 
-    /// Write the 17-byte chunk header at `dst`.
+    /// Write the 17-byte chunk header at `dst`; `flags` is byte 8
+    /// (kFlagKeyframe, kFlagSideBlock).
     static void writeHeader(std::byte* dst, uint32_t frameId, uint16_t chunkIdx,
-                            uint16_t totalChunks, bool isKeyframe, uint32_t payloadSize,
+                            uint16_t totalChunks, uint8_t flags, uint32_t payloadSize,
                             uint32_t backendTs);
 
     /// Queue a job under the cap. Returns true when a delta was evicted; the
@@ -170,11 +210,27 @@ private:
 
     void run();
     void sendJob(const Job& job);
+    /// Wait, on the worker, until pacing lets @p bytes go; returns the wait.
+    int64_t paceBefore(size_t bytes);
+    void waitUs(int64_t us);
 
     std::thread m_Thread;
     std::mutex m_Mutex;
     std::condition_variable m_Cv;
     std::deque<Job> m_Queue;
+    size_t m_MaxQueuedDeltas; // under m_Mutex
     std::atomic<bool> m_Stop{false};
     std::atomic<uint64_t> m_QueueDrops{0};
+
+    // Pacing: asked for from any thread, applied and used on the worker only.
+    std::atomic<int64_t> m_PaceRate{0};
+    std::atomic<size_t> m_PaceBurst{16 * 1024};
+    SendPacer m_Pacer;
+    int64_t m_PacerRate = 0;
+    size_t m_PacerBurst = 0;
+    void* m_PaceTimer = nullptr; // a high-resolution waitable timer, on Windows
+    std::atomic<uint64_t> m_PacedFrames{0};
+    std::atomic<uint64_t> m_SentFrames{0};
+    std::atomic<int64_t> m_WaitedUs{0};
+    std::atomic<int64_t> m_MaxFrameWaitUs{0};
 };

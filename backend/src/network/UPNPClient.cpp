@@ -31,15 +31,19 @@
 #include <miniupnpc/upnpreplyparse.h>
 #endif
 
+#include <QDeadlineTimer>
 #include <QDebug>
 #include <QFile>
 #include <QHostInfo>
 #include <QRegularExpression>
 #include <QSet>
+#include <QTcpSocket>
 #include <QUdpSocket>
+#include <QUrl>
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 #ifdef Q_OS_WIN
@@ -69,6 +73,61 @@ UPNPClient::~UPNPClient()
     cleanup();
 }
 
+#ifdef MW_HAVE_MINIUPNPC
+namespace {
+
+// UPNP_GetValidIGD fetches every device's description over a blocking
+// connect(). On Windows, SO_RCVTIMEO (the only timeout miniupnpc sets) does not
+// bound connect(), so each device that answered the M-SEARCH but drops the TCP
+// SYN costs the OS's full ~21 s retry budget: two of them held a user's streams
+// 42 s, long enough for Sunshine to forget the launch before the RTSP arrived.
+// Knock on every description URL at once and drop the ones that do not answer
+// within the budget before miniupnpc goes near them.
+UPNPDev* dropUnreachableDevices(UPNPDev* devlist, int budgetMs)
+{
+    struct Probe
+    {
+        UPNPDev* dev;
+        std::unique_ptr<QTcpSocket> socket;
+    };
+    std::vector<Probe> probes;
+    for (UPNPDev* dev = devlist; dev; dev = dev->pNext) {
+        const QUrl url(QString::fromLatin1(dev->descURL));
+        auto socket = std::make_unique<QTcpSocket>();
+        if (url.isValid() && !url.host().isEmpty())
+            socket->connectToHost(url.host(), static_cast<quint16>(url.port(80)));
+        probes.push_back({dev, std::move(socket)});
+    }
+
+    // The connects run side by side; waiting on each in turn only spends
+    // what is left of the one shared budget.
+    QDeadlineTimer deadline(budgetMs);
+    UPNPDev* kept = nullptr;
+    UPNPDev** keptTail = &kept;
+    UPNPDev* dropped = nullptr;
+    for (Probe& p : probes) {
+        const bool up = p.socket->state() == QAbstractSocket::ConnectedState ||
+                        (p.socket->state() != QAbstractSocket::UnconnectedState &&
+                         p.socket->waitForConnected(static_cast<int>(deadline.remainingTime())));
+        p.socket->abort();
+        p.dev->pNext = nullptr;
+        if (up) {
+            *keptTail = p.dev;
+            keptTail = &p.dev->pNext;
+        } else {
+            qInfo() << "[UPNP] Skipping" << p.dev->descURL << "— no TCP answer within" << budgetMs
+                    << "ms";
+            p.dev->pNext = dropped;
+            dropped = p.dev;
+        }
+    }
+    freeUPNPDevlist(dropped);
+    return kept;
+}
+
+} // namespace
+#endif
+
 bool UPNPClient::discover(int timeoutMs)
 {
 #ifndef MW_HAVE_MINIUPNPC
@@ -91,6 +150,13 @@ bool UPNPClient::discover(int timeoutMs)
         qWarning() << "[UPNP] No UPnP devices found, error=" << discoverError;
         emit error(
             QString("UPnP discovery failed: no devices found (error=%1)").arg(discoverError));
+        return false;
+    }
+
+    devlist = dropUnreachableDevices(devlist, 1500);
+    if (!devlist) {
+        qWarning() << "[UPNP] No UPnP device answers over TCP";
+        emit error(QStringLiteral("UPnP discovery failed: no device answers over TCP"));
         return false;
     }
 
@@ -132,7 +198,8 @@ bool UPNPClient::discover(int timeoutMs)
     }
 
     m_Available = true;
-    m_GatewayAddr = QHostAddress(QString::fromLatin1(m_LanAddr));
+    // m_LanAddr is this host's address; the router is the control URL's host.
+    m_GatewayAddr = QHostAddress(QUrl(QString::fromLatin1(m_Urls->controlURL)).host());
 
     qInfo() << "[UPNP] IGD found: LAN addr=" << m_LanAddr << "controlURL=" << m_Urls->controlURL
             << "serviceType=" << m_Data->first.servicetype;
@@ -141,13 +208,15 @@ bool UPNPClient::discover(int timeoutMs)
 }
 
 bool UPNPClient::getExistingPortMapping(uint16_t externalPort, const std::string& protocol,
-                                        std::string& internalClient, std::string& internalPort)
+                                        std::string& internalClient, std::string& internalPort,
+                                        std::string* leaseDuration)
 {
 #ifndef MW_HAVE_MINIUPNPC
     Q_UNUSED(externalPort);
     Q_UNUSED(protocol);
     Q_UNUSED(internalClient);
     Q_UNUSED(internalPort);
+    Q_UNUSED(leaseDuration);
     return false;
 #else
     if (!m_Available || !m_Urls || !m_Data) {
@@ -180,6 +249,7 @@ bool UPNPClient::getExistingPortMapping(uint16_t externalPort, const std::string
 
     internalClient = std::string(intClient);
     internalPort = std::string(intPort);
+    if (leaseDuration) *leaseDuration = std::string(leaseDur);
 
     qInfo() << "[UPNP] Existing port mapping found:" << externalPort << protocol.c_str() << "->"
             << intClient << ":" << intPort << "desc='" << desc << "' enabled='" << enabled

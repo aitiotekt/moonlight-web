@@ -91,6 +91,17 @@ public:
     // Force an immediate refresh, ignoring the cache window.
     void refresh();
 
+    // Numeric dotted-version compare ("1.2.10" > "1.2.9"). Tolerant of a leading
+    // 'v' and trailing pre-release suffixes; returns false if unparseable so a
+    // bad tag never nags the user. Public for the elevated --update-apply
+    // helper, which refuses anything that is not newer than itself.
+    static bool isNewer(const QString& latest, const QString& current);
+
+    // The one release this build ever updates to: the project's latest GitHub
+    // release. Compiled in, so the elevated helper takes it from the binary
+    // under the install directory and from nothing the user can write.
+    static QString releasesApiUrl();
+
 signals:
     // A fetch finished — on success *and* on failure. SelfUpdater waits on this
     // after a download that did not match the cached metadata, so it must fire
@@ -108,11 +119,6 @@ private:
     // payload is refused — a relay answer whose download URL is not on GitHub —
     // in which case nothing is written and the caller retries against GitHub.
     bool applyResult(const QJsonObject& release, bool viaRelay);
-
-    // Numeric dotted-version compare ("1.2.10" > "1.2.9"). Tolerant of a leading
-    // 'v' and trailing pre-release suffixes; returns false if unparseable so a
-    // bad tag never nags the user.
-    static bool isNewer(const QString& latest, const QString& current);
 
     // Best asset for this OS/arch from a release's `assets` array. Fills outName
     // with the matched asset filename; returns its browser_download_url (empty

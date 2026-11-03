@@ -70,6 +70,55 @@ describe('session key mappings', () => {
             { code: 'AltRight', altKey: true, metaKey: false },
         );
     });
+    it('clears upstream character and AltGr metadata on a remapped dead key', () => {
+        const m = mapper({ Quote: 'KeyB' });
+        const down = m.send(
+            event('keydown', 'Quote', {
+                char: '~',
+                dead: true,
+                chord: true,
+                altGraph: true,
+                altGrCtrl: true,
+            }),
+        );
+        expect(down).toMatchObject({
+            code: 'KeyB',
+            keyCode: 0x42,
+            char: null,
+            dead: false,
+            chord: false,
+            altGraph: false,
+            altGrCtrl: false,
+        });
+        expect(m.send(event('keyup', 'Quote'))).toMatchObject({ code: 'KeyB', dead: false });
+    });
+    it('preserves upstream AltGr and layout metadata when no mapping applies', () => {
+        const m = mapper({});
+        const original = event('keydown', 'AltRight', { altKey: true, altGraph: true });
+        expect(m.send(original)).toEqual(original);
+        expect(StreamView.codeToWindowsVk('AltRight')).toBe(0xa5);
+    });
+    it('does not inject the upstream AltGr Ctrl release for a remapped Ctrl', () => {
+        const view = sink();
+        view._inputPreferences = normalizeInput({ mappings: { ControlLeft: 'CapsLock' } });
+        view._keyMapper = mapper(view._inputPreferences.mappings);
+        view._sendKeyEvent(event('keydown', 'ControlLeft', { ctrlKey: true }));
+        view._ctrlLeftAt = 10;
+        view._markAltGrCtrl({
+            code: 'AltRight',
+            timeStamp: 10,
+            getModifierState: () => true,
+        });
+        expect(view.sent).toHaveLength(1);
+        expect(view.sent[0].code).toBe('CapsLock');
+    });
+    it('forgets mapped press bookkeeping when upstream swallows a late release', () => {
+        const view = sink();
+        view._sendKeyEvent(event('keydown', 'AltLeft', { altKey: true }));
+        view._forgetHeldKey('AltLeft');
+        expect(view._keyMapper.pressed.size).toBe(0);
+        expect(view._heldPhysKeys.size).toBe(0);
+    });
     it('uses the target physical key, not the original layout character', () => {
         const m = mapper({ KeyA: 'KeyB' });
         const down = m.send(event('keydown', 'KeyA', { char: 'a', nonUs: true }));

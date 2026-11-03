@@ -6,6 +6,12 @@
 <title>MoonlightWeb</title>
 <meta name="robots" content="noindex, nofollow">
 <meta name="theme-color" content="#05080b">
+<!-- No icon, said rather than left for the browser to look for. Without it the
+     browser asks for /favicon.ico, which the service worker of before revision 2
+     hands to this page and then waits 30 s on, since this page holds no line;
+     and a busy worker is not replaced, so the start that updates it would wait
+     those 30 s too (sw.js, SW_REVISION; seen on stream.dev, 27/10/2026). -->
+<link rel="icon" href="data:,">
 <!--
   The MoonlightWeb BOOTSTRAP — the entry page, and nothing else.
 
@@ -286,6 +292,26 @@
      unused slots leave the box until there is something to put in them. */
   #detail:empty,
   #note:empty { display: none; }
+  /* "Not connected" for a machine in the list: the way to drop it (boot.js,
+     paintForget). A quiet text button under the note — the usual reason for
+     this page is a machine that is only switched off, and this must not read
+     as the answer to that. */
+  #forget {
+    display: block;
+    margin: 1.1rem 0 0;
+    padding: .3rem 0;
+    border: 0;
+    background: none;
+    color: var(--text-3);
+    font: inherit;
+    font-size: .8rem;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+  }
+  #forget:hover { color: var(--text-2); }
+  #forget:focus-visible { outline: 1px solid var(--border-2); outline-offset: 2px; }
+  #forget[hidden] { display: none; }
   code {
     font-family: var(--font-mono);
     color: var(--neon-cyan);
@@ -450,6 +476,7 @@
     <p id="status">Securing the communication…</p>
     <p id="detail"></p>
     <p id="note"></p>
+    <button type="button" id="forget" hidden>Remove this machine from my list</button>
   </div>
 </main>
 <script type="module" src="/v1/boot.js"></script>

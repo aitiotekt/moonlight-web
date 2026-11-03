@@ -18,9 +18,11 @@
 #pragma once
 
 #include "../CaptureTypes.h"
+#include "../ScanoutWindow.h"
 #include "IScreenCapture.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -86,7 +88,8 @@ struct KmsOutput
     int x = 0; ///< position on the virtual desktop
     int y = 0;
     bool connected = false;
-    bool active = false; ///< has a CRTC with a framebuffer — something is shown
+    bool active = false;       ///< has a CRTC with a framebuffer — something is shown
+    std::vector<uint8_t> edid; ///< the monitor's, when connected and it has one
 };
 
 class KmsCapture final : public IScreenCapture
@@ -108,6 +111,11 @@ public:
     /// CRTCs only: reading a connector probes it, which reads the monitor's
     /// EDID over the wire, and this is asked every second.
     static std::string modeSignature(const std::string& cardPath);
+
+    /// The render node of the GPU behind @p cardPath — what a route that reads
+    /// no scanout (the portal) converts and encodes on. Empty when the card
+    /// cannot be opened or names none. No capability needed.
+    static std::string renderNodeFor(const std::string& cardPath);
 
     KmsCapture(std::string cardPath, uint32_t connectorId);
     ~KmsCapture();
@@ -144,6 +152,18 @@ public:
 
     const CursorState& cursor() const override { return m_Cursor; }
 
+    /// Where the display server can say that the picture changed inside the
+    /// same buffer — an X server drawing into the one it scans out (X11Damage)
+    /// — the question to ask at a vblank that brought no new buffer: true, and
+    /// that buffer is read again as a new frame. Takes the answer (the flag is
+    /// cleared by asking). Unset: a new buffer is the only new picture.
+    void setInPlaceChanges(std::function<bool()> takeChanged)
+    {
+        m_InPlace = std::move(takeChanged);
+    }
+    /// Frames read again that way since start().
+    uint64_t inPlaceFrames() const { return m_InPlaceFrames; }
+
 private:
     /// Resolve connector → encoder → CRTC → the primary and cursor planes
     /// attached to that CRTC. Re-run on every start(), because a mode change
@@ -151,6 +171,9 @@ private:
     bool resolveTopology(std::string& error);
     /// Export the primary plane's current buffer into @p frame.
     bool exportFramebuffer(uint32_t fbId, KmsFrame& frame, std::string& error);
+    /// Which window of a buffer of that size the primary plane scans out for
+    /// this display — the whole of it, or its part of an X11 root window.
+    ScanoutWindow primaryWindow(int bufferWidth, int bufferHeight);
     /// Read the cursor plane: position every time, image when its buffer changed.
     /// Returns true when anything visible about the pointer moved.
     bool updateCursor();
@@ -173,6 +196,17 @@ private:
     /// Zero where the plane has no hotspot properties (a real GPU).
     uint32_t m_PropHotspotX = 0;
     uint32_t m_PropHotspotY = 0;
+    /// The primary plane's source rectangle; zero where the driver has none.
+    uint32_t m_PropSrcX = 0;
+    uint32_t m_PropSrcY = 0;
+    uint32_t m_PropSrcW = 0;
+    uint32_t m_PropSrcH = 0;
+    /// The windowed buffer said once per start, not at every flip.
+    bool m_WindowSaid = false;
+    /// See setInPlaceChanges().
+    std::function<bool()> m_InPlace;
+    uint64_t m_InPlaceFrames = 0;
+    bool m_InPlaceSaid = false;
 
     int m_Width = 0;
     int m_Height = 0;

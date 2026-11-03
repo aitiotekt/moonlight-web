@@ -61,4 +61,10 @@ bool removeLoginItem();
 /// that stays ticked afterwards would be lying.
 bool isLoginItemInstalled();
 
+/// Rewrite an installed login item that no longer says what this version
+/// would write (Linux: the launcher that carries the capture capabilities, not
+/// the bare binary an earlier version named). Nothing when none is installed,
+/// and nothing on Windows and macOS, whose installers own the item.
+void refreshLoginItem();
+
 } // namespace Autostart

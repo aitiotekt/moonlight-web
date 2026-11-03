@@ -45,8 +45,12 @@
  *     /settings  → redirect to Hosts
  *     /streaming → redirect to Hosts
  */
+// First, before any module prints: the page's console for the client log in
+// debug mode (util/ClientLog.js).
+import { refreshClientLog } from './util/ClientLog.js';
 import { HostListView } from './ui/HostListView.js';
 import { StreamView } from './ui/StreamView.js';
+import { lockLandscape } from './ui/StreamViewFullscreen.js';
 import { SettingsView } from './ui/SettingsView.js';
 import { AdminView } from './ui/AdminView.js';
 import { LoginView } from './ui/LoginView.js';
@@ -55,14 +59,31 @@ import { PlayerJoinView } from './ui/PlayerJoinView.js';
 import { BackendClient } from './api/BackendClient.js';
 import { Toast } from './ui/Toast.js';
 import { DiscordLink } from './ui/DiscordLink.js';
+import * as RemoteNav from './ui/RemoteNav.js';
+import * as ViewHeaderScroll from './ui/ViewHeaderScroll.js';
 import { GamepadDriverNotice } from './ui/GamepadDriverNotice.js';
+import { BMC_LOGO, BMC_FULL_LOGO } from './ui/bmcLogo.js';
+import {
+    SUPPORT_CHANGED_EVENT,
+    noteGoodSession,
+    showSupportButton,
+    takeSupportIntroduction,
+} from './util/supportNudge.js';
 import { VersionGuard } from './util/VersionGuard.js';
 import {
     IS_MOBILE_OR_TABLET,
+    IS_HANDHELD,
+    IS_LOW_MEMORY,
+    IS_TV,
     resolveTearing,
     hdrClientCapability,
+    hdrLaunchCodec,
+    av1HdrSoftwareDecode,
+    SCM_AV1_MAIN10,
     chroma444ClientCapability,
+    chroma444Codec,
 } from './util/BrowserDetect.js';
+import { CODEC_AUTO, autoLaunchCodec, migrateStoredCodecToAuto } from './util/CodecAuto.js';
 import {
     startRefreshRateMonitor,
     currentRefreshMilliHz,
@@ -70,16 +91,35 @@ import {
     measuredFps,
 } from './util/RefreshRate.js';
 import { computeAutoBitrate } from './util/AutoBitrate.js';
+import { applyPyrowaveChoice } from './util/PyrowaveCodec.js';
 import { DEFAULT_ASPECT, loadHostAspect, saveHostAspect } from './util/AspectRatio.js';
 import {
     readResolutionChoice,
     resolveStreamSize,
     fitPixelBudget,
+    autoMaxHeightFor,
+    streamFootprint,
+    tvOverAsk,
+    devicePixelSize,
+    nearlySameStreamSize,
 } from './util/StreamResolution.js';
+import {
+    hardwareDecodeLimit,
+    knownHardwareDecodeLimit,
+    capSizeToDecoder,
+    decoderRefuses,
+} from './util/DecoderLimit.js';
 import { startAspectProbe } from './stream/AspectProbe.js';
+import { AutoCeilingSession } from './stream/AutoCeilingSession.js';
+import {
+    recordCrashRelaunch,
+    settledStreamState,
+    shouldRelaunchAfterCrash,
+} from './stream/CrashRelaunch.js';
 import * as iosAudioUnlock from './audio/iosAudioUnlock.js';
 import { init as i18nInit, applyDOM, t } from './i18n/i18n.js';
 import { escapeHtml } from './util/escapeHtml.js';
+import { micRequested, micSupported } from './audio/MicUplink.js';
 import { IDENTITY_REFUSED } from './util/pairingCrypto.js';
 import {
     startTunnel,
@@ -88,24 +128,22 @@ import {
     tunnelShareToken,
     pageCameThroughTunnel,
     bootstrapAddress,
-    openSideTunnel,
 } from './net/tunnelBridge.js';
 import {
     unpackHandoffKeys,
     isHomeScreenHandoff,
-    startUrlWithSideKeys,
     isHandoffKeySpent,
     markHandoffKeySpent,
 } from './util/homeScreenKeys.js';
 import { SecuringOverlay } from './ui/SecuringOverlay.js';
 import { ourStunHost } from './api/IceServers.js';
+import { probeUdp } from './api/UdpProbe.js';
 import { InstanceMenu } from './ui/InstanceMenu.js';
-import {
-    currentInstanceRef,
-    importInstances,
-    listInstances,
-    rememberInstance,
-} from './util/instances.js';
+import { currentInstanceRef, importInstances, rememberInstance } from './util/instances.js';
+import { bootMark } from './util/bootTiming.js';
+
+// Every module above arrived and ran: the boot watchdog (bootWatch.js) stands down.
+window.mwBooted = true;
 
 // ── Global error handler ──────────────────────────────────────────────────────
 window.addEventListener('error', (evt) => {
@@ -117,7 +155,7 @@ window.addEventListener('error', (evt) => {
                 <div class="hosts-header"><h2>${t('appError.title')}</h2></div>
                 <div class="hosts-error">
                     <p>${t('appError.failedToLoad')}</p>
-                    <p class="hint">${(evt.error && evt.error.message) || evt.message || t('appError.unknownError')}</p>
+                    <p class="hint">${escapeHtml((evt.error && evt.error.message) || evt.message || t('appError.unknownError'))}</p>
                     <button class="btn btn-reload">${t('common.retry')}</button>
                 </div>
             </div>
@@ -135,7 +173,7 @@ window.addEventListener('unhandledrejection', (evt) => {
             <div class="hosts-view">
                 <div class="hosts-header"><h2>${t('appError.initTitle')}</h2></div>
                 <div class="hosts-error">
-                    <p>${msg}</p>
+                    <p>${escapeHtml(msg)}</p>
                     <button class="btn btn-reload">${t('common.retry')}</button>
                 </div>
             </div>
@@ -147,26 +185,34 @@ window.addEventListener('unhandledrejection', (evt) => {
 // The bootstrap's cache of the application's files (bootstrap/sw.js SHELL_CACHE),
 // the one its service worker answers /manifest.webmanifest from.
 const SHELL_CACHE = 'mw-shell';
-/** How many OTHER machines a home-screen shortcut is given keys for. Each is a
- *  connection of its own while the page is signed in; the register holds up
- *  to sixteen, and nobody has that many machines on at once. */
-const SIDE_KEYS_MAX = 8;
-/** How long the other machines' keys are kept for the next manifest, so that
- *  every page load does not open a line to every machine. Well inside the
- *  key's own life (AuthManager::HOME_SCREEN_KEY_TTL_SECS, 24 h), and a key
- *  that dies early is refused at the far end, nothing worse. */
-const SIDE_KEYS_KEEP_MS = 6 * 3600 * 1000;
-/** How long a machine that gave no key — off, an older build, no remembered
- *  session — is left alone before it is asked again. Short: it may be back on
- *  by the time the shortcut is actually made. */
-const SIDE_KEYS_RETRY_MS = 10 * 60 * 1000;
+/** Where the other machines' home-screen keys were kept until v0.4.1, which
+ *  stopped asking for them: each was a live key to a machine that another
+ *  machine's page, on this same origin, could read and spend from anywhere
+ *  (security review R1, 26/10/2026). Emptied at start. */
 const SIDE_KEYS_STORE = 'mw-hs-side-keys';
+/** A screen change seen while a relaunch is on its way is looked at again
+ *  this long after (App._onClientScreenChanged), until none is. */
+const SCREEN_RECHECK_MS = 1500;
+/** What a launch may wait for the browser's word on a rung of Auto's ceiling. */
+const AUTO_CEILING_GUARD_MS = 300;
 
 /** An address rendered as a clickable, copyable link in a banner. */
 const linkHtml = (u) =>
     `<a href="${encodeURI(u)}" target="_blank" rel="noopener">${escapeHtml(u)}</a>`;
 
-const MoonlightApp = {
+/** Set by "Don't show this again" in the "Streaming your own PC?" dialog (issue
+ *  #25): someone testing on the host itself meets it on every launch. Same
+ *  'off' convention as the notice popins' mute keys. */
+const SELF_STREAM_WARN_KEY = 'mw_self_stream_warn';
+function selfStreamWarnMuted() {
+    try {
+        return localStorage.getItem(SELF_STREAM_WARN_KEY) === 'off';
+    } catch {
+        return false;
+    }
+}
+
+export const MoonlightApp = {
     // ── View instances persisted across overlays ─────────────────────────────
     state: 'loading',
     hostListView: null,
@@ -185,6 +231,10 @@ const MoonlightApp = {
     // (not a fallback). If H.264 also fails, stop falling back.
     _fallbackAttemptCount: 0,
 
+    // performance.now() when the owner's current stream was launched; 0 when
+    // none is running (see _noteSupportSession).
+    _streamStartedAt: 0,
+
     // ── Navigation state (never destroyed by overlays) ──────────────────────
     _nav: {
         /** Always 'hosts' — the single main view */
@@ -197,6 +247,11 @@ const MoonlightApp = {
 
     async init() {
         console.log('[MW] Initializing MoonlightWeb...');
+        bootMark('init');
+
+        // A stored HEVC becomes « Auto » once, before anything reads it
+        // (util/CodecAuto.js).
+        migrateStoredCodecToAuto();
 
         // Measure this screen's refresh rate now, and again whenever the
         // window may have changed screen, so a launch can tell the native
@@ -215,7 +270,10 @@ const MoonlightApp = {
         // server, it is what every request below travels on, so it has to be up
         // before the first of them is made.
         try {
-            await startTunnel((stage) => SecuringOverlay.stage(stage));
+            // Up: this console can reach the host now, which it could not
+            // when util/ClientLog.js first asked (debug mode, `[perf]` lines).
+            if (await startTunnel((stage) => SecuringOverlay.stage(stage))) void refreshClientLog();
+            bootMark('tunnel-up');
             // Closes the padlock and lifts the seal on its own schedule. Not
             // awaited: everything below renders behind it, so the moment it
             // holds costs the reveal and not the work.
@@ -250,6 +308,18 @@ const MoonlightApp = {
         // Two addresses, one page. Reached directly, the token is in the path.
         // Reached through the introduction server it is not, and cannot be — see
         // _initPlayerMode.
+        //
+        // A third spelling: the invitation exactly as the board hands it out,
+        // `/<id>#t=<token>`, with only the domain swapped for one that reaches
+        // this host directly (Tailscale Funnel, a Cloudflare tunnel, a domain of
+        // one's own). Nothing in between reads that path here, so it is turned
+        // into the direct form before anything else looks at the address — the
+        // guest lands on the PIN screen, not on the owner's login.
+        if (!pageCameThroughTunnel()) {
+            const direct = window.location.pathname.match(/^\/[0-9a-z]{26}\/?$/i);
+            const token = new URLSearchParams(window.location.hash.slice(1)).get('t');
+            if (direct && token) history.replaceState(null, '', '/p/' + encodeURIComponent(token));
+        }
         if (window.location.pathname === '/p' || window.location.pathname.startsWith('/p/')) {
             await this._initPlayerMode();
             return;
@@ -289,6 +359,7 @@ const MoonlightApp = {
 
         // ── Auth check: show login if remote and not authenticated ─────────
         const authOk = await this._checkAuth();
+        bootMark('auth-checked', authOk ? 'signed in' : 'login shown');
         if (!authOk) return; // LoginView handles rendering, stop here
         this._offerHomeScreenHandoff();
 
@@ -440,11 +511,41 @@ const MoonlightApp = {
         const view = new PlayerJoinView(
             container,
             token,
-            async ({ height, gaming, touchScreen }) => {
-                const result = await BackendClient.playerJoin(token, height);
+            async (
+                { height, gaming, touchScreen, padKey },
+                transportIndex = 0,
+                codec,
+                rejoin = {},
+            ) => {
+                // The guest's own Join starts the count of restarts after a
+                // crash again (stream/CrashRelaunch.js), as the owner's launch.
+                if (!rejoin.reconnectOf && transportIndex === 0 && !codec) {
+                    this._crashRelaunches = [];
+                }
+                // Same question as the owner's launch, same one-minute memory:
+                // a guest on a network that blocks UDP skips the UDP rungs.
+                const udpBlocked = (await this._probeUdpCached()) === false;
+                const result = await BackendClient.playerJoin(
+                    token,
+                    height,
+                    undefined,
+                    transportIndex,
+                    codec,
+                    udpBlocked,
+                    rejoin.reconnectOf,
+                );
+                // Left from the veil while the rejoin was on its way.
+                if (rejoin.aborted) {
+                    BackendClient.playerLeave().catch(() => {});
+                    return;
+                }
 
                 // StreamView renders (and connects) from its constructor, so the
-                // join screen has to be gone first.
+                // join screen has to be gone first. The veil of a rejoin after a
+                // crash stays over the new stream until its first frame.
+                const veil = rejoin.reconnectOf
+                    ? document.getElementById('stream-relaunch-loader')
+                    : null;
                 container.innerHTML = '';
 
                 // The launch payload is the same shape as the owner's, so the whole
@@ -467,14 +568,155 @@ const MoonlightApp = {
                         sessionSlot: typeof result.slot === 'number' ? result.slot : 2,
                         playerMode: true,
                         shareToken: token,
+                        // One controller per invitation: the one picked on the
+                        // join screen, when the invitation allows a gamepad.
+                        gamepadAllowed: view.info.permissions?.gamepad === true,
+                        keyboardMouseAllowed: view.info.permissions?.keyboardMouse === true,
+                        padKey: padKey || null,
                     },
                 );
                 this.streamView = streamView;
+                if (veil) {
+                    container.appendChild(veil);
+                    this._holdRelaunchLoader(streamView);
+                }
+
+                // The guest walks the transport chain as the owner does: a rung
+                // that never connects is replaced by the next one, in place,
+                // instead of dropping them back on the join screen. One try per
+                // rung — the backend holds the app session for the next one.
+                const chain = Array.isArray(result.transport_chain) ? result.transport_chain : [];
+                const at =
+                    typeof result.transport_index === 'number'
+                        ? result.transport_index
+                        : transportIndex;
+
                 streamView.onQuit = () => {
                     this.streamView = null;
+                    // This browser could not decode what the backend picked: back
+                    // in H.264, the guest's one fallback, on the transport that
+                    // just carried the frames. Without it a guest on a browser with
+                    // no HEVC decoder (Firefox, Chrome on Linux) never saw a frame.
+                    if (
+                        !codec &&
+                        streamView._codecFallbackRequested &&
+                        streamView._codecFallback?.codec === 'h264'
+                    ) {
+                        console.warn('[MW] Guest: codec fallback → H.264');
+                        // The guest loses 4:4:4 there as the owner does, and is
+                        // told the same way.
+                        if (streamView._yuv444) Toast.warning(t('launch.chroma444Fallback'));
+                        view.onJoin({ height, gaming, touchScreen, padKey }, at, 'h264').catch(
+                            (err) => {
+                                console.error('[MW] Guest codec fallback failed:', err);
+                                view.refresh();
+                            },
+                        );
+                        return;
+                    }
                     // Back to the join screen: the invitation outlives the stream.
                     if (streamView._sessionEndedByOwner) view.renderEnded();
                     else view.refresh();
+                };
+                streamView.onConnectionFailed = async (reason) => {
+                    const next = at + 1;
+                    // MW-BIND refused the host: no fallback, same rule as the
+                    // owner's (the wss rung has nothing to bind).
+                    if (reason === IDENTITY_REFUSED || next >= chain.length) {
+                        console.error(`[MW] Guest: ${chain[at] || '?'} failed (${reason})`);
+                        streamView.quit();
+                        return;
+                    }
+                    console.warn(
+                        `[MW] Guest: ${chain[at]} failed (${reason}) — trying ${chain[next]}`,
+                    );
+                    Toast.warning(
+                        t('transport.connectFailed', {
+                            from: this._transportLabel(chain[at]),
+                            to: this._transportLabel(chain[next]),
+                        }),
+                    );
+                    streamView.onQuit = null;
+                    this.streamView = null;
+                    await streamView.quit({ silent: true, retire: true });
+                    try {
+                        await view.onJoin({ height, gaming, touchScreen, padKey }, next, codec);
+                    } catch (err) {
+                        console.error('[MW] Guest relaunch failed:', err);
+                        view.refresh();
+                    }
+                };
+                // The link went quiet: the same question, early (_onLiveLinkStall).
+                streamView.onLinkStall = async () => {
+                    if (!streamView.streamId) return;
+                    const state = await BackendClient.playerStreamState(streamView.streamId);
+                    if (state === 'crashed' && this.streamView === streamView)
+                        streamView._handOffLinkLoss();
+                };
+                // The link went once connected. As the owner's (_onLiveLinkLost):
+                // a worker that crashed under it is rejoined behind the veil, on
+                // the same rung and with the same cookie; anything else ends as
+                // it always has.
+                streamView.onLinkLost = async () => {
+                    const state = streamView.streamId
+                        ? await settledStreamState(() =>
+                              BackendClient.playerStreamState(streamView.streamId),
+                          )
+                        : 'unknown';
+                    if (
+                        this.streamView !== streamView ||
+                        streamView._quitting ||
+                        streamView._manualQuitting ||
+                        streamView._takenOver
+                    )
+                        return;
+                    const now = Date.now();
+                    if (!shouldRelaunchAfterCrash(state, this._crashRelaunches, now)) {
+                        if (state === 'crashed')
+                            console.warn('[MW] Guest: the stream worker crashed again — leaving');
+                        streamView._linkLostDefault();
+                        return;
+                    }
+                    this._crashRelaunches = recordCrashRelaunch(this._crashRelaunches, now);
+                    console.warn('[MW] Guest: the stream worker on the host crashed — rejoining');
+                    const again = { reconnectOf: streamView.streamId, aborted: false };
+                    const frame = await streamView.captureLastFrameAsync();
+                    this._showRelaunchLoader(frame, {
+                        reconnecting: true,
+                        stopLabel: t('player.leave'),
+                        onStop: () => {
+                            again.aborted = true;
+                            this._hideRelaunchLoader();
+                            // Back already, under the veil until its first
+                            // frame: its own Leave, which ends on the join screen.
+                            if (this.streamView) {
+                                this.streamView.quit();
+                                return;
+                            }
+                            BackendClient.playerLeave().catch(() => {});
+                            view.refresh();
+                        },
+                    });
+                    streamView.onQuit = null;
+                    streamView.onConnectionFailed = null;
+                    this.streamView = null;
+                    // Closed here only: its worker is gone, and a Leave now
+                    // would free the slot the rejoin comes back to.
+                    await streamView.quit({ silent: true, retire: true, takenOver: true });
+                    try {
+                        await view.onJoin(
+                            { height, gaming, touchScreen, padKey },
+                            at,
+                            codec,
+                            again,
+                        );
+                    } catch (err) {
+                        console.error('[MW] Guest rejoin after a crash failed:', err);
+                        this._hideRelaunchLoader();
+                        if (again.aborted) return;
+                        Toast.error(t('stream.streamDisconnected'));
+                        view.refresh();
+                    }
                 };
             },
         );
@@ -623,6 +865,9 @@ const MoonlightApp = {
 
         this.hostListView = new HostListView(main);
         this.hostListView.onLaunchApp = (host, app) => this.launchApp(host, app);
+        this.hostListView.memoryKey = currentInstanceRef(tunnelHostId()).id;
+        this.hostListView.canAdminister = !!this._hasAdminAccess;
+        bootMark('host-page');
         this.hostListView.start();
 
         // Tell the user how OTHER PCs reach this server (host machine), and —
@@ -633,7 +878,7 @@ const MoonlightApp = {
         // And, on the host machine only, say so when a controller has no driver
         // to reach the games through. The server decides who may be offered the
         // install; the check here only spares everyone else a pointless request.
-        if (this._isHostMachine()) {
+        if (this._isHostMachine() && !BackendClient.adminLocked) {
             GamepadDriverNotice.mount(document.getElementById('view-hosts'));
         }
     },
@@ -855,6 +1100,9 @@ const MoonlightApp = {
         const hostname = window.location.hostname;
 
         if (!info.internetActive) {
+            // Booth mode (--noadmin): nobody here can turn it on, so the
+            // pointer at the admin page has nowhere to lead.
+            if (BackendClient.adminLocked) return null;
             // The action is a clause of the sentence, not a second copy of it
             // bolted on the end. Built by escaping the whole translated line
             // first and putting the anchor back at a marker no escape touches,
@@ -1180,30 +1428,15 @@ const MoonlightApp = {
             }
             if (answered) markHandoffKeySpent(own);
         }
-        const pending = others.filter((o) => !isHandoffKeySpent(o.key));
-        if (pending.length) this._redeemSideKeys(pending);
+        // The other machines' keys a shortcut of before v0.4.1 carries are left
+        // unspent: this page no longer opens a line to another machine with
+        // that machine's key (R1). Each asks its PIN the first time the
+        // shortcut opens it, and the keys die on their own within a day.
+        if (others.length)
+            console.log(
+                `[MW] ${others.length} other machine(s) in this shortcut: their PIN is asked there`,
+            );
         return answered;
-    },
-
-    /** The other machines' keys, each over its own line, all at once. */
-    async _redeemSideKeys(pending) {
-        const name = `${LoginView.suggestedMachineName()} (home screen)`;
-        await Promise.all(
-            pending.map(async ({ id, key }) => {
-                let line = null;
-                try {
-                    line = await openSideTunnel(id);
-                    await BackendClient.redeemHomeScreenKeyAt(line.fetch, id, key, name);
-                    markHandoffKeySpent(key);
-                    console.log(`[MW] Home-screen key redeemed on ${id} — no PIN there either`);
-                } catch (err) {
-                    if (err.statusCode) markHandoffKeySpent(key);
-                    console.warn(`[MW] Home-screen key not redeemed on ${id}:`, err.message);
-                } finally {
-                    line?.close();
-                }
-            }),
-        );
     },
 
     /**
@@ -1212,15 +1445,14 @@ const MoonlightApp = {
      * A shortcut runs in a storage of its own, so everything it should start
      * with has to leave with the one thing Safari gives it: the address in the
      * manifest. The host writes a single-use key into that address for a
-     * signed-in session (/api/app/web-manifest), and keeps this browser's list of
-     * machines beside it, handed over when the key is spent. The other machines
-     * this browser knows are each asked for a key of their own, over a line to
-     * each (openSideTunnel), and those go into the same address: the shortcut
-     * then signs in everywhere that was on the line when it was made.
+     * signed-in session (/api/app/web-manifest), for this machine only: the
+     * shortcut asks another machine's PIN the first time it opens it. This
+     * browser's list of machines stays in the browser (the bootstrap's tunnel.js
+     * answers that request for the applications of before), so the shortcut's
+     * menu fills as it is used.
      *
-     * All best-effort. The list goes to the host first. Then the manifest with
-     * the key is fetched, the other machines' keys written into it, and the
-     * result written over the copy the service worker holds — the phone reads
+     * All best-effort. The manifest with the key is fetched and written over the
+     * copy the service worker holds — the phone reads
      * the manifest while its share sheet is up, with this page's scripts
      * paused behind it, so a request the worker would send to this page waits
      * out the worker's timeout and the shortcut is made with nothing; the
@@ -1228,25 +1460,22 @@ const MoonlightApp = {
      * a fresh URL, because the browser read it when the page loaded — before
      * the PIN, on a first visit — and that copy carries no key.
      *
-     * Not from a shortcut: it has no share sheet, and a line to every other
-     * machine on every launch is the last thing it needs.
+     * Not from a shortcut: it has no share sheet.
      */
     async _offerHomeScreenHandoff() {
+        try {
+            localStorage.removeItem(SIDE_KEYS_STORE);
+        } catch {
+            /* nothing kept, or no storage */
+        }
         const ownId = tunnelHostId();
         if (!ownId || this._runsAsShortcut()) return;
-        const instances = listInstances();
-        BackendClient.shareInstancesForHomeScreen(instances).catch(() => {});
-        const sideKeys = this._collectSideHandoffKeys(
-            instances.filter((e) => e.id !== ownId).slice(0, SIDE_KEYS_MAX),
-            instances,
-        );
         try {
             const fresh = await fetch(`/api/app/web-manifest?t=${Date.now()}`, {
                 cache: 'no-store',
             });
             if (!fresh.ok) return;
             const manifest = await fresh.json();
-            manifest.start_url = startUrlWithSideKeys(manifest.start_url, await sideKeys);
             // The bootstrap's cache, under the file's own name: what the worker
             // matches a request for /manifest.webmanifest against (sw.js).
             const shell = await caches.open(SHELL_CACHE);
@@ -1272,66 +1501,14 @@ const MoonlightApp = {
     },
 
     /**
-     * A key from each of @p machines, kept for a while so the next page load
-     * reuses them rather than opening a line to every machine again. A machine
-     * that is off, or that this browser has no remembered session on, gives
-     * none and the shortcut asks its PIN when first opened on it.
-     *
-     * @returns {Promise<{id: string, key: string}[]>}
-     */
-    async _collectSideHandoffKeys(machines, instances) {
-        const now = Date.now();
-        let kept = [];
-        try {
-            kept = JSON.parse(localStorage.getItem(SIDE_KEYS_STORE) || '[]');
-            if (!Array.isArray(kept)) kept = [];
-        } catch {
-            kept = [];
-        }
-        // An answer still worth keeping: a key inside its keep time, or a
-        // refusal inside its retry time.
-        const fresh = new Map(
-            kept
-                .filter((k) => k && typeof k.id === 'string')
-                .filter((k) => {
-                    const age = now - (k.at || 0);
-                    return typeof k.key === 'string'
-                        ? age < SIDE_KEYS_KEEP_MS
-                        : age < SIDE_KEYS_RETRY_MS;
-                })
-                .map((k) => [k.id, k]),
-        );
-        const results = await Promise.all(
-            machines.map(async ({ id }) => {
-                if (fresh.has(id)) return fresh.get(id);
-                let line = null;
-                try {
-                    line = await openSideTunnel(id);
-                    const key = await BackendClient.askHomeScreenKeyAt(line.fetch, instances);
-                    return { id, key, at: now };
-                } catch (err) {
-                    console.log(`[MW] No home-screen key from ${id}: ${err.message}`);
-                    return { id, key: null, at: now };
-                } finally {
-                    line?.close();
-                }
-            }),
-        );
-        try {
-            localStorage.setItem(SIDE_KEYS_STORE, JSON.stringify(results));
-        } catch {
-            /* next load asks again */
-        }
-        return results.filter((k) => k.key).map(({ id, key }) => ({ id, key }));
-    },
-
-    /**
      * True when this browser has admin access: it runs on the host machine
      * (loopback origin, or a host-key session over the public domain), or it is
      * a LAN machine that unlocked with the remote admin password.
      */
     _isHostLocal() {
         if (this._hasAdminAccess) return true;
+        // Booth mode (--noadmin): on localhost too, nobody administers.
+        if (BackendClient.adminLocked) return false;
         const hostname = window.location.hostname;
         return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
     },
@@ -1356,6 +1533,15 @@ const MoonlightApp = {
         return this._isHostLocal() || !!this._adminUnlockAvailable;
     },
 
+    /** What /api/auth/status says this browser may do here. */
+    _readAccess(status) {
+        this._hasAdminAccess = !!status.is_localhost;
+        this._isRealHostMachine = !!status.is_host_machine;
+        // A LAN machine the operator gave the admin password to: it may ask
+        // for the admin page even though it is not the host.
+        this._adminUnlockAvailable = !!status.admin_unlock_available;
+    },
+
     async _checkAuth() {
         this.state = 'auth_check';
         console.log('[MW] Checking authentication...');
@@ -1365,11 +1551,7 @@ const MoonlightApp = {
 
         try {
             const status = await BackendClient.getAuthStatus();
-            this._hasAdminAccess = !!status.is_localhost;
-            this._isRealHostMachine = !!status.is_host_machine;
-            // A LAN machine the operator gave the admin password to: it may ask
-            // for the admin page even though it is not the host.
-            this._adminUnlockAvailable = !!status.admin_unlock_available;
+            this._readAccess(status);
 
             // Localhost or already authenticated — proceed
             if (status.is_localhost || status.authenticated) {
@@ -1382,12 +1564,31 @@ const MoonlightApp = {
                 return true;
             }
 
+            // Booth mode (--noadmin) lets no new device in: a PIN would be refused.
+            if (status.admin_locked) {
+                main.innerHTML = `
+                    <div class="hosts-view">
+                        <div class="hosts-header"><h2>${t('appError.boothTitle')}</h2></div>
+                        <div class="hosts-error"><p>${t('appError.boothBody')}</p></div>
+                    </div>
+                `;
+                return false;
+            }
+
             // Not authenticated and not localhost — show login
-            this.loginView = new LoginView(main, () => {
+            this.loginView = new LoginView(main, async () => {
                 // On successful login, re-initialize the app
                 console.log('[MW] Authentication successful, re-initializing...');
                 this.loginView = null;
                 this._offerHomeScreenHandoff();
+                // The host offers its admin page to signed-in sessions only, so
+                // the answer read above, from before the login, never offers it.
+                // Read again, the button is there from the first visit.
+                try {
+                    this._readAccess(await BackendClient.getAuthStatus());
+                } catch (err) {
+                    console.warn('[MW] Auth re-check after login failed:', err);
+                }
                 this._initNavButtons();
                 this._initRouter();
                 this._initAsync();
@@ -1405,7 +1606,7 @@ const MoonlightApp = {
                     <div class="hosts-header"><h2>${t('appError.connectionTitle')}</h2></div>
                     <div class="hosts-error">
                         <p>${t('appError.unableToConnect')}</p>
-                        <p class="hint">${err.message || t('appError.unknownError')}</p>
+                        <p class="hint">${escapeHtml(err.message || t('appError.unknownError'))}</p>
                         <button class="btn btn-reload">${t('common.retry')}</button>
                     </div>
                 </div>
@@ -1428,7 +1629,7 @@ const MoonlightApp = {
     async _maybeShowSetup() {
         // Every step needs the local desktop, so this is the host machine's
         // wizard — not a password-unlocked LAN admin's.
-        if (!this._isHostMachine()) return false;
+        if (!this._isHostMachine() || BackendClient.adminLocked) return false;
 
         try {
             const status = await BackendClient.getSetupStatus();
@@ -1596,6 +1797,34 @@ const MoonlightApp = {
                 }
             });
         }
+
+        // Buy me a coffee: a plain link, so the browser opens the new tab. It
+        // comes and goes with the count and the Settings switch.
+        const btnBmc = document.getElementById('btn-bmc');
+        if (btnBmc && !btnBmc.dataset.wired) {
+            // Wired once: this runs again after a login.
+            btnBmc.dataset.wired = '1';
+            const logo = btnBmc.querySelector('.header-btn-bmc-logo');
+            if (logo) logo.innerHTML = BMC_LOGO;
+            const full = btnBmc.querySelector('.header-btn-bmc-full');
+            if (full) full.innerHTML = BMC_FULL_LOGO;
+            btnBmc.addEventListener('click', () => btnBmc.classList.remove('is-new'));
+            window.addEventListener(SUPPORT_CHANGED_EVENT, () => this._refreshSupportButton());
+            this._refreshSupportButton();
+        }
+    },
+
+    /**
+     * Show or hide the header's Buy me a coffee button (util/supportNudge.js
+     * decides). Never in booth mode. The visit it first appears on, it glows.
+     */
+    _refreshSupportButton() {
+        const btnBmc = document.getElementById('btn-bmc');
+        if (!btnBmc) return;
+        const show = !BackendClient.adminLocked && showSupportButton();
+        btnBmc.hidden = !show;
+        if (show && takeSupportIntroduction()) btnBmc.classList.add('is-new');
+        if (!show) btnBmc.classList.remove('is-new');
     },
 
     _updateNavHighlight(active) {
@@ -1675,10 +1904,35 @@ const MoonlightApp = {
             !(opts && opts.skipSelfStreamWarn) &&
             host &&
             host.isLocalHost &&
-            this._isHostMachine()
+            this._isHostMachine() &&
+            !selfStreamWarnMuted()
         ) {
             this._showSelfStreamWarning(host, app);
             return;
+        }
+
+        // A host whose app outlives the stream (issue #24): Stop left an app
+        // running, and Sunshine runs one at a time. The same app is simply
+        // resumed by the server; ANOTHER one is the viewer's call — quit it, or
+        // resume it instead — and it has to be asked before /start, whose
+        // take-over would already have ended whoever streams it. The audio
+        // unlock is taken now, while the click still counts as a gesture.
+        if (!codecOverride && !(opts && opts.runningChecked) && host && host.resumableApps) {
+            iosAudioUnlock.prepareForLaunch(48000);
+            let running = 0;
+            try {
+                const answer = await BackendClient.getRunningApp(host.uuid);
+                running = Number(answer && answer.currentGameId) || 0;
+            } catch (e) {
+                // Unknown: launch anyway — the server still refuses to join
+                // the wrong app, and says so with app_running.
+                console.warn('[MW] Running app unknown, launching anyway:', e);
+            }
+            if (running > 0 && running !== app.id) {
+                iosAudioUnlock.release();
+                this._showAppRunningDialog(host, app, running);
+                return;
+            }
         }
 
         // iOS: create + unlock the AudioContext and start the silent element NOW,
@@ -1690,6 +1944,12 @@ const MoonlightApp = {
         // No-op off iOS.
         iosAudioUnlock.prepareForLaunch(48000);
 
+        // "Start streams in fullscreen" (Settings): asked here, on the launch
+        // click, for the same reason — once the stream is up no gesture is
+        // left and the browser refuses. A codec/HDR fallback relaunch has no
+        // click behind it; the stream view falls back on its own there.
+        if (!codecOverride) this._enterLaunchFullscreen();
+
         console.log(
             `[MW] Launching: ${app.name} (id=${app.id}) on ${host.displayName}` +
                 (codecOverride ? ` (forced codec: ${codecOverride})` : '') +
@@ -1697,6 +1957,10 @@ const MoonlightApp = {
         );
         this.transition('launching');
         Toast.info(t('launch.launching', { name: app.name }));
+        // A Mac without Accessibility streams a picture that ignores every
+        // press, and macOS says nothing: said here, once per launch.
+        if (!codecOverride && host.lacksInputPermission)
+            Toast.warning(t('hosts.nativeInputPermissionStream'));
 
         // Reset fallback counter on user-initiated launch (not a fallback re-launch)
         if (!codecOverride) {
@@ -1705,6 +1969,10 @@ const MoonlightApp = {
             this._transportIndex = 0;
             this._firstTransportRetried = false;
             this._launchRetried = false;
+            // Restarts after a worker crash (stream/CrashRelaunch.js): counted
+            // from this launch on.
+            this._crashRelaunches = [];
+            this._reconnectOf = null;
             // Reset the congestion-degradation ladder. The overrides are
             // session-only (never persisted): a fresh launch always starts from
             // the user's own settings.
@@ -1734,11 +2002,19 @@ const MoonlightApp = {
             this._abortStandby('fresh launch');
             this._activeSlot = 0;
             this._dualSupported = undefined;
+            // Does UDP get out of this network? Asked now, answered while the
+            // rest of the launch is prepared, read just before /start: a
+            // relaunch in this session keeps the same answer.
+            this._udpProbe = this._probeUdpCached();
         }
 
         // Store host/app for HEVC fallback re-launch
         this._lastStreamHost = host;
         this._lastStreamApp = app;
+
+        // When this evening's stream started, for _noteSupportSession. A codec
+        // fallback relaunch is the same stream carrying on: it keeps the time.
+        if (!codecOverride) this._streamStartedAt = performance.now();
 
         // A user-initiated launch clears any previous abort (a codec/HDR
         // fallback relaunch is a continuation of the aborted one — it must
@@ -1763,6 +2039,10 @@ const MoonlightApp = {
         // settings) is never touched.
         Object.assign(streamingSettings, this._degradeOverrides || {});
 
+        // The microphone asked of the host: the list's choice, by default the
+        // system's, and never from a browser that could not capture it.
+        streamingSettings.mic_enabled = micSupported() && micRequested(streamingSettings);
+
         // Override codec if provided (codec fallback chain)
         if (codecOverride) {
             streamingSettings.video_codec = codecOverride;
@@ -1775,16 +2055,44 @@ const MoonlightApp = {
             if (codecOverride === 'h264') {
                 streamingSettings.hdr_enabled = false;
                 // Remember that the user had asked for it: the overlay says so.
-                if (streamingSettings.chroma_444_enabled)
-                    this._chroma444Declined = 'dropped with the codec';
+                if (streamingSettings.chroma_444_enabled) this._chroma444Declined = '4:4:4 dropped';
                 streamingSettings.chroma_444_enabled = false;
             }
+            // The stream that asked for this fallback had frames arriving: its
+            // transport works. Started from the top, the chain would spend every
+            // rung above it on their deadlines again — on a UDP-blocked network,
+            // half a minute of failures before the same wss rung comes back.
+            // Pinned first instead; the backend keeps the rest behind it.
+            const chain = this._transportChain || [];
+            const provenRung = chain[this._transportIndex || 0];
+            if ((this._transportIndex || 0) > 0 && provenRung && !streamingSettings.transport_mode)
+                streamingSettings.transport_mode = provenRung;
         }
         // Explicit HDR override from the fallback chain (e.g. AV1 HDR → HEVC SDR
         // drops HDR). undefined means "leave the stored preference untouched".
         if (hdrOverride !== undefined) {
             streamingSettings.hdr_enabled = hdrOverride === true;
         }
+        // « Auto » (util/CodecAuto.js): HEVC, the codec the host is asked for,
+        // unless HDR below finds that HEVC cannot do the job (hdrLaunchCodec),
+        // or H.264 in a browser whose HEVC already failed (hevcFailedHere).
+        // No codec stored at all is still the server's default, as before. A
+        // fallback relaunch keeps the word of the launch it follows: the
+        // overlay still says Auto.
+        if (!codecOverride) {
+            this._codecAuto = streamingSettings.video_codec === CODEC_AUTO;
+            if (this._codecAuto) {
+                streamingSettings.video_codec = autoLaunchCodec();
+                if (streamingSettings.video_codec === 'h264')
+                    console.log('[MW] Auto: HEVC failed in this browser before — asking H.264');
+            }
+        }
+        // « PyroWave (Wired LAN only) »: asked of a host that says it codes it,
+        // by a browser that decodes it, with the HDR box off; otherwise this
+        // launch is an Auto one, without a word (util/PyrowaveCodec.js). Read
+        // before the native host's HDR below, which follows the screens and
+        // gives way to PyroWave on the host (8-bit SDR).
+        applyPyrowaveChoice(streamingSettings, host, { codecOverride, hdrOverride });
         // The native host decides HDR from both screens, never from the
         // checkbox: asked whenever this screen can show it, granted when the
         // host's display is in HDR. An SDR screen gets SDR from an HDR host —
@@ -1837,19 +2145,62 @@ const MoonlightApp = {
                 streamingSettings.hdr_enabled = false;
             }
         }
+        // Auto's H.264 (this browser's HEVC failed) is asked without HDR: H.264
+        // HDR is High 4:4:4 Predictive 10-bit, which nearly nothing decodes, and
+        // H.264 SDR is where the fallback from HEVC would have ended anyway.
+        if (this._codecAuto && !codecOverride && streamingSettings.video_codec === 'h264') {
+            if (streamingSettings.hdr_enabled) console.log('[MW] Auto in H.264: HDR not asked');
+            streamingSettings.hdr_enabled = false;
+        }
+        // The codec HDR asks for (hdrLaunchCodec): HEVC for an AV1 this
+        // browser hands opaque and breaks on import (WebKit); AV1 for Auto's
+        // HEVC with the enhancer, which only AV1's readback keeps in HDR.
+        const hdrOn = streamingSettings.hdr_enabled === true;
+        const enhanced = streamingSettings.video_enhancement === 'on';
+        const autoAv1 = !codecOverride && this._codecAuto === true && hdrOn && enhanced;
+        const hdrCodec = hdrLaunchCodec(streamingSettings.video_codec, hdrOn, {
+            auto: autoAv1,
+            enhanced,
+            hostAv1Hdr: ((host.serverCodecModeSupport || 0) & SCM_AV1_MAIN10) !== 0,
+            av1Software: autoAv1 ? await av1HdrSoftwareDecode() : false,
+        });
+        if (!codecOverride && hdrCodec !== streamingSettings.video_codec) {
+            console.log(
+                hdrCodec === 'av1'
+                    ? '[MW] Auto, HDR with the enhancer: HEVC frames cannot be read here — asking AV1 HDR'
+                    : '[MW] AV1 HDR: this browser hands its frames opaque — asking HEVC HDR',
+            );
+            streamingSettings.video_codec = hdrCodec;
+        }
 
-        // 4:4:4 is never asked of the host for a browser that decodes no 4:4:4
-        // profile (HEVC RExt, H.264 High 4:4:4). Chrome on Windows decodes
-        // neither: asked anyway, the stream came up, failed three decodes and
-        // fell back to 4:2:0 H.264 three seconds later (B7, 03/09/2026). The
-        // settings page greys the box out on such a browser; this catches a
-        // preference saved on another one (the settings travel with the account).
+        // 4:4:4 is asked of the host only in a codec this browser decodes it in
+        // (HEVC RExt, H.264 High 4:4:4). Chrome on Windows decodes neither:
+        // asked anyway, the stream came up, failed three decodes and fell back
+        // to 4:2:0 H.264 three seconds later (B7, 03/09/2026). A browser that
+        // decodes only H.264 4:4:4 is asked H.264 4:4:4 rather than an HEVC one
+        // it would drop in the same way (25/09/2026, Chrome on an AMD iGPU).
+        // The settings page greys the box out when neither can; this catches a
+        // preference saved on another browser (the settings travel with the
+        // account), and says so.
         if (streamingSettings.chroma_444_enabled) {
             const cap = await chroma444ClientCapability();
-            if (!cap.decode) {
-                console.log('[MW] 4:4:4 preference ignored: this browser decodes no 4:4:4 profile');
-                this._chroma444Declined = 'this browser decodes none';
+            const asked = streamingSettings.video_codec;
+            const codec = chroma444Codec(asked, cap);
+            if (!codec) {
+                console.log(
+                    `[MW] 4:4:4 preference ignored: this browser decodes no 4:4:4 in ${asked || 'hevc'}`,
+                );
+                this._chroma444Declined = 'no 4:4:4 decoder';
                 streamingSettings.chroma_444_enabled = false;
+                // Said once: the preference is put away in this browser, whose
+                // settings page greys the box out anyway.
+                if (this._persistChroma444Disabled() && !codecOverride)
+                    Toast.warning(t('settings.chroma444BrowserUnsupported'));
+            } else if (codec !== (asked || 'hevc')) {
+                console.log(
+                    `[MW] 4:4:4: this browser decodes it in ${codec} only — asking ${codec}`,
+                );
+                streamingSettings.video_codec = codec;
             }
         }
 
@@ -1868,6 +2219,10 @@ const MoonlightApp = {
         if (streamingSettings.power_save) {
             streamingSettings.transport_mode = 'webrtc-media-udp';
         }
+
+        // No STUN answer: the backend skips the UDP rungs for an internet
+        // browser instead of letting each one run to its ICE deadline.
+        if ((await this._udpProbe) === false) streamingSettings.udp_blocked = true;
 
         // Aspect ratio → the backend derives the even width from this "W:H"
         // string. The goal is a frame the HOST fills edge to edge, since anything
@@ -1904,28 +2259,55 @@ const MoonlightApp = {
         // below weighs the two together.
         const fpsAuto = !(streamingSettings.stream_fps > 0);
         this._applyResolvedFps(streamingSettings);
+        // What this browser has earned from this host: read once per launch the
+        // viewer asked for, a codec fallback carries on with it.
+        if (!codecOverride || !this._autoCeiling) this._startAutoCeiling(host, streamingSettings);
+        else this._autoCeiling.reopen();
         const choice = readResolutionChoice(streamingSettings);
-        const size = resolveStreamSize(
-            {
-                mode: choice.mode,
-                height: streamingSettings.stream_height,
-                customWidth: choice.customWidth,
-                customHeight: choice.customHeight,
-            },
-            {
-                nativeHost,
-                touch: IS_MOBILE_OR_TABLET,
-                // "MoonlightWeb Virtual Display": the screen is made for this
-                // stream, so every choice names an exact size instead of a box
-                // to fit into (see util/StreamResolution.js).
-                virtualDisplay: app?.isVirtualDisplay === true,
-            },
-        );
+        const sizeAt = (autoMaxHeight) =>
+            resolveStreamSize(
+                {
+                    mode: choice.mode,
+                    height: streamingSettings.stream_height,
+                    customWidth: choice.customWidth,
+                    customHeight: choice.customHeight,
+                },
+                {
+                    nativeHost,
+                    touch: IS_HANDHELD,
+                    // A TV's Auto stops at 720 lines: latency first.
+                    tv: IS_TV,
+                    // "MoonlightWeb Virtual Display" or an app in gamescope: the
+                    // screen is made for this stream, so every choice names an
+                    // exact size instead of a box to fit into (see
+                    // util/StreamResolution.js).
+                    virtualDisplay: app?.isMadeForStream === true,
+                    autoMaxHeight,
+                },
+            );
         this._fpsAuto = fpsAuto;
-        const bounded = this._applyPixelBudget(streamingSettings, size, choice.mode, fpsAuto);
+        const askedFps = streamingSettings.stream_fps;
+        const decodeLimit = await hardwareDecodeLimit(streamingSettings.video_codec);
+        const askAt = this._autoCeilingAsk(
+            sizeAt,
+            streamingSettings,
+            askedFps,
+            choice.mode,
+            fpsAuto,
+            decodeLimit,
+        );
+        if (!codecOverride) await this._guardAutoCeiling(askAt, streamingSettings);
+        const size = sizeAt(autoMaxHeightFor(this._autoCeilingBudget()));
+        const budgeted = this._applyPixelBudget(streamingSettings, size, choice.mode, fpsAuto);
+        const bounded = this._capToDecoder(budgeted, decodeLimit);
+        if (this._autoCeiling) this._autoCeiling.weigh(askAt, choice.mode === 'auto' || fpsAuto);
         this._applyResolvedSize(streamingSettings, bounded);
-        this._sizeFollowsScreen = size.followsScreen;
-        this._sizeOnVirtualDisplay = app?.isVirtualDisplay === true;
+        if (IS_TV) this._warnTvOverAsk(streamingSettings, choice.mode === 'auto' && fpsAuto);
+        // A gamescope session keeps the size it was started at (a new size
+        // would only find it again, framed): turning the phone relaunches
+        // nothing there.
+        this._sizeFollowsScreen = size.followsScreen && app?.isGamescope !== true;
+        this._sizeOnVirtualDisplay = app?.isMadeForStream === true;
         // The ladder's session-only rung and bitrate outrank the choice: a
         // relaunch through here (a codec fallback under congestion) keeps
         // what the ladder brought the stream down to.
@@ -2017,6 +2399,7 @@ const MoonlightApp = {
                 // Remember context so a failed transport can be relaunched with
                 // the next entry in the priority chain (see _onTransportFailed).
                 this._lastStreamingSettings = streamingSettings;
+                this._noteLiveQuality();
                 // A codec/HDR fallback re-launch (codecOverride set) is not a
                 // fresh user launch — don't re-show the shortcuts/help slide.
                 this._startStreamView(result, host, streamingSettings, !!codecOverride);
@@ -2042,6 +2425,7 @@ const MoonlightApp = {
             }
         } catch (err) {
             console.error('[MW] Launch failed:', err);
+            if (this._retryBelowAutoCeiling(err, host, app, codecOverride, opts)) return;
             // Launch failed before the audio pipeline could take over the iOS
             // session hold — release it so we don't keep a silent element looping.
             iosAudioUnlock.release();
@@ -2059,6 +2443,14 @@ const MoonlightApp = {
             // display on the host, sometimes a macOS permission it can't be
             // granted programmatically. Show an explicit dialog whose wording and
             // repair buttons follow the payload's local_host / local_os.
+            // Another app runs on the host and the server would not join it in
+            // place of this one (the check above could not tell in time).
+            if (err && err.responseBody && err.responseBody.code === 'app_running') {
+                if (this.hostListView) this.hostListView.clearLaunching();
+                this._showAppRunningDialog(host, app, Number(err.responseBody.runningAppId) || 0);
+                this.transition('app_list');
+                return;
+            }
             if (err && err.responseBody && err.responseBody.code === 'video_capture_failed') {
                 this._showVideoCaptureHelp(host, app, err.message, err.responseBody);
                 this.transition('app_list');
@@ -2105,32 +2497,140 @@ const MoonlightApp = {
      * "Stream anyway" re-invokes launchApp with the warning suppressed — done from
      * the button's own click so the iOS audio-unlock user gesture stays valid.
      */
+    /**
+     * Another app already runs on a host whose app outlives the stream: the
+     * question Moonlight asks too. Quit it and launch this one, resume it
+     * instead, or back out. The choices re-invoke launchApp from their own
+     * click, so the iOS audio unlock keeps a gesture to hang on to.
+     */
+    _showAppRunningDialog(host, app, runningId) {
+        if (document.querySelector('.app-running-overlay')) return;
+        const entry =
+            this.hostListView && this.hostListView.appsByHost
+                ? this.hostListView.appsByHost[host.uuid]
+                : null;
+        const apps = (entry && entry.apps) || [];
+        const runningApp = apps.find((a) => a.id === runningId) || null;
+        const runningName = runningApp ? runningApp.name : t('appRunning.unknownApp');
+
+        const overlay = document.createElement('div');
+        overlay.className = 'pairing-overlay app-running-overlay';
+        const resumeHtml = runningApp
+            ? `<button class="btn btn-secondary app-running-resume">${escapeHtml(
+                  t('appRunning.resume', { name: runningName }),
+              )}</button>`
+            : '';
+        overlay.innerHTML = `
+            <div class="pairing-dialog" role="dialog" aria-modal="true">
+                <h3>${escapeHtml(t('appRunning.title'))}</h3>
+                <p class="pairing-instruction">${escapeHtml(
+                    t('appRunning.body', {
+                        running: runningName,
+                        host: host.displayName || host.name || '',
+                        app: app.name,
+                    }),
+                )}</p>
+                <p class="pairing-instruction app-running-error" hidden></p>
+                <div class="pairing-actions pairing-actions-stack app-running-actions">
+                    <button class="btn btn-danger app-running-quit">${escapeHtml(
+                        t('appRunning.quitAndLaunch', { name: app.name }),
+                    )}</button>
+                    ${resumeHtml}
+                    <button class="btn btn-secondary app-running-cancel">${escapeHtml(
+                        t('common.cancel'),
+                    )}</button>
+                </div>
+            </div>
+        `;
+
+        let busy = false;
+        const onKey = (e) => {
+            if (e.key === 'Escape' && !busy) cancel();
+        };
+        const cleanup = () => {
+            document.removeEventListener('keydown', onKey);
+            overlay.remove();
+        };
+        const cancel = () => {
+            cleanup();
+            // Nothing failed: the viewer chose not to go on.
+            if (this.hostListView) {
+                this.hostListView.clearLaunching();
+                this.hostListView.start();
+            }
+        };
+        const resume = () => {
+            cleanup();
+            if (this.hostListView) this.hostListView.clearLaunching();
+            this.launchApp(host, runningApp, undefined, undefined, {
+                skipSelfStreamWarn: true,
+                runningChecked: true,
+            });
+        };
+        const quitAndLaunch = async () => {
+            if (busy) return;
+            busy = true;
+            // The gesture is this click; the quit below outlasts it.
+            iosAudioUnlock.prepareForLaunch(48000);
+            const quitBtn = overlay.querySelector('.app-running-quit');
+            overlay.querySelectorAll('button').forEach((b) => (b.disabled = true));
+            quitBtn.textContent = t('appRunning.quitting', { name: runningName });
+            try {
+                await BackendClient.stopHostSession(host.uuid);
+            } catch (e) {
+                console.error('[MW] Quitting the running app failed:', e);
+                busy = false;
+                iosAudioUnlock.release();
+                overlay.querySelectorAll('button').forEach((b) => (b.disabled = false));
+                quitBtn.textContent = t('appRunning.quitAndLaunch', { name: app.name });
+                const errEl = /** @type {HTMLElement} */ (
+                    overlay.querySelector('.app-running-error')
+                );
+                errEl.textContent = t('appRunning.quitFailed', { name: runningName });
+                errEl.hidden = false;
+                return;
+            }
+            cleanup();
+            host.currentGameId = 0;
+            // Its seat's answer too, where each device has one (MultiSeat).
+            if (this.hostListView && this.hostListView.forgetDeviceRunning)
+                this.hostListView.forgetDeviceRunning(host.uuid);
+            if (this.hostListView) this.hostListView.clearLaunching();
+            this.launchApp(host, app, undefined, undefined, {
+                skipSelfStreamWarn: true,
+                runningChecked: true,
+            });
+        };
+
+        overlay.querySelector('.app-running-cancel').addEventListener('click', cancel);
+        const resumeBtn = overlay.querySelector('.app-running-resume');
+        if (resumeBtn) resumeBtn.addEventListener('click', resume);
+        overlay.querySelector('.app-running-quit').addEventListener('click', quitAndLaunch);
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay && !busy) cancel();
+        });
+        document.addEventListener('keydown', onKey);
+        document.body.appendChild(overlay);
+    },
+
     async _showSelfStreamWarning(host, app) {
         // Guard against a double-open (e.g. a replayed click).
         if (document.querySelector('.self-stream-overlay')) return;
 
-        // Fetch the "reach me from elsewhere" URL up front (best-effort).
-        const info = await this._computeRemoteAccessUrls();
-        if (document.querySelector('.self-stream-overlay')) return;
-        const url = info && info.url ? info.url : '';
-
         const overlay = document.createElement('div');
         overlay.className = 'pairing-overlay self-stream-overlay';
-        // Plain (non-clickable) text so the user can select and copy the URL to
-        // paste into a browser on another device.
-        const offlineHtml =
-            info && url && url === info.rendezvousUrl && !info.rendezvousOnline
-                ? `<p class="setting-desc">${escapeHtml(t('admin.rendezvousOffline'))}</p>`
-                : '';
-        const urlHtml = url
-            ? `<p class="self-stream-url">${escapeHtml(t('selfStream.useUrl'))}
-                   <span class="self-stream-url-value">${escapeHtml(url)}</span></p>${offlineHtml}`
-            : '';
+        // The dialog opens on the click, the address joins it when known: right
+        // after the instance starts, the status request can queue behind other
+        // slow ones for seconds, and the choice never depended on it.
         overlay.innerHTML = `
             <div class="pairing-dialog">
                 <h3>${escapeHtml(t('selfStream.title'))}</h3>
                 <p class="pairing-instruction">${escapeHtml(t('selfStream.body'))}</p>
-                ${urlHtml}
+                <div class="self-stream-url-slot"></div>
+                <label class="self-stream-mute">
+                    <input type="checkbox" class="self-stream-mute-check">
+                    <span>${escapeHtml(t('selfStream.dontShowAgain'))}</span>
+                </label>
                 <div class="pairing-actions">
                     <button class="btn btn-secondary self-stream-cancel">${escapeHtml(
                         t('common.cancel'),
@@ -2160,6 +2660,16 @@ const MoonlightApp = {
             }
         };
         const proceed = () => {
+            // Kept only on the way in: Cancel says this launch was a mistake,
+            // and the warning is what catches the next one.
+            const mute = /** @type {HTMLInputElement} */ (
+                overlay.querySelector('.self-stream-mute-check')
+            );
+            if (mute && mute.checked) {
+                try {
+                    localStorage.setItem(SELF_STREAM_WARN_KEY, 'off');
+                } catch {}
+            }
             cleanup();
             this.launchApp(host, app, undefined, undefined, { skipSelfStreamWarn: true });
         };
@@ -2171,6 +2681,20 @@ const MoonlightApp = {
         });
         document.addEventListener('keydown', onKey);
         document.body.appendChild(overlay);
+
+        // The "reach me from elsewhere" URL, best-effort. Plain (non-clickable)
+        // text so the user can select and copy it into a browser on another
+        // device.
+        const info = await this._computeRemoteAccessUrls();
+        const url = info && info.url ? info.url : '';
+        const slot = overlay.querySelector('.self-stream-url-slot');
+        if (!url || !slot || !overlay.isConnected) return;
+        const offlineHtml =
+            url === info.rendezvousUrl && !info.rendezvousOnline
+                ? `<p class="setting-desc">${escapeHtml(t('admin.rendezvousOffline'))}</p>`
+                : '';
+        slot.innerHTML = `<p class="self-stream-url">${escapeHtml(t('selfStream.useUrl'))}
+                   <span class="self-stream-url-value">${escapeHtml(url)}</span></p>${offlineHtml}`;
     },
 
     /**
@@ -2202,7 +2726,8 @@ const MoonlightApp = {
         const name = (host && (host.displayName || host.name)) || '';
         // The failing host is this very machine, and this browser is on it —
         // the only situation where the buttons below reach the right Sunshine.
-        const canAct = !!(info && info.local_host) && this._isHostMachine();
+        const canAct =
+            !!(info && info.local_host) && this._isHostMachine() && !BackendClient.adminLocked;
         const isMac = canAct && info.local_os === 'macOS';
         // Advice differs by whose machine (and which OS) needs the fixing.
         const bodyKey = !canAct
@@ -2315,6 +2840,19 @@ const MoonlightApp = {
             );
         }
 
+        // The viewer picked a microphone and the host could not take it: said
+        // once per user-initiated launch, like the transport above, with the
+        // host's own reason (a remote host, no virtual cable…). Not for the
+        // default: nobody asked for it, and it would be said at every launch.
+        if (
+            streamingSettings.mic_chosen === true &&
+            streamingSettings.mic_enabled === true &&
+            result.mic === false &&
+            !suppressShortcuts
+        ) {
+            Toast.warning(t('stream.micUnavailable', { why: result.mic_why || '' }));
+        }
+
         this.streamView = this._createStreamView(result, host, streamingSettings, {
             sessionSlot: slot,
             slotUniqueId: BackendClient.clientUniqueIdForSlot(slot),
@@ -2325,23 +2863,7 @@ const MoonlightApp = {
         // chain / codec fallback) so it doesn't re-pop on every degrade step.
         this.streamView._suppressShortcutsSlide = suppressShortcuts;
 
-        // ── Callbacks ──────────────────────────────────────────────────────
-        // onQuit: normal end (Stop button / mid-stream disconnect).
-        this.streamView.onQuit = () => this._onStreamingQuit();
-        // onConnectionFailed: transport never connected → try the next entry
-        // in the priority chain (or give up if the chain is exhausted).
-        this.streamView.onConnectionFailed = (reason) => this._onTransportFailed(reason);
-        // onCongestion: sustained congestion detected mid-stream → relaunch with
-        // a degraded session-only profile (bitrate −30% steps, resolution rungs,
-        // media transport, 60 fps cap). See _onStreamCongested().
-        this.streamView.onCongestion = () => this._onStreamCongested();
-        // onCongestionSignal: every individual congestion hint (IDR/PLI/drops).
-        // Tracks quiet time for the automatic quality upgrade.
-        this.streamView.onCongestionSignal = () => {
-            this._lastCongSignal = performance.now();
-        };
-        this.streamView.onHostDisplayFormat = (msg) => this._onHostDisplayFormat(msg);
-        this.streamView.onClientScreenChanged = (device) => this._onClientScreenChanged(device);
+        this._wireLiveView(this.streamView);
         this._armUpgradeTimer();
         this._adoptNativeFormat(result);
         this._startAspectProbe();
@@ -2455,6 +2977,31 @@ const MoonlightApp = {
      * is told of a change through `clientrefresh` and paces to it without a
      * relaunch.
      */
+    /**
+     * On a TV, say when the launch asks more than Auto would: the stream goes
+     * as asked, the viewer chose it, but a TV's decoder may not keep up
+     * (util/StreamResolution.js, tvOverAsk). Once per page and setting, not at
+     * every relaunch of the same stream.
+     * @param {object} settings the launch's copy, size and rate resolved
+     * @param {boolean} allAuto both size and rate left to Auto
+     */
+    _warnTvOverAsk(settings, allAuto) {
+        if (allAuto) return;
+        const over = tvOverAsk({
+            height: settings.stream_height > 0 ? settings.stream_height : 0,
+            fps: settings.stream_fps > 0 ? settings.stream_fps : 60,
+            autoFps: autoFps() || 0,
+        });
+        if (!over) return;
+        const key = over.height + '@' + over.fps;
+        if (this._tvOverAskShown === key) return;
+        this._tvOverAskShown = key;
+        console.warn(
+            '[MW] TV asked ' + key + ' — Auto would take ' + over.autoHeight + '@' + over.autoFps,
+        );
+        Toast.warning(t('launch.tvOverAsk', over));
+    },
+
     _applyResolvedFps(settings) {
         if (settings.stream_fps > 0) return;
         const fps = autoFps();
@@ -2475,8 +3022,10 @@ const MoonlightApp = {
      *
      * A resolution and a frame rate are picked apart and multiply together;
      * whenever one of the two was ours to pick, the product is ours to keep
-     * sane (util/StreamResolution.js, fitPixelBudget). Two explicit choices
-     * are left exactly as asked.
+     * sane (util/StreamResolution.js, fitPixelBudget) — with the half that
+     * was ours: a resolution or a rate the viewer named stays, and only the
+     * Auto one comes down for it. Two explicit choices are left exactly as
+     * asked.
      *
      * `stream_fps_max` is the ceiling the native host must respect: without
      * it, a client presenting on vsync gets the nearest divisor of its own
@@ -2493,6 +3042,9 @@ const MoonlightApp = {
         const bounded = fitPixelBudget(size, settings.stream_fps, {
             clientFps: measuredFps(),
             aspect: settings.stream_aspect,
+            resolutionNamed: mode !== 'auto',
+            rateNamed: !fpsAuto,
+            budget: this._autoCeilingBudget(),
         });
         if (bounded.capped) {
             console.log(
@@ -2512,6 +3064,118 @@ const MoonlightApp = {
         return bounded.size;
     },
 
+    /** The pixels a second this launch may spend: see AutoCeilingSession. */
+    _autoCeilingBudget() {
+        return this._autoCeiling ? this._autoCeiling.budget : undefined;
+    },
+
+    /** Read what this browser has earned from @p host, for this launch. */
+    _startAutoCeiling(host, settings) {
+        // A launch that gave up before any view ended: nothing crashed.
+        if (this._autoCeiling) this._autoCeiling.end();
+        this._autoCeiling = new AutoCeilingSession({
+            host: host.uuid,
+            codec: settings.video_codec,
+            native: host.backendType === 'native',
+            device: {
+                tv: IS_TV,
+                handheld: IS_HANDHELD,
+                lowMemory: IS_LOW_MEMORY,
+                powerSave: settings.power_save === true,
+            },
+        });
+        if (this._autoCeilingPageWatch) return;
+        // A tab killed from the background, or a page left, is no crash.
+        this._autoCeilingPageWatch = true;
+        window.addEventListener('pagehide', () => {
+            if (this._autoCeiling) this._autoCeiling.pause();
+        });
+        document.addEventListener('visibilitychange', () => {
+            if (!this._autoCeiling) return;
+            if (document.hidden) this._autoCeiling.pause();
+            else this._autoCeiling.resume();
+        });
+    },
+
+    /**
+     * What this launch comes to under a budget, the way _applyPixelBudget and
+     * _capToDecoder would make it.
+     * @param {(autoMaxHeight: number) => object} sizeAt the size for a ceiling
+     * @param {object} settings
+     * @param {number} fps the rate asked for, before any budget
+     * @param {string} mode the resolution's mode
+     * @param {boolean} fpsAuto
+     * @param {{width:number, height:number}|null} limit the decoder's
+     * @returns {(budget: number) => {width:number, height:number, fps:number,
+     *            pixelRate:number}}
+     */
+    _autoCeilingAsk(sizeAt, settings, fps, mode, fpsAuto, limit) {
+        const aspect = settings.stream_aspect;
+        const clientFps = measuredFps();
+        return (budget) => {
+            const size = sizeAt(autoMaxHeightFor(budget));
+            const fit =
+                mode !== 'auto' && !fpsAuto
+                    ? { size, fps }
+                    : fitPixelBudget(size, fps, {
+                          clientFps,
+                          aspect,
+                          resolutionNamed: mode !== 'auto',
+                          rateNamed: !fpsAuto,
+                          budget,
+                      });
+            return streamFootprint(capSizeToDecoder(fit.size, limit).size, fit.fps, aspect);
+        };
+    },
+
+    /** The browser's outright "no" brings this launch down a rung, in the time
+     *  a launch can spare. See AutoCeilingSession.guard. */
+    async _guardAutoCeiling(askAt, settings) {
+        if (!this._autoCeiling) return;
+        await this._autoCeiling.guard(
+            askAt,
+            (ask, left) =>
+                decoderRefuses(
+                    settings.video_codec,
+                    {
+                        width: ask.width,
+                        height: ask.height,
+                        fps: ask.fps,
+                        bitrate:
+                            this._autoBitrateFor(
+                                settings,
+                                ask.height,
+                                ask.width + ':' + ask.height,
+                            ) * 1000,
+                    },
+                    left,
+                ),
+            AUTO_CEILING_GUARD_MS,
+        );
+    },
+
+    /**
+     * The host refused a launch at a rung on trial: once, it goes again a rung
+     * down, with no message. Not for a host that did not answer (the network
+     * then, not the rung), nor for the refusals that have their own dialog.
+     * @returns {boolean} the launch is on its way again
+     */
+    _retryBelowAutoCeiling(err, host, app, codecOverride, opts) {
+        const session = this._autoCeiling;
+        if (!session || codecOverride || (opts && opts.autoCeilingRetried)) return false;
+        if (this._startupAborted || !err || !(err.statusCode >= 500)) return false;
+        const code = err.responseBody && err.responseBody.code;
+        if (code === 'app_running' || code === 'video_capture_failed') return false;
+        if (!session.refused()) return false;
+        this.transition('app_list');
+        this.launchApp(host, app, undefined, undefined, {
+            ...opts,
+            skipSelfStreamWarn: true,
+            autoCeilingRetried: true,
+        });
+        return true;
+    },
+
     /** The estimate's bitrate, in kbps, for a frame of that size. */
     _autoBitrateFor(settings, height, aspect) {
         return (
@@ -2521,9 +3185,31 @@ const MoonlightApp = {
                 aspect,
                 settings.chroma_444_enabled === true,
                 settings.hdr_enabled === true,
-                IS_MOBILE_OR_TABLET,
+                IS_HANDHELD,
             ) * 1000
         );
+    },
+
+    /**
+     * Bring a launch size under what this browser's hardware decoder takes
+     * (util/DecoderLimit.js): beyond it a stream does not degrade, it does not
+     * start. Every choice goes through here, a named one included — the
+     * alternative to a smaller picture is none.
+     */
+    _capToDecoder(size, limit) {
+        const { size: capped, capped: changed } = capSizeToDecoder(size, limit);
+        if (changed)
+            console.log(
+                '[MW] Hardware decoder takes ' +
+                    limit.width +
+                    'x' +
+                    limit.height +
+                    ' at most: ' +
+                    (size.aspect || size.height + ' lines') +
+                    ' → ' +
+                    (capped.aspect || capped.height + ' lines'),
+            );
+        return capped;
     },
 
     /**
@@ -2553,29 +3239,46 @@ const MoonlightApp = {
      * monitor of another size or scale — and the choice follows this screen
      * (Auto on the native host, "Match my screen"): the stream is relaunched
      * at the new size, seamlessly where the host allows two sessions. Nothing
-     * happens when the size the host is asked for does not change.
+     * happens when the size the host is asked for does not change, or only by
+     * a few pixels (nearlySameStreamSize).
+     *
+     * One relaunch at a time: a change while one is on its way is looked at
+     * again once it is over, against the screen as it is by then. Two in a row
+     * superseded each other on the host, and the second one's virtual display
+     * was asked for while the first was still being set (15/10/2026).
      */
     _onClientScreenChanged(device) {
         if (!this._sizeFollowsScreen || this._nav.overlay !== 'streaming') return;
-        if (this._standbyView) return;
+        if (this._standbyView || this._standbyLaunching || this._relaunching) {
+            clearTimeout(this._screenRecheckTimer);
+            this._screenRecheckTimer = setTimeout(
+                () => this._onClientScreenChanged(devicePixelSize()),
+                SCREEN_RECHECK_MS,
+            );
+            return;
+        }
         const settings = this._lastStreamingSettings;
         const host = this._lastStreamHost;
         if (!settings || !host) return;
         const choice = readResolutionChoice(settings);
-        const size = resolveStreamSize(
-            {
-                mode: choice.mode,
-                height: settings.stream_height,
-                customWidth: choice.customWidth,
-                customHeight: choice.customHeight,
-            },
-            {
-                nativeHost: host.backendType === 'native',
-                device,
-                touch: IS_MOBILE_OR_TABLET,
-                virtualDisplay: this._sizeOnVirtualDisplay === true,
-            },
-        );
+        const sizeAt = (autoMaxHeight) =>
+            resolveStreamSize(
+                {
+                    mode: choice.mode,
+                    height: settings.stream_height,
+                    customWidth: choice.customWidth,
+                    customHeight: choice.customHeight,
+                },
+                {
+                    nativeHost: host.backendType === 'native',
+                    device,
+                    touch: IS_HANDHELD,
+                    tv: IS_TV,
+                    virtualDisplay: this._sizeOnVirtualDisplay === true,
+                    autoMaxHeight,
+                },
+            );
+        const size = sizeAt(autoMaxHeightFor(this._autoCeilingBudget()));
         // The new screen carries its own budget: a window moved from a 1080p
         // monitor to a 4K one asks for more pixels, and the pair is weighed
         // again before anything is relaunched. An Auto rate is read from the
@@ -2585,10 +3288,17 @@ const MoonlightApp = {
         const fps = settings.stream_fps;
         const fpsAuto = this._fpsAuto === true;
         if (fpsAuto) settings.stream_fps = autoFps() || settings.stream_fps;
-        const bounded = this._applyPixelBudget(settings, size, choice.mode, fpsAuto);
+        const askedFps = settings.stream_fps;
+        const decodeLimit = knownHardwareDecodeLimit(settings.video_codec);
+        const bounded = this._capToDecoder(
+            this._applyPixelBudget(settings, size, choice.mode, fpsAuto),
+            decodeLimit,
+        );
         if (
-            bounded.height === settings.stream_height &&
-            bounded.aspect === settings.stream_aspect &&
+            nearlySameStreamSize(bounded, {
+                height: settings.stream_height,
+                aspect: settings.stream_aspect,
+            }) &&
             settings.stream_fps === fps
         )
             return;
@@ -2601,6 +3311,11 @@ const MoonlightApp = {
                 (settings.stream_fps || 60) +
                 ' fps',
         );
+        if (this._autoCeiling)
+            this._autoCeiling.weigh(
+                this._autoCeilingAsk(sizeAt, settings, askedFps, choice.mode, fpsAuto, decodeLimit),
+                choice.mode === 'auto' || fpsAuto,
+            );
         this._applyResolvedSize(settings, bounded);
         this._qualityRelaunch(this._transportIndex || 0);
     },
@@ -2763,6 +3478,43 @@ const MoonlightApp = {
     },
 
     /**
+     * The callbacks of the view on screen — the first one of a launch, and
+     * the standby a seamless relaunch swaps in. One list for both: the
+     * swapped-in view once missed onClientScreenChanged, and a second screen
+     * change after a relaunch relaunched nothing (N95 bench, 16/10/2026).
+     */
+    _wireLiveView(sv) {
+        // onQuit: normal end (Stop button / mid-stream disconnect).
+        sv.onQuit = () => this._onStreamingQuit();
+        // onConnectionFailed: transport never connected → try the next entry
+        // in the priority chain (or give up if the chain is exhausted).
+        sv.onConnectionFailed = (reason) => this._onTransportFailed(reason);
+        // onLinkLost: the link went once connected → ask the host why, and
+        // start the stream again if its worker crashed (_onLiveLinkLost).
+        sv.onLinkLost = () => this._onLiveLinkLost(sv);
+        // onLinkStall: nothing came over the link for a moment → ask the host
+        // at once whether the worker crashed (_onLiveLinkStall).
+        sv.onLinkStall = () => this._onLiveLinkStall(sv);
+        // onCongestion: sustained congestion detected mid-stream → relaunch with
+        // a degraded session-only profile (bitrate −30% steps, resolution rungs,
+        // media transport, 60 fps cap). See _onStreamCongested().
+        sv.onCongestion = () => this._onStreamCongested();
+        // onCongestionSignal: every individual congestion hint (IDR/PLI/drops).
+        // Tracks quiet time for the automatic quality upgrade.
+        sv.onCongestionSignal = () => {
+            this._lastCongSignal = performance.now();
+        };
+        sv.onHostDisplayFormat = (msg) => this._onHostDisplayFormat(msg);
+        sv.onClientScreenChanged = (device) => this._onClientScreenChanged(device);
+        sv.autoCeilingIdle = () => !!(this._standbyView || this._relaunching);
+        const ceiling = this._autoCeiling;
+        sv.autoCeilingMeter = ceiling ? ceiling.meter(performance.now()) : null;
+        sv.autoCeilingOnTrial = () => !!(ceiling && ceiling.onTrial);
+        sv.autoCeilingMaxPixelRate = ceiling ? ceiling.stepCeiling : 0;
+        sv.autoCeilingLine = () => (ceiling ? ceiling.statsLine : null);
+    },
+
+    /**
      * Build a StreamView (active or standby) from a successful launch response.
      * Shared by _startStreamView and the seamless dual-stream transition.
      */
@@ -2771,8 +3523,10 @@ const MoonlightApp = {
         const upnpEnabled = true;
         const internalTransport = result.transport || (result.signalingUrl ? 'webrtc' : 'wss');
         const transportMode = result.transport_mode || internalTransport;
-        // Respect the "show performance stats" setting (default: true)
-        const showPerfStats = streamingSettings.show_performance_stats !== false;
+        // Respect the "show performance stats" setting, off unless ticked — as
+        // the settings page and the backend read it. A first stream to a new
+        // host has no value yet, and showed the card under an unticked box.
+        const showPerfStats = streamingSettings.show_performance_stats === true;
         // Touch/trackpad sensitivity (default 2.2)
         const touchSensitivity =
             typeof streamingSettings.touch_sensitivity === 'number'
@@ -2818,6 +3572,10 @@ const MoonlightApp = {
             ...viewOpts,
             intraRefresh: result.intra_refresh === true,
             gamepadProfile,
+            // Multiplier on relative mouse motion (pointer lock). The host never
+            // learns the viewer's mouse resolution, so a low-DPI mouse makes a
+            // game slow to aim with, and this is the one place to answer it.
+            mouseSensitivity: streamingSettings.mouse_sensitivity,
             // Click-to-photon probe: the host says whether it raises its flag
             // on every click (debug builds on Windows, setting on). Only then
             // does the view install its measuring side.
@@ -2825,18 +3583,62 @@ const MoonlightApp = {
             // The host is this machine's own screen (mw-native-host): the mouse
             // is sent at its raw report rate there — see _bindPointerRaw.
             nativeHost: result.native === true,
+            // The host took this viewer's microphone (audio/MicUplink.js): the
+            // view answers the audio section with it. Never a guest's.
+            mic: viewOpts.playerMode !== true && result.mic === true,
+            // How it sounds (Settings → Microphone sound): MIC_QUALITY's name.
+            micQuality: streamingSettings.mic_quality,
+            // The virtual display drawn by another GPU than the display it
+            // replaced, when the host says so: the view tells the user to
+            // restart a stuttering app, once the stream shows the stall —
+            // see util/vdGpuApartNotice.js.
+            vdGpuApart:
+                result.vd_gpu_apart && typeof result.vd_gpu_apart === 'object'
+                    ? result.vd_gpu_apart
+                    : null,
+            // This browser streams the machine it runs on ("Stream anyway"):
+            // what the host injects comes back to this very window, and the
+            // view must not send it again — see StreamView.handleKeyDown.
+            selfStream: !!(host && host.isLocalHost && this._isHostMachine()),
             // The frame rate this launch asked for: the ceiling the view's
             // decode-rate governor climbs back to — see DecodeRateGovernor.
             streamFps: Number(streamingSettings.stream_fps) || 0,
+            // …and whether it was Auto's choice: only then may the detection
+            // step the stream above it (stream/CadenceStepper.js).
+            fpsAuto: this._fpsAuto === true,
+            // "Quit the app when the stream stops": Stop then closes the app on
+            // a host where it would otherwise keep running for a resume.
+            quitAppOnStop: streamingSettings.quit_app_on_stop === true,
+            // "Start streams in fullscreen": the launch click already asked
+            // for it; the view completes it where that was not possible.
+            fullscreenOnStart: streamingSettings.fullscreen_on_start === true,
             // Its encoder heals a lost frame with a delta (reference
             // invalidation): the view then decodes through a gap.
             refInvalidation: result.ref_invalidation === true,
+            // The size the native host streams: the view cuts a decoded AV1
+            // frame padded past it back to it (stream/FrameCrop.js).
+            frameSize:
+                result.native === true && result.stream_width > 0 && result.stream_height > 0
+                    ? { width: result.stream_width, height: result.stream_height }
+                    : null,
             // Frames per intra-refresh wave (0 when the stream does not
             // refresh that way): sizes the ride-out watchdog in frames.
             intraRefreshFrames: Number(result.intra_refresh_frames) || 0,
             // "NVENC" / "AMF" / "oneVPL", for the stats overlay — only the
             // native host, whose encoder runs on this very machine, can name it.
             nativeEncoder: typeof result.native_encoder === 'string' ? result.native_encoder : '',
+            // The card launched (a screen on the native host), for the stats
+            // overlay. A guest launched none.
+            screenName:
+                viewOpts.playerMode !== true && this._lastStreamApp
+                    ? this._lastStreamApp.displayName || ''
+                    : '',
+            // The host codes PyroWave (this browser's codec for a wired LAN,
+            // util/PyrowaveCodec.js): this page decodes it itself
+            // (stream/ultra/UltraPlayer.js). Never a guest's: its feed is the
+            // owner's H.264, HEVC or AV1.
+            ultraCodec:
+                viewOpts.playerMode !== true && result.ultra_codec === 'pyrowave' ? 'pyrowave' : '',
             // What /start told the host this screen refreshes at, so the view
             // only speaks up again when the number changes.
             clientRefreshMilliHz: currentRefreshMilliHz(),
@@ -2848,11 +3650,16 @@ const MoonlightApp = {
             // plain codec name and the viewer had no way to tell a granted 4:2:0
             // from a refused 4:4:4. The two client-side reasons are recorded at
             // the moment of the drop; what is left is the host's answer.
+            // The codec was Auto's to choose: the overlay says so beside it.
+            codecAuto: viewOpts.playerMode !== true && this._codecAuto === true,
             chroma444Declined:
                 this._chroma444Declined ||
                 (streamingSettings.chroma_444_enabled === true && result.yuv444 !== true
-                    ? 'the host does not encode it'
+                    ? 'no 4:4:4 on host'
                     : null),
+            // What the host knows this stream by: asked how it ended once its
+            // link goes (_onLiveLinkLost).
+            streamId: typeof result.stream_id === 'string' ? result.stream_id : '',
         };
         // The degradation ladder stands down for the native host — see
         // _onStreamCongested.
@@ -2908,6 +3715,25 @@ const MoonlightApp = {
         return `${scheme}://${window.location.host}${path}`;
     },
 
+    /**
+     * probeUdp, remembered for a minute: a user who stops and starts again on
+     * the same network does not wait for the same answer twice. A false is
+     * logged — it is the one that changes the session.
+     *
+     * @returns {Promise<boolean|null>}
+     */
+    _probeUdpCached() {
+        const now = Date.now();
+        const cached = this._udpProbeCache;
+        if (cached && now - cached.at < 60000) return Promise.resolve(cached.verdict);
+        return probeUdp(1500).then((verdict) => {
+            this._udpProbeCache = { at: Date.now(), verdict };
+            if (verdict === false)
+                console.log('[MW] UDP probe: no STUN answer in 1.5 s — UDP looks blocked here');
+            return verdict;
+        });
+    },
+
     /** Human-readable label for a transport mode (warning toasts / logs). */
     _transportLabel(mode) {
         const keys = {
@@ -2918,6 +3744,68 @@ const MoonlightApp = {
             wss: 'transport.wss',
         };
         return keys[mode] ? t(keys[mode]) : mode;
+    },
+
+    /**
+     * The live view's link went after it connected (StreamView.onLinkLost).
+     * The host says how that stream ended (stream/CrashRelaunch.js): a worker
+     * that crashed under it is started again on the transport that worked,
+     * behind the "Reconnecting…" veil and with no /quit, which would take the
+     * guests and the host's app down with it. Anything else (a network cut,
+     * the app closed, Stop or a take-over elsewhere, no answer in time) ends
+     * as it always has.
+     */
+    async _onLiveLinkLost(sv) {
+        const host = this._lastStreamHost;
+        const state =
+            sv.streamId && host
+                ? await settledStreamState(() => BackendClient.streamState(host.uuid, sv.streamId))
+                : 'unknown';
+        // Stop pressed, a notice from the host, or a relaunch that replaced
+        // this view while the answer came: the ending is theirs.
+        if (sv !== this.streamView || sv._quitting || sv._manualQuitting || sv._takenOver) return;
+        const now = Date.now();
+        if (this._relaunching || !shouldRelaunchAfterCrash(state, this._crashRelaunches, now)) {
+            if (state === 'crashed')
+                console.warn('[MW] The stream worker crashed again — ending the stream');
+            sv._linkLostDefault();
+            return;
+        }
+        if (state === 'crashed' && sv.autoCeilingMeter)
+            sv.autoCeilingMeter.noteSick('worker_crash', true);
+        this._crashRelaunches = recordCrashRelaunch(this._crashRelaunches, now);
+        // Named to the host until a launch succeeds (_doRelaunchTransport).
+        this._reconnectOf = sv.streamId;
+        console.warn('[MW] The stream worker on the host crashed — starting the stream again');
+        this._relaunchTransport(this._transportIndex || 0);
+    },
+
+    /**
+     * Nothing has come over the live view's link for a moment while it still
+     * counts as up (StreamView._checkLinkStall). The host knows of a crashed
+     * worker within a tenth of a second, ICE takes some 8 s to call the link
+     * dead: a crash heard now is handed to _onLiveLinkLost at once. Anything
+     * else changes nothing — a stalling link carries on, or ends as it does.
+     */
+    async _onLiveLinkStall(sv) {
+        const host = this._lastStreamHost;
+        if (!sv.streamId || !host) return;
+        const state = await BackendClient.streamState(host.uuid, sv.streamId);
+        if (state !== 'crashed' || sv !== this.streamView) return;
+        console.warn('[MW] The link went quiet: the host says its stream worker crashed');
+        sv._handOffLinkLoss();
+    },
+
+    /**
+     * The end of a launch that has given up: through the view's quit() when
+     * there is one. A failed relaunch has already taken it down, and then its
+     * onQuit is called here, or the page would stay on an empty stream screen.
+     */
+    _endAfterFailedLaunch() {
+        this._reconnectOf = null;
+        this._hideRelaunchLoader();
+        if (this.streamView) this.streamView.quit({ silent: true });
+        else this._onStreamingQuit();
     },
 
     /**
@@ -2945,6 +3833,16 @@ const MoonlightApp = {
 
         const chain = this._transportChain || [];
         const cur = this._transportIndex || 0;
+
+        // Back after a worker crash, and the host refused: that stream is not
+        // this page's to take back any more (another device streams the host
+        // since). It ends as it would have without the restart.
+        if (reason === 'reconnect_refused') {
+            console.warn('[MW] The host refused the restart after a crash — ending the stream');
+            Toast.error(t('stream.streamDisconnected'));
+            this._endAfterFailedLaunch();
+            return;
+        }
 
         // The launch itself never returned a session (timeout, 502, Sunshine
         // refusal). Nothing was tried at the transport level — no offer, no ICE
@@ -2994,8 +3892,7 @@ const MoonlightApp = {
                     walkedOut ? '(chain exhausted)' : '(retried once)',
                 );
                 Toast.error(t(walkedOut ? 'transport.allFailed' : 'transport.launchFailed'));
-                this._hideRelaunchLoader();
-                if (this.streamView) this.streamView.quit({ silent: true });
+                this._endAfterFailedLaunch();
                 return;
             }
             this._launchRetried = true;
@@ -3018,8 +3915,7 @@ const MoonlightApp = {
                     'no fallback transport',
             );
             Toast.error(t('transport.identityRefused'));
-            this._hideRelaunchLoader();
-            if (this.streamView) this.streamView.quit({ silent: true });
+            this._endAfterFailedLaunch();
             return;
         }
 
@@ -3030,7 +3926,16 @@ const MoonlightApp = {
         // Always retry the FIRST transport once before moving down the chain — a
         // single transient ICE failure on the preferred transport shouldn't
         // immediately downgrade. The retry is silent (no warning toast).
-        if (cur === 0 && !this._firstTransportRetried && !decoderFail) {
+        //
+        // Not after an ICE timeout: that is the whole ICE deadline spent with no
+        // pair ever answering — a network that blocks this transport, not a
+        // blip — and a second deadline on the same rung only made a browser on
+        // a UDP-blocked network wait twice as long for the rung that works.
+        // The flag still records that a transport failed: the launch_failed
+        // branch above walks on rather than giving up once it is set.
+        const iceTimedOut = /ice timeout/i.test(String(reason));
+        if (cur === 0 && iceTimedOut) this._firstTransportRetried = true;
+        if (cur === 0 && !this._firstTransportRetried && !decoderFail && !iceTimedOut) {
             this._firstTransportRetried = true;
             console.warn(`[MW] Transport ${chain[0]} failed (${reason}) — retrying once (silent)`);
             this._relaunchTransport(0);
@@ -3058,10 +3963,9 @@ const MoonlightApp = {
                 `[MW] All transports failed (last: ${chain[cur] || '?'}, reason: ${reason})`,
             );
             Toast.error(t('transport.allFailed'));
-            this._hideRelaunchLoader();
             // quit() fires onQuit → _onStreamingQuit, which handles navigation
             // back to the apps view. silent: suppress the "Stream end" toast.
-            if (this.streamView) this.streamView.quit({ silent: true });
+            this._endAfterFailedLaunch();
         }
     },
 
@@ -3071,12 +3975,30 @@ const MoonlightApp = {
      *  last frame of the outgoing stream is provided (quality transition on a
      *  live stream), the connection steps are NOT shown: just the frame with a
      *  small corner spinner, so the switch reads as a brief pause, not a
-     *  reconnection. */
-    _showRelaunchLoader(freezeFrame) {
+     *  reconnection.
+     *
+     *  opts.reconnecting: the host's worker crashed and the stream starts
+     *  again — the frame (or the bare surround) goes under a veil that says
+     *  "Reconnecting…", the loader centred over it. opts.onStop and
+     *  opts.stopLabel: a guest's way out, which is Leave. */
+    _showRelaunchLoader(freezeFrame, opts = {}) {
         if (document.getElementById('stream-relaunch-loader')) return;
         const el = document.createElement('div');
         el.id = 'stream-relaunch-loader';
-        if (freezeFrame) {
+        if (opts.reconnecting) {
+            el.classList.add('is-reconnecting');
+            el.innerHTML =
+                '<div class="startup-loader" aria-hidden="true"><div class="startup-loader-ring"></div></div>';
+            const label = document.createElement('div');
+            label.className = 'relaunch-reconnecting';
+            label.setAttribute('role', 'status');
+            label.textContent = t('stream.reconnecting');
+            el.appendChild(label);
+            if (freezeFrame) {
+                freezeFrame.className = 'relaunch-freeze-frame';
+                el.insertBefore(freezeFrame, el.firstChild);
+            }
+        } else if (freezeFrame) {
             el.classList.add('has-freeze-frame');
             el.innerHTML =
                 '<div class="startup-loader" aria-hidden="true"><div class="startup-loader-ring"></div></div>';
@@ -3113,8 +4035,9 @@ const MoonlightApp = {
         const stopBtn = document.createElement('button');
         stopBtn.className = 'btn stream-quit-btn';
         stopBtn.id = 'btn-relaunch-quit';
-        stopBtn.textContent = IS_MOBILE_OR_TABLET ? t('stream.stop') : t('stream.stopStreaming');
-        stopBtn.onclick = () => this._abortStreamStartup();
+        stopBtn.textContent =
+            opts.stopLabel || (IS_MOBILE_OR_TABLET ? t('stream.stop') : t('stream.stopStreaming'));
+        stopBtn.onclick = opts.onStop || (() => this._abortStreamStartup());
         header.appendChild(stopBtn);
         el.appendChild(header);
         document.getElementById('app').appendChild(el);
@@ -3132,6 +4055,7 @@ const MoonlightApp = {
         if (this._startupAborted) return;
         console.warn('[MW] Stream startup aborted by the user');
         this._startupAborted = true;
+        this._reconnectOf = null;
         this._abortStandby('startup aborted');
         this._hideRelaunchLoader();
         this._stopUpgradeTimer();
@@ -3248,6 +4172,7 @@ const MoonlightApp = {
         // the loser's session kills the winner's stream.
         if (this._relaunching) return;
         this._relaunching = true;
+        this._noteLiveQuality();
         let failReason = null;
         try {
             failReason = await this._doRelaunchTransport(nextIndex, host, app);
@@ -3264,6 +4189,9 @@ const MoonlightApp = {
     async _doRelaunchTransport(nextIndex, host, app) {
         // A legacy relaunch takes over every slot — drop any in-flight standby.
         this._abortStandby('legacy relaunch');
+        // The stream's worker crashed (_onLiveLinkLost): the same relaunch,
+        // under the "Reconnecting…" veil, naming the lost stream to the host.
+        const reconnectOf = this._reconnectOf || null;
 
         // Claim and silence the outgoing view BEFORE the first await: from here
         // on, none of its events may re-enter the relaunch machinery or surface
@@ -3299,7 +4227,7 @@ const MoonlightApp = {
         const freezeFrame = sv ? await sv.captureLastFrameAsync() : null;
         // Loader up BEFORE teardown so the apps view underneath is never
         // revealed (stay on the stream initialization screen).
-        this._showRelaunchLoader(freezeFrame);
+        this._showRelaunchLoader(freezeFrame, { reconnecting: !!reconnectOf });
 
         // Quietly tear down the outgoing StreamView (no navigation, no toast).
         // retire: keep the Sunshine host app session alive — we relaunch the
@@ -3309,9 +4237,16 @@ const MoonlightApp = {
         // then 503s), the frontend connect timeout fires mid-RTSP-handshake,
         // and the killed handshake leaves a stale session key that makes every
         // later attempt die with "Failed to decrypt RTSP response".
+        //
+        // After a crash, closed here only (takenOver): the worker is gone with
+        // its slot, and the host has nothing left to quit.
         if (sv) {
             try {
-                await sv.quit({ silent: true, retire: true });
+                await sv.quit(
+                    reconnectOf
+                        ? { silent: true, retire: true, takenOver: true }
+                        : { silent: true, retire: true },
+                );
             } catch (e) {
                 /* ignore */
             }
@@ -3328,7 +4263,11 @@ const MoonlightApp = {
             transport_index: nextIndex,
         };
         try {
-            const result = await BackendClient.launchApp(host.uuid, app.id, settings);
+            const result = await BackendClient.launchApp(
+                host.uuid,
+                app.id,
+                reconnectOf ? { ...settings, reconnect_of: reconnectOf } : settings,
+            );
             // Stop pressed while this relaunch was in flight: _abortStreamStartup
             // had no view to quit through (the outgoing one is already gone), so
             // hand the freshly started session back here instead of mounting it.
@@ -3350,6 +4289,7 @@ const MoonlightApp = {
                 // over, so a later one earns its retry again. (Loop-safe — this
                 // only resets after a session actually started.)
                 this._launchRetried = false;
+                this._reconnectOf = null;
                 // Transport relaunch (fallback chain / congestion degradation) —
                 // suppress the shortcuts slide so it doesn't re-pop each step.
                 // Pass the merged settings so the degradation overrides (reduced
@@ -3361,32 +4301,8 @@ const MoonlightApp = {
                     this.streamView.restoreViewState(viewState);
                     this._carryViewState = null;
                 }
-                if (freezeFrame && this.streamView) {
-                    // Hold the frozen frame until the new stream presents its
-                    // first frame (bounded — the failure paths hide the loader
-                    // themselves, this timer only covers a silent stall).
-                    //
-                    // On expiry the frame moves BEHIND the loader instead of
-                    // going away with it: a host that stopped encoding (still
-                    // screen, no damage, so the IDRs we keep asking for are
-                    // applied to a frame that is never captured) leaves the new
-                    // view with an empty canvas, and dropping the cover there
-                    // used to reveal it as a black screen that stood until the
-                    // user moved the mouse. As a poster it keeps showing what
-                    // the host screen actually looks like, and — unlike the
-                    // loader — it lets the pointer through, so that mouse move
-                    // is possible. StreamView drops it on its first frame.
-                    const failsafe = setTimeout(() => {
-                        const img = document.querySelector(
-                            '#stream-relaunch-loader .relaunch-freeze-frame',
-                        );
-                        if (img && this.streamView) this.streamView.showStalePoster(img);
-                        this._hideRelaunchLoader();
-                    }, 15000);
-                    this.streamView.onFirstFrame = () => {
-                        clearTimeout(failsafe);
-                        this._hideRelaunchLoader();
-                    };
+                if ((freezeFrame || reconnectOf) && this.streamView) {
+                    this._holdRelaunchLoader(this.streamView);
                 } else {
                     // New StreamView rendered its own #stream-view on top — drop
                     // the bridging loader.
@@ -3397,6 +4313,9 @@ const MoonlightApp = {
                 return 'launch_failed';
             }
         } catch (err) {
+            // The host would not take this stream back after its crash.
+            if (reconnectOf && err && err.statusCode === 409 && err.message === 'reconnect_refused')
+                return 'reconnect_refused';
             // The host never gave us a session — a timeout, a 502, a Sunshine
             // refusal. That is a verdict on the HOST, not on this transport, so
             // it must not be charged to the chain (see _onTransportFailed).
@@ -3404,6 +4323,32 @@ const MoonlightApp = {
             return 'launch_failed';
         }
         return null;
+    },
+
+    /**
+     * Hold the relaunch loader over @p sv until its first frame (bounded — the
+     * failure paths hide the loader themselves, this timer only covers a
+     * silent stall).
+     *
+     * On expiry the frame moves BEHIND the loader instead of going away with
+     * it: a host that stopped encoding (still screen, no damage, so the IDRs
+     * we keep asking for are applied to a frame that is never captured) leaves
+     * the new view with an empty canvas, and dropping the cover there used to
+     * reveal it as a black screen that stood until the user moved the mouse.
+     * As a poster it keeps showing what the host screen actually looks like,
+     * and — unlike the loader — it lets the pointer through, so that mouse
+     * move is possible. StreamView drops it on its first frame.
+     */
+    _holdRelaunchLoader(sv) {
+        const failsafe = setTimeout(() => {
+            const img = document.querySelector('#stream-relaunch-loader .relaunch-freeze-frame');
+            if (img && this.streamView) this.streamView.showStalePoster(img);
+            this._hideRelaunchLoader();
+        }, 15000);
+        sv.onFirstFrame = () => {
+            clearTimeout(failsafe);
+            this._hideRelaunchLoader();
+        };
     },
 
     // ── Seamless dual-stream transition ───────────────────────────────────
@@ -3469,12 +4414,17 @@ const MoonlightApp = {
         console.log('[MW] Seamless transition: preparing standby stream on slot', standbySlot);
 
         let result;
+        // Until the host answers there is no standby view yet, and a screen
+        // change must not start a second launch on the same slot.
+        this._standbyLaunching = true;
         try {
             result = await BackendClient.launchApp(host.uuid, app.id, settings);
         } catch (err) {
+            this._standbyLaunching = false;
             console.warn('[MW] Standby launch failed — legacy relaunch:', err);
             return this._relaunchTransport(relaunchIndex);
         }
+        this._standbyLaunching = false;
         if (result.status === 'dual_unavailable') {
             // Capability probe answered: this host cannot host a second
             // concurrent session — remember it and use the legacy path.
@@ -3499,11 +4449,76 @@ const MoonlightApp = {
         this._standbyView = sv;
         this._standbyResult = result;
         sv.onFirstFrame = () => this._promoteStandby();
-        sv.onConnectionFailed = (reason) =>
-            this._abortStandby('connect failed: ' + reason, relaunchIndex);
-        sv.onQuit = () => this._abortStandby('standby quit', relaunchIndex);
+        sv.onConnectionFailed = (reason) => this._failStandby('connect failed: ' + reason);
+        sv.onQuit = () => this._failStandby('standby quit');
         // Failsafe: a standby that never produces a frame must not dangle.
-        this._standbyTimer = setTimeout(() => this._abortStandby('timeout', relaunchIndex), 25000);
+        this._standbyTimer = setTimeout(() => this._failStandby('timeout'), 25000);
+    },
+
+    /**
+     * The host said the standby was streaming and it never showed a picture
+     * (issue #36). That host cannot run two sessions of one app, and on a
+     * Sunshine the failed attempt can leave the running app unable to stream
+     * at all until it is quit — so it is never tried there again, by this page
+     * or (told through the standby's /quit) by the backend, which keeps it
+     * across restarts. The live stream was never the problem: it keeps playing
+     * at the quality it has, and the next step of the ladder takes the classic
+     * relaunch. Tearing the live stream down here to apply the step anyway is
+     * what used to leave every resume without a picture.
+     */
+    async _failStandby(reason) {
+        const sv = this._standbyView;
+        if (!sv) return;
+        // Unless its worker crashed: that says nothing of the host, which
+        // stays free to run two sessions.
+        const host = this._lastStreamHost;
+        const crashed =
+            sv.streamId && host
+                ? (await settledStreamState(() =>
+                      BackendClient.streamState(host.uuid, sv.streamId),
+                  )) === 'crashed'
+                : false;
+        if (this._standbyView !== sv) return;
+        this._restoreLiveQuality();
+        if (crashed) {
+            console.warn('[MW] The standby stream worker crashed — the host keeps two sessions');
+            this._abortStandby(reason + ' (worker crashed)');
+            return;
+        }
+        this._dualSupported = false;
+        console.warn('[MW] Standby never showed a picture — this host is kept to one session');
+        this._abortStandby(reason, { dualFailed: true });
+    },
+
+    /**
+     * What the live stream was launched with: settings, ladder overrides and
+     * rung. Every quality change writes the wished-for state first and then
+     * relaunches; a standby that fails puts this back, so the state never
+     * claims a quality the stream does not have.
+     */
+    _noteLiveQuality() {
+        this._liveQuality = {
+            settings: this._lastStreamingSettings ? { ...this._lastStreamingSettings } : null,
+            overrides: this._degradeOverrides
+                ? { ...this._degradeOverrides }
+                : this._degradeOverrides,
+            level: this._degradeLevel,
+            originalHeight: this._originalStreamHeight,
+        };
+    },
+
+    _restoreLiveQuality() {
+        const q = this._liveQuality;
+        if (!q) return;
+        // In place: the view and the ladder hold this object.
+        const s = this._lastStreamingSettings;
+        if (s && q.settings) {
+            for (const k of Object.keys(s)) delete s[k];
+            Object.assign(s, q.settings);
+        }
+        this._degradeOverrides = q.overrides ? { ...q.overrides } : q.overrides;
+        this._degradeLevel = q.level;
+        this._originalStreamHeight = q.originalHeight;
     },
 
     /** First decoded frame on the standby: swap the display, hand over input
@@ -3532,16 +4547,11 @@ const MoonlightApp = {
         this._activeSlot =
             typeof result.slot === 'number' ? result.slot : this._activeSlot === 0 ? 1 : 0;
         if (typeof result.dual_supported === 'boolean') this._dualSupported = result.dual_supported;
+        this._noteLiveQuality();
 
         this.streamView = sv;
         sv.onFirstFrame = null;
-        sv.onQuit = () => this._onStreamingQuit();
-        sv.onConnectionFailed = (reason) => this._onTransportFailed(reason);
-        sv.onCongestion = () => this._onStreamCongested();
-        sv.onCongestionSignal = () => {
-            this._lastCongSignal = performance.now();
-        };
-        sv.onHostDisplayFormat = (msg) => this._onHostDisplayFormat(msg);
+        this._wireLiveView(sv);
         sv.activate();
         // Before the retirement below: the successor's capture element takes the
         // focus over while the outgoing one still holds it, so the OS keyboard
@@ -3563,9 +4573,9 @@ const MoonlightApp = {
         }
     },
 
-    /** Tear down a failed/stale standby. When a relaunch index is provided the
-     *  quality transition still happens via the legacy path. */
-    _abortStandby(reason, relaunchIndex) {
+    /** Tear down a failed/stale standby; the live stream is left as it is.
+     *  opts.dualFailed: tell the backend this host cannot run two sessions. */
+    _abortStandby(reason, opts = {}) {
         if (this._standbyTimer) {
             clearTimeout(this._standbyTimer);
             this._standbyTimer = null;
@@ -3579,12 +4589,11 @@ const MoonlightApp = {
         sv.onConnectionFailed = null;
         sv.onFirstFrame = null;
         try {
-            sv.quit({ silent: true, retire: true }).catch(() => {});
+            sv.quit({ silent: true, retire: true, dualFailed: opts.dualFailed === true }).catch(
+                () => {},
+            );
         } catch (e) {
             /* ignore */
-        }
-        if (this.streamView && typeof relaunchIndex === 'number') {
-            this._relaunchTransport(relaunchIndex);
         }
     },
 
@@ -3690,7 +4699,7 @@ const MoonlightApp = {
                     effective.stream_aspect,
                     effective.chroma_444_enabled === true,
                     effective.hdr_enabled === true,
-                    IS_MOBILE_OR_TABLET,
+                    IS_HANDHELD,
                 ) * 1000;
             newBitrate = Math.max(2000, Math.min(newBitrate, autoKbps));
             toastKey = 'stream.degradeResolution';
@@ -3701,11 +4710,20 @@ const MoonlightApp = {
             // applicable on the media transport (<video> element, no canvas).
             //
             // 'auto', never a named algorithm: the renderer routes it (F0e) —
-            // FSR1/SGSR on WebGL2 in SDR, WebGPU only in HDR. This used to name
+            // MWSR on WebGL2 in SDR (WebGPU on an iPhone), WebGPU in HDR. This used to name
             // 'sgsr', which forced the WebGPU pass on a stream the user had
             // chosen to run on Canvas2D — the pass that costs 20 ms in a worker
             // on macOS (F0), on exactly the link that was already struggling.
-            if (effective.video_enhancement !== 'on' && !onMedia && !o.transport_mode) {
+            //
+            // Not on a device of a gigabyte or less: its GPU is of the same
+            // class (a Mi TV's Mali-G31 lost the WebGL context to the pass,
+            // 01/10/2026), and the smaller stream is the relief.
+            if (
+                effective.video_enhancement !== 'on' &&
+                !onMedia &&
+                !o.transport_mode &&
+                !IS_LOW_MEMORY
+            ) {
                 o.video_enhancement = 'on';
                 o.video_enhancement_algo = 'auto';
                 this._enhancementAutoForced = true;
@@ -3845,7 +4863,26 @@ const MoonlightApp = {
      * automatically re-launch with H.264 forced. The fallback counter prevents
      * infinite loops if H.264 also fails.
      */
+    _endAutoCeiling() {
+        const session = this._autoCeiling;
+        if (!session) return;
+        const sv = this.streamView;
+        const fallback = sv && sv._codecFallbackRequested ? sv._codecFallback : null;
+        // Opaque HDR frames say nothing of this machine's strength.
+        if (fallback && fallback.reason !== 'opaque-hdr-frames' && sv.autoCeilingMeter)
+            sv.autoCeilingMeter.noteSick('codec_fallback', true);
+        session.end();
+        if (!fallback) this._autoCeiling = null;
+    },
+
     _onStreamingQuit() {
+        // A stream that lasted counts toward the coffee thank-you — read before
+        // anything below drops the view. A codec fallback is not an end: the
+        // relaunch carries the same stream on.
+        if (!(this.streamView && this.streamView._codecFallbackRequested))
+            this._noteSupportSession();
+        this._endAutoCeiling();
+
         // Drop any lingering transport-relaunch loader and the upgrade poll,
         // and any standby leg of a seamless transition (the live stream ended).
         this._hideRelaunchLoader();
@@ -3853,6 +4890,7 @@ const MoonlightApp = {
         this._stopAspectProbe();
         this._nativeFormat = null;
         this._abortStandby('active stream ended');
+        this._reconnectOf = null;
         // The session is over — no successor will claim the inherited display
         // state, and a bridged soft keyboard must not outlive the stream.
         this._carryViewState = null;
@@ -3871,6 +4909,8 @@ const MoonlightApp = {
         // Capture fallback state BEFORE nulling streamView
         const fallbackRequested = this.streamView && this.streamView._codecFallbackRequested;
         const fallbackTarget = this.streamView && this.streamView._codecFallback;
+        // Whether the stream that asks for it was asked HDR: only then is HDR lost.
+        const fallbackFromHdr = !!(this.streamView && this.streamView._hdrEnabled);
         const fallbackHost = this._lastStreamHost;
         const fallbackApp = this._lastStreamApp;
 
@@ -3900,14 +4940,25 @@ const MoonlightApp = {
                 return;
             }
 
+            // The same codec again, on keyframes (StreamView._checkSilentDecoder):
+            // nothing the viewer asked for is lost, so nothing to tell them.
+            const sameCodecAgain = fallbackTarget.reason === 'silent-decoder';
             console.warn(
-                `[MW] Codec fallback → ${fallbackTarget.codec}` +
-                    `${fallbackTarget.hdr ? ' HDR' : ' SDR'} (attempt ${this._fallbackAttemptCount})`,
+                sameCodecAgain
+                    ? `[MW] Relaunch on keyframes: the decoder went silent (attempt ${this._fallbackAttemptCount})`
+                    : (fallbackTarget.reason === 'opaque-hdr-frames'
+                          ? '[MW] Relaunch without the HDR readback (opaque frames)'
+                          : '[MW] Codec fallback') +
+                          ` → ${fallbackTarget.codec}` +
+                          `${fallbackTarget.hdr ? ' HDR' : ' SDR'} (attempt ${this._fallbackAttemptCount})`,
             );
 
             // When the fallback drops HDR, persist the unchecked preference so the
-            // Settings HDR checkbox reflects reality, and inform the user.
-            if (fallbackTarget.hdr === false) {
+            // Settings HDR checkbox reflects reality, and inform the user. Not
+            // when the stream had no HDR to drop: an SDR HEVC falling back to
+            // H.264 told a viewer who never asked for HDR that it was
+            // unavailable (Firefox, 28/10/2026).
+            if (fallbackTarget.hdr === false && fallbackFromHdr && !sameCodecAgain) {
                 // Not for the native host, which never reads the checkbox: its
                 // HDR comes back on the next launch if this screen can show it.
                 if (fallbackHost && fallbackHost.backendType !== 'native')
@@ -3917,9 +4968,15 @@ const MoonlightApp = {
             // The H.264 fallback silently drops 4:4:4 as well (launchApp), and
             // that loss had no voice at all: the overlay reads "H264" with no
             // mention of chroma, so a viewer who asked for 4:4:4 has no way to
-            // learn they are watching 4:2:0. Say it exactly like HDR.
-            if (fallbackTarget.codec === 'h264' && this._persistChroma444Disabled()) {
-                Toast.warning(t('launch.chroma444Fallback'));
+            // learn they are watching 4:2:0. Say it exactly like HDR — whenever
+            // the stream that failed asked for it, not only when the saved
+            // preference still did (a launch can ask 4:4:4 the storage no
+            // longer holds, and then the loss went unsaid again).
+            if (fallbackTarget.codec === 'h264' && !sameCodecAgain) {
+                const asked = (this._lastStreamingSettings || {}).chroma_444_enabled === true;
+                if (this._persistChroma444Disabled() || asked) {
+                    Toast.warning(t('launch.chroma444Fallback'));
+                }
             }
 
             // Keep the full-screen loader up across teardown + relaunch so the
@@ -3958,6 +5015,18 @@ const MoonlightApp = {
         }
     },
 
+    /**
+     * One owner stream is over: hand its length to util/supportNudge.js, which
+     * counts it if it lasted. Guests quit through their own path and never get
+     * here. Spends the start time, so a second call for the same stream is a
+     * no-op.
+     */
+    _noteSupportSession() {
+        const started = this._streamStartedAt;
+        this._streamStartedAt = 0;
+        if (started > 0) noteGoodSession((performance.now() - started) / 1000);
+    },
+
     // =========================================================================
     // Cleanup helpers
     // =========================================================================
@@ -3978,6 +5047,45 @@ const MoonlightApp = {
     transition(newState) {
         console.log(`[MW] State: ${this.state} -> ${newState}`);
         this.state = newState;
+        // Fullscreen entered by the launch click: the stream takes it over
+        // (and leaves it on Stop); a launch that ends anywhere else gives it
+        // back, so a failed launch never strands the user in a fullscreen
+        // host list.
+        if (this._launchFullscreen && newState !== 'launching') {
+            this._launchFullscreen = false;
+            if (newState !== 'streaming' && document.fullscreenElement) {
+                document.exitFullscreen().catch(() => {});
+            }
+        }
+    },
+
+    /**
+     * Enter fullscreen from the launch click when Settings ask for it.
+     * The Fullscreen API needs a user gesture, and the launch click is the
+     * last one before the stream: by the time the stream is up, the browser
+     * refuses (Chrome, Firefox and Safari keep a click "active" ~5 s). An
+     * iPhone has no Fullscreen API for the page at all — StreamView fills
+     * the page instead (_applyFullscreenOnStart).
+     */
+    _enterLaunchFullscreen() {
+        this._launchFullscreen = false;
+        let wanted = false;
+        try {
+            const stored = JSON.parse(localStorage.getItem('mw-streaming-settings') || '{}');
+            wanted = stored.fullscreen_on_start === true;
+        } catch (e) {
+            /* unreadable settings: the default, off */
+        }
+        const root = document.documentElement;
+        if (!wanted || document.fullscreenElement || typeof root.requestFullscreen !== 'function')
+            return;
+        this._launchFullscreen = true;
+        // On a phone, fullscreen comes sideways and stays so (lockLandscape) —
+        // asked now, while the launch click still counts as a gesture.
+        root.requestFullscreen().then(lockLandscape, (err) => {
+            this._launchFullscreen = false;
+            console.warn('[MW] Fullscreen at launch refused:', err.message);
+        });
     },
 };
 
@@ -3991,5 +5099,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // the catalogs are in so its label is not the English one for a French
     // reader, and left alone from then on. The stream hides it in CSS.
     DiscordLink.mount();
+    // Arrows and pads get around the pages on a TV (nothing is attached
+    // elsewhere). Before the app, so its listeners see the keys first.
+    RemoteNav.init();
+    // The Settings / Admin title follows the scroll (settings.css).
+    ViewHeaderScroll.init();
     MoonlightApp.init();
 });

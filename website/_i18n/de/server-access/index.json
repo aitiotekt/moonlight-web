@@ -1,0 +1,22 @@
+{
+  "meta.title": "Mit deinem Host verbinden — MoonlightWeb",
+  "meta.description": "Öffne deinen MoonlightWeb-Host in jedem Browser, indem du seinen Code eingibst — für Geräte ohne Adressleiste, auf denen sich der Link des Hosts nicht eintippen lässt.",
+  "crumbs": "<a href=\"/\">Startseite</a> / Verbinden",
+  "kicker": "Verbinden",
+  "h1": "Deinen Host öffnen",
+  "lead": "Gib den Code deines Hosts ein, um ihn in diesem Browser zu öffnen. Gedacht für Geräte <strong>ohne Adressleiste</strong>, auf denen sich der Link des Hosts nicht eintippen lässt.",
+  "label": "Host-Code",
+  "open": "Öffnen",
+  "err": "Das ist kein Host-Code: Er besteht aus 26 Buchstaben und Ziffern, dem Ende des Host-Links.",
+  "hint": "Du kannst auch einfach den ganzen Link einfügen.",
+  "last.label": "Zuletzt von hier geöffnet:",
+  "last.forget": "Vergessen",
+  "h2.where": "Wo finde ich den Code?",
+  "p.where": "Auf dem Host-PC zeigt MoonlightWeb seinen Link an, sobald der <strong>Internetzugriff</strong> eingerichtet ist, zum Beispiel <code>stream.moonlightweb.top/a1b2c3d4e5f6g7h8j9k0m1n2</code>. Der Code ist der Teil nach dem letzten <code>/</code>: 26 Buchstaben und Ziffern.",
+  "h2.once": "Nur einmal pro Gerät",
+  "p.once": "Sobald ein Host mit seiner PIN entsperrt ist, merkt sich dieser Browser ihn. Wenn du zwei oder mehr Hosts entsperrst, wechselst du über ein Menü in der App zwischen ihnen, ohne etwas erneut einzugeben. Diese Seite merkt sich außerdem den zuletzt von hier geöffneten Code.",
+  "x.faq.t": "FAQ lesen",
+  "x.faq.d": "Die meisten Fragen sind hier schon beantwortet.",
+  "x.guides.t": "Host einrichten",
+  "x.guides.d": "Installiere MoonlightWeb auf dem PC, den du streamen willst."
+}

@@ -67,7 +67,10 @@ AmfApi::AmfApi()
     // Never linked: the DLL belongs to the Radeon driver, and its absence is
     // the normal state of every machine without an AMD GPU.
     HMODULE dll = ::GetModuleHandleA(AMF_DLL_NAMEA);
-    if (!dll) dll = ::LoadLibraryA(AMF_DLL_NAMEA);
+    // From System32 only, where the driver puts it: absent (any machine without
+    // that vendor's GPU), a bare name would go on down the search order to
+    // PATH, which the user writes, in a worker that may run elevated.
+    if (!dll) dll = ::LoadLibraryExA(AMF_DLL_NAMEA, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!dll) {
         m_Reason = "no AMD encoder runtime on this machine";
         return;

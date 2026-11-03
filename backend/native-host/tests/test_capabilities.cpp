@@ -8,6 +8,7 @@
 
 #ifdef _WIN32
 #include "encode/windows/MfCapabilities.h"
+#include "platform/windows/IndirectDisplay.h"
 #endif
 
 #include <string>
@@ -133,6 +134,50 @@ void run_capabilities_tests()
         CHECK(!error.empty());
     }
 
+    SECTION("Capabilities — a session of the guests' shared feed needs no video, only a display");
+    {
+        // VideoSource::External: the feed's process encodes, this session only
+        // injects and captures audio — so no video callback is asked for.
+        SessionConfig cfg;
+        cfg.videoSource = VideoSource::External;
+        cfg.displayId = 0;
+        cfg.externalRight = 1920;
+        cfg.externalBottom = 1080;
+        std::string error;
+        auto session =
+            NativeHost::createSession(cfg, nullptr, nullptr, nullptr, nullptr, nullptr, error);
+#ifdef _WIN32
+        const Capabilities caps = NativeHost::probe();
+        if (caps.available && !caps.displays.empty()) {
+            CHECK(session != nullptr);
+            if (session) {
+                // Nothing is captured or encoded: the start is input (and
+                // audio when asked) and nothing else.
+                std::string startError;
+                CHECK(session->start(startError));
+                CHECK_EQ(session->info().displayId, 0);
+                CHECK(session->info().capture == CaptureApi::None);
+                CHECK(!session->info().audio); // no audio callback given
+                session->setExternalDesktop(0, 0, 2560, 1440);
+                session->stop();
+            }
+        } else {
+            CHECK(session == nullptr && !error.empty());
+        }
+#else
+        // Windows only, for now: said, never a crash.
+        CHECK(session == nullptr);
+        CHECK(!error.empty());
+#endif
+        // A display that is not there is refused with a reason, as always.
+        SessionConfig gone = cfg;
+        gone.displayId = 999;
+        std::string why;
+        CHECK(NativeHost::createSession(gone, nullptr, nullptr, nullptr, nullptr, nullptr, why) ==
+              nullptr);
+        CHECK(!why.empty());
+    }
+
     SECTION("Capabilities — enum names are all populated");
 
     {
@@ -181,10 +226,12 @@ void run_capabilities_tests()
                      caps.diagnostic.empty() ? toString(caps.reason) : caps.diagnostic.c_str());
         std::fprintf(stderr, "  capture: %s\n", toString(caps.capture));
         for (const GpuInfo& gpu : caps.gpus) {
-            std::fprintf(stderr, "  gpu %d: %s [%04x:%04x] luid=%016llx encoders=%zu codecs=%zu\n",
-                         gpu.id, gpu.name.c_str(), gpu.vendorId, gpu.deviceId,
-                         static_cast<unsigned long long>(gpu.nativeHandle), gpu.encoders.size(),
-                         gpu.codecs.size());
+            std::fprintf(
+                stderr, "  gpu %d: %s [%04x:%04x] luid=%016llx driver=%s encoders=%zu codecs=%zu\n",
+                gpu.id, gpu.name.c_str(), gpu.vendorId, gpu.deviceId,
+                static_cast<unsigned long long>(gpu.nativeHandle),
+                gpu.driverVersion ? driverVersionText(gpu.driverVersion).c_str() : "-",
+                gpu.encoders.size(), gpu.codecs.size());
             for (EncoderApi e : gpu.encoders)
                 std::fprintf(stderr, "        encoder: %s\n", toString(e));
         }
@@ -198,6 +245,27 @@ void run_capabilities_tests()
         // Selector down the cross-GPU path on a machine that does not need it.
         for (const DisplayInfo& d : caps.displays)
             CHECK(caps.gpuFor(d) != nullptr);
+
+#ifdef _WIN32
+        // A virtual display driver's adapter goes by the name of the GPU that
+        // renders for it; listed without a screen, it is that GPU twice (four
+        // "UHD Graphics" on the N95, a second Arc A380 beside Parsec on
+        // DualRTX), and each probe asked its encoders again.
+        for (const GpuInfo& gpu : caps.gpus) {
+            LUID luid = {};
+            luid.LowPart = static_cast<DWORD>(gpu.nativeHandle & 0xFFFFFFFFu);
+            luid.HighPart = static_cast<LONG>(gpu.nativeHandle >> 32);
+            if (!platform::isIndirectDisplayOnly(luid)) continue;
+            bool drivesOne = false;
+            for (const DisplayInfo& d : caps.displays)
+                drivesOne = drivesOne || d.gpuId == gpu.id;
+            CHECK(drivesOne);
+        }
+        // Every GPU that encodes says its driver: the log line of a session and
+        // the D3D12 route's list of excluded drivers both read it.
+        for (const GpuInfo& gpu : caps.gpus)
+            if (!gpu.encoders.empty()) CHECK(gpu.driverVersion != 0);
+#endif
     }
 
 #ifdef _WIN32

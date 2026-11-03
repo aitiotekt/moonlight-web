@@ -19,6 +19,7 @@
 
 #include "common/Logger.h"
 #include "common/WinSystemPath.h"
+#include "network/AddressRace.h"
 
 #include "mw/native/NativeHost.h"
 
@@ -229,6 +230,7 @@ void install(std::function<void(Result, QString)> done)
     req.setRawHeader("User-Agent", "MoonlightWeb");
     req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                      QNetworkRequest::NoLessSafeRedirectPolicy);
+    AddressRace::enableOn(req);
     req.setTransferTimeout(kTransferTimeoutMs);
 
     Logger::info(QStringLiteral("[gamepad] downloading %1").arg(downloadUrl()));

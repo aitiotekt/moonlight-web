@@ -95,29 +95,6 @@ export function isHomeScreenHandoff({ own, others }) {
     return own.startsWith('hs-') || (!own && others.length > 0);
 }
 
-/**
- * The manifest's start_url with the other machines' keys written into its
- * `#k=`, beside the key already there. No keys, no change.
- *
- * @param {string} startUrl   e.g. "/0123…#k=hs-AAAA"
- * @param {SideKey[]} others
- * @returns {string}
- */
-export function startUrlWithSideKeys(startUrl, others) {
-    if (!others || others.length === 0 || typeof startUrl !== 'string') return startUrl;
-    const hash = startUrl.indexOf('#');
-    const base = hash < 0 ? startUrl : startUrl.slice(0, hash);
-    const parts = (hash < 0 ? '' : startUrl.slice(hash + 1)).split('&').filter(Boolean);
-    let own = '';
-    const kept = parts.filter((p) => {
-        if (!p.startsWith('k=')) return true;
-        own = decodeURIComponent(p.slice(2));
-        return false;
-    });
-    kept.push('k=' + encodeURIComponent(packHandoffKeys(own, others)));
-    return base + '#' + kept.join('&');
-}
-
 // ── Keys that have had their answer ──────────────────────────────────────────
 
 const SPENT_STORE = 'mw-hs-spent';

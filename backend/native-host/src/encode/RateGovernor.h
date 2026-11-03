@@ -55,7 +55,12 @@ namespace mw::native::encode {
 ///    cut costs sharpness for a second and an overrun costs the viewer's hand.
 ///  - **Floor**: kFloorPercent of the setting, and never under kFloorKbps. Below
 ///    that the picture is not worth sending; the stream is better off letting
-///    the frontend's own ladder move resolution or transport.
+///    the frontend's own ladder move resolution or transport. A session may
+///    hold a higher floor (SessionConfig::governorFloorPercent): the guests'
+///    shared feed keeps ~60 % of its setting, so that one slow guest cannot
+///    pull the picture of every other one down to a fifth of it — below that
+///    floor the slow guest drops frames on its own, and the intra-refresh
+///    repairs what it lost.
 ///  - **Silence**: no report for kSilenceMs — the feedback channel itself is
 ///    stuck — reads as overuse once, then nothing until a report comes back.
 ///  - **Back from the background**: a report flagged `resumed` says the
@@ -79,8 +84,26 @@ namespace mw::native::encode {
 ///    kProbeGraceMs of its last step, says the link really narrowed. The
 ///    good rate falls back to where the climb started, so the next climb is
 ///    a slow one: the rate can overshoot once, not oscillate.
+///  - **A queue that overflowed** (the product's rule since 21/10/2026,
+///    `ovfgood=0` the bench's "before" — overflowLowersGoodByDefault): a
+///    frame the relay shed off a backed-up send buffer is overuse, and the
+///    good rate falls to one cut under the rate it overflowed at, however
+///    long ago the climb ended. Seen on an N95 host on 19/10/2026: back at
+///    30 Mbit/s in 1.5 s at 15:19:05, the buffer overflowed 7.4 s later —
+///    past the grace, so the good rate stayed 30 Mbit/s — and again at
+///    15:19:25. The fast climb then stops a cut short, and the last step is
+///    the slow one: ~2.5 s more from there back to the rate that overflowed.
 ///
 /// Pure and clocked by the caller, so it can be tested without a network.
+///
+/// ── The bench's governor=off ───────────────────────────────────────────────
+///
+/// `--native-bench` has no receiver: its silence cut the target to 80 % four
+/// seconds into every pass, and a ramp= step back up never reached the
+/// encoder, a raise needing quiet reports. Started to follow the setting, the
+/// governor makes the target the setting, both ways, at once, and reports and
+/// silences move nothing: the encoder's rate control is measured against the
+/// steps it is given (plan pipeline-video-d3d12-v2, G3).
 class RateGovernor
 {
 public:
@@ -97,9 +120,15 @@ public:
     static constexpr int64_t kGoodHoldMs = 5000;
     static constexpr int64_t kProbeGraceMs = 5000;
 
-    /// @p settingKbps the viewer's ceiling. Starts there.
-    void start(int settingKbps, int64_t nowMs)
+    /// @p settingKbps the viewer's ceiling. Starts there. @p followSetting:
+    /// the bench's governor=off, above. @p floorPercent: the floor as a share
+    /// of the setting (kFloorPercent unless the session holds a higher one),
+    /// clamped to 0..100; kFloorKbps stays the floor under it.
+    void start(int settingKbps, int64_t nowMs, bool followSetting = false,
+               int floorPercent = kFloorPercent)
     {
+        m_Follow = followSetting;
+        m_FloorPercent = floorPercent < 0 ? 0 : floorPercent > 100 ? 100 : floorPercent;
         m_Setting = settingKbps > 0 ? settingKbps : 20000;
         m_Target = m_Setting;
         m_QuietSinceMs = nowMs;
@@ -112,6 +141,9 @@ public:
         m_ClimbStartKbps = 0;
         m_LastFastRaiseMs = kNever;
         m_LastRaiseFast = false;
+        m_AreaSinceMs = nowMs;
+        m_AreaLastMs = nowMs;
+        m_AreaKbpsMs = 0;
     }
 
     /// The viewer moved the ceiling (the frontend's ladder, or a new session
@@ -120,6 +152,11 @@ public:
     {
         if (settingKbps <= 0) return;
         m_Setting = settingKbps;
+        if (m_Follow) {
+            if (m_Target != m_Setting) m_Changes++;
+            m_Target = m_Setting;
+            return;
+        }
         if (m_Target > m_Setting) m_Target = m_Setting;
         if (m_GoodKbps > m_Setting) m_GoodKbps = m_Setting;
         if (m_GoodSampleKbps > m_Setting) m_GoodSampleKbps = m_Setting;
@@ -129,8 +166,10 @@ public:
     /// changed.
     bool report(const LinkFeedback& fb, int64_t nowMs)
     {
+        account(nowMs);
         m_LastReportMs = nowMs;
         m_LastRaiseFast = false;
+        if (m_Follow) return false;
         if (fb.resumed) {
             const bool restore = m_SilenceCut && m_TargetBeforeSilence > m_Target;
             m_SilenceCut = false;
@@ -145,8 +184,18 @@ public:
             return true;
         }
         m_SilenceCut = false;
-        const bool overuse = fb.owdRiseMs >= kOveruseMs || fb.gaps > 0 || fb.evictions > 0;
-        const bool quiet = fb.owdRiseMs < kQuietMs && fb.gaps == 0 && fb.evictions == 0;
+        // SCTP sending again more than retrcut= chunks in a thousand is a
+        // link the stream overruns, and quiet wants it under half of that
+        // (setRetransCut).
+        const bool retransOver = m_RetransCut > 0 && fb.retransPermille >= m_RetransCut;
+        const bool retransQuiet = m_RetransCut <= 0 || fb.retransPermille * 2 < m_RetransCut;
+        if (retransOver) m_RetransOveruses++;
+        // The relay's shed frames, while the rule is on (setOverflowLowersGood).
+        const bool overflowed = m_OverflowLowersGood && fb.overflows > 0;
+        const bool overuse = fb.owdRiseMs >= kOveruseMs || fb.gaps > 0 || fb.evictions > 0 ||
+                             retransOver || overflowed;
+        const bool quiet = fb.owdRiseMs < kQuietMs && fb.gaps == 0 && fb.evictions == 0 &&
+                           retransQuiet && !overflowed;
 
         if (overuse) {
             m_QuietSinceMs = nowMs;
@@ -157,6 +206,13 @@ public:
             if (m_LastFastRaiseMs != kNever && nowMs - m_LastFastRaiseMs < kProbeGraceMs)
                 m_GoodKbps = m_ClimbStartKbps;
             m_LastFastRaiseMs = kNever;
+            // A queue that overflowed at this rate, the climb long over: the
+            // link no longer carries it, whatever it carried before.
+            if (overflowed) {
+                m_Overflows++;
+                const int under = m_Target - m_Target * kCutPercent / 100;
+                if (m_GoodKbps > under) m_GoodKbps = under;
+            }
             const bool changed = cut();
             rearmGoodSample(nowMs);
             return changed;
@@ -181,7 +237,8 @@ public:
     /// target changed — only ever because the reports stopped coming.
     bool tick(int64_t nowMs)
     {
-        if (m_SilenceCut || nowMs - m_LastReportMs < kSilenceMs) return false;
+        account(nowMs);
+        if (m_Follow || m_SilenceCut || nowMs - m_LastReportMs < kSilenceMs) return false;
         m_SilenceCut = true;
         m_TargetBeforeSilence = m_Target;
         m_HoldUntilMs = nowMs + kHoldAfterCutMs;
@@ -196,13 +253,76 @@ public:
         return changed;
     }
 
+    /// `retrcut=` (plan Wi-Fi W2 B): SCTP retransmitting at least @p permille
+    /// chunks in a thousand over a report window reads as overuse, and quiet
+    /// then wants under half of that. 0: the governor does not look at SCTP
+    /// at all, which is where it starts; the Windows session sets
+    /// kRetransCutPermille unless the key says otherwise.
+    ///
+    /// The receiver's delay rise is a minimum over its window: on a Mac in
+    /// Wi-Fi a few frames still arrive at once while most wait ~20 ms in
+    /// usrsctp behind a window shrunk by each drop, and the rise never reaches
+    /// kOveruseMs. The retransmissions are what the host itself sees of it;
+    /// at 20 Mbit/s instead of 42 the Mac's drops fell ninefold and its click
+    /// came back from 74 to 48.5 ms (W1 bis, 03/10/2026).
+    ///
+    /// Measured on 03/10/2026 against the Arc of DualRTX, two alternated
+    /// rounds each, the page at 240: on a Mac in Wi-Fi the click came back
+    /// from 73.6 to 62.6 ms (p90 112 to 86), the browser's socket dropped
+    /// 366 datagrams instead of 1,016, a frame's age at p90 went from 86 to
+    /// 29 ms, the host's small messages from ~330 to 35 ms at p90, and the
+    /// frames thrown away from 182 to 34 a minute, for 23 against 20 Mbit/s
+    /// received; on an N95 in Wi-Fi, 109.2 to 100.2 ms. On Ethernet (UM790Pro)
+    /// SCTP sent 1 to 8 chunks again in a whole session; once, all 8 fell in
+    /// one report window and the rate went from 40 to 32 Mbit/s for 3.5 s.
+    /// The click stayed where it was (39.0 ms against 39.8 without).
+    void setRetransCut(int permille) { m_RetransCut = permille > 0 ? permille : 0; }
+    /// The Windows session's own retrcut=, per thousand.
+    static constexpr int kRetransCutPermille = 3;
+    int retransCut() const { return m_RetransCut; }
+    /// Reports that read as overuse for SCTP's retransmissions alone or with
+    /// the rest.
+    int retransOveruses() const { return m_RetransOveruses; }
+
+    /// Plan « Gels du lien », G: the relay's shed frames
+    /// (LinkFeedback::overflows) are overuse, and lower the good rate to one
+    /// cut under the rate they overflowed at. Off, where it starts, the
+    /// governor does not read them at all; the session turns it on unless the
+    /// bench's ovfgood=0 says otherwise (overflowLowersGoodByDefault).
+    void setOverflowLowersGood(bool on) { m_OverflowLowersGood = on; }
+    bool overflowLowersGood() const { return m_OverflowLowersGood; }
+    /// Reports that carried shed frames, while the rule is on.
+    int overflows() const { return m_Overflows; }
+
+    /// The target's mean since start(), weighted by how long each value
+    /// lasted, up to @p nowMs: what the encoder was given over the session,
+    /// for its last log line (the A/B of ovfgood=). A ceiling the viewer
+    /// moved counts from the next report or tick.
+    int meanTargetKbps(int64_t nowMs) const
+    {
+        const int64_t last = nowMs > m_AreaLastMs ? nowMs - m_AreaLastMs : 0;
+        const int64_t span = nowMs - m_AreaSinceMs;
+        if (span <= 0) return m_Target;
+        return static_cast<int>((m_AreaKbpsMs + static_cast<int64_t>(m_Target) * last) / span);
+    }
+
+    /// At the setting, the reports coming, and every one of them quiet for at
+    /// least @p forMs before @p nowMs: a link with room to spare, for the few
+    /// pictures more a press sends (core/InputAdmit.h).
+    bool calm(int64_t nowMs, int64_t forMs) const
+    {
+        return !m_SilenceCut && m_Target >= m_Setting && nowMs - m_LastReportMs < kSilenceMs &&
+               nowMs - m_QuietSinceMs >= forMs;
+    }
+
     int targetKbps() const { return m_Target; }
     int settingKbps() const { return m_Setting; }
     int floorKbps() const
     {
-        const int pct = m_Setting * kFloorPercent / 100;
+        const int pct = static_cast<int>(static_cast<int64_t>(m_Setting) * m_FloorPercent / 100);
         return pct > kFloorKbps ? pct : kFloorKbps;
     }
+    int floorPercent() const { return m_FloorPercent; }
     bool limiting() const { return m_Target < m_Setting; }
     int overuses() const { return m_Overuses; }
     int silences() const { return m_Silences; }
@@ -216,6 +336,14 @@ public:
 
 private:
     static constexpr int64_t kNever = INT64_MIN;
+
+    /// The time the target spent at its value since the last call.
+    void account(int64_t nowMs)
+    {
+        if (nowMs <= m_AreaLastMs) return;
+        m_AreaKbpsMs += static_cast<int64_t>(m_Target) * (nowMs - m_AreaLastMs);
+        m_AreaLastMs = nowMs;
+    }
 
     void rearmGoodSample(int64_t nowMs)
     {
@@ -256,6 +384,12 @@ private:
         return true;
     }
 
+    bool m_Follow = false; ///< the bench's governor=off
+    int m_RetransCut = 0;  ///< retrcut=, per thousand; 0 off
+    int m_RetransOveruses = 0;
+    bool m_OverflowLowersGood = false; ///< ovfgood=
+    int m_Overflows = 0;
+    int m_FloorPercent = kFloorPercent;
     int m_Setting = 20000;
     int m_Target = 20000;
     int64_t m_QuietSinceMs = 0;
@@ -276,6 +410,10 @@ private:
     int m_Overuses = 0;
     int m_Silences = 0;
     int m_Changes = 0;
+    /// The target integrated over time, kbps × ms, since m_AreaSinceMs.
+    int64_t m_AreaKbpsMs = 0;
+    int64_t m_AreaSinceMs = 0;
+    int64_t m_AreaLastMs = 0;
 };
 
 } // namespace mw::native::encode

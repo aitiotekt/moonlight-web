@@ -25,7 +25,9 @@
 
 namespace mw::native::audio {
 
-/// Turns an irregular capture feed into one frame every 5 ms.
+/// Turns an irregular capture feed into one frame every 5 ms — or every 10 or
+/// 20 ms under the bench key `audioframe=` (plan « le son et la priorité des
+/// paquets », A3 L2), the frame then being 480 or 960 samples.
 ///
 /// The relay that carries the audio advances the RTP clock by exactly one
 /// frame per packet, whatever the wall clock did in between, and the browser
@@ -42,7 +44,7 @@ namespace mw::native::audio {
 ///    samples are dropped — a queued sample is latency, and audio a frame
 ///    behind is worth less to a player than a click they will not hear.
 ///  - `dueFrames()` says how many frames the clock owes at `nowUs`. The clock
-///    never stops: a frame is due every 5 ms from `start()` on.
+///    never stops: a frame is due every period from `start()` on.
 ///  - `pop()` fills one frame from the queue, or with silence when the queue
 ///    runs dry (an underrun, counted). Silence on the wire is what keeps the
 ///    receiver's clock honest through a quiet host.
@@ -73,7 +75,8 @@ class AudioPacer
 public:
     static constexpr int kSampleRate = 48000;
     static constexpr int kChannels = 2;
-    /// 5 ms at 48 kHz — the Opus frame the whole pipeline is built around.
+    /// 5 ms at 48 kHz — the Opus frame the whole pipeline is built around, and
+    /// the default of every instance.
     static constexpr int kFrameSamples = 240;
     static constexpr int64_t kFramePeriodUs = 5000;
     static constexpr size_t kFrameFloats = static_cast<size_t>(kFrameSamples) * kChannels;
@@ -82,14 +85,33 @@ public:
     /// scheduling jitter of a 20 ms burst.
     static constexpr int64_t kUnderrunGraceUs = 2 * kFramePeriodUs;
 
-    explicit AudioPacer(int maxQueuedFrames = 4)
-        : m_MaxQueuedFloats(static_cast<size_t>(std::max(1, maxQueuedFrames)) * kFrameFloats)
+    /// The frame sizes Opus takes that this pipeline can carry: 5, 10, 20 ms.
+    static constexpr bool isFrameSamples(int samples)
+    {
+        return samples == 240 || samples == 480 || samples == 960;
+    }
+
+    /// `frameSamples` other than 240, 480 or 960 falls back to 240.
+    explicit AudioPacer(int maxQueuedFrames = 4, int frameSamples = kFrameSamples)
+        : m_FrameSamples(isFrameSamples(frameSamples) ? frameSamples : kFrameSamples)
+        , m_FrameFloats(static_cast<size_t>(m_FrameSamples) * kChannels)
+        , m_FramePeriodUs(static_cast<int64_t>(m_FrameSamples) * 1'000'000 / kSampleRate)
+        , m_MaxQueuedFloats(static_cast<size_t>(std::max(1, maxQueuedFrames)) * m_FrameFloats)
     {}
+
+    /// This instance's frame: samples per channel, floats, period, grace.
+    int frameSamples() const { return m_FrameSamples; }
+    size_t frameFloats() const { return m_FrameFloats; }
+    int64_t framePeriodUs() const { return m_FramePeriodUs; }
+    int64_t underrunGraceUs() const { return m_GraceUs >= 0 ? m_GraceUs : 2 * m_FramePeriodUs; }
+    /// Another grace than two periods (`audiograce=<ms>` on Windows); < 0 puts
+    /// the default back.
+    void setUnderrunGraceUs(int64_t us) { m_GraceUs = us; }
 
     /// Anchor the clock: the first frame is due one period from `nowUs`.
     void start(int64_t nowUs)
     {
-        m_NextDueUs = nowUs + kFramePeriodUs;
+        m_NextDueUs = nowUs + m_FramePeriodUs;
         m_Started = true;
     }
 
@@ -115,25 +137,25 @@ public:
     int dueFrames(int64_t nowUs)
     {
         if (!m_Started || nowUs < m_NextDueUs) return 0;
-        const int64_t owed = (nowUs - m_NextDueUs) / kFramePeriodUs + 1;
-        const int maxBurst = static_cast<int>(m_MaxQueuedFloats / kFrameFloats);
+        const int64_t owed = (nowUs - m_NextDueUs) / m_FramePeriodUs + 1;
+        const int maxBurst = static_cast<int>(m_MaxQueuedFloats / m_FrameFloats);
         if (owed > maxBurst) {
             m_Reanchors++;
-            m_NextDueUs = nowUs - (static_cast<int64_t>(maxBurst) - 1) * kFramePeriodUs;
+            m_NextDueUs = nowUs - (static_cast<int64_t>(maxBurst) - 1) * m_FramePeriodUs;
             return maxBurst;
         }
         return static_cast<int>(owed);
     }
 
-    /// Fill one frame (kFrameFloats floats) and advance the clock. Returns
+    /// Fill one frame (frameFloats() floats) and advance the clock. Returns
     /// false when the queue had nothing and silence went out instead.
     bool pop(float* out)
     {
-        m_NextDueUs += kFramePeriodUs;
+        m_NextDueUs += m_FramePeriodUs;
         if (takeFrame(out)) return true;
         // A partial frame is not worth a hole: keep what there is for the next
         // tick and send silence now.
-        std::memset(out, 0, kFrameFloats * sizeof(float));
+        std::memset(out, 0, m_FrameFloats * sizeof(float));
         m_Underruns++;
         return false;
     }
@@ -148,26 +170,42 @@ public:
     };
 
     /// `pop()` with the grace of the class comment. `nowUs` is the caller's
-    /// clock; a frame owed less than kUnderrunGraceUs ago waits for the
+    /// clock; a frame owed less than underrunGraceUs() ago waits for the
     /// capture rather than being replaced by silence.
     Take take(float* out, int64_t nowUs)
     {
         if (takeFrame(out)) {
-            m_NextDueUs += kFramePeriodUs;
+            m_NextDueUs += m_FramePeriodUs;
             return Take::Frame;
         }
-        if (nowUs - m_NextDueUs < kUnderrunGraceUs) {
+        if (nowUs - m_NextDueUs < underrunGraceUs()) {
             m_Deferrals++;
             return Take::Deferred;
         }
-        m_NextDueUs += kFramePeriodUs;
-        std::memset(out, 0, kFrameFloats * sizeof(float));
+        m_NextDueUs += m_FramePeriodUs;
+        std::memset(out, 0, m_FrameFloats * sizeof(float));
         m_Underruns++;
         return Take::Silence;
     }
 
     /// Samples waiting, in frames (fractional part dropped).
-    size_t queuedFrames() const { return m_Queue.size() / kFrameFloats; }
+    size_t queuedFrames() const { return m_Queue.size() / m_FrameFloats; }
+    /// Samples waiting (per channel), partial frame included.
+    size_t queuedSamples() const { return m_Queue.size() / kChannels; }
+
+    /// The largest absolute sample of one frame (`floats` floats, a 5 ms
+    /// frame's by default): the bench's audio log reads where a test tone
+    /// starts from it.
+    static float peakOf(const float* frame, size_t floats = kFrameFloats)
+    {
+        float peak = 0.0f;
+        if (!frame) return peak;
+        for (size_t i = 0; i < floats; ++i) {
+            const float v = frame[i] < 0.0f ? -frame[i] : frame[i];
+            if (v > peak) peak = v;
+        }
+        return peak;
+    }
     int64_t nextDueUs() const { return m_NextDueUs; }
 
     /// Frames of captured audio thrown away because the queue was full.
@@ -182,10 +220,11 @@ public:
 private:
     bool takeFrame(float* out)
     {
-        if (m_Queue.size() < kFrameFloats) return false;
-        std::copy(m_Queue.begin(), m_Queue.begin() + static_cast<std::ptrdiff_t>(kFrameFloats),
+        if (m_Queue.size() < m_FrameFloats) return false;
+        std::copy(m_Queue.begin(), m_Queue.begin() + static_cast<std::ptrdiff_t>(m_FrameFloats),
                   out);
-        m_Queue.erase(m_Queue.begin(), m_Queue.begin() + static_cast<std::ptrdiff_t>(kFrameFloats));
+        m_Queue.erase(m_Queue.begin(),
+                      m_Queue.begin() + static_cast<std::ptrdiff_t>(m_FrameFloats));
         return true;
     }
 
@@ -195,16 +234,20 @@ private:
         const size_t excess = m_Queue.size() - m_MaxQueuedFloats;
         // Drop whole frames only, so the queue keeps frame alignment: what is
         // left is what the next pop() reads first.
-        const size_t dropFloats = ((excess + kFrameFloats - 1) / kFrameFloats) * kFrameFloats;
+        const size_t dropFloats = ((excess + m_FrameFloats - 1) / m_FrameFloats) * m_FrameFloats;
         const size_t n = std::min(dropFloats, m_Queue.size());
         m_Queue.erase(m_Queue.begin(), m_Queue.begin() + static_cast<std::ptrdiff_t>(n));
-        m_Dropped += static_cast<int64_t>(n / kFrameFloats);
+        m_Dropped += static_cast<int64_t>(n / m_FrameFloats);
     }
 
+    const int m_FrameSamples;
+    const size_t m_FrameFloats;
+    const int64_t m_FramePeriodUs;
     const size_t m_MaxQueuedFloats;
     std::deque<float> m_Queue;
     bool m_Started = false;
     int64_t m_NextDueUs = 0;
+    int64_t m_GraceUs = -1;
     int64_t m_Dropped = 0;
     int64_t m_Underruns = 0;
     int64_t m_Reanchors = 0;

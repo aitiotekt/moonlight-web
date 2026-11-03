@@ -34,8 +34,13 @@ OpusEncoder::~OpusEncoder()
     if (m_Encoder) opus_encoder_destroy(m_Encoder);
 }
 
-bool OpusEncoder::open(std::string& error)
+bool OpusEncoder::open(std::string& error, int frameSamples)
 {
+    if (frameSamples != 240 && frameSamples != 480 && frameSamples != 960) {
+        error = "Opus frame of " + std::to_string(frameSamples) + " samples: 240, 480 or 960 only";
+        return false;
+    }
+    m_FrameSamples = frameSamples;
     int err = OPUS_OK;
     m_Encoder =
         opus_encoder_create(kSampleRate, kChannels, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
@@ -63,7 +68,7 @@ size_t OpusEncoder::encode(const float* interleaved, std::vector<uint8_t>& out)
 {
     if (!m_Encoder || !interleaved) return 0;
     if (out.size() < kMaxPacketBytes) out.resize(kMaxPacketBytes);
-    const opus_int32 n = opus_encode_float(m_Encoder, interleaved, kFrameSamples, out.data(),
+    const opus_int32 n = opus_encode_float(m_Encoder, interleaved, m_FrameSamples, out.data(),
                                            static_cast<opus_int32>(out.size()));
     if (n < 0) {
         if (!m_LoggedError) {

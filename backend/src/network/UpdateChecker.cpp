@@ -16,6 +16,7 @@
  */
 
 #include "UpdateChecker.h"
+#include "AddressRace.h"
 #include "common/Edition.h"
 #include "common/Logger.h"
 
@@ -116,6 +117,11 @@ UpdateChecker::UpdateChecker(QString currentVersion, bool relayEnabled, QObject*
         Logger::info(QStringLiteral("[Update] checking via the MoonlightWeb update relay"));
 }
 
+QString UpdateChecker::releasesApiUrl()
+{
+    return QString::fromLatin1(kReleasesApi);
+}
+
 bool UpdateChecker::relayAvailable()
 {
     // Any version does: the question is whether the endpoint can be built at
@@ -204,6 +210,7 @@ void UpdateChecker::fetchFrom(const QString& url, bool viaRelay)
     // without that key never reaches here — buildRelayUrl() returns empty and
     // the check goes straight to GitHub.
     if (viaRelay) req.setRawHeader("X-API-Key", qgetenv("MW_PDNS_TOKEN"));
+    AddressRace::enableOn(req);
     req.setTransferTimeout(8000);
 
     QNetworkReply* reply = m_nam->get(req);
@@ -286,6 +293,14 @@ bool UpdateChecker::applyResult(const QJsonObject& release, bool viaRelay)
                 .arg(downloadUrl));
         return false;
     }
+    // The release page too: the board turns it into a link, and a relay that
+    // could name any scheme there could put a javascript: one under a click.
+    if (viaRelay && !releaseUrl.isEmpty() && !isGitHubUrl(releaseUrl)) {
+        Logger::warning(
+            QStringLiteral("[Update] relay pointed the release page off GitHub (%1) — ignoring it")
+                .arg(releaseUrl));
+        return false;
+    }
 
     QJsonObject obj;
     obj["current"] = m_current;
@@ -351,7 +366,7 @@ QString UpdateChecker::pickAsset(const QJsonArray& assets, QString& outName, qin
     // holds (release.yml):
     //   Windows: MoonlightWeb-installer-<ver>-win-x64.exe / -win-arm64.exe
     //   macOS:   moonlightweb-<ver>-macos-arm64.pkg
-    //   Linux:   moonlightweb-<ver>-linux-x64.{deb,rpm,AppImage}
+    //   Linux:   moonlightweb-<ver>-linux-x64.{deb,rpm}, moonlightweb-<ver>-x86_64.AppImage
     QStringList wanted;
 #if defined(Q_OS_WIN)
     wanted << (isArm64() ? QStringLiteral("win-arm64.exe") : QStringLiteral("win-x64.exe"));

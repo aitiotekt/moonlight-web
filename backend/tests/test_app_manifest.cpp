@@ -56,6 +56,13 @@ void run_app_manifest_tests()
     writeFile(root + "scripts/build.sh", "#!/bin/sh");
     writeFile(root + "build/out.js", "compiled");
     writeFile(root + "js/app.js.map", "{\"version\":3}");
+    // Tool configuration at the root, which install() leaves out of a package.
+    writeFile(root + "package.json", "{}");
+    writeFile(root + "package-lock.json", "{}");
+    writeFile(root + "eslint.config.js", "export default []");
+    writeFile(root + "tsconfig.json", "{}");
+    writeFile(root + "vitest.config.js", "export default {}");
+    writeFile(root + "prompt-frontend.md", "notes");
 
     const StaticFileHandler handler(root, QStringLiteral("1.2.3"));
     const QStringList files = handler.listFiles();
@@ -81,10 +88,48 @@ void run_app_manifest_tests()
     CHECK(!files.contains(QStringLiteral("/test/app.test.js")));
     CHECK(!files.contains(QStringLiteral("/scripts/build.sh")));
     CHECK(!files.contains(QStringLiteral("/build/out.js")));
+    CHECK(!files.contains(QStringLiteral("/package.json")));
+    CHECK(!files.contains(QStringLiteral("/package-lock.json")));
+    CHECK(!files.contains(QStringLiteral("/eslint.config.js")));
+    CHECK(!files.contains(QStringLiteral("/tsconfig.json")));
+    CHECK(!files.contains(QStringLiteral("/vitest.config.js")));
+    CHECK(!files.contains(QStringLiteral("/prompt-frontend.md")));
 
     // Served to whoever opens the debugger, never in the set every visitor
     // downloads before the page appears.
     CHECK(!files.contains(QStringLiteral("/js/app.js.map")));
+
+    SECTION("app manifest — what is not listed is not served either");
+
+    // A run from the source tree serves what a package ships, no more: asking by
+    // name gets the same answer as a file that is not there.
+    for (const char* path :
+         {"/package-lock.json", "/package.json", "/eslint.config.js", "/tsconfig.json",
+          "/vitest.config.js", "/prompt-frontend.md", "/.prettierrc.json", "/.claude/notes.md",
+          "/test/app.test.js", "/node_modules/left-pad/index.js", "/coverage/index.html",
+          "/scripts/build.sh", "/build/out.js", "/PACKAGE-LOCK.JSON"})
+        CHECK_EQ(handler.serveFile(QString::fromLatin1(path)).statusCode, 404);
+    // Same file, other spellings of its path.
+    CHECK_EQ(handler.serveFile(QStringLiteral("//package-lock.json")).statusCode, 404);
+    CHECK_EQ(handler.serveFile(QStringLiteral("/./package-lock.json")).statusCode, 404);
+    CHECK(handler.serveFile(QStringLiteral("/js/../package-lock.json")).statusCode >= 400);
+#ifdef Q_OS_WIN
+    CHECK_EQ(handler.serveFile(QStringLiteral("/\\package-lock.json")).statusCode, 404);
+#endif
+    // The application itself still is, the source map included.
+    CHECK_EQ(handler.serveFile(QStringLiteral("/js/app.js")).statusCode, 200);
+    CHECK_EQ(handler.serveFile(QStringLiteral("/js/app.js.map")).statusCode, 200);
+    CHECK_EQ(handler.serveFile(QStringLiteral("/index.html")).statusCode, 200);
+
+    SECTION("app manifest — each listed file has its size");
+
+    // The bootstrap orders its downloads by these: the largest first.
+    CHECK_EQ(handler.servedSize(QStringLiteral("/index.html")), qint64(15));
+    CHECK_EQ(handler.servedSize(QStringLiteral("/js/app.js")), qint64(9));
+    CHECK_EQ(handler.servedSize(QStringLiteral("/assets/logo.png")), qint64(4));
+    for (const QString& p : files)
+        CHECK(handler.servedSize(p) >= 0);
+    CHECK_EQ(handler.servedSize(QStringLiteral("/js/missing.js")), qint64(-1));
 
     SECTION("app manifest — paths are request paths, and stable");
 

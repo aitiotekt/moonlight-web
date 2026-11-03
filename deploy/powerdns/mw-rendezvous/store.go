@@ -15,6 +15,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -69,14 +71,39 @@ const minOwnerToken = 32
 
 type claim struct {
 	Owner   string `json:"owner"`   // hex(HMAC_S(owner token))
-	Created int64  `json:"created"` // unix seconds, for operational insight only
+	Created int64  `json:"created"` // unix seconds
+	// When a host last held its line on it, unix seconds, to the hour (touch);
+	// 0 = never. An id nobody ever held a line on is what a flood of claims
+	// leaves behind, and it is let go of after unusedTTL.
+	Seen int64 `json:"seen,omitempty"`
 }
+
+// touchEvery is how stale Seen may get: a line held again within the hour
+// changes nothing on disk.
+const touchEvery = time.Hour
+
+// pruneEvery bounds how often a new claim pays for the walk that drops unused
+// ids.
+const pruneEvery = time.Minute
 
 type claimStore struct {
 	mu     sync.Mutex
 	path   string
 	secret []byte
 	claims map[string]claim // id → claim
+
+	// Set after newClaimStore; zero values keep the store as it always was —
+	// unbounded, nothing expires, every flush written at once.
+	maxClaims int           // new claims refused past this many ids; 0 = no cap
+	unusedTTL time.Duration // an id never held a line on is dropped after this; 0 = kept
+	delay     time.Duration // flush() coalesces writes over this; 0 = synchronous
+
+	lastPrune time.Time
+	dirty     bool
+	scheduled bool
+	// Held across a whole write, snapshot included, so two writes can never
+	// land in the reverse order of the states they took.
+	writeMu sync.Mutex
 }
 
 func newClaimStore(path string, secret []byte) (*claimStore, error) {
@@ -90,12 +117,22 @@ func newClaimStore(path string, secret []byte) (*claimStore, error) {
 	}
 	var on struct {
 		Claims map[string]claim `json:"claims"`
+		Seen   bool             `json:"seenTracked"`
 	}
 	if err := json.Unmarshal(data, &on); err != nil {
 		return nil, err
 	}
 	if on.Claims != nil {
 		s.claims = on.Claims
+	}
+	// A file from before Seen was kept: every id on it was claimed by a host
+	// that may well hold its line, and none may be taken for an unused one.
+	if !on.Seen {
+		now := time.Now().Unix()
+		for id, c := range s.claims {
+			c.Seen = now
+			s.claims[id] = c
+		}
 	}
 	return s, nil
 }
@@ -107,22 +144,70 @@ func (s *claimStore) fingerprint(token string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// persist writes the store atomically. Caller holds s.mu.
-func (s *claimStore) persist() error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
+// write persists the store atomically, if anything changed since the last
+// write. Takes s.mu for the snapshot only: the disk is written outside it, so a
+// host's handshake (owns) never waits on a file being rewritten.
+func (s *claimStore) write() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	s.mu.Lock()
+	s.scheduled = false
+	if !s.dirty {
+		s.mu.Unlock()
+		return nil
 	}
 	body, err := json.MarshalIndent(struct {
 		Claims map[string]claim `json:"claims"`
-	}{s.claims}, "", "  ")
+		Seen   bool             `json:"seenTracked"`
+	}{s.claims, true}, "", "  ")
+	s.dirty = err != nil
+	s.mu.Unlock()
 	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		s.markDirty()
 		return err
 	}
 	tmp := s.path + ".tmp"
 	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+		s.markDirty()
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		s.markDirty()
+		return err
+	}
+	return nil
+}
+
+// markDirty records that the file is behind, after a write that failed.
+func (s *claimStore) markDirty() {
+	s.mu.Lock()
+	s.dirty = true
+	s.mu.Unlock()
+}
+
+// pruneLocked drops the ids nobody ever held a line on, once they are older
+// than unusedTTL. Caller holds s.mu.
+func (s *claimStore) pruneLocked(now time.Time) {
+	if s.unusedTTL <= 0 || now.Sub(s.lastPrune) < pruneEvery {
+		return
+	}
+	s.lastPrune = now
+	cut := now.Add(-s.unusedTTL).Unix()
+	dropped := 0
+	for id, c := range s.claims {
+		if c.Seen == 0 && c.Created < cut {
+			delete(s.claims, id)
+			dropped++
+		}
+	}
+	if dropped > 0 {
+		s.dirty = true
+	}
 }
 
 // Outcomes of a claim attempt.
@@ -133,6 +218,7 @@ const (
 	claimExisting                    // same owner re-presenting an id it holds
 	claimTaken                       // someone else owns this id
 	claimHasOther                    // this owner already holds a different id
+	claimFull                        // the store holds maxClaims ids already
 )
 
 // claim records ownership of id for token, or reports why it cannot.
@@ -159,8 +245,36 @@ func (s *claimStore) claim(id, token string) claimResult {
 			return claimHasOther
 		}
 	}
-	s.claims[id] = claim{Owner: fp, Created: time.Now().Unix()}
+	// Bounded, so a flood of new identifiers stops at a size this container
+	// holds, instead of growing until it is killed and restarts in a loop. The
+	// ids hosts hold are untouched by it; only new ones wait.
+	now := time.Now()
+	s.pruneLocked(now)
+	if s.maxClaims > 0 && len(s.claims) >= s.maxClaims {
+		return claimFull
+	}
+	s.claims[id] = claim{Owner: fp, Created: now.Unix()}
+	s.dirty = true
 	return claimCreated
+}
+
+// touch records that a host holds its line on id, to the hour: what keeps an
+// id from being let go of as unused.
+func (s *claimStore) touch(id string) {
+	s.mu.Lock()
+	c, ok := s.claims[id]
+	now := time.Now().Unix()
+	if !ok || now-c.Seen < int64(touchEvery/time.Second) {
+		s.mu.Unlock()
+		return
+	}
+	c.Seen = now
+	s.claims[id] = c
+	s.dirty = true
+	s.mu.Unlock()
+	if err := s.flush(); err != nil {
+		log.Printf("[mw-rendezvous] WARN cannot persist claim store: %v", err)
+	}
 }
 
 // owns reports whether token is the owner of id. Used on every host handshake.
@@ -187,6 +301,7 @@ func (s *claimStore) release(id, token string) bool {
 		return false
 	}
 	delete(s.claims, id)
+	s.dirty = true
 	return true
 }
 
@@ -197,10 +312,25 @@ func (s *claimStore) count() int {
 }
 
 // flush persists the current state; callers use it after a mutating operation.
+// With a delay, the writes of a burst of claims are one write, made that long
+// after the first of them: rewriting the whole file for each one is what let a
+// flood of claims slow every host's handshake down. A claim lost to a crash in
+// between is made again by its host, the next time it connects.
 func (s *claimStore) flush() error {
+	if s.delay <= 0 {
+		return s.write()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.persist()
+	if !s.scheduled {
+		s.scheduled = true
+		time.AfterFunc(s.delay, func() {
+			if err := s.write(); err != nil {
+				log.Printf("[mw-rendezvous] WARN cannot persist claim store: %v", err)
+			}
+		})
+	}
+	return nil
 }
 
 // ── Per-IP budget (sliding window) ──────────────────────────────────────────
@@ -216,12 +346,18 @@ type quota struct {
 	mu        sync.Mutex
 	max       int
 	window    time.Duration
+	bits      int // the IPv6 prefix an attempt is charged to (quotaKeyBits)
 	hits      map[string][]time.Time
 	lastSweep time.Time
 }
 
 func newQuota(max int, window time.Duration) *quota {
-	return &quota{max: max, window: window, hits: map[string][]time.Time{}, lastSweep: time.Now()}
+	return newQuotaBits(max, window, 64)
+}
+
+func newQuotaBits(max int, window time.Duration, bits int) *quota {
+	return &quota{max: max, window: window, bits: bits, hits: map[string][]time.Time{},
+		lastSweep: time.Now()}
 }
 
 // sweep drops every address whose attempts have all aged out. Caller holds q.mu.
@@ -243,12 +379,41 @@ func (q *quota) sweep(now time.Time) {
 	q.lastSweep = now
 }
 
+// quotaKey is what an address's attempts are charged to. An IPv6 subscriber is
+// handed a whole /64 at the least, so keying on the full address would give one
+// household 2^64 fresh budgets; the /64 is what an IPv4 address is to an ISP —
+// one subscriber. An IPv4 address that arrives mapped (::ffff:a.b.c.d) is that
+// IPv4 address. Brackets and a port are tolerated; anything unparsable is used
+// as it is.
+func quotaKey(addr string) string { return quotaKeyBits(addr, 64) }
+
+// quotaKeyBits is quotaKey with the IPv6 prefix it charges: 48 is what a
+// tunnel broker hands out for free, 65 536 /64s in one.
+func quotaKeyBits(addr string, bits int) string {
+	s := strings.TrimSpace(addr)
+	a, err := netip.ParseAddr(strings.Trim(s, "[]"))
+	if err != nil {
+		ap, perr := netip.ParseAddrPort(s)
+		if perr != nil {
+			return s
+		}
+		a = ap.Addr()
+	}
+	a = a.WithZone("").Unmap()
+	if a.Is4() {
+		return a.String()
+	}
+	p, _ := a.Prefix(bits)
+	return p.String()
+}
+
 // allow records an attempt for ip and reports whether it fits the budget.
 // A max of 0 disables the quota.
 func (q *quota) allow(ip string) bool {
 	if q.max <= 0 {
 		return true
 	}
+	ip = quotaKeyBits(ip, q.bits)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	now := time.Now()

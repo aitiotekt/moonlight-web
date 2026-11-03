@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HDR A/B</title>
+    <style>
+      :root {
+        --bg: #111;
+        --fg: #ddd;
+        --muted: #888;
+        --line: #333;
+        --accent: #6cf;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px system-ui, sans-serif;
+      }
+      #bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--line);
+      }
+      #bar select,
+      #bar button {
+        font: inherit;
+        background: #222;
+        color: var(--fg);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 4px 8px;
+      }
+      #status {
+        color: var(--muted);
+      }
+      #key {
+        color: var(--accent);
+        font-weight: 600;
+      }
+      #panes {
+        display: flex;
+        height: calc(100% - 48px);
+      }
+      .pane {
+        position: relative;
+        flex: 1 1 50%;
+        overflow: auto;
+        border-right: 1px solid var(--line);
+      }
+      .pane:last-child {
+        border-right: none;
+      }
+      .pane canvas {
+        display: block;
+      }
+      .label {
+        position: sticky;
+        top: 8px;
+        left: 8px;
+        float: left;
+        z-index: 1;
+        margin: 8px;
+        padding: 2px 10px;
+        background: rgba(0, 0, 0, 0.7);
+        border-radius: 4px;
+        font-size: 22px;
+        font-weight: 700;
+      }
+      body.flip .pane {
+        flex-basis: 100%;
+      }
+      body.flip .pane.hidden {
+        display: none;
+      }
+      #flipBtn {
+        display: none;
+      }
+      body.flip #flipBtn {
+        display: inline-block;
+      }
+      #warn {
+        display: none;
+        margin: 12px;
+        padding: 12px 16px;
+        border: 2px solid #e55;
+        border-radius: 6px;
+        background: #311;
+        font-size: 16px;
+        line-height: 1.4;
+      }
+      body.degraded #warn {
+        display: block;
+      }
+      body.degraded:not(.force) #panes {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <label>Image
+        <select id="case"></select>
+      </label>
+      <label>Vue
+        <select id="view">
+          <option value="side">Côte à côte (défilement lié)</option>
+          <option value="flip">Bascule plein écran (Espace)</option>
+        </select>
+      </label>
+      <button id="flipBtn">Basculer A ↔ B</button>
+      <button id="reveal">Révéler A / B</button>
+      <span id="key"></span>
+      <span id="status">…</span>
+    </div>
+    <div id="warn">
+      <div id="warnText"></div>
+      <button id="force">Afficher quand même (sans valeur pour la décision HDR)</button>
+    </div>
+    <div id="panes">
+      <div class="pane" id="paneA"><div class="label">A</div><canvas id="cvA"></canvas></div>
+      <div class="pane" id="paneB"><div class="label">B</div><canvas id="cvB"></canvas></div>
+    </div>
+    <script type="module" src="hdr-compare.js"></script>
+  </body>
+</html>

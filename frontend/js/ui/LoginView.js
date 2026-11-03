@@ -29,8 +29,12 @@ import { BackendClient } from '../api/BackendClient.js';
 import { Toast } from './Toast.js';
 import { t } from '../i18n/i18n.js';
 import { escapeHtml } from '../util/escapeHtml.js';
+import { InstanceMenu } from './InstanceMenu.js';
 import { currentInstanceRef, listInstances } from '../util/instances.js';
 import { tunnelHostId } from '../net/tunnelBridge.js';
+
+/** The session name last signed in under (see rememberedMachineName). */
+const MACHINE_NAME_KEY = 'mw-session-name';
 
 export class LoginView {
     constructor(container, onAuthenticated) {
@@ -41,6 +45,11 @@ export class LoginView {
         this._loading = true;
         this._error = '';
         this._remaining = 3;
+        // A wrong PIN typed on this page. Until there is one — here, or one the
+        // host counted earlier — the attempts left are not shown: a count of
+        // tries before a lockout reads as a warning to someone who has done
+        // nothing wrong yet.
+        this._wrongPinHere = false;
         this._lockoutRemaining = 0;
         this._lockoutTimer = null;
         this._submitting = false;
@@ -51,6 +60,8 @@ export class LoginView {
         this._localUrl = ''; // https://localhost[:port] — the host machine's way back in
         // The other machines this browser has already been to (see _renderServerField).
         this._otherInstances = [];
+        this._currentInstanceId = '';
+        this._serverMenu = null;
         // Keep the session across browser restarts. On by default: most people
         // log in from their own device and should never see this page twice.
         // Unchecking it is what someone on a borrowed machine wants — the cookie
@@ -74,6 +85,7 @@ export class LoginView {
         // The machines this browser can leave for, read once per visit to this
         // screen: nothing writes to that register while a login is on screen.
         this._otherInstances = this._readOtherInstances();
+        this._renderServerField();
 
         // Offer the host machine its way back in (see _buildLocalUrl).
         await this._resolveLocalUrl();
@@ -82,6 +94,7 @@ export class LoginView {
         try {
             const status = await BackendClient.getAuthStatus();
             if (status.authenticated) {
+                this._releaseServerField();
                 this.onAuthenticated();
                 return;
             }
@@ -104,7 +117,10 @@ export class LoginView {
     }
 
     destroy() {
+        this._releaseServerField();
         this._stopLockoutTimer();
+        this._releaseSubmitInView();
+        this._releasePinCaret();
     }
 
     /**
@@ -135,11 +151,42 @@ export class LoginView {
     }
 
     /**
-     * Build a suggested machine name from client OS + browser.
-     * e.g. "Windows Chrome", "macOS Safari", "Android Chrome"
+     * The name this browser signed in under last time, else one built from
+     * client OS + browser, e.g. "Windows Chrome", "macOS Safari".
      */
     _suggestMachineName() {
-        this._machineName = LoginView.suggestedMachineName();
+        this._machineName = LoginView.rememberedMachineName();
+    }
+
+    /**
+     * The name typed into "Name this session" at the last successful sign-in.
+     *
+     * The host lists every device by that name, so someone who took the
+     * trouble to call their phone "Living-room tablet" should not find it back
+     * as "Android Chrome" after the session ends and they unlock again. Kept
+     * only when it differs from the suggestion: an untouched field keeps
+     * following the browser, which is what the suggestion is for.
+     */
+    static rememberedMachineName() {
+        try {
+            const stored = (localStorage.getItem(MACHINE_NAME_KEY) || '').trim();
+            if (stored) return stored.slice(0, 24);
+        } catch {
+            /* no storage: the suggestion, as before */
+        }
+        return LoginView.suggestedMachineName();
+    }
+
+    static _rememberMachineName(name) {
+        try {
+            if (name && name !== LoginView.suggestedMachineName()) {
+                localStorage.setItem(MACHINE_NAME_KEY, name);
+            } else {
+                localStorage.removeItem(MACHINE_NAME_KEY);
+            }
+        } catch {
+            /* the field just starts from the suggestion next time */
+        }
     }
 
     /** The name suggestion alone, for a session created without this form. */
@@ -228,10 +275,8 @@ export class LoginView {
 
     _renderPinForm() {
         return `
-            <div class="login-form">
+            <div class="login-form login-form--pin">
                 <p class="login-subtitle">${t('login.pinSubtitle')}</p>
-
-                ${this._renderServerField()}
 
                 <!-- Machine name -->
                 <div class="login-field">
@@ -244,7 +289,7 @@ export class LoginView {
                 </div>
 
                 <!-- PIN input -->
-                <div class="login-field">
+                <div class="login-field login-field--pin">
                     <label class="login-label" for="login-pin-input">${t('login.pinLabel')}</label>
                     <div class="login-pin-input-wrap">
                         <input type="text" id="login-pin-input" class="login-pin-input"
@@ -258,7 +303,7 @@ export class LoginView {
                 ${this._renderRememberField()}
 
                 ${this._error ? `<p id="login-error" class="login-error">${this.esc(this._error)}</p>` : '<p id="login-error" class="login-error"></p>'}
-                <p id="login-remaining" class="login-remaining">${this._remaining > 0 && this._remaining <= 3 ? this.esc(t('login.attemptsRemaining', { count: this._remaining })) : ''}</p>
+                <p id="login-remaining" class="login-remaining">${this._showRemaining() ? this.esc(t('login.attemptsRemaining', { count: this._remaining })) : ''}</p>
                 ${
                     this._lockoutRemaining > 0
                         ? `
@@ -292,6 +337,7 @@ export class LoginView {
     _readOtherInstances() {
         try {
             const currentId = currentInstanceRef(tunnelHostId()).id;
+            this._currentInstanceId = currentId;
             return listInstances().filter((e) => e.id !== currentId && this._isWebUrl(e.url));
         } catch {
             // No storage (private mode, a quota refusal). The login screen is
@@ -332,24 +378,29 @@ export class LoginView {
      *
      * Absent entirely when there is nowhere to go, rather than shown empty: a
      * chooser with one unusable entry is a question with no answer.
+     *
+     * It lives in the page header, where the machine menu sits once inside —
+     * the same component, the same place, so the way out of this screen is
+     * where the way to another machine always is. Among the fields of the
+     * form, or beside the title in the box, it read as one more question to
+     * answer before the PIN.
      */
     _renderServerField() {
-        if (this._otherInstances.length === 0) return '';
+        const mount = document.getElementById('instance-menu');
+        if (!mount || this._otherInstances.length === 0) return;
 
-        return `
-                <div class="login-field">
-                    <label class="login-label" for="login-server-select">${t('login.serverSelection')}</label>
-                    <select id="login-server-select" class="settings-select login-select">
-                        <option value="" selected>${this.esc(t('login.serverCurrent'))}</option>
-                        ${this._otherInstances
-                            .map(
-                                (e) =>
-                                    `<option value="${this.esc(e.url)}">${this.esc(e.name)}</option>`,
-                            )
-                            .join('')}
-                    </select>
-                </div>
-        `;
+        if (!this._serverMenu) this._serverMenu = new InstanceMenu(mount);
+        const label = t('login.serverCurrent');
+        this._serverMenu.render(this._currentInstanceId, label, [
+            { id: this._currentInstanceId, name: label, url: '' },
+            ...this._otherInstances,
+        ]);
+    }
+
+    /** Hand the header back empty: the app draws its own menu once inside. */
+    _releaseServerField() {
+        this._serverMenu?.destroy();
+        this._serverMenu = null;
     }
 
     /**
@@ -373,8 +424,6 @@ export class LoginView {
         return `
             <div class="login-form">
                 <p class="login-subtitle">${t('login.certSubtitle')}</p>
-
-                ${this._renderServerField()}
 
                 <!-- Machine name -->
                 <div class="login-field">
@@ -427,28 +476,22 @@ export class LoginView {
             this._bindPinEvents();
         }
 
+        // The session name, kept in state for the same reason as "Remember
+        // me" below: a wrong PIN re-renders the form, and the name typed a
+        // moment ago used to come back as the suggestion.
+        const machineInput = this.container.querySelector('#login-machine-input');
+        if (machineInput) {
+            machineInput.addEventListener('input', () => {
+                this._machineName = machineInput.value;
+            });
+        }
+
         // "Remember me" — shared by both forms, kept in state so a failed
         // attempt (which re-renders) does not silently flip it back on.
         const rememberCheck = this.container.querySelector('#login-remember');
         if (rememberCheck) {
             rememberCheck.addEventListener('change', () => {
                 this._remember = rememberCheck.checked;
-            });
-        }
-
-        // "Server selection" — shared by both forms. Picking a machine LEAVES
-        // this one: each install is a separate program on a separate PC with
-        // its own session, so this is a navigation and not a view switch, the
-        // same as the header menu does once inside.
-        const serverSelect = this.container.querySelector('#login-server-select');
-        if (serverSelect) {
-            serverSelect.addEventListener('change', () => {
-                const url = serverSelect.value;
-                // The empty value is the row that is already on screen; putting
-                // the selection back is all it means.
-                if (!url) return;
-                serverSelect.disabled = true;
-                window.location.href = url;
             });
         }
 
@@ -474,17 +517,80 @@ export class LoginView {
 
         if (!input || !btn) return;
 
+        // Right after the last digit (start when none yet): where the caret is
+        // kept. Anywhere else, the next digit would land among the dashes
+        // or between two digits, and the mask then reads them back in an
+        // order the person never typed. A selection is left alone: a long
+        // press makes one, and it is what brings up the phone's Paste — put
+        // back to a caret, the menu went with it (realme, 20/10/2026). What is
+        // typed over it replaces it, and a paste is read whole (below).
+        const caretSlot = () => {
+            const count = input.value.replace(/\D/g, '').length;
+            return count + (count > 3 ? 1 : 0);
+        };
+        // A finger's caret is left where it landed. iOS opens Paste on a tap
+        // ON the caret: put back after the last digit, it was only ever there,
+        // and only a tap at the very start brought the menu (iPhone,
+        // 26/10/2026). What is typed away from the slot still lands after the
+        // last digit: see beforeinput below.
+        let byTouch = false;
+        input.addEventListener('pointerdown', (e) => {
+            byTouch = e.pointerType !== 'mouse';
+        });
+        const pinCaret = (force) => {
+            if (document.activeElement !== input) return;
+            if (byTouch && force !== true) return;
+            if (input.selectionStart !== input.selectionEnd) return;
+            const slot = caretSlot();
+            if (input.selectionStart !== slot || input.selectionEnd !== slot) {
+                input.setSelectionRange(slot, slot);
+            }
+        };
+
+        // A digit typed or erased with the caret off its slot (a finger put it
+        // there) is still the next one, or the last one, and never lands among
+        // the others. Done here when the browser lets it; otherwise the input
+        // that follows reads it from `offSlot`.
+        let offSlot = null;
+        input.addEventListener('beforeinput', (e) => {
+            offSlot = null;
+            const at = input.selectionStart;
+            if (at !== input.selectionEnd || at === caretSlot()) return;
+            const typed = input.value.replace(/\D/g, '');
+            if (e.inputType === 'insertText') {
+                offSlot = (typed + (e.data || '').replace(/\D/g, '')).slice(0, 6);
+            } else if (e.inputType === 'deleteContentBackward') {
+                offSlot = typed.slice(0, -1);
+            } else {
+                return;
+            }
+            if (e.cancelable) {
+                e.preventDefault();
+                showDigits(offSlot);
+                offSlot = null;
+            }
+        });
+
         input.addEventListener('input', () => {
+            const digits = offSlot ?? input.value.replace(/\D/g, '').slice(0, 6);
+            offSlot = null;
+            showDigits(digits);
+        });
+
+        const showDigits = (digits) => {
             // Mask: fill a "DDD DDD" template left-to-right — each typed digit
             // replaces the next dash. Caret stays right after the last digit.
-            const digits = input.value.replace(/\D/g, '').slice(0, 6);
             const filled = digits.padEnd(6, '-');
             input.value = filled.slice(0, 3) + ' ' + filled.slice(3);
-            // Caret right after the last digit (start when none yet).
-            const caret = digits.length + (digits.length > 3 ? 1 : 0);
+            const caret = caretSlot();
             input.setSelectionRange(caret, caret);
             btn.disabled = digits.length === 0 || this._lockoutRemaining > 0 || this._submitting;
-        });
+            // All six typed on a phone: put the keyboard away, so Unlock is in
+            // plain sight instead of under it.
+            if (digits.length === 6 && window.matchMedia?.('(pointer: coarse)').matches) {
+                input.blur();
+            }
+        };
 
         // Show the "--- ---" template (centered) while focused, caret on the
         // first dash; clear it on blur so the dim placeholder shows when empty.
@@ -493,11 +599,36 @@ export class LoginView {
             if (digits.length === 0) {
                 input.value = '--- ---';
             }
-            // Caret on the first dash: right after the last digit (start when none).
-            // Defer so it wins over the mouse-click caret placement.
-            const caret = digits.length + (digits.length > 3 ? 1 : 0);
-            setTimeout(() => input.setSelectionRange(caret, caret), 0);
+            // Defer so it wins over the mouse-click caret placement. The tap
+            // that opens the field gets the slot too; the next ones do not.
+            setTimeout(() => pinCaret(true), 0);
         });
+
+        // A copied PIN fills the field wherever the caret or selection was:
+        // six digits pasted are the PIN, fewer follow the ones already typed.
+        input.addEventListener('paste', (e) => {
+            const pasted = (e.clipboardData?.getData('text') || '').replace(/\D/g, '');
+            if (!pasted) return;
+            e.preventDefault();
+            const typed = input.value.replace(/\D/g, '');
+            input.value = (pasted.length >= 6 ? pasted : typed + pasted).slice(0, 6);
+            input.dispatchEvent(new Event('input'));
+        });
+
+        // A click or an arrow key would move the caret off its slot: each is
+        // put straight back (a finger's tap is not, see above). selectionchange
+        // covers clicks and drags on every engine; the key and pointer events
+        // are there for the ones that do not fire it for text fields.
+        input.addEventListener('keydown', (e) => {
+            if (/^(Arrow(Left|Right|Up|Down)|Home|End|PageUp|PageDown)$/.test(e.key)) {
+                e.preventDefault();
+            }
+        });
+        for (const type of ['select', 'click', 'keyup']) input.addEventListener(type, pinCaret);
+        input.addEventListener('pointerup', () => setTimeout(pinCaret, 0));
+        this._releasePinCaret();
+        document.addEventListener('selectionchange', pinCaret);
+        this._pinCaretCleanup = () => document.removeEventListener('selectionchange', pinCaret);
         input.addEventListener('blur', () => {
             if (input.value.replace(/\D/g, '').length === 0) {
                 input.value = '';
@@ -526,6 +657,72 @@ export class LoginView {
                 this._submitPin(input, machineInput, btn);
             }
         });
+
+        this._keepSubmitInView(input, btn);
+    }
+
+    /**
+     * Keep Unlock in sight while the PIN is typed on a phone.
+     *
+     * The soft keyboard covers the bottom of the screen and the browser only
+     * brings the focused field into view, so the button just under it stayed
+     * behind the keyboard: the code was typed, the keyboard put away, and the
+     * page scrolled by hand to find Unlock. While the field has focus, the
+     * scroll area gets the keyboard's height as room at the bottom and is
+     * scrolled just far enough for the button to clear it.
+     *
+     * Measured against the visual viewport, which is the part of the page the
+     * keyboard leaves visible, on iOS and Android alike. A no-op on desktop,
+     * where there is no keyboard to cover anything.
+     */
+    _keepSubmitInView(input, btn) {
+        this._releaseSubmitInView();
+        const vv = window.visualViewport;
+        // On a TV the document scrolls, not #main-content (layout.css).
+        const docScrolls = document.documentElement.classList.contains('remote-nav');
+        const scroller = /** @type {HTMLElement|null} */ (
+            docScrolls ? document.scrollingElement : this.container.closest('#main-content')
+        );
+        if (!vv || !scroller || !window.matchMedia('(pointer: coarse)').matches) return;
+
+        const reveal = () => {
+            if (document.activeElement !== input || !btn.isConnected) return;
+            const covered = Math.max(0, document.documentElement.clientHeight - vv.height);
+            scroller.style.paddingBottom = covered > 0 ? `${covered}px` : '';
+            // Whichever ends first: the keyboard's top edge, or the scroll
+            // area's own (the footer sits under it).
+            const visibleBottom = docScrolls
+                ? vv.offsetTop + vv.height
+                : Math.min(vv.offsetTop + vv.height, scroller.getBoundingClientRect().bottom);
+            const overflow = btn.getBoundingClientRect().bottom + 12 - visibleBottom;
+            if (overflow > 0) scroller.scrollTop += overflow;
+        };
+        const stop = () => {
+            vv.removeEventListener('resize', reveal);
+            vv.removeEventListener('scroll', reveal);
+            scroller.style.paddingBottom = '';
+        };
+        const onFocus = () => {
+            vv.addEventListener('resize', reveal);
+            vv.addEventListener('scroll', reveal);
+            // The keyboard slides in over ~300 ms, and not every browser
+            // reports the viewport change as it happens.
+            setTimeout(reveal, 350);
+        };
+        input.addEventListener('focus', onFocus);
+        input.addEventListener('blur', stop);
+        input.addEventListener('input', reveal);
+        this._submitInViewCleanup = stop;
+    }
+
+    _releaseSubmitInView() {
+        if (this._submitInViewCleanup) this._submitInViewCleanup();
+        this._submitInViewCleanup = null;
+    }
+
+    _releasePinCaret() {
+        if (this._pinCaretCleanup) this._pinCaretCleanup();
+        this._pinCaretCleanup = null;
     }
 
     _bindCertEvents() {
@@ -588,7 +785,9 @@ export class LoginView {
             const result = await BackendClient.validatePin(pin, machineName, this._remember);
 
             if (result.status === 'ok') {
+                LoginView._rememberMachineName(machineName);
                 Toast.success(t('login.authSuccess'));
+                this._releaseServerField();
                 this.onAuthenticated();
                 return;
             }
@@ -617,7 +816,9 @@ export class LoginView {
             );
 
             if (result.status === 'ok') {
+                LoginView._rememberMachineName(machineName);
                 Toast.success(t('login.authSuccess'));
+                this._releaseServerField();
                 this.onAuthenticated();
                 return;
             }
@@ -633,6 +834,19 @@ export class LoginView {
             reader.onerror = (e) => reject(new Error(t('login.readFileError')));
             reader.readAsText(file);
         });
+    }
+
+    /**
+     * Whether the attempts left are worth saying: once a PIN was wrong — on this
+     * page, or before it, which the host's count says by being under its first
+     * allowance of three (AuthManager::bucketRemainingAttempts).
+     */
+    _showRemaining() {
+        return (
+            this._remaining > 0 &&
+            this._remaining <= 3 &&
+            (this._wrongPinHere || this._remaining < 3)
+        );
     }
 
     _handlePinError(err, input, btn) {
@@ -653,6 +867,7 @@ export class LoginView {
             }
         } else if (statusCode === 401) {
             errorMsg = t('login.invalidPin');
+            this._wrongPinHere = true;
             if (body.lockout_seconds > 0) {
                 this._startLockoutTimer(body.lockout_seconds);
             }

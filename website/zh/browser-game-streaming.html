@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<!-- Generated from /browser-game-streaming.html and _i18n/zh/browser-game-streaming.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>以浏览器为先的 Parsec 和 Steam Remote Play 替代方案 — MoonlightWeb</title>
+<meta name="description" content="MoonlightWeb 是只为网页浏览器设计的游戏串流：在任何带浏览器的设备上畅玩你自己的 PC，客户端无需安装任何东西。自托管、开源、无需账户。">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#05080d">
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="以浏览器为先的 Parsec 和 Steam Remote Play 替代方案 — MoonlightWeb">
+<meta property="og:description" content="MoonlightWeb 是只为网页浏览器设计的游戏串流：在任何带浏览器的设备上畅玩你自己的 PC，客户端无需安装任何东西。自托管、开源、无需账户。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://moonlightweb.top/zh/browser-game-streaming.html">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<meta property="og:locale" content="zh_CN">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="以浏览器为先的 Parsec 和 Steam Remote Play 替代方案 — MoonlightWeb">
+<meta name="twitter:description" content="MoonlightWeb 是只为网页浏览器设计的游戏串流：在任何带浏览器的设备上畅玩你自己的 PC，客户端无需安装任何东西。自托管、开源、无需账户。">
+<meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/zh/browser-game-streaming.html">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/browser-game-streaming.html">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/browser-game-streaming.html">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/browser-game-streaming.html">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/browser-game-streaming.html">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/browser-game-streaming.html">
+<!-- /i18n:alternates -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<link rel="stylesheet" href="/assets/pages.css?v={{(fileStat `/assets/pages.css`).ModTime.Unix}}">
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://moonlightweb.top/zh/"},
+    {"@type": "ListItem", "position": 2, "name": "Game streaming built for the browser", "item": "https://moonlightweb.top/zh/browser-game-streaming.html"}
+  ]
+}
+</script>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/zh/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/zh/" data-nav="home">首页</a><a href="/zh/guides/" data-nav="guides">指南</a><a href="/zh/faq.html" data-nav="faq">常见问题</a><a href="/zh/contact.html" data-nav="contact">联系</a><a href="/zh/server-access/" data-nav="connect">连接主机</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/browser-game-streaming.html">English</option><option value="fr" data-href="/fr/browser-game-streaming.html">Français</option><option value="de" data-href="/de/browser-game-streaming.html">Deutsch</option><option value="zh" data-href="/zh/browser-game-streaming.html" lang="zh" selected>中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<main>
+<div class="wrap">
+  <nav class="crumbs" aria-label="Breadcrumb" data-i18n-html="crumbs"><a href="/zh/">首页</a> / 为浏览器打造的游戏串流</nav>
+  <span class="kicker" data-i18n="kicker">为什么选择 MoonlightWeb</span>
+  <h1 data-i18n="h1">为浏览器打造的游戏串流</h1>
+  <p class="lead" data-i18n-html="lead">Parsec、Steam Remote Play 和 Moonlight 都是在别处畅玩自己 PC 的好方法。MoonlightWeb 走的是自己的路：<strong>它为网页浏览器而设计，也只为它而设计</strong>——在你用来游玩的每一台设备上，客户端都是一个网页。</p>
+
+  <h2 data-i18n="diff.h">MoonlightWeb 带来了什么</h2>
+  <ul>
+    <li data-i18n-html="diff.1"><strong>100% 网页，并为此调优。</strong>客户端的每个部分都建立在浏览器最擅长的能力之上，并在其中做了优化：带自适应拥塞控制的 WebRTC 传输、通过 WebCodecs 硬件解码、在 WebGL2 或 WebGPU 中渲染和放大、通过 WebRTC 播放 Opus 音频。在家中 Wi-Fi 下低于 20 毫秒。</li>
+    <li data-i18n-html="diff.2"><strong>游玩的设备上无需安装任何东西。</strong>无需应用、无需插件、无需等待更新：打开一个网址即可开玩。在借来的笔记本、Chromebook、iPad 或电视上都很方便。</li>
+    <li data-i18n-html="diff.3"><strong>每台设备上都是同一个页面。</strong>Windows、macOS、Linux、ChromeOS、Android、iPhone、iPad、电视浏览器——一个客户端、一种外观、一套设置。</li>
+    <li data-i18n-html="diff.4"><strong>自托管且开源。</strong>GPL-3.0，无需账户、无需订阅。串流是你的浏览器与你的 PC 之间点对点的直接连接。</li>
+    <li data-i18n-html="diff.5"><strong>自有的捕获与编码引擎。</strong>装在游戏 PC 上，它立刻就是一台主机——它还能与 <a href="/zh/sunshine-web-client.html">Sunshine、Apollo、Wolf 和 MultiSeat</a> 主机配对。</li>
+    <li data-i18n-html="diff.6"><strong>最多四名玩家。</strong>邀请三位好友加入你 PC 上正在运行的游戏，每人使用自己的设备和浏览器，以及自己的手柄。</li>
+  </ul>
+
+  <h2 data-i18n="know.h">值得了解</h2>
+  <ul>
+    <li data-i18n="know.1">游戏 PC 运行 MoonlightWeb 服务器：Windows 10 或 11、Apple Silicon 上的 macOS，或 Linux，并配备能编码视频的 GPU。</li>
+    <li data-i18n="know.2">可选的编解码器取决于你用来游玩的设备和浏览器：H264 到处都能用，HEVC 和 AV1 则在能硬件解码它们的地方可用。</li>
+  </ul>
+
+  <h2 data-i18n="where.h">在哪里游玩</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/zh/play/chromebook.html"><strong data-i18n="x.cb.t">Chromebook</strong><span data-i18n="x.cb.d">在 Chrome 中畅玩你的 PC 游戏，无需安装任何东西。</span></a>
+    <a class="cyb" href="/zh/play/iphone-ipad.html"><strong data-i18n="x.ios.t">iPhone 和 iPad</strong><span data-i18n="x.ios.d">在 Safari 中，无需从 App Store 下载任何东西。</span></a>
+    <a class="cyb" href="/zh/play/tv.html"><strong data-i18n="x.tv.t">电视</strong><span data-i18n="x.tv.d">通过电视或电视盒子的浏览器。</span></a>
+  </div>
+
+  <p class="muted" data-i18n="tm">Parsec 是 Unity Technologies 的商标；Steam 和 Steam Remote Play 是 Valve Corporation 的商标。MoonlightWeb 是一个独立项目，与上述两家公司均无关联。</p>
+
+  <h2 data-i18n="read.h">开始使用</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/zh/guides/"><strong data-i18n="x.guides.t">安装指南</strong><span data-i18n="x.guides.d">在 Windows、macOS 或 Linux 上设置服务器。</span></a>
+    <a class="cyb" href="/zh/faq.html"><strong data-i18n="x.faq.t">常见问题</strong><span data-i18n="x.faq.d">延迟、编解码器、安全、互联网远程游玩——所有常见问题。</span></a>
+  </div>
+</div>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/zh/">首页</a> · <a href="/zh/guides/">指南</a> · <a href="/zh/faq.html">常见问题</a> · <a href="/zh/contact.html">联系</a> · <a href="/zh/server-access/">连接主机</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>咖啡</span></a></span><span class="foot-play">畅玩设备： <a href="/zh/play/chromebook.html">Chromebook</a> · <a href="/zh/play/iphone-ipad.html">iPhone 和 iPad</a> · <a href="/zh/play/tv.html">电视</a> · <a href="/zh/sunshine-web-client.html">Sunshine 网页客户端</a> · <a href="/zh/browser-game-streaming.html">为什么选择浏览器客户端</a></span></div></footer>
+
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+</body>
+</html>

@@ -41,8 +41,8 @@ namespace mw::routerports {
 //   has to be acceptable, not ours.
 //
 //   it is nowhere near anything else this project binds. The stream block
-//   starts at 48010, GameStream owns 47984-48010, MultiSeat and Wolf sit above
-//   48100. A hole here can never be mistaken for one of those, in a router
+//   starts at 48550, GameStream owns 47984-48010, MultiSeat and Wolf sit above
+//   48095. A hole here can never be mistaken for one of those, in a router
 //   table or in a log.
 //
 // Eight of them: a first host takes what it needs from the front, a second
@@ -67,15 +67,45 @@ constexpr uint16_t kTunnelPoolEnd = 46031;
 // ephemeral port, no worse off than every tunnel was before any of this.
 constexpr int kTunnelPortCap = 4;
 
+// A DEV identity's tunnel holes (the DEV build, or --dev: Edition.h) come from
+// a block of their own, and from nowhere else — neither the list above nor the
+// installed host's pool.
+//
+// A --dev runs beside the installed host on one machine, behind one LAN
+// address, and the router cannot tell the two apart: an entry pointed at that
+// address reads as ours to both, so the walk handed the --dev the very holes
+// the installed host held. A tunnel socket is only bound while a browser is
+// connected, so the --dev also found the port free, bound it, and kept it.
+// 09/10/2026: a --dev held UDP 3479 for an afternoon, and every browser the
+// installed 0.3.1 put on that hole looped on its lock screen, from 5G and the
+// office alike. The price: no corporate firewall passes these ports, so a --dev
+// is reached from the LAN, 5G or a home connection. Between the installed
+// host's pool and the media pool.
+constexpr uint16_t kDevTunnelPoolBegin = 46064;
+constexpr uint16_t kDevTunnelPoolEnd = 46095;
+
 // ── The stream ──────────────────────────────────────────────────────────────
 //
-// Each stream slot binds 48010 + slot locally, and that never changes: the
-// --dev firewall rule and every diagnostic know the block. What the ROUTER
-// forwards to it is negotiated — the slot's own number first, so a lone host
-// looks exactly as it always did, then a pool for the host whose neighbour
-// got there first. A router forwards any external port to any internal one;
-// the browser is told the external, the socket keeps the internal.
-constexpr uint16_t kMediaBasePort = 48010;
+// Each stream slot binds 48550 + slot locally, and that never changes: the
+// packages' firewall rule, the --dev one and every diagnostic know the block.
+// What the ROUTER forwards to it is negotiated — the slot's own number first,
+// so a lone host looks exactly as it always did, then a pool for the host whose
+// neighbour got there first. A router forwards any external port to any
+// internal one; the browser is told the external, the socket keeps the internal.
+//
+// Where the block sits is chosen for the machines it runs on, which also run
+// the streaming servers. Sunshine and Apollo own 47984-48010 (48010 is their
+// RTSP, over TCP — which the media socket binds too under ICE-TCP), MultiSeat
+// seats and Wolf 48095 to ~48340, and a GameStream server moved up by a
+// thousand, the usual way to run a second one, 48984-49010. 49152 and above is
+// where Windows and macOS hand out ephemeral ports, and where Hyper-V, WSL and
+// Docker reserve whole blocks at boot. Linux hands out 32768-60999, so the
+// packages reserve the block there (ip_local_reserved_ports). Until 0.3.1 it
+// was 48010-48033, right on Sunshine's RTSP port.
+constexpr uint16_t kMediaBasePort = 48550;
+// One port per stream slot: the ceiling of concurrent streams, and the block
+// the packages open, 48550-48573.
+constexpr int kMediaPortCount = 24;
 constexpr uint16_t kMediaPoolBegin = 46100;
 constexpr uint16_t kMediaPoolEnd = 46199;
 
@@ -93,5 +123,12 @@ constexpr int kRenewIntervalMs = 1800000;
 // discovery (two seconds) plus one round of SOAP; anything longer and the
 // browser's page would look dead.
 constexpr int kClaimWaitMs = 4000;
+
+// Looking for the router again after a discovery found none: half a minute
+// first (the network at logon, a router slow to answer once), doubling up to
+// ten minutes. Each look is one M-SEARCH of two seconds on the allocator's
+// thread.
+constexpr int kRediscoverFirstMs = 30000;
+constexpr int kRediscoverMaxMs = 600000;
 
 } // namespace mw::routerports

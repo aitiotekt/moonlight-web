@@ -28,6 +28,41 @@ import { IS_MOBILE_OR_TABLET, IS_IOS, IS_STANDALONE } from '../util/BrowserDetec
 const ORIENTATION_SYNC_DELAYS = [60, 160, 320, 600];
 
 /**
+ * Whether this device can be held in landscape by the page itself.
+ *
+ * screen.orientation.lock() works on Android browsers, and only while the page
+ * is fullscreen. WebKit defines the method and refuses every call, so iOS and
+ * iPadOS are left out by name rather than by trying: a refusal there would
+ * arrive after the page had already gone fullscreen in portrait.
+ */
+export function canLockLandscape() {
+    // `lock` is missing from TypeScript's DOM types (removed in lib.dom 4.x).
+    const orientation = /** @type {any} */ ((window.screen || {}).orientation);
+    return (
+        IS_MOBILE_OR_TABLET && !IS_IOS && !!orientation && typeof orientation.lock === 'function'
+    );
+}
+
+/**
+ * Fullscreen on a phone is landscape, fixed: the stream fills the screen
+ * sideways and turning the phone no longer turns the picture. Asked whenever
+ * the page goes fullscreen — the browser releases the lock by itself when it
+ * leaves. Resolves false when the lock was refused.
+ * @returns {Promise<boolean>}
+ */
+export function lockLandscape() {
+    if (!canLockLandscape() || !document.fullscreenElement) return Promise.resolve(false);
+    const orientation = /** @type {any} */ (window.screen.orientation);
+    return orientation.lock('landscape').then(
+        () => true,
+        (err) => {
+            console.warn('[StreamView] Landscape lock refused:', err && err.message);
+            return false;
+        },
+    );
+}
+
+/**
  * Fullscreen / wake-lock / gaming-mode-exit subsystem for StreamView.
  *
  * Covers the standard Fullscreen API, the iOS CSS fallback, the Screen Wake
@@ -69,10 +104,16 @@ export class StreamViewFullscreen {
         // 3. window.orientationchange — legacy fallback for those iOS versions.
         window.addEventListener('orientationchange', this._onOrientationChange);
 
-        // Fullscreen change listener (for button visibility)
+        // Fullscreen change listener (button visibility, and the landscape
+        // lock that goes with fullscreen on a phone).
         this._onFullscreenChange = () => {
+            if (document.fullscreenElement) this._holdLandscape();
+            else this._releaseLandscape();
             this._updateMobileFsButtonVisibility();
         };
+        // The launch click may have gone fullscreen before this view existed
+        // ("Start streams in fullscreen", app.js _enterLaunchFullscreen).
+        if (document.fullscreenElement) this._holdLandscape();
         document.addEventListener('fullscreenchange', this._onFullscreenChange);
         if (this.videoEl) {
             this.videoEl.addEventListener('webkitbeginfullscreen', this._onFullscreenChange);
@@ -143,8 +184,40 @@ export class StreamViewFullscreen {
         this._lastLandscape = landscape;
 
         if (!landscape) this._exitMobileFullscreen();
+        else if (this._fullscreenOnStart && this._fullscreenOnStartDone) {
+            // An iPhone has no lock and no Fullscreen API: with "Start streams
+            // in fullscreen" on, landscape IS fullscreen there — filling the
+            // page needs no gesture — and portrait leaves it, above.
+            if (typeof document.documentElement.requestFullscreen !== 'function') {
+                this._enterCssFallbackFullscreen();
+            }
+        }
         this._updateMobileFsButtonVisibility();
         return true;
+    }
+
+    /**
+     * Hold the phone's picture in landscape while fullscreen (see
+     * lockLandscape). Where it cannot be held — refused, or a device that has
+     * no lock — a phone upright does not stay fullscreen: portrait is always
+     * the page with its header.
+     * @this {StreamViewInstance}
+     */
+    _holdLandscape() {
+        if (!IS_MOBILE_OR_TABLET || this._standby) return;
+        lockLandscape().then((held) => {
+            if (!held && !this._isDeviceLandscape()) this._exitMobileFullscreen();
+        });
+    }
+
+    /** @this {StreamViewInstance} */
+    _releaseLandscape() {
+        if (!canLockLandscape()) return;
+        try {
+            window.screen.orientation.unlock();
+        } catch (e) {
+            /* already released with the fullscreen */
+        }
     }
 
     /**
@@ -174,6 +247,33 @@ export class StreamViewFullscreen {
         this._screenOrientation = null;
         this._onOrientationChange = null;
         this._lastLandscape = null;
+    }
+
+    /**
+     * "Start streams in fullscreen" (settings), once the stream is up.
+     *
+     * The real fullscreen was asked on the launch click (app.js
+     * _enterLaunchFullscreen) — here it is too late for one, no gesture is
+     * left. What remains:
+     *   - already fullscreen: take Escape into the host, as when entered here;
+     *   - no Fullscreen API (iPhone): fill the page, the CSS fallback the
+     *     button gives there too;
+     *   - refused elsewhere (a fallback relaunch, a click too long ago): the
+     *     header button stays, nothing forced.
+     * The standby view of a dual stream leaves it to the live one.
+     * @this {StreamViewInstance}
+     */
+    _applyFullscreenOnStart() {
+        if (!this._fullscreenOnStart || this._standby || this._fullscreenOnStartDone) return;
+        this._fullscreenOnStartDone = true;
+        if (document.fullscreenElement) {
+            this._syncKeyboardLock();
+            this._updateMobileFsButtonVisibility();
+            return;
+        }
+        if (typeof document.documentElement.requestFullscreen !== 'function') {
+            this._enterCssFallbackFullscreen();
+        }
     }
 
     /**
@@ -286,6 +386,9 @@ export class StreamViewFullscreen {
      */
     _enterCssFallbackFullscreen() {
         if (this._cssFullscreen || this._quitting) return;
+        // Portrait is never fullscreen on a phone, and the page cannot turn
+        // it: the stream waits for the device to be turned (_syncOrientationState).
+        if (IS_MOBILE_OR_TABLET && !this._isDeviceLandscape()) return;
         this._cssFullscreen = true;
 
         // Add CSS class to the stream-view container
@@ -489,8 +592,10 @@ export class StreamViewFullscreen {
      * Show/hide the header fullscreen button (placed next to the Stop button).
      *
      * Desktop: always visible (unless already in fullscreen).
-     * Mobile/tablet: visible only in landscape — in portrait the user should
-     * rotate first (rotation auto-enters fullscreen anyway).
+     * Mobile/tablet: in landscape only. A phone's bar upright has no room
+     * for it: centred over the bar, it sat on the keyboard, Share and Stop
+     * buttons (realme, Android, 20/10/2026) — even where the page could turn
+     * the picture itself (canLockLandscape). The user rotates first.
      * @this {StreamViewInstance}
      */
     _updateMobileFsButtonVisibility() {
@@ -509,9 +614,9 @@ export class StreamViewFullscreen {
             this._mobileFsBtn.style.display = this._isDeviceLandscape() ? '' : 'none';
         }
 
-        // Reposition the reminder (header vs top-center) and the stats card
-        // (under the header vs top corner).
-        this._positionGamingOverlay();
+        // Reposition the reminder (header vs top-center, where it then fades)
+        // and the stats card (under the header vs top corner).
+        this._updateGamingOverlay();
         this._positionStatsOverlay();
     }
 }

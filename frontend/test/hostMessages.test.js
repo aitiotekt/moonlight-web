@@ -17,6 +17,9 @@ describe('hostMessages — what reaches the stream view', () => {
             'cursorpos',
             'inputgate',
             'displayformat',
+            'feedcodec',
+            'fpsstep',
+            'inputstamp',
         ]) {
             expect(isViewMessage(type)).toBe(true);
         }

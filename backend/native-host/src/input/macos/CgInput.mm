@@ -362,6 +362,12 @@ void CgInput::inject(const InputEvent& event)
     case InputEvent::Type::KeyUp: injectKey(event, false); break;
     case InputEvent::Type::CharDown:
     case InputEvent::Type::CharUp:
+        // A chord of the touch keyboard's bar keeps its US position here, as
+        // it always went: the Windows host alone resolves it by its character.
+        if (event.chord) {
+            injectKey(event, event.type == InputEvent::Type::CharDown);
+            break;
+        }
         // A character is never a modifier itself, so the client's mask is the
         // whole truth about what is held around it.
         if (event.modifiersKnown) reconcileModifiers(event.modifiers);
@@ -847,7 +853,13 @@ void CgInput::injectMouseButton(int button, bool down)
     // Pressed where the pointer IS: after relative moves only the window
     // server knows, and a click at a stale spot would move a detached pointer.
     syncPointer();
+    if (!m_ClickTrace || !down) {
+        postButton(button, down, m_X, m_Y);
+        return;
+    }
+    const int64_t startUs = steadyNowUs();
     postButton(button, down, m_X, m_Y);
+    m_ClickTrace->press(0, startUs, steadyNowUs());
 }
 
 void CgInput::postButton(int button, bool down, double x, double y)

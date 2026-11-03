@@ -1,0 +1,594 @@
+<!doctype html>
+<!--
+  MoonlightWeb — WebHID probe: what Chrome hands a page about a game device
+  (plan "Passthrough HID", H0). Copyright (C) 2026 Bruno Martin. GPLv3.
+
+  For the person holding the device, so its words are French. "Choisir un
+  appareil" opens Chrome's chooser (Joystick, Game Pad, Multi-axis, Simulation);
+  each chosen device is opened and its input reports counted: rate, gap between
+  two reports (median, p95, max), size and the last bytes of each report id,
+  bytes that moved highlighted. The Gamepad API is read alongside, to show that
+  both see the device at once. "Copier le relevé" puts the whole reading on the
+  clipboard as JSON, collections included.
+
+  Permission check: reload the page. A device listed under "déjà autorisés"
+  without a new click keeps its permission across sessions, which Chrome only
+  does for a device with a serial number and a product name.
+
+  "Transmettre à l'hôte" (H2) sends every open device to mw-hid-poc
+  (backend/native-host/tools/hid-poc) on the host given: its collections once,
+  then each input report as it arrives, binary [slot][report id][seq u16][bytes].
+  The host's answers (descriptor built, nodes made, requests from the OS, stats)
+  show under the device. Requests from the host are shown, never sent to the
+  device: no output report from the host reaches the real wheel from this page.
+
+  "Retour de force" (plan P4.0) shows under a device with a Logitech HID++
+  interface (usage page 0xFF43): it finds feature 0x8123 (FORCE_FEEDBACK) through
+  the Root feature and reads its slots, rotation range and gain. The force buttons
+  each send one short, weak effect, only when clicked: the question is whether
+  the wheel takes HID++ force commands from Chrome while G HUB runs beside it.
+  Layout of 0x8123 as described in docs/design/hid-passthrough-study.md (P4.0):
+  [0xFF device][feature index][function << 4 | software id][params], big-endian.
+
+  WebHID wants a secure context: serve the folder on the loopback
+  (python -m http.server 39918 --bind 127.0.0.1) and open
+  http://127.0.0.1:39918/hid-probe.html in Chrome or Edge. The reading is also in
+  globalThis.__probe (report(), text()) for a CDP driver.
+-->
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relevé WebHID</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 14px 18px 40px; background: #121417; color: #e8e8e8;
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 16px; margin: 0 0 6px; color: #8aa0b4; font-weight: 600; }
+  h2 { font-size: 18px; margin: 0 0 4px; color: #ffd54a; }
+  .mono { font-family: ui-monospace, Consolas, Menlo, monospace; }
+  .warn { color: #e0a060; }
+  .muted { color: #8aa0b4; font-size: 13px; }
+  .bar { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+  button { font: inherit; font-size: 16px; padding: 8px 16px; border-radius: 8px; border: 1px solid #44505c;
+           background: #26303a; color: #eee; cursor: pointer; }
+  button.primary { background: #2f6f3f; border-color: #3f8f52; font-weight: 600; }
+  .dev { margin: 12px 0; padding: 12px 16px; border-radius: 10px; background: #1d2228; border: 1px solid #2f3a45; }
+  table { border-collapse: collapse; font-size: 13px; margin: 6px 0; }
+  td, th { border: 1px solid #333c45; padding: 2px 6px; text-align: left; }
+  th { color: #8aa0b4; font-weight: 500; }
+  .bytes span { padding: 0 1px; }
+  .bytes span.moved { background: #23462a; }
+  input { font: inherit; font-size: 14px; padding: 6px 8px; border-radius: 6px; border: 1px solid #44505c;
+          background: #0d0f11; color: #eee; }
+  .ffb { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2f3a45; }
+  #result { width: 100%; height: 220px; margin-top: 10px; background: #0d0f11; color: #cfe; border: 1px solid #333;
+            font: 12px ui-monospace, Consolas, Menlo, monospace; display: none; }
+</style>
+</head>
+<body>
+<h1>Relevé WebHID — MoonlightWeb (H0)</h1>
+<div id="support"></div>
+<div class="bar">
+  <button id="pick" class="primary">Choisir un appareil</button>
+  <button id="copy">Copier le relevé</button>
+  <button id="reset">Remettre les compteurs à zéro</button>
+</div>
+<div class="bar">
+  <input id="host" class="mono" size="28" placeholder="ws://192.168.1.x:39920">
+  <button id="send">Transmettre à l'hôte</button>
+  <span id="link" class="muted"></span>
+</div>
+<div id="persist" class="muted"></div>
+<div id="devices"></div>
+<div id="pads" class="muted mono"></div>
+<textarea id="result" readonly></textarea>
+
+<script>
+'use strict';
+
+// Usages a game device declares at the top of its report descriptor. Keyboard,
+// mouse and Consumer Control stay out: the host refuses them anyway.
+const FILTERS = [
+    { usagePage: 0x01, usage: 0x04 }, // Joystick
+    { usagePage: 0x01, usage: 0x05 }, // Game Pad
+    { usagePage: 0x01, usage: 0x08 }, // Multi-axis Controller
+    { usagePage: 0x02 }, // Simulation Controls (wheels, pedals)
+];
+
+const ITEM_FIELDS = [
+    'isAbsolute', 'isArray', 'isBufferedBytes', 'isConstant', 'isLinear', 'isRange', 'isVolatile',
+    'hasNull', 'hasPreferredState', 'wrap', 'usages', 'usageMinimum', 'usageMaximum',
+    'reportSize', 'reportCount', 'unitExponent', 'unitSystem', 'unitFactorLengthExponent',
+    'unitFactorMassExponent', 'unitFactorTimeExponent', 'unitFactorTemperatureExponent',
+    'unitFactorCurrentExponent', 'unitFactorLuminousIntensityExponent', 'logicalMinimum',
+    'logicalMaximum', 'physicalMinimum', 'physicalMaximum', 'strings',
+];
+
+const $ = (id) => document.getElementById(id);
+const hex4 = (n) => n.toString(16).padStart(4, '0');
+const hex2 = (n) => n.toString(16).padStart(2, '0');
+
+// The HID objects keep their fields on the prototype: JSON.stringify sees none.
+function plainItem(item) {
+    const o = {};
+    for (const k of ITEM_FIELDS) {
+        const v = item[k];
+        if (v === undefined) continue;
+        o[k] = Array.isArray(v) ? [...v] : v;
+    }
+    return o;
+}
+function plainReport(r) {
+    return { reportId: r.reportId, items: (r.items || []).map(plainItem) };
+}
+function plainCollection(c) {
+    return {
+        usagePage: c.usagePage,
+        usage: c.usage,
+        type: c.type,
+        children: (c.children || []).map(plainCollection),
+        inputReports: (c.inputReports || []).map(plainReport),
+        outputReports: (c.outputReports || []).map(plainReport),
+        featureReports: (c.featureReports || []).map(plainReport),
+    };
+}
+
+// Bits a report carries, by kind and id, from the collections: what the host
+// will rebuild. Compared with the bytes that really arrive.
+function reportBits(collections) {
+    const out = { input: {}, output: {}, feature: {} };
+    const walk = (c) => {
+        for (const [kind, list] of [['input', c.inputReports], ['output', c.outputReports], ['feature', c.featureReports]]) {
+            for (const r of list || []) {
+                let bits = 0;
+                for (const it of r.items || []) bits += it.reportSize * it.reportCount;
+                out[kind][r.reportId] = (out[kind][r.reportId] || 0) + bits;
+            }
+        }
+        for (const ch of c.children || []) walk(ch);
+    };
+    for (const c of collections) walk(c);
+    return out;
+}
+
+function quantile(sorted, q) {
+    if (!sorted.length) return null;
+    return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+}
+
+const state = {
+    started: new Date().toISOString(),
+    permittedAtLoad: [], // devices getDevices() returned before any click
+    devices: new Map(), // HIDDevice -> record
+};
+
+function keyOf(d) {
+    return `${hex4(d.vendorId)}:${hex4(d.productId)}`;
+}
+
+function newRecord(device) {
+    return {
+        device,
+        key: keyOf(device),
+        name: device.productName,
+        openedAt: performance.now(),
+        collections: device.collections.map(plainCollection),
+        reports: new Map(), // reportId -> {count, size, first, last, prev}
+        lastAt: null,
+        gaps: [],
+        total: 0,
+        error: null,
+        ffb: device.collections.some((c) => c.usagePage === 0xff43) ? { log: [], index: 0, busy: false, pending: null } : null,
+    };
+}
+
+function resetCounters() {
+    for (const rec of state.devices.values()) {
+        rec.reports.clear();
+        rec.gaps = [];
+        rec.total = 0;
+        rec.lastAt = null;
+        rec.openedAt = performance.now();
+    }
+}
+
+// ── Transmettre à l'hôte (H2) ────────────────────────────────────────────────
+const link = {
+    ws: null,
+    rtts: [],
+    slots: new Map(), // record -> slot
+};
+
+function slotOf(rec) {
+    if (!link.slots.has(rec)) link.slots.set(rec, link.slots.size);
+    return link.slots.get(rec);
+}
+
+function sendAttach(rec) {
+    if (!link.ws || link.ws.readyState !== WebSocket.OPEN || rec.error) return;
+    rec.host = { state: 'envoyé' };
+    link.ws.send(JSON.stringify({
+        type: 'attach',
+        slot: slotOf(rec),
+        vendorId: rec.device.vendorId,
+        productId: rec.device.productId,
+        productName: rec.name,
+        collections: rec.collections,
+    }));
+}
+
+function sendReport(rec, e, bytes) {
+    if (!link.ws || link.ws.readyState !== WebSocket.OPEN || !rec.host) return;
+    rec.seq = ((rec.seq || 0) + 1) & 0xffff;
+    const frame = new Uint8Array(4 + bytes.length);
+    frame[0] = slotOf(rec);
+    frame[1] = e.reportId;
+    frame[2] = rec.seq & 0xff;
+    frame[3] = rec.seq >> 8;
+    frame.set(bytes, 4);
+    link.ws.send(frame);
+}
+
+function onHostMessage(msg) {
+    if (msg.type === 'pong') {
+        link.rtts.push(performance.now() - msg.t);
+        if (link.rtts.length > 200) link.rtts.shift();
+        return;
+    }
+    if (msg.type === 'hello') {
+        $('link').textContent = msg.canCreate ? 'Hôte connecté' : `Hôte connecté, sans création : ${msg.why}`;
+        for (const rec of state.devices.values()) sendAttach(rec);
+        return;
+    }
+    const rec = Array.from(link.slots.keys()).find((r) => link.slots.get(r) === msg.slot);
+    if (!rec) return;
+    if (msg.type === 'attached') rec.host = { state: 'créé', descriptor: msg.descriptor, nodes: msg.nodes };
+    else if (msg.type === 'refused') rec.host = { state: 'refusé', why: msg.why, descriptor: msg.descriptor };
+    else if (msg.type === 'stats') rec.host = { ...rec.host, stats: msg };
+    else if (msg.type === 'request') {
+        rec.host = { ...rec.host, requests: [...(rec.host?.requests || []).slice(-4), msg] };
+    }
+}
+
+function connectHost() {
+    const url = $('host').value.trim();
+    if (!url) return;
+    try { localStorage.setItem('hidProbeHost', url); } catch { /* private window */ }
+    if (link.ws) link.ws.close();
+    link.slots.clear();
+    for (const rec of state.devices.values()) delete rec.host;
+    $('link').textContent = 'Connexion…';
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    link.ws = ws;
+    ws.onmessage = (ev) => { try { onHostMessage(JSON.parse(ev.data)); } catch { /* not JSON */ } };
+    ws.onclose = () => { if (link.ws === ws) $('link').textContent = 'Hôte déconnecté'; };
+    ws.onerror = () => { $('link').textContent = `Hôte injoignable (${url})`; };
+}
+
+setInterval(() => {
+    if (link.ws && link.ws.readyState === WebSocket.OPEN) link.ws.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+}, 1000);
+
+function hostView(rec) {
+    const h = rec.host;
+    if (!h) return '';
+    const r = link.rtts.slice().sort((a, b) => a - b);
+    const rtt = r.length ? ` · aller-retour réseau médian ${quantile(r, 0.5).toFixed(1)} ms` : '';
+    const s = h.stats
+        ? ` · ${h.stats.received} reçus, ${h.stats.lost} perdus, écriture → evdev médian ${Math.round(h.stats.injectUs.median)} µs, p95 ${Math.round(h.stats.injectUs.p95)} µs`
+        : '';
+    const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const req = (h.requests || []).map((q) => `${esc(q.kind)} id ${q.reportId} : ${esc(q.data)}`).join(' · ');
+    return `<div class="mono">Hôte : ${h.state}${h.why ? ` (${esc(h.why)})` : ''}${h.nodes ? ` · ${esc(h.nodes)}` : ''}${s}${rtt}</div>`
+        + (req ? `<div class="mono muted">Demandes de l'hôte (non transmises) : ${req}</div>` : '');
+}
+
+// ── Retour de force HID++ (P4.0) ────────────────────────────────────────────
+const HIDPP_LONG = 0x11; // 19 bytes after the id
+const HIDPP_VERY_LONG = 0x12; // 63 bytes after the id
+const HIDPP_SWID = 0x01;
+const FEATURE_FFB = 0x8123;
+const HIDPP_ERRORS = ['', 'inconnue', 'arguments invalides', 'hors limites', 'matériel', 'non permise',
+    'index de fonction invalide', 'fonction invalide', 'occupé', 'non prise en charge'];
+
+function ffbLog(rec, line) {
+    const f = rec.ffb;
+    f.log.push(`${new Date().toLocaleTimeString()} ${line}`);
+    if (f.log.length > 12) f.log.shift();
+}
+
+// One HID++ 2.0 call: resolves with the reply's parameters, rejects on an error
+// reply or after 1 s. The wheel answers on the same report id, bytes 1 and 2
+// (feature index, function | swid) echoed; an error reply has 0xFF at byte 1.
+function hidpp(rec, featureIndex, fn, params = [], reportId = HIDPP_LONG) {
+    const size = reportId === HIDPP_VERY_LONG ? 63 : 19;
+    const data = new Uint8Array(size);
+    data[0] = 0xff;
+    data[1] = featureIndex;
+    data[2] = (fn << 4) | HIDPP_SWID;
+    data.set(params.slice(0, size - 3), 3);
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            rec.ffb.pending = null;
+            reject(new Error('pas de réponse en 1 s'));
+        }, 1000);
+        rec.ffb.pending = {
+            match(bytes) {
+                if (bytes[1] === featureIndex && bytes[2] === data[2]) return resolve(bytes.slice(3)), true;
+                if (bytes[1] === 0xff && bytes[2] === featureIndex && bytes[3] === data[2]) {
+                    return reject(new Error(`erreur HID++ ${bytes[4]} (${HIDPP_ERRORS[bytes[4]] || '?'})`)), true;
+                }
+                return false;
+            },
+            done() { clearTimeout(timer); rec.ffb.pending = null; },
+        };
+        rec.device.sendReport(reportId, data).catch((err) => {
+            rec.ffb.pending?.done();
+            reject(err);
+        });
+    }).finally(() => rec.ffb.pending?.done());
+}
+
+const be16 = (v) => [(v >> 8) & 0xff, v & 0xff];
+const u16 = (b, i) => (b[i] << 8) | b[i + 1];
+
+async function ffbRead(rec) {
+    const f = rec.ffb;
+    const root = await hidpp(rec, 0x00, 0, be16(FEATURE_FFB));
+    if (!root[0]) throw new Error('le volant n\'a pas la fonction 0x8123');
+    f.index = root[0];
+    const info = await hidpp(rec, f.index, 0);
+    f.slots = info[0];
+    const ap = await hidpp(rec, f.index, 5);
+    f.aperture = u16(ap, 0);
+    const gains = await hidpp(rec, f.index, 7);
+    f.gain = u16(gains, 0);
+    ffbLog(rec, `0x8123 à l'index ${f.index} · ${f.slots} emplacements · ${f.aperture}° · gain ${f.gain}`);
+}
+
+// Constant force, autostarted, for `ms` milliseconds. `level` is signed 16-bit;
+// which sign turns which way is one of the things this probe finds out.
+async function ffbConstant(rec, level, ms) {
+    const p = [0, 0x80 | 0x00, ...be16(ms), ...be16(0), ...be16(level & 0xffff), 0, 0, 0, 0, 0, 0];
+    const r = await hidpp(rec, rec.ffb.index, 2, p);
+    ffbLog(rec, `force ${level > 0 ? '+' : ''}${Math.round(level / 327.67)} % ${ms} ms → emplacement ${r[0]}`);
+}
+
+// Centring spring, autostarted, no end: coefficients and saturations from a
+// strength in 0..1. Kept in its slot until "Tout arrêter".
+async function ffbSpring(rec, strength) {
+    const k = Math.round(strength * 0x7fff);
+    const sat = Math.round(strength * 0x7fff) >> 1;
+    const p = [0, 0x80 | 0x06, ...be16(0), ...be16(0),
+        ...be16(sat), ...be16(k), ...be16(0), ...be16(0), ...be16(k), ...be16(sat)];
+    const r = await hidpp(rec, rec.ffb.index, 2, p, HIDPP_VERY_LONG);
+    ffbLog(rec, `ressort ${Math.round(strength * 100)} % → emplacement ${r[0]}`);
+}
+
+// Reset every effect, then a zero spring: the firmware's own centring survives
+// a reset, and the kernel driver frees the wheel the same way.
+async function ffbStop(rec) {
+    await hidpp(rec, rec.ffb.index, 1);
+    await hidpp(rec, rec.ffb.index, 2, [0, 0x80 | 0x06, ...new Array(16).fill(0)], HIDPP_VERY_LONG);
+    ffbLog(rec, 'tout arrêté (reset + ressort nul)');
+}
+
+async function ffbRun(rec, what) {
+    const f = rec.ffb;
+    if (f.busy) return;
+    f.busy = true;
+    try {
+        if (!f.index && what !== 'read') await ffbRead(rec);
+        if (what === 'read') await ffbRead(rec);
+        else if (what === 'left') await ffbConstant(rec, -0x1999, 500);
+        else if (what === 'right') await ffbConstant(rec, 0x1999, 500);
+        else if (what === 'spring') await ffbSpring(rec, 0.3);
+        else if (what === 'stop') await ffbStop(rec);
+    } catch (err) {
+        ffbLog(rec, `échec : ${String(err && err.message || err)}`);
+    } finally {
+        f.busy = false;
+        render();
+    }
+}
+
+function ffbView(rec) {
+    if (!rec.ffb) return '';
+    const btn = (what, label) => `<button data-ffb="${what}" data-dev="${rec.key}">${label}</button>`;
+    return `<div class="ffb"><b>Retour de force HID++ (P4.0)</b>
+        <span class="muted">Mains sur le volant : chaque bouton envoie un seul effet, faible (20 %) et court.</span>
+        <div class="bar">${btn('read', 'Lire 0x8123')}${btn('left', '← 20 % 0,5 s')}${btn('right', '20 % → 0,5 s')}${btn('spring', 'Ressort 30 %')}${btn('stop', 'Tout arrêter')}</div>
+        <div class="mono muted">${rec.ffb.log.join('<br>') || 'Rien envoyé.'}</div></div>`;
+}
+
+function onReport(rec, e) {
+    if (rec.ffb?.pending && (e.reportId === HIDPP_LONG || e.reportId === HIDPP_VERY_LONG)) {
+        rec.ffb.pending.match(new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength));
+    }
+    const now = e.timeStamp || performance.now();
+    if (rec.lastAt !== null) {
+        rec.gaps.push(now - rec.lastAt);
+        if (rec.gaps.length > 20000) rec.gaps.splice(0, 10000);
+    }
+    rec.lastAt = now;
+    rec.total++;
+    const bytes = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
+    sendReport(rec, e, bytes);
+    let r = rec.reports.get(e.reportId);
+    if (!r) {
+        r = { count: 0, size: bytes.length, first: Array.from(bytes), last: null, moved: new Set() };
+        rec.reports.set(e.reportId, r);
+    }
+    r.count++;
+    r.size = bytes.length;
+    const cur = Array.from(bytes);
+    if (r.last) for (let i = 0; i < cur.length; i++) if (cur[i] !== r.last[i]) r.moved.add(i);
+    r.last = cur;
+}
+
+async function attach(device) {
+    if (state.devices.has(device)) return;
+    const rec = newRecord(device);
+    state.devices.set(device, rec);
+    try {
+        if (!device.opened) await device.open();
+        device.addEventListener('inputreport', (e) => onReport(rec, e));
+    } catch (err) {
+        rec.error = String(err && err.message || err);
+    }
+    sendAttach(rec);
+}
+
+function stats(rec) {
+    const secs = (performance.now() - rec.openedAt) / 1000;
+    const g = rec.gaps.slice().sort((a, b) => a - b);
+    return {
+        reportsPerSec: secs > 0 ? +(rec.total / secs).toFixed(1) : 0,
+        gapMs: {
+            median: g.length ? +quantile(g, 0.5).toFixed(2) : null,
+            p95: g.length ? +quantile(g, 0.95).toFixed(2) : null,
+            max: g.length ? +g[g.length - 1].toFixed(2) : null,
+        },
+        total: rec.total,
+    };
+}
+
+function gamepadView() {
+    const pads = (navigator.getGamepads ? navigator.getGamepads() : []) || [];
+    return Array.from(pads).filter(Boolean).map((p) => ({ index: p.index, id: p.id, mapping: p.mapping, axes: p.axes.length, buttons: p.buttons.length }));
+}
+
+function report() {
+    const pads = gamepadView();
+    return {
+        probe: 'hid-probe H0',
+        started: state.started,
+        at: new Date().toISOString(),
+        userAgent: navigator.userAgent,
+        permittedAtLoad: state.permittedAtLoad,
+        devices: Array.from(state.devices.values()).map((rec) => {
+            const vid = hex4(rec.device.vendorId), pid = hex4(rec.device.productId);
+            const declared = reportBits(rec.collections);
+            return {
+                vid, pid,
+                productName: rec.name,
+                permissionKept: state.permittedAtLoad.some((p) => p.vid === vid && p.pid === pid),
+                error: rec.error,
+                ...stats(rec),
+                gamepadApiSeesIt: pads.some((p) => p.id.toLowerCase().includes(vid) && p.id.toLowerCase().includes(pid)),
+                reports: Array.from(rec.reports.entries()).map(([id, r]) => ({
+                    reportId: id,
+                    count: r.count,
+                    bytes: r.size,
+                    declaredBits: declared.input[id] ?? null,
+                    first: r.first.map(hex2).join(' '),
+                    last: r.last ? r.last.map(hex2).join(' ') : null,
+                    movedBytes: Array.from(r.moved).sort((a, b) => a - b),
+                })),
+                declaredBits: declared,
+                collections: rec.collections,
+            };
+        }),
+        gamepadApi: pads,
+    };
+}
+
+function text() {
+    return JSON.stringify(report(), null, 2);
+}
+
+globalThis.__probe = { report, text, state };
+
+function render() {
+    const host = $('devices');
+    const parts = [];
+    for (const rec of state.devices.values()) {
+        const s = stats(rec);
+        const declared = reportBits(rec.collections);
+        const kept = state.permittedAtLoad.some((p) => `${p.vid}:${p.pid}` === rec.key);
+        let rows = '';
+        for (const [id, r] of rec.reports) {
+            const cells = (r.last || []).map((b, i) => `<span class="${r.moved.has(i) ? 'moved' : ''}">${hex2(b)}</span>`).join(' ');
+            const bits = declared.input[id];
+            rows += `<tr><td>${id}</td><td>${r.count}</td><td>${r.size}${bits != null ? ` (déclaré ${bits / 8})` : ''}</td><td class="mono bytes">${cells}</td></tr>`;
+        }
+        const tops = rec.collections.map((c) => `page 0x${hex2(c.usagePage)} usage 0x${hex2(c.usage)}`).join(', ');
+        parts.push(`<div class="dev">
+            <h2>${rec.name || '(sans nom)'} <span class="mono muted">${rec.key}</span></h2>
+            <div class="muted">Collections : ${tops || 'aucune'} · permission ${kept ? 'gardée au rechargement' : 'donnée dans cette page'}</div>
+            ${rec.error ? `<div class="warn">Ouverture refusée : ${rec.error}</div>` : ''}
+            <div class="mono">${s.reportsPerSec} rapports/s · écart médian ${s.gapMs.median ?? '–'} ms · p95 ${s.gapMs.p95 ?? '–'} ms · max ${s.gapMs.max ?? '–'} ms · ${s.total} reçus</div>
+            <table><tr><th>id</th><th>reçus</th><th>octets</th><th>derniers octets (vert = a bougé)</th></tr>${rows || '<tr><td colspan="4" class="muted">Bougez un manche ou appuyez sur un bouton.</td></tr>'}</table>
+            ${hostView(rec)}
+            ${ffbView(rec)}
+        </div>`);
+    }
+    host.innerHTML = parts.join('') || '<div class="muted">Aucun appareil ouvert.</div>';
+    const pads = gamepadView();
+    $('pads').textContent = pads.length
+        ? 'API Gamepad en même temps : ' + pads.map((p) => `#${p.index} ${p.id}`).join(' · ')
+        : 'API Gamepad : rien (appuyez sur un bouton de l\'appareil, page visible).';
+}
+
+async function init() {
+    if (!('hid' in navigator)) {
+        $('support').innerHTML = '<div class="warn">Ce navigateur n\'a pas WebHID : il faut Chrome ou Edge sur ordinateur, dans une page en https ou en 127.0.0.1.</div>';
+        $('pick').disabled = true;
+        return;
+    }
+    const already = await navigator.hid.getDevices();
+    state.permittedAtLoad = already.map((d) => ({ vid: hex4(d.vendorId), pid: hex4(d.productId), productName: d.productName }));
+    $('persist').textContent = already.length
+        ? 'Déjà autorisés au chargement (permission gardée) : ' + already.map((d) => `${d.productName} ${keyOf(d)}`).join(' · ')
+        : 'Aucun appareil autorisé au chargement. Après un choix, rechargez la page : s\'il réapparaît ici, Chrome garde la permission.';
+    for (const d of already) await attach(d);
+    navigator.hid.addEventListener('disconnect', (e) => {
+        const rec = state.devices.get(e.device);
+        if (rec) rec.error = 'débranché';
+    });
+    setInterval(render, 250);
+    render();
+}
+
+$('pick').addEventListener('click', async () => {
+    try {
+        const chosen = await navigator.hid.requestDevice({ filters: FILTERS });
+        for (const d of chosen) await attach(d);
+    } catch (err) {
+        $('support').innerHTML = `<div class="warn">${String(err && err.message || err)}</div>`;
+    }
+    render();
+});
+
+$('copy').addEventListener('click', async () => {
+    const t = text();
+    const area = $('result');
+    area.style.display = 'block';
+    area.value = t;
+    try {
+        await navigator.clipboard.writeText(t);
+        $('copy').textContent = 'Relevé copié';
+    } catch {
+        area.select();
+        $('copy').textContent = 'Copiez le texte ci-dessous';
+    }
+});
+
+$('reset').addEventListener('click', () => { resetCounters(); render(); });
+// pointerdown, not click: render() rebuilds the cards four times a second, and a
+// click whose press and release land on two generations of a button is lost.
+$('devices').addEventListener('pointerdown', (ev) => {
+    const b = ev.target.closest('button[data-ffb]');
+    if (!b) return;
+    const rec = Array.from(state.devices.values()).find((r) => r.key === b.dataset.dev && r.ffb);
+    if (rec) ffbRun(rec, b.dataset.ffb);
+});
+$('send').addEventListener('click', connectHost);
+try { $('host').value = localStorage.getItem('hidProbeHost') || ''; } catch { /* private window */ }
+
+init();
+</script>
+</body>
+</html>

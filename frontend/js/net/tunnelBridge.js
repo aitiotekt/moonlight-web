@@ -41,11 +41,14 @@
  * copied here. There is exactly one copy of that code, it is the copy the
  * published digests cover, and a watchdog comparing the live host against the
  * reference copy is therefore checking the code that actually runs.
+ *
+ * When that connection drops, lineKeeper.js dials it again under the page.
  */
+import { LineKeeper } from './lineKeeper.js';
+import { showLineNotice } from '../ui/LineNotice.js';
 
-let tunnel = null;
-/** The bootstrap's transport module, once startTunnel() has loaded it. */
-let transport = null;
+/** The connection, and the next one when it drops; null without a tunnel. */
+let keeper = null;
 let hostId = null;
 let hostKey = null;
 let shareToken = null;
@@ -86,7 +89,7 @@ export function tunnelShareToken() {
 
 /** Whether this page is reached through the introduction server. */
 export function isTunnelMode() {
-    return tunnel !== null;
+    return keeper !== null;
 }
 
 /**
@@ -151,72 +154,11 @@ export function bootstrapAddressFor(id, { hash, pathname }) {
  * send(), same close() — so the calling code does not branch.
  */
 export function openSignalingSocket(url) {
-    if (!tunnel) return new WebSocket(url);
+    if (!keeper) return new WebSocket(url);
     // Only the path matters to the host; the scheme and authority describe an
     // address that does not answer on this path.
     const parsed = new URL(url, location.origin);
-    return tunnel.openSocket(parsed.pathname + parsed.search);
-}
-
-/** How long a side connection waits for the other machine to be on the line.
- *  Shorter than the transport's own deadline: a machine that is off is the
- *  ordinary case here, and nothing on screen waits for the answer. */
-const SIDE_TUNNEL_TIMEOUT_MS = 12000;
-
-/**
- * A connection to ANOTHER machine, for a question this page has for it — the
- * key a home-screen shortcut would open it with — while this page's own
- * connection stays as it is.
- *
- * The far machine gets its own cookie jar and its own pairing identity, both
- * named after it in this browser's storage, exactly as if a tab had been opened
- * on it: a session it remembers is presented, and the answer's cookie is kept
- * under its name. Nothing of the page's own connection is touched, and the
- * service worker never sees this line — a request on it is made here, not
- * through fetch().
- *
- * Resolves to { fetch, close }, or rejects when the machine is not on the line
- * within the deadline. The caller closes it; a connection to a machine one
- * only had a question for has no business staying up.
- *
- * @param {string} otherHostId
- * @param {number} [timeoutMs]
- */
-export async function openSideTunnel(otherHostId, timeoutMs = SIDE_TUNNEL_TIMEOUT_MS) {
-    if (!transport) throw new Error('this page is not on the rendezvous');
-    const side = new transport.Tunnel(otherHostId);
-    const close = () => {
-        if (typeof side.close === 'function') {
-            side.close();
-            return;
-        }
-        // A bootstrap from before Tunnel.close(): put the line down by hand.
-        side.onclosed = null;
-        for (const part of [side._dc, side._pc, side._ws]) {
-            try {
-                part?.close();
-            } catch {
-                /* already gone */
-            }
-        }
-    };
-
-    let timer;
-    const deadline = new Promise((_, reject) => {
-        timer = setTimeout(
-            () => reject(new Error(`${otherHostId} did not answer in time`)),
-            timeoutMs,
-        );
-    });
-    try {
-        await Promise.race([side.connect(), deadline]);
-    } catch (e) {
-        close();
-        throw e;
-    } finally {
-        clearTimeout(timer);
-    }
-    return { fetch: (url, init) => side.fetch(url, init), close };
+    return keeper.line.openSocket(parsed.pathname + parsed.search);
 }
 
 /**
@@ -225,7 +167,8 @@ export async function openSideTunnel(otherHostId, timeoutMs = SIDE_TUNNEL_TIMEOU
  * The worker sends the pieces of a request and a port to reply on. Anything that
  * goes wrong is reported as an error rather than left to time out: a worker
  * waiting on a port that will never be posted to is a page that hangs with no
- * explanation.
+ * explanation. The one wait is for a line being dialled again, which the keeper
+ * bounds well inside the worker's own deadline once the page is in front.
  */
 function serveWorkerRequests() {
     navigator.serviceWorker.addEventListener('message', async (event) => {
@@ -236,7 +179,7 @@ function serveWorkerRequests() {
         if (!port) return;
 
         try {
-            const response = await tunnel.fetch(msg.url, {
+            const response = await keeper.fetch(msg.url, {
                 method: msg.method,
                 headers: msg.headers,
                 body: msg.body ? new Uint8Array(msg.body) : undefined,
@@ -280,8 +223,6 @@ export async function startTunnel(onStage) {
     } catch {
         return false;
     }
-    transport = mod;
-
     hostId = mod.hostIdFromLocation();
     hostKey = mod.hostKeyFromLocation();
     shareToken = mod.shareTokenFromLocation();
@@ -301,24 +242,26 @@ export async function startTunnel(onStage) {
         await new Promise(() => {});
     }
 
-    tunnel = new mod.Tunnel(hostId);
+    const first = new mod.Tunnel(hostId);
     // Reported so the seal on screen can follow something real rather than a
     // timer: identity, calling, binding, connecting, ready.
-    if (onStage) tunnel.onstatus = onStage;
-    tunnel.onclosed = () => {
-        // Go back through the bootstrap. It is the one path that can re-establish
-        // everything — connection, cached interface, worker — and it says what is
-        // happening while it does, rather than leaving a dead page on screen.
-        location.replace(bootstrapAddress());
-    };
+    if (onStage) first.onstatus = onStage;
+    // Go back through the bootstrap. It is the one path that can re-establish
+    // everything — connection, cached interface, worker — and it says what is
+    // happening while it does, rather than leaving a dead page on screen. Once
+    // the line is up, the keeper tries a new line first.
+    const toBootstrap = () => location.replace(bootstrapAddress());
+    first.onclosed = toBootstrap;
 
-    try {
-        await tunnel.connect();
-    } catch (e) {
-        tunnel = null;
-        throw e;
-    }
+    await first.connect();
 
+    keeper = new LineKeeper({
+        dial: () => new mod.Tunnel(hostId),
+        giveUp: toBootstrap,
+        streaming: () => document.body.classList.contains('streaming-active'),
+        notice: showLineNotice,
+    });
+    keeper.adopt(first);
     serveWorkerRequests();
     return true;
 }

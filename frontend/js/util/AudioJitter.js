@@ -26,37 +26,107 @@
  * in bursts rather than in a steady stream, and NetEq reads a burst exactly as
  * it reads a congested link.
  *
- * A target puts a stake in the ground: aim for this, grow past it only if the
- * link really needs it. 60 ms is twelve Opus frames — room for a burst of a
- * dozen packets, a tenth of a second under the measured idle figure, and still
- * far above the 5 ms frame it plays out. Audio that cracks under it would mean
- * the arrival jitter is real rather than self-inflicted, which is the thing
- * this measures. Video's target is set the same way, adaptively, from
- * StreamView's stats loop (WebRtcMedia.setVideoJitterBufferTarget).
+ * From September a target of 60 ms was set on every stream. But libwebrtc
+ * applies `jitterBufferTarget` as a MINIMUM delay (NetEq's base minimum): it
+ * can raise the buffer, never take it below what NetEq wants, so on a clean
+ * link every sound waited for the floor. Measured (plan « le son et la priorité
+ * des paquets », A2-A3 L1): Chrome on a Mac −37 ms without it; Bruno's blind
+ * listening on Wi-Fi, 11/10, heard the same with and without, and without it
+ * NetEq concealed nothing that was not a lost packet. Since then the default is
+ * no floor at all: NetEq sizes itself.
  *
- * `jitterBufferTarget` is Chromium-only; Firefox and Safari ignore it and keep
- * their own adaptive buffer, so this is a no-op there rather than a fallback.
+ * The bench key `mw_audio_target` in localStorage still sets one (a whole
+ * number of ms, 60 for the old default), or `off` none.
+ *
+ * Chrome 124 and later, Firefox 115 and later and Safari 27 have the property
+ * (MDN); a browser without it is a no-op here rather than a fallback.
+ *
+ * Only the stream's sound: the audio road's tracks (`vaudio`, `uaudio`, POC
+ * Ultra U1.4 ter) are audio tracks that carry video, and their receivers are
+ * kept at 0 by RtpVideo.
  */
 
-/** What the audio buffer aims for, in milliseconds. */
-export const AUDIO_JITTER_TARGET_MS = 60;
+/** What the audio buffer aims for by default: nothing, NetEq sizes itself. */
+export const AUDIO_JITTER_TARGET_MS = null;
+
+/** The bench key: a floor in ms (0-4000), or `off` to leave NetEq alone. */
+export const AUDIO_TARGET_KEY = 'mw_audio_target';
+
+/** The audio road's transceivers, which are not the stream's sound. */
+const AUDIO_ROAD_MID = /^[vu]audio$/;
 
 /**
- * Aim every audio receiver of @p pc at @p ms milliseconds.
+ * The floor the bench asks for, read once per stream: the default (none) without
+ * the key, `null` for `off` (no target at all), or a whole number of ms.
+ *
+ * @param {{getItem: (k: string) => string|null}} [storage]
+ * @returns {number|null}
+ */
+export function audioJitterTargetMs(storage) {
+    let raw = null;
+    try {
+        const s = storage || globalThis.localStorage;
+        raw = s ? s.getItem(AUDIO_TARGET_KEY) : null;
+    } catch {
+        raw = null;
+    }
+    if (raw === null || raw === undefined || String(raw).trim() === '')
+        return AUDIO_JITTER_TARGET_MS;
+    const v = String(raw).trim().toLowerCase();
+    if (v === 'off') return null;
+    const ms = Number(v);
+    if (!Number.isFinite(ms) || ms < 0 || ms > 4000) return AUDIO_JITTER_TARGET_MS;
+    return Math.floor(ms);
+}
+
+/** Whether this browser's receivers take `jitterBufferTarget` at all. */
+export function jitterBufferTargetSupported() {
+    return (
+        typeof RTCRtpReceiver !== 'undefined' &&
+        !!RTCRtpReceiver.prototype &&
+        'jitterBufferTarget' in RTCRtpReceiver.prototype
+    );
+}
+
+/**
+ * The receivers of the stream's sound: every audio receiver but the audio
+ * road's, told apart by their transceiver's mid.
  *
  * @param {RTCPeerConnection} pc
- * @param {number} [ms] target in milliseconds; the default is the one above
- * @returns {number} how many receivers took it (0 on a browser without the
- *          property, which is not a failure)
+ * @returns {RTCRtpReceiver[]}
  */
-export function setAudioJitterBufferTarget(pc, ms = AUDIO_JITTER_TARGET_MS) {
+export function streamAudioReceivers(pc) {
+    if (!pc || typeof pc.getReceivers !== 'function') return [];
+    const roads = new Set();
+    if (typeof pc.getTransceivers === 'function') {
+        for (const t of pc.getTransceivers()) {
+            if (t && t.receiver && AUDIO_ROAD_MID.test(t.mid || '')) roads.add(t.receiver);
+        }
+    }
+    return pc
+        .getReceivers()
+        .filter((r) => r && r.track && r.track.kind === 'audio' && !roads.has(r));
+}
+
+/**
+ * Aim the stream's audio receiver of @p pc at @p ms milliseconds.
+ *
+ * @param {RTCPeerConnection} pc
+ * @param {number|null} [ms] target in milliseconds; the default is the bench
+ *        key's, or none; `null` touches nothing
+ * @returns {number} how many receivers took it (0 on a browser without the
+ *          property, or with no target, which is not a failure)
+ */
+export function setAudioJitterBufferTarget(pc, ms = audioJitterTargetMs()) {
     if (!pc || typeof pc.getReceivers !== 'function') return 0;
+    if (ms === null) return 0;
     const targetMs = Math.max(0, ms | 0);
+    console.info(
+        '[Audio] jitter buffer target ' + targetMs + ' ms (bench key ' + AUDIO_TARGET_KEY + ')',
+    );
     let applied = 0;
     try {
-        for (const receiver of pc.getReceivers()) {
-            const track = receiver && receiver.track;
-            if (!track || track.kind !== 'audio') continue;
+        for (const receiver of streamAudioReceivers(pc)) {
             if (receiver.jitterBufferTarget === undefined) continue;
             receiver.jitterBufferTarget = targetMs;
             applied++;

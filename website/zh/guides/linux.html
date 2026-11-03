@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<!-- Generated from /guides/linux.html and _i18n/zh/guides/linux.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>在 Linux 上安装 MoonlightWeb — 把你的 PC 串流到任意浏览器</title>
+<meta name="description" content="分步指南：在你的 Linux 游戏 PC 上安装 MoonlightWeb 服务器（.deb、.rpm 或便携 AppImage），把游戏串流到任何带浏览器的设备。它自己捕获并编码这台 PC，客户端无需安装任何东西。">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#05080d">
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="在 Linux 上安装 MoonlightWeb — 把你的 PC 串流到任意浏览器">
+<meta property="og:description" content="分步指南：在你的 Linux 游戏 PC 上安装 MoonlightWeb 服务器（.deb、.rpm 或便携 AppImage），把游戏串流到任何带浏览器的设备。它自己捕获并编码这台 PC，客户端无需安装任何东西。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://moonlightweb.top/zh/guides/linux.html">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="在 Linux 上安装 MoonlightWeb — 把你的 PC 串流到任意浏览器">
+<meta name="twitter:description" content="分步指南：在你的 Linux 游戏 PC 上安装 MoonlightWeb 服务器（.deb、.rpm 或便携 AppImage），把游戏串流到任何带浏览器的设备。它自己捕获并编码这台 PC，客户端无需安装任何东西。">
+<meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/zh/guides/linux.html">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/guides/linux.html">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/guides/linux.html">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/guides/linux.html">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/guides/linux.html">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/guides/linux.html">
+<!-- /i18n:alternates -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<link rel="stylesheet" href="/assets/pages.css?v={{(fileStat `/assets/pages.css`).ModTime.Unix}}">
+<!-- Shared header/footer styling -->
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://moonlightweb.top/zh/"},
+        {"@type": "ListItem", "position": 2, "name": "Guides", "item": "https://moonlightweb.top/zh/guides/"},
+        {"@type": "ListItem", "position": 3, "name": "Install on Linux", "item": "https://moonlightweb.top/zh/guides/linux.html"}
+      ]
+    },
+    {
+      "@type": "HowTo",
+      "name": "Install MoonlightWeb on Linux and stream your PC to any browser",
+      "description": "Install the MoonlightWeb server on a Linux gaming PC — it captures and encodes that machine itself — and play from any device with a browser.",
+      "totalTime": "PT5M",
+      "estimatedCost": {"@type": "MonetaryAmount", "currency": "USD", "value": "0"},
+      "supply": [{"@type": "HowToSupply", "name": "Linux gaming PC (x64) with a GPU capable of hardware encoding"}],
+      "tool": [{"@type": "HowToTool", "name": "A modern browser on any client device (Chrome, Edge, Safari, Firefox)"}],
+      "step": [
+        {"@type": "HowToStep", "name": "Download a package", "text": "Download the .deb (Debian, Ubuntu, Mint, Pop!_OS), the .rpm (Fedora, RHEL, Rocky, Alma, openSUSE) or the portable AppImage (SteamOS and the rest; Arch uses the AUR package) from the MoonlightWeb releases page.", "url": "https://moonlightweb.top/zh/guides/linux.html#step-download"},
+        {"@type": "HowToStep", "name": "Install and launch the server", "text": "Install the package with your package manager, or make the AppImage executable and run it, on the gaming PC.", "url": "https://moonlightweb.top/zh/guides/linux.html#step-install"},
+        {"@type": "HowToStep", "name": "Answer the setup wizard", "text": "On first launch the setup wizard at https://localhost/setup asks about the optional Internet link. Nothing else is installed: the app captures and encodes this desktop itself.", "url": "https://moonlightweb.top/zh/guides/linux.html#step-setup"},
+        {"@type": "HowToStep", "name": "Open a browser on any device", "text": "Go to https://localhost on the PC itself, or your LAN IP from another device on your network.", "url": "https://moonlightweb.top/zh/guides/linux.html#step-open"},
+        {"@type": "HowToStep", "name": "Your PC is already there", "text": "The gaming PC is listed straight away, with one card per screen — no pairing, no PIN. Other hosts on the network (Sunshine, Wolf, MultiSeat) are discovered too and pair with a PIN.", "url": "https://moonlightweb.top/zh/guides/linux.html#step-pair"},
+        {"@type": "HowToStep", "name": "Press play", "text": "Pick a game or the full desktop and play from any browser in the house — or anywhere.", "url": "https://moonlightweb.top/zh/guides/linux.html#step-play"}
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/zh/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/zh/" data-nav="home">首页</a><a href="/zh/guides/" data-nav="guides" aria-current="page">指南</a><a href="/zh/faq.html" data-nav="faq">常见问题</a><a href="/zh/contact.html" data-nav="contact">联系</a><a href="/zh/server-access/" data-nav="connect">连接主机</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/guides/linux.html">English</option><option value="fr" data-href="/fr/guides/linux.html">Français</option><option value="de" data-href="/de/guides/linux.html">Deutsch</option><option value="zh" data-href="/zh/guides/linux.html" lang="zh" selected>中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<main>
+<div class="wrap">
+  <nav class="crumbs" aria-label="Breadcrumb" data-i18n-html="crumbs"><a href="/zh/">首页</a> / <a href="/zh/guides/">指南</a> / Linux</nav>
+  <span class="kicker" data-i18n="kicker">安装指南 · Linux</span>
+  <h1 data-i18n="h1">把你的 Linux 游戏 PC 串流到任何浏览器</h1>
+  <p class="lead" data-i18n-html="lead">MoonlightWeb 是一个免费、开源（GPL-3.0）的服务器，把你的游戏主机串流到任何带浏览器的设备。<strong>在游戏 PC 上装一个软件包。其他每台设备只要打开一个网址。</strong></p>
+
+  <h2 data-i18n="need.h">你需要什么</h2>
+  <ul>
+    <li data-i18n="need.1">一台 Linux 游戏 PC（x64），配备支持硬件编码的 GPU——也就是运行你游戏的那台机器。</li>
+    <li data-i18n-html="need.2"><strong>不需要安装别的</strong>——MoonlightWeb 自己捕获桌面（KMS，或 Wayland 下合成器自己的屏幕录制）并通过 VA-API 或 Vulkan Video 编码。声音需要 <strong>PipeWire</strong>：在仍然使用纯 PulseAudio 的机器上，串流会没有声音，日志中会说明。已经在别处跑着 Sunshine、Wolf 或 MultiSeat？那些机器可以在同一个页面里配对。</li>
+    <li data-i18n="need.3">任何带现代浏览器的设备都可作客户端：Chrome、Edge、Safari 或 Firefox。无需应用、无需账户。</li>
+    <li data-i18n-html="need.4">发行版不低于 <strong>Ubuntu 22.04</strong>、<strong>Debian 12</strong> 或 <strong>Fedora 36</strong>（glibc 2.34+）。Qt 和 OpenSSL 已内置，但系统的 C 运行库永远无法内置：在更旧的发行版上，软件包能装上，应用却拒绝启动。</li>
+  </ul>
+
+  <h2 id="one-line-install" data-i18n="repo.h">捷径：一条命令，还自带更新</h2>
+  <p data-i18n-html="repo.p">MoonlightWeb 提供经过签名的 <strong>APT</strong> 和 <strong>DNF</strong> 软件源。从软件源安装，意味着系统的更新程序会自动让 MoonlightWeb 保持最新，而且应用会像其他程序一样出现在 <strong>GNOME 软件</strong>、<strong>KDE Discover</strong> 和 Ubuntu 的 <strong>App Center</strong> 中。这一条命令会检测你的发行版并做正确的事：</p>
+  <pre><code>curl -fsSL https://moonlightweb.top/install.sh | bash</code></pre>
+  <p data-i18n="repo.manual">想手动操作？那正是下面这些步骤：</p>
+  <pre><code># Debian / Ubuntu / Mint / Pop!_OS
+sudo install -d /etc/apt/keyrings
+sudo curl -fsSL -o /etc/apt/keyrings/moonlightweb.gpg https://packages.moonlightweb.top/moonlightweb.gpg
+sudo curl -fsSL -o /etc/apt/sources.list.d/moonlightweb.sources https://packages.moonlightweb.top/moonlightweb.sources
+sudo apt update &amp;&amp; sudo apt install moonlightweb
+
+# Fedora / RHEL / Rocky / Alma / Nobara
+sudo curl -fsSL -o /etc/yum.repos.d/moonlightweb.repo https://packages.moonlightweb.top/moonlightweb.repo
+sudo dnf install moonlightweb
+
+# openSUSE
+sudo curl -fsSL -o /etc/zypp/repos.d/moonlightweb.repo https://packages.moonlightweb.top/moonlightweb.repo
+sudo zypper install moonlightweb
+
+# Arch / Manjaro / EndeavourOS
+paru -S moonlightweb-bin</code></pre>
+  <p data-i18n-html="repo.rest">SteamOS、Bazzite 及其他不可变系统没有可以添加软件源的包管理器——它们继续使用便携的 AppImage，同一条命令也会帮你下载。下面的手动方式在任何系统上依然有效。</p>
+
+  <h2 id="docker" data-i18n="docker.h">更喜欢 Docker？无头服务器、NAS 与迷你 PC</h2>
+  <p data-i18n-html="docker.p">官方多架构镜像（<code>amd64</code> + <code>arm64</code>）已发布到 GitHub Container Registry。在任何装有 Docker 的 Linux 主机上一条命令即可——<code>--network host</code> 让容器直接处于你的局域网中，从而发现网络上的主机。容器没有桌面可供捕获：因此它串流的是你配对的机器，而不是它自己：</p>
+  <pre><code>docker run -d --name moonlightweb --network host \
+  -v mw-data:/data --restart unless-stopped \
+  ghcr.io/linckosz/moonlight-web:latest</code></pre>
+  <p data-i18n-html="docker.p2">容器没有可信任的本地浏览器，因此先设置一次访问 PIN 码，然后打开 <code>https://&lt;服务器-IP&gt;</code> 并输入：</p>
+  <pre><code>docker exec moonlightweb moonlightweb --new-pin</code></pre>
+  <p data-i18n-html="docker.rest">用 <code>docker pull</code> 更新并重建容器——数据卷会保留你的配对和证书。Compose 文件、端口表、macvlan 以及一键互联网访问都在 <a href="https://github.com/linckosz/moonlight-web/blob/main/docker/README.md" target="_blank" rel="noopener">Docker 指南</a>中。</p>
+
+  <h2 data-i18n="steps.h">逐步安装</h2>
+  <div class="gsteps">
+    <div class="gstep cyb" id="step-download">
+      <h3 data-i18n="step1.h">下载一个软件包</h3>
+      <p data-i18n-html="step1.p">从<a href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener">发布页面</a>按你的发行版系列选择：<strong>Debian、Ubuntu、Mint、Pop!_OS、elementary、Zorin</strong> 用 <code>.deb</code>；<strong>Fedora、RHEL、CentOS Stream、Rocky、Alma、Nobara、openSUSE</strong> 用 <code>.rpm</code>；<strong>SteamOS、Bazzite</strong> 及其他一切用便携的 <code>.AppImage</code>（<strong>Arch 和 Manjaro</strong> 用 AUR 软件包 <code>moonlightweb-bin</code>）。每个软件包都是自包含的（内置 Qt 和 OpenSSL——无需安装任何依赖）。</p>
+    </div>
+    <div class="gstep cyb" id="step-install">
+      <h3 data-i18n="step2.h">安装并启动——在游戏 PC 上</h3>
+      <pre><code># Debian / Ubuntu / Mint / Pop!_OS — double-clicking the .deb works too
+sudo apt install ./moonlightweb-*-linux-x64.deb
+
+# Fedora / RHEL / Rocky / Alma / Nobara
+sudo dnf install ./moonlightweb-*-linux-x64.rpm
+
+# openSUSE
+sudo zypper install --allow-unsigned-rpm ./moonlightweb-*-linux-x64.rpm
+
+# Arch / SteamOS / other — portable AppImage (needs FUSE 2, see below)
+chmod +x moonlightweb-*.AppImage
+./moonlightweb-*.AppImage</code></pre>
+      <p data-i18n-html="step2.p">软件包安装到 <code>/opt/moonlightweb</code>，添加菜单项和 <code>moonlightweb</code> 命令，打开所需的防火墙端口，并立即启动服务器。</p>
+      <p data-i18n-html="step2.p3"><strong>要让这台机器当主机，请使用 .deb、.rpm 或 AUR 软件包。</strong>屏幕捕获需要文件 capability，而它无法在 AppImage 内保留：便携 AppImage 仍能串流你网络上的 Sunshine、Wolf 和 MultiSeat 主机，但永远无法串流它自己的屏幕。</p>
+    </div>
+    <div class="gstep cyb" id="step-setup">
+      <h3 data-i18n="stepS.h">回答设置向导</h3>
+      <p data-i18n-html="stepS.p">首次启动时，MoonlightWeb 会打开 <code>https://localhost/setup</code>，它只问剩下的这一个问题：是否允许互联网连接（远程串流会话，默认关闭）。别的什么都不装——这个桌面由应用自己捕获。在 GNOME 以外的 Wayland 会话中，第一次串流可能会弹出一次合成器的屏幕共享对话框；之后授权会被记住。</p>
+    </div>
+    <div class="gstep cyb" id="step-open">
+      <h3 data-i18n="step3.h">在任何设备上打开浏览器</h3>
+      <p data-i18n-html="step3.p">在 PC 本机上：<code>https://localhost</code>。从你网络上的其他设备：你的局域网 IP。要从网络之外游玩：启用互联网访问，应用便会给你一个直达这台机器的远程接入链接。你也可以使用自己的域名和证书。</p>
+    </div>
+    <div class="gstep cyb" id="step-pair">
+      <h3 data-i18n="step4.h">你的 PC 已经在那里</h3>
+      <p data-i18n="step4.p">这台机器一开始就列在那里，每块屏幕一张卡片——无需配对，也没有 PIN 码。你网络上的其他主机（Sunshine、Wolf、MultiSeat）会通过 mDNS 出现在旁边：那些只需配对一次——对于 Sunshine，在其网页中输入 MoonlightWeb 显示的 PIN 码——之后永久记住。</p>
+    </div>
+    <div class="gstep cyb" id="step-play">
+      <h3 data-i18n="step5.h">按下开始</h3>
+      <p data-i18n="step5.p">选择一块屏幕、一款游戏或完整桌面。全屏、手柄在手——最高 4K、240 fps，Wi-Fi 下延迟低于 20 毫秒。（Linux 主机的 HDR 尚未实现。）</p>
+    </div>
+  </div>
+
+  <p style="text-align:center"><a class="btn btn-primary" href="https://github.com/linckosz/moonlight-web/releases" target="_blank" rel="noopener" data-umami-event="download" data-umami-event-loc="guide-linux" data-i18n="dl.btn">⬇ 下载 Linux 版</a></p>
+
+  <h2 data-i18n="tr.h">疑难解答</h2>
+  <h3 data-i18n="trOld.h">安装很顺利，但点击应用毫无反应</h3>
+  <p data-i18n-html="trOld.p">几乎都是发行版比上面的要求更旧。菜单项在没有终端的情况下启动，加载器的报错无处显示，点击看起来就像什么都没发生。请在终端中运行 <code>/opt/moonlightweb/bin/MoonlightWeb</code>：若出现包含 <code>GLIBC_</code> 或 <code>GLIBCXX_</code> <em>not found</em> 的行即可确认。唯一的办法是升级发行版——程序无法自带 C 运行库。</p>
+  <h3 data-i18n="tr0.h">双击 AppImage 只弹出“搜索软件”的窗口</h3>
+  <p data-i18n-html="tr0.p">AppImage 只是一个普通文件：在被标记为可执行之前，桌面环境不会运行它（<code>chmod +x moonlightweb-*.AppImage</code>，或者<em>属性 → 权限 → 允许执行</em>）。它还需要 <strong>FUSE 2</strong>，而 Ubuntu 22.04 及以后不再自带——请用 <code>sudo apt install libfuse2t64</code> 安装（Ubuntu 24.04 之前为 <code>libfuse2</code>），或者用 <code>./moonlightweb-*.AppImage --appimage-extract-and-run</code> 运行。<strong>在 Debian、Ubuntu 及其衍生版上，请直接使用 <code>.deb</code></strong>：双击即可安装，没有这些限制，还会添加正规的菜单项。</p>
+  <h3 data-i18n="tr1.h">主机没有出现在浏览器里</h3>
+  <p data-i18n="tr1.p">请确保客户端设备与游戏 PC 处于同一网络，并且你的防火墙放行了 MoonlightWeb 的端口。你也可以通过 IP 手动添加主机。</p>
+  <h3 data-i18n="tr2.h">HEVC 或 AV1 被置灰</h3>
+  <p data-i18n="tr2.p">你的浏览器无法硬件解码的编解码器选项会被自动禁用——这是正常的。H264 到处都能用；HEVC 和 AV1 是否可用取决于客户端设备的浏览器和 GPU。</p>
+  <h3 data-i18n="tr3.h">弱网络下串流卡顿</h3>
+  <p data-i18n-html="tr3.p">降低串流分辨率并启用 <strong>Video Enhancement（视频增强）</strong>：串流会在客户端 GPU 上放大并锐化（WebGL2 或 WebGPU 运行 MoonlightWeb 自研放大算法），于是 720p 串流看起来接近 1440p。</p>
+
+  <div class="note" data-i18n-html="note"><strong>网络受限？</strong>当网络屏蔽 UDP 时，MoonlightWeb 会自动回退到 TCP，仍是直连——除非 PC 的防火墙已开启（firewalld，或已启用的 ufw）：目前安装包只为串流开放 UDP 端口。</div>
+
+  <h2 data-i18n="read.h">继续阅读</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/zh/faq.html"><strong data-i18n="x.faq.t">常见问题</strong><span data-i18n="x.faq.d">延迟、编解码器、安全、互联网远程游玩——所有常见问题。</span></a>
+    <a class="cyb" href="/zh/guides/windows.html"><strong data-i18n="x.win.t">在 Windows 上安装</strong><span data-i18n="x.win.d">向导式安装程序——一个向导，别的都不用配。</span></a>
+    <a class="cyb" href="/zh/guides/macos.html"><strong data-i18n="x.mac.t">在 macOS 上安装</strong><span data-i18n="x.mac.d">Apple Silicon 指南，附 .pkg 安装程序。</span></a>
+  </div>
+</div>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/zh/">首页</a> · <a href="/zh/guides/">指南</a> · <a href="/zh/faq.html">常见问题</a> · <a href="/zh/contact.html">联系</a> · <a href="/zh/server-access/">连接主机</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>咖啡</span></a></span><span class="foot-play">畅玩设备： <a href="/zh/play/chromebook.html">Chromebook</a> · <a href="/zh/play/iphone-ipad.html">iPhone 和 iPad</a> · <a href="/zh/play/tv.html">电视</a> · <a href="/zh/sunshine-web-client.html">Sunshine 网页客户端</a> · <a href="/zh/browser-game-streaming.html">为什么选择浏览器客户端</a></span></div></footer>
+
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+</body>
+</html>

@@ -20,16 +20,22 @@
 #include "../../capture/windows/IWindowsCapture.h"
 #include "../IInputSink.h"
 #include "../RecentreDetector.h"
+#include "../SystemMouse.h"
+#include "../VirtualHid.h"
+#include "../../core/ClickTrace.h"
 #include "VigemGamepad.h"
+#include "WinTextKeys.h"
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
+#include <unordered_map>
 
 namespace mw::native::input {
 
@@ -77,6 +83,19 @@ public:
     void setGateCallback(InputGateCallback callback) override;
     bool releaseBlock() override;
 
+    /// The bench's click trace (clicktrace=1): each mouse button press handed
+    /// to the OS goes into @p trace, which must outlive this sink. Before
+    /// start(), or not at all.
+    void setClickTrace(ClickTrace* trace) { m_ClickTrace = trace; }
+
+    /// The host's own mouse (input/SystemMouse.h), made by start() through the
+    /// "MoonlightWeb Virtual HID" driver: -1 (the product) when the host has
+    /// no pointing device of its own, 0 never, 1 always — beside a real mouse
+    /// too, for the bench (EncoderTuning::virtualMouse). Before start().
+    void setVirtualMouse(int mode) { m_MouseMode = mode; }
+
+    bool showsPointer() override;
+
 private:
     /// The body of releaseBlock, on its own thread — see the .cpp.
     void runRelease(void* blockerWindow);
@@ -95,10 +114,22 @@ private:
     void injectKey(const InputEvent& event, bool down);
     /// One character the client's layout produced, pressed and released as the
     /// real key of the HOST's layout that carries it — so the scancode exists
-    /// and games see a key, unlike injectText's Unicode path (which is the
-    /// fallback here for a character no local key can reach).
-    void injectChar(const std::string& utf8, bool down);
+    /// and games see a key. A character the layout reaches through a dead key
+    /// is typed whole on the press, and Unicode is the fallback for one no
+    /// local key can reach (WinTextKeys.h).
+    void injectChar(const InputEvent& event, bool down);
+    /// A chord of the touch keyboard's bar: the key carrying the character,
+    /// nothing else touched (WinTextKeys planChordEdge).
+    void injectChord(const InputEvent& event, char32_t ch, const WinKeyLayout* layout, bool down);
+    /// Text from a soft keyboard: the keys of the host's layout, in one
+    /// SendInput per piece, Unicode only where no key types a character.
     void injectText(const std::string& utf8);
+    /// Count what a text did, for the session's line at stop(); the first one
+    /// also says which kind of window took it. Never a character.
+    void noteText(const WinTextCounts& counts, const std::string& unicodeWhy, void* window,
+                  uintptr_t hkl);
+    /// The modifiers the viewer holds, read off m_HeldKeys. Under m_HeldMutex.
+    WinHeldMods heldModsLocked() const;
     void injectMouseMove(int deltaX, int deltaY);
     /// Warp the pointer to the nearest point of the captured display if it is
     /// on another screen. A relative move applied from there is visible.
@@ -115,6 +146,48 @@ private:
     void injectScroll(int amount, bool horizontal);
     void syncLockKeys(const InputEvent& event);
 
+    // ── The host's own mouse ────────────────────────────────────────────────
+    //
+    // On a host with no pointing device, a mouse of our own, made through the
+    // driver (porte S1: one fixed descriptor, input/SystemMouse.h). Windows
+    // then shows its pointer, and games that read Raw Input by device get one.
+    //
+    // What goes through it: relative moves, and — while the viewer moves the
+    // pointer relatively (gaming mode, a game that re-centres) — the buttons
+    // and the wheels. An absolute position stays SendInput, which has no
+    // device to say it: a report travels the HID stack and lands after a
+    // SendInput sent at the same moment, so a click right after a placement
+    // goes the same way as the placement, or it would land before it. A
+    // button is released the way it was pressed.
+    //
+    // Made in start() when it can be (a worker elevated or SYSTEM, the driver
+    // 0.1.2.0 or later); when it cannot, everything is SendInput as before
+    // and Mouse Keys show the pointer (PointerPresence).
+
+    /// Makes it, per m_MouseMode. Said in the log either way.
+    void startVirtualMouse();
+    /// One movement through it, with the buttons it holds. Under m_HeldMutex.
+    /// False when the device refused it — then it is let go of, and the
+    /// caller does it through SendInput instead.
+    bool sendThroughMouseLocked(int dx, int dy, int notches, int panNotches);
+    /// The device let go of, after a refusal: what it held is released with it.
+    void dropVirtualMouseLocked();
+
+    int m_MouseMode = -1;
+    std::unique_ptr<IVirtualHid> m_Mouse;
+    /// Its buttons down (systemmouse::buttonBit). Under m_HeldMutex.
+    uint8_t m_MouseButtons = 0;
+    /// Whether the viewer's last motion was relative: buttons and wheels go
+    /// through the device then. Input-thread only.
+    bool m_Relative = false;
+    systemmouse::Notches m_WheelNotches;
+    systemmouse::Notches m_PanNotches;
+    /// When it was made, and whether Windows lists it yet — see showsPointer().
+    int64_t m_MouseMadeUs = 0;
+    int64_t m_MouseLookedUs = 0;
+    bool m_MouseListed = false;
+    bool m_MouseUnlistedSaid = false;
+
     /// Release everything still recorded as held. Called by stop().
     void releaseAll();
 
@@ -123,8 +196,9 @@ public:
     /// only so the file-local helper can build one.
     struct WindowStanding
     {
-        int level = -1;   ///< integrity RID; -1 = unknown (protected process)
-        std::string name; ///< "title" (exe, pid), filled for elevated windows only
+        int level = -1;    ///< integrity RID; -1 = unknown (no window, a token not ours to read)
+        bool ours = false; ///< a window of this very process: never in the way
+        std::string name;  ///< "title" (exe, pid), filled for elevated and unknown windows only
     };
 
 private:
@@ -138,12 +212,45 @@ private:
 
     const WindowStanding& cachedStanding(void* window, StandingCache& cache);
     /// "uipi", "policy", or "" when a press aimed at `standing` goes through.
+    /// An unknown window is "policy" unless the viewer is let into elevated ones.
     const char* gateReason(const WindowStanding& standing) const;
     /// Tell the log and the listener when the gate's state changed. @p window
     /// is the HWND `standing` describes, kept so releaseBlock knows what to
     /// leave minimised. @p force reports even an unchanged state, which is how
     /// releaseBlock answers a viewer waiting on its own button.
     void reportGate(const WindowStanding& standing, void* window, bool force = false);
+
+    // ── Between the gate and Windows (security review M2, 26/10/2026) ───────
+    //
+    // The gate reads the window a press is aimed at when the press is handed
+    // over; Windows applies it after whatever was sent before it. For a viewer
+    // the policy holds back, two things close that gap: a click or a scroll in
+    // absolute mode goes in WITH the position the gate looked at, in the same
+    // SendInput; and a press that follows what switches windows waits for the
+    // switch to land. While the viewer moves relatively nothing is anchored —
+    // an absolute move would be a jump in a game — and a window that takes the
+    // focus on its own, in the instant between the check and the press, is
+    // not caught either.
+
+    /// What may switch windows, noted after it is sent. Input-thread only.
+    void noteSwitch(const InputEvent& event);
+    /// Wait out a switch noted less than 100 ms ago: any press waits for one
+    /// asked by the keyboard, a keyboard press also for a click's.
+    void settleAfterSwitch(bool keyboard);
+    /// A held-back viewer's press goes where it was last placed.
+    bool anchored() const;
+
+    /// The last placement, in desktop pixels and in SendInput's absolute
+    /// units. Input-thread only, like m_Relative.
+    bool m_Placed = false;
+    int64_t m_PlacedX = 0;
+    int64_t m_PlacedY = 0;
+    int32_t m_PlacedAbsX = 0;
+    int32_t m_PlacedAbsY = 0;
+    /// When a switch was last asked by the keyboard, and by a click; 0: none
+    /// pending. Input-thread only.
+    int64_t m_SwitchUs = 0;
+    int64_t m_ClickUs = 0;
 
     StandingCache m_Focused;     ///< the foreground window — keyboard's target
     StandingCache m_UnderCursor; ///< the window under the pointer — a click's
@@ -177,6 +284,9 @@ private:
     // worker runs as SYSTEM. An ordinary worker still injects on the caller's
     // thread, on exactly the path that was measured.
     bool m_Follow = false;
+    ClickTrace* m_ClickTrace = nullptr;
+    /// When the last button press was queued for the follower (click trace).
+    std::atomic<int64_t> m_PressQueuedUs{0};
     std::thread m_Follower;
     std::mutex m_QueueMutex;
     std::condition_variable m_QueueWake;
@@ -208,6 +318,23 @@ private:
     std::mutex m_HeldMutex;
     std::set<int> m_HeldKeys;    ///< virtual-key codes
     std::set<int> m_HeldButtons; ///< browser button numbers, 1..5
+    /// The scancode a held key went down with, when the host's layout chose
+    /// it rather than the US table (a character's key), E0 in the high byte:
+    /// what releaseAll lets go of is the key that went down, not its VK's US
+    /// position — on AZERTY those are different keys.
+    std::map<int, uint16_t> m_HeldScan;
+    /// The key each character went down on, so its release lets go of that
+    /// key whatever the layout says by then. Only for characters held as one
+    /// key: a dead-key pair or Unicode is typed whole on the press.
+    std::unordered_map<char32_t, WinStroke> m_CharKeys;
+
+    /// What the session's text did, for one line at stop(): counts and why
+    /// Unicode was needed, never a character. Guarded: the follower thread
+    /// types while stop() reads.
+    std::mutex m_TextMutex;
+    WinTextCounts m_Text;
+    std::set<std::string> m_TextUnicodeWhy;
+    bool m_TextWindowSaid = false;
 
     /// Events applied since start(), and which InputEvent::Type values have
     /// been seen at least once (one bit each). Only ever read for the log

@@ -237,6 +237,13 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; (see AutostartCheck in [Code]), ticked by default and still within reach at
 ; the very last click — and, on an update, showing what the machine already does.
 
+#if MyArch == "arm64"
+[InstallDelete]
+; The x64 virtual display driver an earlier ARM64 installer laid down: this
+; one bundles none (see the Virtual Display page in [Code]).
+Type: filesandordirs; Name: "{app}\drivers\vdd"
+
+#endif
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
@@ -265,11 +272,10 @@ const
   UninstallKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppId}_is1';
   // Trigger-less, elevated task the running (unprivileged) app starts with
   // `schtasks /Run` to apply an update without a UAC prompt nobody could answer
-  // from a remote browser. Its action is the fixed staging path SelfUpdater
-  // downloads to — the two MUST agree or the task runs nothing.
+  // from a remote browser. Its action is our exe under {app} with
+  // --update-apply, which verifies what SelfUpdater staged before running it.
   UpdateTaskName = '{#MyAppName} Update';
-  UpdateStagedExe = '%LocalAppData%\{#MyAppName}\update\MoonlightWeb-update.exe';
-  UpdateSilentArgs = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-';
+  UpdateApplyArgs = '--update-apply';
   // Trigger-less, elevated task the running (unprivileged) app starts to add
   // or remove a virtual display on a headless machine — a driver install that
   // would otherwise raise a UAC prompt on a desktop with no monitor. Its
@@ -288,6 +294,14 @@ const
   // page, so an update does not ask again (the device node itself is the
   // truth about what is installed; the helper never creates a second one).
   VDisplaySetupKey = 'SOFTWARE\{#MyAppName}\Setup';
+  // Ctrl+Alt+Suppr from the stream (design §31.7): Windows takes SendSAS from
+  // the launcher service only under this machine policy — 1 lets services
+  // press it, 3 services and Ease of Access. Set when nothing has set it. Each
+  // edition relying on a value one of our installers set is named under
+  // SasOwnersKey, and the value goes when the last of them is uninstalled.
+  SasPolicyKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System';
+  SasPolicyValue = 'SoftwareSASGeneration';
+  SasOwnersKey = 'SOFTWARE\MoonlightWeb\SoftwareSASGeneration';
 
 var
   InternetPage: TWizardPage;
@@ -403,6 +417,39 @@ begin
   Result := RegQueryDWordValue(HKEY_LOCAL_MACHINE, VDisplaySetupKey,
                                'AutostartWanted', v);
   if Result then want := v <> 0;
+end;
+
+// The policy Ctrl+Alt+Suppr needs (see SasPolicyKey). Left alone when anyone
+// else set it — an administrator, a group policy, another remote desktop — to
+// whatever value: their answer stands, and nothing of ours ever removes it.
+procedure ClaimSasPolicy();
+var
+  v: Cardinal;
+begin
+  if not RegQueryDWordValue(HKEY_LOCAL_MACHINE, SasPolicyKey, SasPolicyValue, v) then begin
+    if RegWriteDWordValue(HKEY_LOCAL_MACHINE, SasPolicyKey, SasPolicyValue, 1) then
+      RegWriteDWordValue(HKEY_LOCAL_MACHINE, SasOwnersKey, '{#MyAppName}', 1);
+  end else if RegKeyExists(HKEY_LOCAL_MACHINE, SasOwnersKey) then
+    // One of our installers set it, for the other edition: this one relies on
+    // it too.
+    RegWriteDWordValue(HKEY_LOCAL_MACHINE, SasOwnersKey, '{#MyAppName}', 1);
+end;
+
+// Uninstall: the value goes only if one of our installers set it, no other
+// edition still relies on it, and it still says what we wrote.
+procedure ReleaseSasPolicy();
+var
+  names: TArrayOfString;
+  v: Cardinal;
+begin
+  if not RegKeyExists(HKEY_LOCAL_MACHINE, SasOwnersKey) then Exit;
+  RegDeleteValue(HKEY_LOCAL_MACHINE, SasOwnersKey, '{#MyAppName}');
+  if RegGetValueNames(HKEY_LOCAL_MACHINE, SasOwnersKey, names) and
+     (GetArrayLength(names) > 0) then Exit;
+  RegDeleteKeyIncludingSubkeys(HKEY_LOCAL_MACHINE, SasOwnersKey);
+  RegDeleteKeyIfEmpty(HKEY_LOCAL_MACHINE, 'SOFTWARE\MoonlightWeb');
+  if RegQueryDWordValue(HKEY_LOCAL_MACHINE, SasPolicyKey, SasPolicyValue, v) and (v = 1) then
+    RegDeleteValue(HKEY_LOCAL_MACHINE, SasPolicyKey, SasPolicyValue);
 end;
 
 // True when a Desktop shortcut created by a previous install is still there.
@@ -527,7 +574,11 @@ begin
   InternetSkipButton.Visible := False;
 
   // Step: "MoonlightWeb Virtual Display". Same shape as the Internet page:
-  // a question with two answers and no default, asked once.
+  // a question with two answers and no default, asked once. Not on ARM64:
+  // the driver bundled is x64 only, and Windows on ARM takes a driver package
+  // signed by Microsoft only (0x800b0109, 20/10/2026), so there is nothing to
+  // offer — VDisplayPage stays nil and every use of it below checks.
+#if MyArch != "arm64"
   VDisplayPage := CreateCustomPage(InternetPage.ID,
     ExpandConstant('{cm:VDisplayPageCaption}'), ExpandConstant('{cm:VDisplayPageDesc}'));
 
@@ -549,6 +600,7 @@ begin
   VDisplayOptionLabel.Font.Style := [fsBold];
   VDisplayOptionLabel.Font.Color := $43A02E;
   VDisplayOptionLabel.Caption := ExpandConstant('{cm:VDisplayPageOption}');
+#endif
 
   // Live checklist shown during post-install (driven in RunProvisionChecklist).
   ProgressPage := CreateOutputProgressPage(
@@ -621,7 +673,11 @@ begin
   else if (InternetPage <> nil) and (PageID = InternetPage.ID) then
     Result := SettingsHasKey('internet_access_enabled')
   else if (VDisplayPage <> nil) and (PageID = VDisplayPage.ID) then
-    Result := RegValueExists(HKEY_LOCAL_MACHINE, VDisplaySetupKey, 'VirtualDisplayAccepted');
+    // A silent walk reads as "Accepter", and an update from the web app is
+    // always silent: a page that was skipped stays skipped rather than be
+    // answered by nobody. A silent first install does install it.
+    Result := WizardSilent or
+              RegValueExists(HKEY_LOCAL_MACHINE, VDisplaySetupKey, 'VirtualDisplayAccepted');
 end;
 
 // Content of the Ready page's memo. In update mode it says what is about to
@@ -671,6 +727,10 @@ begin
   // install never gets here at all), the box sits under the closing text.
   if CurPageID = wpFinished then begin
     if WizardForm.RunList.Visible then begin
+      // RunList draws its check glyph Offset pixels in from its own left edge;
+      // match it so both boxes stand in one column.
+      AutostartCheck.Left := WizardForm.RunList.Left + WizardForm.RunList.Offset;
+      AutostartCheck.Width := WizardForm.RunList.Width - WizardForm.RunList.Offset;
       AutostartCheck.Top := WizardForm.RunList.Top;
       WizardForm.RunList.Top := AutostartCheck.Top + AutostartCheck.Height + ScaleY(8);
     end else
@@ -709,6 +769,23 @@ end;
 // Defined with the task helpers further down; declared here because the Finish
 // click below is the one place it is called from before that.
 procedure ApplyAutostartChoice(want: Boolean); forward;
+
+// The Internet answer of a silent install: only an explicit /INTERNET=yes (or
+// on, true, 1) on the command line opens it. Anything else keeps it closed,
+// and the log says why.
+function SilentInternetWanted(): Boolean;
+var
+  value: String;
+begin
+  value := Lowercase(Trim(ExpandConstant('{param:INTERNET|}')));
+  Result := (value = 'yes') or (value = 'on') or (value = 'true') or (value = '1');
+  if Result then
+    Log('Internet: opened by /INTERNET=' + value + ' (silent install)')
+  else if value = '' then
+    Log('Internet: kept closed (silent install, no /INTERNET=yes)')
+  else
+    Log('Internet: kept closed (silent install, /INTERNET=' + value + ' is not yes)');
+end;
 
 // The Internet page is the only one that answers a question, and it answers it
 // through this hook: "Accepter" is Next itself, "Passer" is Next reached through
@@ -777,6 +854,53 @@ begin
   // The gamepad driver is wanted on an update as much as on a fresh install,
   // and it is the only thing this installer fetches from the network.
   InstallVigemBus();
+end;
+
+// --- Visual C++ runtime ----------------------------------------------------
+//
+// MoonlightWeb.exe links against Microsoft's C++ runtime (VCRUNTIME140.dll,
+// MSVCP140.dll, MSVCP140_1.dll). windeployqt puts Microsoft's own
+// vc_redist.<arch>.exe in the payload but installs nothing, and on a Windows
+// that never received the runtime from anything else — a fresh install, a VM —
+// the exe dies at load with "VCRUNTIME140.dll was not found": the server, and
+// every helper this installer runs through it (worker service, virtual
+// display). Seen on a fresh Windows 11 in October 2026; every bench machine
+// already had the runtime, and so does the CI runner whose smoke test starts
+// the exe.
+//
+// The redistributable's file version is the runtime version it installs, and
+// it records that version under Runtimes\<arch>. Installed only when missing
+// or older than ours: an exe built with a newer toolset than the runtime it
+// finds can still load and then fail, so "present" alone is not enough.
+
+function VCRuntimeAtLeast(Wanted: Int64): Boolean;
+var
+  installed, major, minor, bld: Cardinal;
+  key: String;
+begin
+  Result := False;
+  key := 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\{#MyArch}';
+  if not RegQueryDWordValue(HKLM64, key, 'Installed', installed) or (installed <> 1) then Exit;
+  if not RegQueryDWordValue(HKLM64, key, 'Major', major) then Exit;
+  if not RegQueryDWordValue(HKLM64, key, 'Minor', minor) then Exit;
+  if not RegQueryDWordValue(HKLM64, key, 'Bld', bld) then Exit;
+  Result := ComparePackedVersion(PackVersionComponents(major, minor, bld, 0), Wanted) >= 0;
+end;
+
+procedure InstallVCRuntime();
+var
+  redist: String;
+  wanted: Int64;
+  rc: Integer;
+begin
+  redist := ExpandConstant('{app}\vc_redist.{#MyArch}.exe');
+  if not FileExists(redist) then Exit;
+  if not GetPackedVersion(redist, wanted) then wanted := 0;
+  if VCRuntimeAtLeast(wanted) then Exit;
+  // /norestart: the DLLs are usable at once on a machine that had none, which
+  // is the case this is for. Exit codes (3010 = reboot wanted, 1638 = newer
+  // already there) change nothing for us, so none is reported.
+  Exec(redist, '/install /quiet /norestart', '', SW_HIDE, ewWaitUntilTerminated, rc);
 end;
 
 // --- Auto-start: logon scheduled task (keeps the tray icon, native) -------
@@ -890,16 +1014,20 @@ end;
 // installer runs elevated, so it registers a trigger-less task with
 // RunLevel=HighestAvailable: `schtasks /Run` on it later elevates silently.
 //
-// The task's action is a FIXED path under %LocalAppData% (expanded by Task
-// Scheduler in the user's own context) that SelfUpdater downloads the new
-// installer to. Per-user on purpose: a machine-wide staging directory would let
-// any local account drop an executable that we then run elevated.
+// The task's action is our exe under {app} (admin-writable only), never the
+// installer SelfUpdater downloads: that one sits under %LocalAppData%, which
+// the user's own unelevated programs can write — any of them could drop an
+// executable there and start the task. --update-apply copies the download to
+// {app}\update-staging (Administrators and SYSTEM only), checks it against
+// GitHub's sha256 for the latest release (and against our signer, when this
+// build is signed) and only then runs it (src/network/UpdateApply.h).
 procedure RegisterUpdateTask();
 var
-  user, xml, xmlPath: String;
+  user, xml, xmlPath, exePath: String;
   rc: Integer;
 begin
   user := TaskPrincipal();
+  exePath := TaskXmlEscape(ExpandConstant('{app}\{#MyAppExe}'));
   // No <?xml?> declaration and pure ASCII, for the same reason as the logon task.
   xml :=
     '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' + #13#10 +
@@ -918,8 +1046,8 @@ begin
     '</Settings>' + #13#10 +
     // No <Triggers>: the task exists purely to be started on demand.
     '  <Actions Context="Author"><Exec>' +
-    '<Command>' + UpdateStagedExe + '</Command>' +
-    '<Arguments>' + UpdateSilentArgs + '</Arguments>' +
+    '<Command>"' + exePath + '"</Command>' +
+    '<Arguments>' + UpdateApplyArgs + '</Arguments>' +
     '</Exec></Actions>' + #13#10 +
     '</Task>' + #13#10;
   xmlPath := ExpandConstant('{tmp}\mw-update-task.xml');
@@ -1051,6 +1179,12 @@ var
   dir: String;
   rc: Integer;
 begin
+#if MyArch == "arm64"
+  // No driver on ARM64 (see the page above): install and uninstall alike
+  // have nothing to run.
+  Log(Format('virtual display helper (%s): skipped, no driver on ARM64', [verb]));
+  Exit;
+#endif
   dir := ExpandConstant('{tmp}\vdisplay');
   ForceDirectories(dir);
   if not SaveStringToFile(dir + '\request.json', '{"action":"' + verb + '"}', False) then Exit;
@@ -1058,6 +1192,31 @@ begin
        VDisplayArgs + ' --stage=driver --vdisplay-dir "' + dir + '"',
        ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, rc);
   Log(Format('virtual display helper (%s): exit %d', [verb, rc]));
+end;
+
+// "MoonlightWeb Virtual HID", the HID passthrough's driver: the app's elevated
+// helper again. `install` re-hashes the package under {app}\drivers\vhid
+// against the constants compiled into the exe, then creates or updates the
+// driver's node; `uninstall` removes it once no MoonlightWeb edition that
+// installed it is left. Best-effort like ViGEmBus: without the driver the
+// passthrough is simply unavailable, so nothing here may fail the setup. The
+// package is signed by MoonlightWeb's own certificate, which the helper trusts
+// for the install alone (Root and Trusted Publishers, out of both again
+// before it returns). A build that bundles no package (Windows on ARM: it
+// takes a driver signed by Microsoft only, 0x800b0109 on 20/10/2026) skips it
+// entirely.
+// Through it the stream also gives a host with no pointing device a mouse of
+// its own (SystemMouse.h). Exit 3010 asks for no restart: a game
+// still held a device made through the old driver, which stays loaded until
+// Windows next restarts, and the app works with either. An update that brings
+// the same driver installs nothing, so it never gets there.
+procedure RunVirtualHidHelper(verb: String);
+var
+  rc: Integer;
+begin
+  Exec(ExpandConstant('{app}\{#MyAppExe}'), '--vhid-apply ' + verb,
+       ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, rc);
+  Log(Format('virtual HID helper (%s): exit %d', [verb, rc]));
 end;
 
 // Release the files under {app} before the copy: a running server holds its exe
@@ -1447,6 +1606,9 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   lines: TArrayOfString;
   internet, consent: String;
+#if MyArch == "arm64"
+  rc: Integer;
+#endif
 begin
   // Before the file copy: nothing under {app} can be replaced while the server
   // is holding it open.
@@ -1463,6 +1625,9 @@ begin
 
   if CurStep <> ssPostInstall then Exit;
 
+  // First: everything below that runs MoonlightWeb.exe needs its runtime.
+  InstallVCRuntime();
+
   // Register the elevated on-demand task that lets the (unprivileged) server
   // apply the next update by itself, with no UAC prompt. Refreshed on every
   // install so the action always matches the current staging convention.
@@ -1471,14 +1636,22 @@ begin
 #endif
   // The virtual display helper task: every edition, since a DEV build can
   // stream a headless machine just as well. Refreshed on every install so
-  // the action follows {app}.
+  // the action follows {app}. Not on ARM64, which has no driver to apply;
+  // the task an earlier installer may have left there goes.
+#if MyArch != "arm64"
   RegisterVirtualDisplayTask();
+#else
+  Exec('schtasks.exe', '/Delete /TN "' + VDisplayTaskName + '" /F', '', SW_HIDE,
+       ewWaitUntilTerminated, rc);
+#endif
   // The elevated stream worker task: every edition, refreshed so the action
   // follows {app}.
   RegisterStreamWorkerTask();
   // And the launcher service above it, which the worker prefers when it is
   // there. Both are kept: the task is the fallback if the service is stopped.
   RegisterWorkerService();
+  // The policy under which that service may press Ctrl+Alt+Suppr.
+  ClaimSasPolicy();
   // "MoonlightWeb Virtual Display" itself: on Accept, and again on every
   // update once accepted (the helper finds the node and creates no second
   // one — this is what makes an update a no-op and a reinstall a repair).
@@ -1486,6 +1659,10 @@ begin
     RegWriteDWordValue(HKEY_LOCAL_MACHINE, VDisplaySetupKey, 'VirtualDisplayAccepted', 1);
   if RegValueExists(HKEY_LOCAL_MACHINE, VDisplaySetupKey, 'VirtualDisplayAccepted') then
     RunVirtualDisplayHelper('install');
+  // The HID passthrough's driver, with the native host it serves; again on
+  // every update, which is how a newer driver arrives.
+  if FileExists(ExpandConstant('{app}\drivers\vhid\MoonlightWebVHid.inf')) then
+    RunVirtualHidHelper('install');
 
   // provisioning.json — consumed and removed by the server on first run.
   // An update skips it: the server is already provisioned, and replaying a
@@ -1495,12 +1672,19 @@ begin
   if (not UpdateMode) or (not SettingsHasKey('internet_access_enabled')) then begin
     // Written as UTF-8 (no BOM): the consent text is localized (accents) and the
     // server parses this file with a strict UTF-8 JSON parser.
+    // A silent install shows no page, and Inno walks it as if Next had been
+    // pressed — which used to read as "Accepter". Nobody answered there, so
+    // Internet stays closed unless the command line says otherwise.
+    if WizardSilent then InternetAuthorized := SilentInternetWanted();
     if InternetAuthorized then internet := 'true' else internet := 'false';
     // Exact agreement text the user read on the Internet page — recorded by the
-    // server in its DNS registration audit log (legal traceability).
+    // server in its DNS registration audit log (legal traceability). From a
+    // silent install, the record says the page was not read.
     consent := ExpandConstant('{cm:InternetPageBody}') + ' / '
              + ExpandConstant('{cm:InternetPageOption}');
     StringChangeEx(consent, '%n', ' ', True);
+    if WizardSilent and InternetAuthorized then
+      consent := 'Silent install, /INTERNET=yes on the command line (page not shown): ' + consent;
     // No "sunshine" object any more: this installer installs no streaming server
     // and pairs no local host, so there is nothing to auto-pair. Provisioning
     // reads a missing object as auto_pair=false and marks the step skipped, so
@@ -1650,15 +1834,19 @@ begin
     Exec('schtasks.exe', '/Delete /TN "{#MyAppName}" /F', '', SW_HIDE,
          ewWaitUntilTerminated, rc);
     // The elevated on-demand update launcher goes too — leaving it behind would
-    // keep an elevated task pointing at a path the user can still write to.
+    // keep an elevated task pointing at an exe that is no longer there.
     Exec('schtasks.exe', '/Delete /TN "' + UpdateTaskName + '" /F', '', SW_HIDE,
          ewWaitUntilTerminated, rc);
     DelTree(ExpandConstant('{localappdata}\{#MyAppName}\update'), True, True, True);
+    // Where --update-apply verified and ran the last installer (~60 MB).
+    DelTree(ExpandConstant('{app}\update-staging'), True, True, True);
     // "MoonlightWeb Virtual Display" goes with the app — this is the one
     // place it is ever removed from (the app offers no such button). Run
     // while the exe and the driver files are still under {app}.
     RunVirtualDisplayHelper('uninstall');
     RegDeleteKeyIncludingSubkeys(HKEY_LOCAL_MACHINE, VDisplaySetupKey);
+    // The HID passthrough's driver, unless another edition still uses it.
+    RunVirtualHidHelper('uninstall');
     // The virtual display helper task and its staging directory.
     Exec('schtasks.exe', '/Delete /TN "' + VDisplayTaskName + '" /F', '', SW_HIDE,
          ewWaitUntilTerminated, rc);
@@ -1669,6 +1857,8 @@ begin
     // The launcher service, while the exe that knows how to remove it is still
     // under {app} — and before the taskkill below, which would take it too.
     UnregisterWorkerService();
+    // And the policy it pressed Ctrl+Alt+Suppr under, if ours alone.
+    ReleaseSasPolicy();
     Exec('taskkill.exe', '/IM "{#MyAppExe}" /F', '', SW_HIDE,
          ewWaitUntilTerminated, rc);
     // Remove the firewall rule added at install time.

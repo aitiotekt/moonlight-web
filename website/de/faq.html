@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<!-- Generated from /faq.html and _i18n/de/faq.json by scripts/website/build-site.mjs: edit those, then rebuild. -->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoonlightWeb FAQ — Game-Streaming im Browser, erklärt</title>
+<meta name="description" content="Häufige Fragen zu MoonlightWeb: wie Game-Streaming im Browser läuft, Latenz, 4K HDR und Codecs, iPhone/iPad/TV, Internetzugriff, Sicherheit, Datenschutz, Controller.">
+<meta name="author" content="Bruno Martin">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#05080d">
+<meta property="og:site_name" content="MoonlightWeb">
+<meta property="og:title" content="MoonlightWeb FAQ — Game-Streaming im Browser, erklärt">
+<meta property="og:description" content="Häufige Fragen zu MoonlightWeb: wie Game-Streaming im Browser läuft, Latenz, 4K HDR und Codecs, iPhone/iPad/TV, Internetzugriff, Sicherheit, Datenschutz, Controller.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://moonlightweb.top/de/faq.html">
+<meta property="og:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="MoonlightWeb FAQ — Game-Streaming im Browser, erklärt">
+<meta name="twitter:description" content="Häufige Fragen zu MoonlightWeb: wie Game-Streaming im Browser läuft, Latenz, 4K HDR und Codecs, iPhone/iPad/TV, Internetzugriff, Sicherheit, Datenschutz, Controller.">
+<meta name="twitter:image" content="https://moonlightweb.top/assets/desktop.jpg">
+<link rel="canonical" href="https://moonlightweb.top/de/faq.html">
+<!-- i18n:alternates (written by scripts/website/build-site.mjs) -->
+<link rel="alternate" hreflang="en" href="https://moonlightweb.top/faq.html">
+<link rel="alternate" hreflang="fr" href="https://moonlightweb.top/fr/faq.html">
+<link rel="alternate" hreflang="de" href="https://moonlightweb.top/de/faq.html">
+<link rel="alternate" hreflang="zh" href="https://moonlightweb.top/zh/faq.html">
+<link rel="alternate" hreflang="x-default" href="https://moonlightweb.top/faq.html">
+<!-- /i18n:alternates -->
+<link rel="icon" href="/assets/favicon.ico" sizes="48x48">
+<link rel="icon" type="image/png" sizes="48x48" href="/assets/icon-48.png">
+<link rel="icon" type="image/png" sizes="96x96" href="/assets/icon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/icon-180.png">
+<link rel="stylesheet" href="/assets/pages.css?v={{(fileStat `/assets/pages.css`).ModTime.Unix}}">
+<!-- Shared header/footer styling -->
+<link rel="stylesheet" href="/assets/chrome.css?v={{(fileStat `/assets/chrome.css`).ModTime.Unix}}">
+<script defer src="https://stats.moonlightweb.top/script.js"
+        data-website-id="6b952a24-dc15-4be8-a595-ae9d835fbc6a"
+        data-domains="moonlightweb.top,www.moonlightweb.top"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://moonlightweb.top/de/"},
+        {"@type": "ListItem", "position": 2, "name": "FAQ", "item": "https://moonlightweb.top/de/faq.html"}
+      ]
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is MoonlightWeb?",
+          "acceptedAnswer": {"@type": "Answer", "text": "MoonlightWeb is a free, open-source (GPL-3.0), self-hosted server that streams your gaming PC to any device with a browser — phone, tablet, laptop, TV. You install one small server on the gaming PC, which captures and encodes that machine itself; every other device just opens a URL. Nothing to install on the client."}
+        },
+        {
+          "@type": "Question",
+          "name": "Is MoonlightWeb really free?",
+          "acceptedAnswer": {"@type": "Answer", "text": "Yes. MoonlightWeb is licensed under GPL-3.0, with no accounts, no subscriptions and no paid tiers. It is self-hosted: your games stream directly from your own PC and never touch a third-party cloud."}
+        },
+        {
+          "@type": "Question",
+          "name": "What do I need to use it?",
+          "acceptedAnswer": {"@type": "Answer", "text": "Two things: the gaming PC (Windows, macOS Apple Silicon or Linux) with a GPU that can encode, and any client device with a modern browser — Chrome, Edge, Safari or Firefox. No second streaming server is needed: MoonlightWeb captures and encodes the machine it is installed on. Sunshine, Wolf and MultiSeat hosts elsewhere on the network can be paired from the same page."}
+        },
+        {
+          "@type": "Question",
+          "name": "Do I need to install an app on my phone, tablet or TV?",
+          "acceptedAnswer": {"@type": "Answer", "text": "No. The client is 100% web: you just open a URL in the browser. The only install is the server, on the gaming PC itself."}
+        },
+        {
+          "@type": "Question",
+          "name": "Is MoonlightWeb the same project as moonlight-web-stream?",
+          "acceptedAnswer": {"@type": "Answer", "text": "No. They are two separate open-source projects with close names. moonlight-web-stream (github.com/MrCreativ3001/moonlight-web-stream) is a web client for a Sunshine host. MoonlightWeb (moonlightweb.top, github.com/linckosz/moonlight-web) has its own capture and encode engine: installed on the gaming PC, it streams that PC by itself, with no Sunshine needed. It can also pair with Sunshine, Apollo, Wolf and MultiSeat hosts."}
+        },
+        {
+          "@type": "Question",
+          "name": "Can I play PC games on an iPhone or iPad?",
+          "acceptedAnswer": {"@type": "Answer", "text": "Yes — open the URL in Safari, nothing from the App Store. Your phone becomes a full client: multi-touch trackpad (1 finger aims, 2 scroll and pinch), a native virtual keyboard with modifier keys, and game controllers, at up to 120 fps with under 20 ms Wi-Fi latency."}
+        },
+        {
+          "@type": "Question",
+          "name": "Can I play on a smart TV?",
+          "acceptedAnswer": {"@type": "Answer", "text": "Any device with a modern browser can be a client. On TVs, the experience depends on the built-in browser; a recent browser with hardware video decoding gives the best results, and a plugged-in or Bluetooth gamepad completes the couch setup. An Android TV box works too: it is tested with the TV Bro browser, and the remote gets around the pages and drives the stream."}
+        },
+        {
+          "@type": "Question",
+          "name": "What latency can I expect?",
+          "acceptedAnswer": {"@type": "Answer", "text": "Under 20 ms over Wi-Fi. MoonlightWeb uses a WebRTC UDP transport with adaptive congestion control, designed for fast-paced games rather than remote-desktop use."}
+        },
+        {
+          "@type": "Question",
+          "name": "What resolutions, frame rates and codecs are supported?",
+          "acceptedAnswer": {"@type": "Answer", "text": "Up to 4K HDR at up to 240 fps, with H264, HEVC and AV1 — hardware-decoded in the browser via WebCodecs. Codec options your browser can't decode are automatically greyed out. HDR displays get real HDR output."}
+        },
+        {
+          "@type": "Question",
+          "name": "How do I play over the Internet, away from home?",
+          "acceptedAnswer": {"@type": "Answer", "text": "Streams are direct, peer-to-peer WebRTC between your browser and your PC. Your PC holds one outgoing connection to an introduction server and is reached at a link of its own - no public sub-domain, no exposed web ports; instances that already hold a sub-domain keep it until February 2027. You can also bring your own domain and certificate."}
+        },
+        {
+          "@type": "Question",
+          "name": "Is it secure? Where does my stream go?",
+          "acceptedAnswer": {"@type": "Answer", "text": "MoonlightWeb is self-hosted: the stream goes directly from your PC to your browser, never through anyone else's cloud. Hosts are paired with a PIN, and the entry link is served over HTTPS under a certificate we maintain - nothing is issued for, or published about, your machine."}
+        },
+        {
+          "@type": "Question",
+          "name": "What is Video Enhancement?",
+          "acceptedAnswer": {"@type": "Answer", "text": "GPU upscaling and sharpening running in the browser via WebGL2 or WebGPU (MoonlightWeb's own upscaler). You can stream at 720p over 4G or hotel Wi-Fi and display near-1440p quality — with zero extra load on the gaming PC, since it runs client-side."}
+        },
+        {
+          "@type": "Question",
+          "name": "What is MWSR?",
+          "acceptedAnswer": {"@type": "Answer", "text": "MWSR (MoonlightWeb Super Resolution) is MoonlightWeb's own real-time upscaler, the one Video Enhancement runs in Auto. It rebuilds each decoded frame at your screen's size from that frame alone, in one GPU pass: no frame history and no neural network, so it adds no frame of delay and stays light enough for a phone. It sharpens edges without halos, reduces a stream larger than the screen, and works in HDR. Its code is open under the MIT License, so any program may use it. Compare it with FSR1, NIS and SGSR1 on your own GPU at https://moonlightweb.top/mwsr/."}
+        },
+        {
+          "@type": "Question",
+          "name": "Does it work with game controllers?",
+          "acceptedAnswer": {"@type": "Answer", "text": "Yes — Xbox and PlayStation controllers work with rumble, alongside keyboard, pointer-lock mouse, touch trackpad and a virtual keyboard. Most other pads are recognized automatically, and any pad can be remapped in Settings (Switch Pro controllers: over USB). Racing wheels, flight sticks and RC radios work too: from Chrome or Edge on a computer, MoonlightWeb's own host can hand the game the real device, every axis included, with force feedback for wheels on Windows and Linux hosts."}
+        },
+        {
+          "@type": "Question",
+          "name": "What happens on strict firewalls or hotel Wi-Fi?",
+          "acceptedAnswer": {"@type": "Answer", "text": "UDP first, for the lowest latency. On a network that blocks UDP, the stream falls back to TCP on its own, still a direct connection, never through a relay. A network that only lets web ports out (80 and 443) can still block it: the host's direct address is then the way."}
+        },
+        {
+          "@type": "Question",
+          "name": "How does MoonlightWeb work under the hood?",
+          "acceptedAnswer": {"@type": "Answer", "text": "A small C++/Qt server runs on the gaming PC. It captures a GPU surface and hands it straight to the GPU encoder in the same process that holds the WebRTC connection — no loopback hop, no RTP, no FEC — then sends video, audio and input to browsers over WebRTC. For a host you pair with instead, it embeds moonlight-common-c and speaks the GameStream protocol (RTSP/RTP/ENet) to it. In the browser: WebCodecs decodes, WebGL2 or WebGPU renders, and the browser's WebRTC player plays the Opus audio."}
+        },
+        {
+          "@type": "Question",
+          "name": "What data does MoonlightWeb collect?",
+          "acceptedAnswer": {"@type": "Answer", "text": "Nothing that identifies you. There is no account, and streams go directly from your PC to your browser. The application sends anonymous statistics about its streams: resolution, frame rate, codec, connection type, session length, MoonlightWeb version and operating system — never your PC name, your account, what you launch, or your IP address. One switch in the app’s settings turns them off at once, and changes nothing else. This website counts visits with self-hosted cookieless analytics: no cookie, no advertising, no cross-site tracking, and no stored IP address."}
+        },
+        {
+          "@type": "Question",
+          "name": "Why does my system warn me about the installer?",
+          "acceptedAnswer": {"@type": "Answer", "text": "The installers are not signed with a paid certificate, and Windows SmartScreen and macOS Gatekeeper flag anything they do not recognise. The code is public, so you can read exactly what you are installing. On Windows: click More info, then Run anyway. On macOS the warning only applies to browser downloads, so `brew install --cask linckosz/tap/moonlightweb` or `curl -fsSL https://moonlightweb.top/install.sh | bash` avoids it entirely; otherwise allow the downloaded file in System Settings, Privacy & Security, Open Anyway."}
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+
+<!-- Header written by scripts/website/build-site.mjs -->
+<header id="site-header"><div class="wrap"><a class="brand" href="/de/"><img src="/assets/icon-192.png" alt="MoonlightWeb logo" width="28" height="28"> MOONLIGHTWEB</a><nav aria-label="Main navigation"><a href="/de/" data-nav="home">Start</a><a href="/de/guides/" data-nav="guides">Anleitungen</a><a href="/de/faq.html" data-nav="faq" aria-current="page">FAQ</a><a href="/de/contact.html" data-nav="contact">Kontakt</a><a href="/de/server-access/" data-nav="connect">Verbinden</a></nav><div class="hdr-actions"><span class="lang"><select id="lang-select" aria-label="Language" data-umami-event="lang"><option value="en" data-href="/faq.html">English</option><option value="fr" data-href="/fr/faq.html">Français</option><option value="de" data-href="/de/faq.html" selected>Deutsch</option><option value="zh" data-href="/zh/faq.html" lang="zh">中文</option></select></span><a class="btn btn-primary gh-btn" href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" aria-label="GitHub" data-umami-event="github" data-umami-event-loc="nav">★ <span class="gh-label">GitHub</span></a></div></div></header>
+
+<main>
+<div class="wrap">
+  <nav class="crumbs" aria-label="Breadcrumb" data-i18n-html="crumbs"><a href="/de/">Startseite</a> / FAQ</nav>
+  <span class="kicker" data-i18n="kicker">FAQ</span>
+  <h1 data-i18n="h1">Game-Streaming im Browser, erklärt</h1>
+  <p class="lead" data-i18n-html="lead">Alles, was Leute über <a href="/de/">MoonlightWeb</a> wissen wollen — Latenz, Codecs, Geräte, Spielen übers Internet, Sicherheit. <strong>Deine Antwort ist nicht dabei?</strong> Frag auf <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener">GitHub</a>.</p>
+
+  <h2 data-i18n="h2.basics">Grundlagen</h2>
+  <details open>
+    <summary data-i18n="q1.s">Was ist MoonlightWeb?</summary>
+    <div class="a" data-i18n-html="q1.a"><p>Ein kostenloser, quelloffener (GPL-3.0) und selbst gehosteter Server, der deinen Gaming-PC auf jedes Gerät mit Browser streamt — Smartphone, Tablet, Laptop, TV. Du installierst einen kleinen Server auf dem Gaming-PC, der genau diesen Rechner selbst aufnimmt und encodiert; alle anderen Geräte öffnen einfach eine URL. Auf dem Client musst du nichts installieren.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q2.s">Ist MoonlightWeb wirklich kostenlos?</summary>
+    <div class="a" data-i18n-html="q2.a"><p>Ja. GPL-3.0-lizenziert, keine Konten, keine Abos, keine kostenpflichtigen Stufen. Es ist selbst gehostet: Deine Spiele streamen direkt von deinem eigenen PC und landen nie in der Cloud eines Drittanbieters.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q3.s">Was brauche ich dafür?</summary>
+    <div class="a" data-i18n-html="q3.a"><p>Zwei Dinge: den Gaming-PC (Windows, macOS mit Apple Silicon oder Linux) mit einer GPU, die encodieren kann, und ein beliebiges Client-Gerät mit modernem Browser — Chrome, Edge, Safari oder Firefox.</p><p>Kein zweiter Streaming-Server: MoonlightWeb nimmt den Rechner auf, auf dem es installiert ist, und encodiert ihn. Wenn du woanders schon <strong>Sunshine</strong>, <strong>Wolf</strong> oder <strong>MultiSeat</strong> laufen hast, werden diese Hosts auf derselben Seite gefunden und gekoppelt.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q4.s">Muss ich eine App auf Smartphone, Tablet oder TV installieren?</summary>
+    <div class="a" data-i18n-html="q4.a"><p>Nein. Der Client ist zu 100 % webbasiert: Du öffnest einfach eine URL im Browser. Installiert wird nur der Server, und zwar auf dem Gaming-PC selbst.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q17.s">Ist MoonlightWeb dasselbe Projekt wie moonlight-web-stream?</summary>
+    <div class="a" data-i18n-html="q17.a"><p>Nein. Es sind zwei getrennte Open-Source-Projekte mit ähnlichen Namen. <a href="https://github.com/MrCreativ3001/moonlight-web-stream" target="_blank" rel="noopener">moonlight-web-stream</a> ist ein Web-Client für einen Sunshine-Host. MoonlightWeb (diese Seite, <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener">linckosz/moonlight-web</a>) hat eine eigene Aufnahme- und Encoding-Engine: Auf dem Gaming-PC installiert, streamt es diesen PC selbst, ganz ohne Sunshine. Es kann sich außerdem <a href="/de/sunshine-web-client.html">mit Sunshine koppeln</a>, ebenso mit Apollo, Wolf und MultiSeat.</p></div>
+  </details>
+
+  <h2 data-i18n="h2.devices">Geräte</h2>
+  <details>
+    <summary data-i18n="q5.s">Kann ich PC-Spiele auf dem iPhone oder iPad spielen?</summary>
+    <div class="a" data-i18n-html="q5.a"><p>Ja — öffne die URL in Safari, nichts aus dem App Store. Dein Smartphone wird zum vollwertigen Client: Multitouch-Trackpad (1 Finger zielt, 2 scrollen &amp; zoomen), eine native virtuelle Tastatur mit Sondertasten und Gamecontroller — bis zu 120 fps bei unter 20 ms Latenz im WLAN.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q6.s">Kann ich auf einem Smart-TV spielen?</summary>
+    <div class="a" data-i18n-html="q6.a"><p>Jedes Gerät mit modernem Browser kann Client sein. Auf Fernsehern hängt das Erlebnis vom eingebauten Browser ab; ein aktueller Browser mit Hardware-Videodekodierung liefert die besten Ergebnisse, und ein per Kabel oder Bluetooth verbundenes Gamepad macht das Couch-Setup komplett. Eine Android-TV-Box funktioniert auch: Sie ist mit dem Browser TV Bro getestet, und die Fernbedienung führt durch die Seiten und steuert den Stream.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q7.s">Funktioniert es mit Gamecontrollern?</summary>
+    <div class="a" data-i18n-html="q7.a"><p>Ja — Xbox- und PlayStation-Controller funktionieren, Vibration inklusive, neben Tastatur, Maus mit Pointer-Lock, Touch-Trackpad und virtueller Tastatur. Die meisten anderen Pads werden automatisch erkannt, und jedes Pad lässt sich in den Einstellungen neu belegen (Switch-Pro-Controller: per USB).</p><p><a href="/de/controllers.html">Lenkräder, Flugsticks und RC-Fernsteuerungen</a> funktionieren ebenfalls: Aus Chrome oder Edge auf einem Computer kann der MoonlightWeb-Host dem Spiel das echte Gerät übergeben, mit allen Achsen, und bei Lenkrädern mit Force Feedback auf Windows- und Linux-Hosts.</p></div>
+  </details>
+
+  <h2 data-i18n="h2.perf">Leistung</h2>
+  <details>
+    <summary data-i18n="q8.s">Mit welcher Latenz kann ich rechnen?</summary>
+    <div class="a" data-i18n-html="q8.a"><p>Unter 20 ms im WLAN. MoonlightWeb nutzt einen WebRTC-UDP-Transport mit adaptiver Überlastregelung, gemacht für schnelle Spiele statt für Remote-Desktop.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q9.s">Welche Auflösungen, Bildraten und Codecs werden unterstützt?</summary>
+    <div class="a" data-i18n-html="q9.a"><p>Bis zu 4K HDR mit bis zu 240 fps, mit H264, HEVC und AV1 — per Hardware im Browser dekodiert über WebCodecs. Codecs, die dein Browser nicht dekodieren kann, werden automatisch ausgegraut. HDR-Displays bekommen echtes HDR.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q10.s">Was ist Video Enhancement?</summary>
+    <div class="a" data-i18n-html="q10.a"><p>GPU-Upscaling und -Schärfung, die über WebGL2 oder WebGPU im Browser laufen (MoonlightWebs eigener Upscaler). Streame in 720p über 4G oder Hotel-WLAN und genieße fast 1440p-Qualität — ganz ohne Zusatzlast auf dem Gaming-PC, weil alles auf dem Client läuft.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q18.s">Was ist MWSR?</summary>
+    <div class="a" data-i18n-html="q18.a"><p>MWSR (MoonlightWeb Super Resolution) ist MoonlightWebs eigener Echtzeit-Upscaler, den Video Enhancement im Modus Auto nutzt. Er baut jedes dekodierte Bild allein aus diesem Bild in der Größe deines Bildschirms neu auf, in einem einzigen GPU-Durchgang: ohne Bildverlauf und ohne neuronales Netz, also ohne ein zusätzliches Bild Verzögerung und leicht genug für ein Smartphone. Er schärft Kanten ohne Halos, verkleinert einen Stream, der größer als der Bildschirm ist, und funktioniert in HDR. Sein Code steht unter der MIT-Lizenz: Jedes Programm darf ihn nutzen. <a href="/mwsr/">Vergleiche ihn auf deiner eigenen GPU mit FSR1, NIS und SGSR1</a>.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q11.s">Was passiert bei strengen Firewalls oder Hotel-WLAN?</summary>
+    <div class="a" data-i18n-html="q11.a"><p>Zuerst UDP für die geringste Latenz. In einem Netzwerk, das UDP blockiert, weicht der Stream von selbst auf TCP aus, weiterhin als direkte Verbindung, nie über ein Relay. Ein Netzwerk, das nur Web-Ports (80 und 443) nach außen lässt, kann ihn trotzdem blockieren: Dann führt der Weg über die direkte Adresse des Hosts.</p></div>
+  </details>
+
+  <h2 data-i18n="h2.internet">Spielen übers Internet &amp; Sicherheit</h2>
+  <details>
+    <summary data-i18n="q12.s">Wie spiele ich übers Internet, wenn ich nicht zu Hause bin?</summary>
+    <div class="a" data-i18n-html="q12.a"><p>Streams laufen als direkte Peer-to-Peer-WebRTC-Verbindung zwischen deinem Browser und deinem PC. Dein PC hält eine ausgehende Verbindung zu einem Vermittlungsserver und ist unter einem eigenen Link erreichbar — keine öffentliche Subdomain, keine offenen Web-Ports; Installationen, die schon eine Subdomain haben, behalten sie bis Februar 2027. Du kannst auch deine eigene Domain und dein eigenes Zertifikat verwenden.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q13.s">Ist das sicher? Wohin geht mein Stream?</summary>
+    <div class="a" data-i18n-html="q13.a"><p>MoonlightWeb ist selbst gehostet: Der Stream geht direkt von deinem PC zu deinem Browser, nie durch die Cloud von jemand anderem. Hosts werden per PIN gekoppelt, und der Zugangslink wird über HTTPS mit einem Zertifikat ausgeliefert, das wir pflegen — für deinen Rechner wird nichts ausgestellt und über ihn nichts veröffentlicht.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q14.s">Wie funktioniert MoonlightWeb unter der Haube?</summary>
+    <div class="a" data-i18n-html="q14.a"><p>Auf dem Gaming-PC läuft ein kleiner C++/Qt-Server. Er nimmt eine GPU-Oberfläche auf und reicht sie direkt an den GPU-Encoder weiter, im selben Prozess, der auch die WebRTC-Verbindung hält — kein Umweg über das Loopback-Netzwerk, kein RTP, kein FEC — und schickt dann Video, Audio und Eingaben per WebRTC an die Browser. Im Browser dekodiert WebCodecs, WebGL2 oder WebGPU rendert, und der WebRTC-Player des Browsers spielt das Opus-Audio ab.</p><p>Für einen Host, mit dem du dich stattdessen koppelst, bindet derselbe Server <code>moonlight-common-c</code> ein, spricht mit ihm das GameStream-Protokoll (RTSP/RTP/ENet) und leitet diesen Stream dann auf dieselbe Weise weiter.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q15.s">Warum warnt mein System vor dem Installer?</summary>
+    <div class="a" data-i18n-html="q15.a"><p>Weil die Installer nicht mit einem kostenpflichtigen Zertifikat signiert sind — SmartScreen unter Windows und Gatekeeper unter macOS schlagen bei allem an, was sie nicht kennen, ob signiert oder nicht, ob sicher oder nicht. Der Code ist öffentlich, du kannst also genau nachlesen, was du installierst.</p><p>Unter <strong>Windows</strong>: Klick auf <em>Weitere Informationen</em> und dann auf <em>Trotzdem ausführen</em>.</p><p>Unter <strong>macOS</strong> umgehst du die Warnung ganz — sie betrifft nur Downloads über den Browser:</p><pre><code>brew install --cask linckosz/tap/moonlightweb</code></pre><pre><code>curl -fsSL https://moonlightweb.top/install.sh | bash</code></pre><p>Oder behalte die heruntergeladene Datei und erlaube sie unter <strong>Systemeinstellungen → Datenschutz &amp; Sicherheit → Dennoch öffnen</strong>. Details in der <a href="/de/guides/macos.html">macOS-Anleitung</a>.</p></div>
+  </details>
+  <details>
+    <summary data-i18n="q16.s">Welche Daten sammelt MoonlightWeb?</summary>
+    <div class="a" data-i18n-html="q16.a"><p>Nichts, was dich identifiziert. Du musst kein Konto anlegen, und deine Streams laufen direkt zwischen deinem PC und deinem Browser — sie erreichen uns nie.</p><p><strong>In der Anwendung.</strong> Sie sendet anonyme Statistiken über ihre Streams: Auflösung, Bildrate, Codec, Verbindungsart, Dauer einer Sitzung, dazu die MoonlightWeb-Version und das Betriebssystem. Niemals den Namen deines PCs, dein Konto, was du startest, oder deine IP-Adresse. Ein Schalter in den Einstellungen der App stellt sie sofort ab — und ein Nein ändert sonst nichts: Streaming und Updates funktionieren genau gleich. Dort kann jeder angemeldete Nutzer auch nachlesen, was gezählt wird; eingeladene Spieler bekommen dieselbe Auskunft über den Cookies-Button auf ihrer Beitrittsseite.</p><p><strong>Wenn du übers Internet spielst.</strong> Damit dein Browser deinen PC überhaupt findet, müssen zwei Dinge passieren, und keines davon ist eine Statistik. Dein PC hält eine ausgehende Verbindung zu unserem Vermittlungsserver, der deshalb seine öffentliche Adresse kennt und weiß, wann er online ist — nie, was du spielst oder wer du bist. Und beide Seiten fragen einen STUN-Server, ebenfalls unseren, nach ihrer eigenen öffentlichen Adresse, denn so finden zwei Rechner einander direkt. Beides steht in der Vereinbarung, die die App anzeigt, bevor du den Internetzugriff einschaltest, und nichts davon passiert, solange er aus ist.</p><p><strong>Auf dieser Website.</strong> Besuche werden mit einem selbst gehosteten, cookielosen Analysetool (<a href="https://umami.is" target="_blank" rel="noopener">Umami</a>) gezählt, das wir selbst betreiben: kein Cookie, keine Werbung, kein Tracking über andere Websites hinweg, und deine IP-Adresse wird nicht gespeichert — sie wird in eine Zahl umgewandelt, die sich jeden Tag ändert. Deshalb begrüßt dich hier kein Cookie-Banner. Das Einzige, was diese Website in deinem Browser speichert, ist die Sprache, die du gewählt hast.</p></div>
+  </details>
+
+  <h2 data-i18n="h2.start">Loslegen</h2>
+  <div class="xlinks">
+    <a class="cyb" href="/de/guides/windows.html"><strong data-i18n="x.win.t">Unter Windows installieren</strong><span data-i18n="x.win.d">Geführter Installer — ein Assistent, sonst nichts einzurichten.</span></a>
+    <a class="cyb" href="/de/guides/macos.html"><strong data-i18n="x.mac.t">Unter macOS installieren</strong><span data-i18n="x.mac.d">Anleitung für Apple Silicon mit dem .pkg-Installer.</span></a>
+    <a class="cyb" href="/de/guides/linux.html"><strong data-i18n="x.lin.t">Unter Linux installieren</strong><span data-i18n="x.lin.d">.deb, .rpm oder portables AppImage.</span></a>
+  </div>
+</div>
+</main>
+
+<!-- Footer written by scripts/website/build-site.mjs -->
+<footer id="site-footer"><div class="wrap"><span><img src="/assets/icon-192.png" alt="" width="18" height="18" style="border-radius:4px;vertical-align:-3px;margin-right:6px"> MoonlightWeb · © 2026 Bruno Martin · GPL‑3.0</span><span><a href="/de/">Start</a> · <a href="/de/guides/">Anleitungen</a> · <a href="/de/faq.html">FAQ</a> · <a href="/de/contact.html">Kontakt</a> · <a href="/de/server-access/">Verbinden</a> · <a href="https://github.com/linckosz/moonlight-web" target="_blank" rel="noopener" data-umami-event="github" data-umami-event-loc="footer">GitHub</a> · <a href="https://buymeacoffee.com/brunoocto" target="_blank" rel="noopener" data-umami-event="buy-me-a-coffee" data-umami-event-loc="footer" class="bmc-link"><span data-bmc-logo></span><span>Kaffee</span></a></span><span class="foot-play">Spielen auf: <a href="/de/play/chromebook.html">Chromebook</a> · <a href="/de/play/iphone-ipad.html">iPhone und iPad</a> · <a href="/de/play/tv.html">TV</a> · <a href="/de/sunshine-web-client.html">Web-Client für Sunshine</a> · <a href="/de/browser-game-streaming.html">Warum ein Browser-Client</a></span></div></footer>
+
+<script src="/assets/chrome.js?v={{(fileStat `/assets/chrome.js`).ModTime.Unix}}"></script>
+</body>
+</html>

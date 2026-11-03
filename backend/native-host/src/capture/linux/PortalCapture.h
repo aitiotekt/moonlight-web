@@ -26,6 +26,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 // The screen as the compositor hands it over, through the ScreenCast portal's
 // PipeWire stream — the capture route for an AppImage, which can hold no
@@ -51,6 +53,9 @@
 //  - Some compositors give DMA-BUF (the fast path, importable by EGL) and some
 //    give shared memory. Both are carried; `dmabuf()` says which, because the
 //    GPU pipeline needs the first and only the CPU pipeline can use the second.
+//    A compositor hands a DMA-BUF only to a client that names the modifiers it
+//    can import (PipeWire's DMA-BUF negotiation): GNOME gave shared memory to
+//    this route until it did (offerDmabuf, 29/09/2026).
 //  - The pointer comes as METADATA beside the picture (that is what the
 //    handshake asks for), so it is reported like KMS reports its cursor plane
 //    and the client keeps drawing its own.
@@ -71,6 +76,55 @@ public:
     /// is why it is here and not on the interface.
     void setRestoreToken(std::string token);
 
+    /// Capture a VIRTUAL monitor the compositor creates for this session, at
+    /// @p width x @p height and @p fps — the size and cadence are what this
+    /// side asks for in the PipeWire format, which is how the compositor sizes
+    /// it. Set before start().
+    void setVirtualMonitor(int width, int height, int fps);
+
+    /// Make that virtual monitor through KWin rather than the portal (KDE
+    /// Plasma 6, KwinVirtualOutput.h): an output named after @p name, at the
+    /// size setVirtualMonitor gave. Its stream is read on the session's own
+    /// PipeWire. Before start().
+    void setKwinVirtualOutput(std::string name);
+
+    /// Ask Mutter itself rather than the portal — GNOME's own screen cast,
+    /// with no dialog (MutterScreenCast.h): the virtual monitor
+    /// setVirtualMonitor describes or, with @p connector, the monitor of that
+    /// name as it is — another stream's virtual one, for a guest — whose
+    /// format is the monitor's own. Its stream is read on the session's own
+    /// PipeWire, and a session Mutter closes is a lost display. Before start().
+    /// @p realMonitor: a screen of the desktop ("Screen" without the scanout),
+    /// whose pointer stays beside the picture, as on any real monitor.
+    void setMutter(std::string connector, bool realMonitor = false);
+
+    /// Read gamescope's own node @p node instead — an app in its own gamescope
+    /// (GamescopeSession.h), on the session's PipeWire, no portal, nobody to
+    /// ask — and its pointer from its Xwayland, @p xDisplay (XFixesCursor.h).
+    /// gamescope's process @p pid gone is the picture lost: its stream only
+    /// pauses. Before start().
+    void setGamescope(uint32_t node, std::string xDisplay, int pid);
+
+    /// What a GPU can import, offered to the compositor for DMA-BUF: its
+    /// render node, and per DRM fourcc the modifiers (GlConvert::
+    /// importableModifiers). Offered before shared memory, which stays the
+    /// fallback: a compositor that takes none of them hands that over.
+    struct DmabufOffer
+    {
+        std::string renderNode;
+        std::vector<std::pair<uint32_t, std::vector<uint64_t>>> modifiers;
+        /// The bench's portaldmabuf=1: offered even where the frames keep
+        /// trails of the pointer (GNOME's virtual monitor before GNOME 48), to
+        /// measure what the shared memory taken there instead costs.
+        bool evenWithTrails = false;
+    };
+    /// Set before start(). Without an offer the portal is asked for shared
+    /// memory only, as this route always did.
+    void offerDmabuf(DmabufOffer offer);
+    /// The render node of the GPU that converts and encodes, DMA-BUF or not:
+    /// the Vulkan conversion reads shared memory too (C13.10), on that GPU.
+    void setRenderNode(std::string renderNode);
+
     /// Ask the portal, connect to the node it names, and wait for the first
     /// negotiated format. ⚠️ Raises the portal's dialog unless a restore token
     /// was set — see PortalScreenCast::start.
@@ -82,6 +136,10 @@ public:
     /// The grant to store, after a start that raised the dialog. Empty when the
     /// portal issued none — in which case it will ask again next time.
     std::string restoreToken() const;
+
+    /// After a start() on Mutter's route that failed: Mutter refused the route
+    /// outright, where the portal may still serve (MutterScreenCast::refused).
+    bool mutterRefused() const;
 
     /// The last buffer that arrived, if there is a new one. Timeout when the
     /// screen has not changed — the same contract KmsCapture offers, and what
@@ -97,12 +155,37 @@ public:
     /// True when buffers arrive as DMA-BUF and the GPU pipeline can import
     /// them; false when they are shared memory and only the CPU pair can.
     /// Not on the interface: it is the one thing the session must ask THIS
-    /// route, to know which pipeline pair can take its frames.
+    /// route, to know which pipeline pair can take its frames. Known when
+    /// start() returns: it waits for the first buffer.
     bool dmabuf() const;
-    /// Empty: the portal names no render node. The GPU pipeline picks one.
+    /// GNOME's virtual monitor before GNOME 48 with a DMA-BUF offer: its
+    /// DMA-BUF frames keep trails of a pointer that moves over a still
+    /// desktop, so it starts in shared memory, and setDmabufWhilePointerHidden
+    /// moves it to DMA-BUF and back. False everywhere else, and before start().
+    bool switchesDmabufWithPointer() const;
+    /// Offer DMA-BUF again while the pointer is hidden (@p hidden), shared
+    /// memory alone while it may show: the formats offered again on the live
+    /// stream, which the compositor renegotiates in place. True when the
+    /// offer changed; the buffers that follow say what was settled on
+    /// (dmabuf()). Capture thread.
+    bool setDmabufWhilePointerHidden(bool hidden);
+    /// The compositor has renegotiated the format again and again since
+    /// start() without a single picture: it settles on one it cannot fill —
+    /// KWin with a DMA-BUF modifier its renderer cannot allocate (Plasma 6.3
+    /// in a VM, hundreds a second). A slow first picture is not this: one
+    /// format, then the wait.
+    bool renegotiatingWithoutPicture() const;
+    /// The GPU the session named (setRenderNode), else the offer's when the
+    /// buffers are DMA-BUF; empty when neither says one.
     std::string renderNodePath() const override;
     DesktopRect desktopRect() const override;
     const CursorState& cursor() const override;
+    /// A GNOME virtual monitor before GNOME 48: its pointer is asked painted
+    /// into every picture (MutterScreenCast::embedsPointer), and its frames
+    /// are taken in shared memory while it may show — Mutter's DMA-BUF ones
+    /// leave trails of it (setDmabufWhilePointerHidden). Never on a monitor
+    /// KWin makes, nor from GNOME 48.
+    bool cursorInPicture() const override;
 
 private:
     struct Impl;

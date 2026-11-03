@@ -539,6 +539,7 @@ if(MW_BUILD_TESTS)
     enable_testing()
     add_executable(mw-security-tests
         tests/security_main.cpp
+        tests/test_clipboard_policy.cpp
         tests/test_connection_guard.cpp
         tests/test_request_guard.cpp
         tests/test_api_csrf.cpp
@@ -572,6 +573,11 @@ if(MW_BUILD_TESTS)
     target_include_directories(mw-security-tests PRIVATE src tests)
     target_link_libraries(mw-security-tests PRIVATE Qt6::Core Qt6::Network OpenSSL::Crypto)
     add_test(NAME security-tnr COMMAND mw-security-tests)
+endif()
+
+if(APPLE)
+    target_sources(mw-server PRIVATE src/streaming/ClipboardMac.mm)
+    target_link_libraries(mw-server PRIVATE "-framework AppKit")
 endif()
 
 # ── Install / packaging ────────────────────────────────────────────────────

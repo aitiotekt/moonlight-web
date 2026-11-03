@@ -121,14 +121,16 @@ void StreamRelay::setClipboardEnabled(bool enabled)
     // owns the socket. Auto-disconnected when the relay dies.
     connect(ClipboardBridge::instance(), &ClipboardBridge::hostTextChanged, this,
             [this](const QString& text) {
-                if (m_Stopping || !m_WsClient ||
-                    m_WsClient->state() != QAbstractSocket::ConnectedState)
-                    return;
-                QJsonObject m;
-                m["type"] = "clipboard";
-                m["text"] = text;
-                m_WsClient->sendTextMessage(
-                    QString::fromUtf8(QJsonDocument(m).toJson(QJsonDocument::Compact)));
+                m_ClipboardSettings.forwardHostText(text, [this](const QString& text) {
+                    if (m_Stopping || !m_WsClient ||
+                        m_WsClient->state() != QAbstractSocket::ConnectedState)
+                        return;
+                    QJsonObject m;
+                    m["type"] = "clipboard";
+                    m["text"] = text;
+                    m_WsClient->sendTextMessage(
+                        QString::fromUtf8(QJsonDocument(m).toJson(QJsonDocument::Compact)));
+                });
             });
 }
 
@@ -509,6 +511,9 @@ void StreamRelay::onNewWsConnection()
         return;
     }
 
+    m_ClipboardSettings.reset();
+    if (m_ClipboardEnabled) ClipboardBridge::instance()->setSubscription(this, false);
+
     qInfo() << "[StreamRelay] WS client created, connecting signals...";
 
     connect(m_WsClient, &QWebSocket::textMessageReceived, this, &StreamRelay::onWsTextMessage);
@@ -548,11 +553,8 @@ void StreamRelay::onNewWsConnection()
     }
 
     if (m_ClipboardEnabled) {
-        // Advertise clipboard sync, then push the current host clipboard
-        // once so copy-before-connect pastes locally.
-        m_WsClient->sendTextMessage(
-            QStringLiteral("{\"type\":\"clipboardcaps\",\"available\":true}"));
-        ClipboardBridge::instance()->requestAnnounce();
+        // Only advertise capabilities; the client must configure directions first.
+        m_WsClient->sendTextMessage(QString::fromUtf8(ClipboardBridge::capabilitiesMessage()));
     }
 
     emit clientConnected();
@@ -603,6 +605,17 @@ void StreamRelay::onWsTextMessage(const QString& message)
 
     // An invited player only gets what the owner ticked. Dropped in silence.
     if (!InputMsg::allowed(type, m_InputPolicy)) return;
+
+    if (m_ClipboardSettings.handleMessage(
+            type, msg, m_ClipboardEnabled,
+            [this](bool receive) {
+                ClipboardBridge::instance()->setSubscription(this, receive);
+                if (receive) ClipboardBridge::instance()->requestAnnounce();
+            },
+            [this](const QString& text, bool wrapCtrl) {
+                ClipboardBridge::instance()->pasteFromClient(m_Shim, text, wrapCtrl);
+            }))
+        return;
 
     if (type == "keydown" || type == "keyup") {
         bool down = (type == "keydown");
@@ -663,14 +676,6 @@ void StreamRelay::onWsTextMessage(const QString& message)
         // sent once per session on the browser's first real keyboard event.
         m_Shim->syncLockKeys(msg["numLock"].toBool(false), msg["capsLock"].toBool(false),
                              msg["scrollLock"].toBool(false));
-    } else if (type == "clipboardpaste") {
-        // Browser Ctrl/Cmd+V: commit the client text to the host clipboard,
-        // then inject the paste chord (main-thread hop keeps that order).
-        // Only meaningful when the streamed host is this machine.
-        if (m_ClipboardEnabled) {
-            ClipboardBridge::instance()->pasteFromClient(m_Shim, msg["text"].toString(),
-                                                         msg["injectCtrl"].toBool(false));
-        }
     } else if (type == "unblockinput") {
         // The way out of a closed input gate — native host only, full
         // reasoning in DataChannelRelay's handler.
@@ -729,6 +734,8 @@ void StreamRelay::onWsTextMessage(const QString& message)
 
 void StreamRelay::onWsDisconnected()
 {
+    m_ClipboardSettings.reset();
+    if (m_ClipboardEnabled) ClipboardBridge::instance()->setSubscription(this, false);
     qInfo() << "[StreamRelay::onWsDisconnected] ENTER, m_Running=" << m_Running
             << "m_Stopping=" << m_Stopping << "m_StreamStarted=" << m_StreamStarted
             << "frames sent=" << m_FrameCount << "pending video=" << m_PendingVideoFrames.size()

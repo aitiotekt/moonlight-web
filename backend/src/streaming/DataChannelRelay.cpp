@@ -636,14 +636,16 @@ void DataChannelRelay::setClipboardEnabled(bool enabled)
     // send itself is thread-safe. Auto-disconnected when the relay dies.
     connect(ClipboardBridge::instance(), &ClipboardBridge::hostTextChanged, this,
             [this](const QString& text) {
-                if (m_Stopping.load() || !m_Connected || !m_InputDc) return;
-                QJsonObject m;
-                m["type"] = "clipboard";
-                m["text"] = text;
-                QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
-                try {
-                    m_InputDc->send(std::string(j.constData(), j.size()));
-                } catch (const std::exception&) {}
+                m_ClipboardSettings.forwardHostText(text, [this](const QString& text) {
+                    if (m_Stopping.load() || !m_Connected || !m_InputDc) return;
+                    QJsonObject m;
+                    m["type"] = "clipboard";
+                    m["text"] = text;
+                    QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
+                    try {
+                        m_InputDc->send(std::string(j.constData(), j.size()));
+                    } catch (const std::exception&) {}
+                });
             });
 }
 
@@ -913,19 +915,19 @@ void DataChannelRelay::createDataChannels()
     if (m_InputDc) {
         m_InputDc->onOpen([this]() {
             qInfo() << "[DataChannelRelay] Input DataChannel open";
+            m_ClipboardSettings.reset();
+            if (m_ClipboardEnabled) ClipboardBridge::instance()->setSubscription(this, false);
             m_Connected = true;
             // All 3 DataChannels are open when we reach here
             // (they all open together as part of SCTP association)
             emit dataChannelsOpen();
 
             if (m_ClipboardEnabled) {
-                // Advertise clipboard sync, then push the current host
-                // clipboard once so copy-before-connect pastes locally.
-                static const char kCaps[] = "{\"type\":\"clipboardcaps\",\"available\":true}";
+                // Only advertise capabilities; the client must configure directions first.
+                const char* kCaps = ClipboardBridge::capabilitiesMessage();
                 try {
                     m_InputDc->send(std::string(kCaps));
                 } catch (const std::exception&) {}
-                ClipboardBridge::instance()->requestAnnounce();
             }
 
             // Start periodic stats timer — marshal to the Qt main thread:
@@ -941,7 +943,7 @@ void DataChannelRelay::createDataChannels()
                 },
                 Qt::QueuedConnection);
         });
-        m_InputDc->onClosed([this]() { qInfo() << "[DataChannelRelay] Input DataChannel closed"; });
+        m_InputDc->onClosed([]() { qInfo() << "[DataChannelRelay] Input DataChannel closed"; });
 
         // Input messages arrive from browser on this channel
         m_InputDc->onMessage([this](const std::variant<rtc::binary, rtc::string>& msg) {
@@ -1266,6 +1268,17 @@ void DataChannelRelay::onInputMessage(const std::string& message)
     // An invited player only gets what the owner ticked. Dropped in silence.
     if (!InputMsg::allowed(type, m_InputPolicy)) return;
 
+    if (m_ClipboardSettings.handleMessage(
+            type, msg, m_ClipboardEnabled,
+            [this](bool receive) {
+                ClipboardBridge::instance()->setSubscription(this, receive);
+                if (receive) ClipboardBridge::instance()->requestAnnounce();
+            },
+            [this](const QString& text, bool wrapCtrl) {
+                ClipboardBridge::instance()->pasteFromClient(m_Shim, text, wrapCtrl);
+            }))
+        return;
+
     if (type == "cursormode") {
         // Who draws the mouse pointer. In desktop mode the browser draws its
         // own — at its own refresh rate, independent of the stream — and the
@@ -1468,14 +1481,6 @@ void DataChannelRelay::onInputMessage(const std::string& message)
         // sent once per session on the browser's first real keyboard event.
         m_Shim->syncLockKeys(msg["numLock"].toBool(false), msg["capsLock"].toBool(false),
                              msg["scrollLock"].toBool(false));
-    } else if (type == "clipboardpaste") {
-        // Browser Ctrl/Cmd+V: commit the client text to the host clipboard,
-        // then inject the paste chord (main-thread hop keeps that order).
-        // Only meaningful when the streamed host is this machine.
-        if (m_ClipboardEnabled) {
-            ClipboardBridge::instance()->pasteFromClient(m_Shim, msg["text"].toString(),
-                                                         msg["injectCtrl"].toBool(false));
-        }
     } else if (type == "requestidr") {
         qInfo() << "[DataChannelRelay] Requesting IDR frame from Sunshine (browser request)";
         std::lock_guard<std::mutex> lk(m_VideoMutex);
@@ -1928,7 +1933,11 @@ void DataChannelRelay::stop()
             native->setDirectFrameSink(nullptr);
     }
 
-    if (m_Stopping.exchange(true)) {
+    const bool wasStopping = m_Stopping.exchange(true);
+    // Cleanup stays on the relay thread, not in an asynchronous RTC close callback.
+    m_ClipboardSettings.reset();
+    if (m_ClipboardEnabled) ClipboardBridge::instance()->setSubscription(this, false);
+    if (wasStopping) {
         qInfo() << "[DataChannelRelay::stop] Already stopping, skip";
         return;
     }

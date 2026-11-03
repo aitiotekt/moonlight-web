@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "ClipboardPolicy.h"
+
 #include "RelayBase.h"
 #include <QByteArray>
 #include <QMutex>
@@ -159,6 +161,7 @@ private:
     // machine). Written once on the main thread before the relay moves to its
     // dedicated thread, read from relay/libdatachannel threads afterwards.
     bool m_ClipboardEnabled = false;
+    ClipboardPolicy::SessionSettings m_ClipboardSettings;
     int m_FrameCount = 0;
 
     // P2-B: when true, onVideoFrame runs on the capture thread (DirectConnection)

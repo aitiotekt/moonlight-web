@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "ClipboardPolicy.h"
+
 #include "InputPolicy.h"
 
 #include <QObject>
@@ -141,6 +143,7 @@ private:
     // machine). Written once on the main thread before the relay moves to
     // its dedicated thread.
     bool m_ClipboardEnabled = false;
+    ClipboardPolicy::SessionSettings m_ClipboardSettings;
     // Same lifetime discipline as m_ClipboardEnabled: written before the move
     // to the relay thread, read-only afterwards.
     InputMsg::Policy m_InputPolicy;

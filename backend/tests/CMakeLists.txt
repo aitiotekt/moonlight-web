@@ -51,6 +51,7 @@ set(CMAKE_AUTOMOC ON)
 add_executable(run_tests
     # Test sources
     main.cpp
+    test_clipboard_policy.cpp
     test_input_encoder.cpp
     test_stream_config.cpp
     test_input_crypto.cpp

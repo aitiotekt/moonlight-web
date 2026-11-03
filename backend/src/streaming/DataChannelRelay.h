@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "ClipboardPolicy.h"
+
 #include "RelayBase.h"
 #include "HostLagTracker.h"
 #include "LinkFreezeLog.h"
@@ -330,6 +332,7 @@ private:
     // machine). Written once on the main thread before the relay moves to its
     // dedicated thread, read from relay/libdatachannel threads afterwards.
     bool m_ClipboardEnabled = false;
+    ClipboardPolicy::SessionSettings m_ClipboardSettings;
     /// See setRideOutLoss. Written once before the thread move, read on the
     /// relay thread afterwards.
     bool m_RideOutLoss = false;

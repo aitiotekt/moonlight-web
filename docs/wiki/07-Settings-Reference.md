@@ -119,6 +119,7 @@ CI bakes `MW_DOMAIN` and `MW_PDNS_TOKEN` (from repo secrets, via CMake defines) 
 | Key | Description |
 |---|---|
 | `mw-streaming-settings` | The whole Settings overlay state as one JSON object (`SettingsView`): mirrors of the streaming defaults above, sent with each `/start`, **plus** per-device-only fields — `touch_sensitivity`, `touch_screen` (absolute touch instead of the trackpad model — both exposed on mobile/tablet only, a touchscreen laptop keeps the mouse/trackpad path), `tearing_enabled` + `tearing_default_v2` (on by default, Chromium desktop only; off = VSync pacing — the marker tells a stored `false` apart from the earlier OFF default), `video_worker` (`auto`\|`on`\|`off` — OffscreenCanvas decode/render worker, `auto` by default), `power_save` + `power_save_backup` (mobile light pipeline), `seamless_switching`. |
+| `mw-session-input:owner\|guest:<uuid>` | Optional per-host clipboard directions and physical key mappings, including the remember flag. Owner and guest preferences are separate; clipboard contents are never stored. |
 | `mw-lang` | UI language (en/fr/zh). |
 | `mw_client_uniqueid` | Per-browser Sunshine identity (session isolation); the standby stream slot derives its own id from it. |
 | `mw_jitter_auto` | Adaptive jitterBufferTarget toggle (webrtc-media). |
@@ -180,6 +181,58 @@ Authentication is unchanged: remote devices still need the admin PIN or the cert
 - Everything on this page is about the **certificate** and **the machine's own name**. The certificate is not needed for remote access as such: the entry link is served under the introduction server's certificate and the tunnel is bound to the machine's own key, so an instance with no domain and no PEM file is already reachable from anywhere ([Security §6.5](06-Security.md#65-tls)).
 - `unique_id` and `rendezvous_id` are untouched: the entry link keeps working alongside your own name, and restoring `"domain": "MW_DOMAIN"` simply leaves the instance with no public DNS name again.
 - The `stream` label is only reserved on the project's shared domain, never on yours.
+
+## 7.6 Session input settings
+
+Open **Input settings** in the streaming header. Preferences apply to the current
+session and survive its quality, transport and reconnect transitions. Enable
+**Remember for this host** to reuse them in this browser for that host; guest
+preferences are stored separately. This option covers both clipboard and key
+mapping settings in the panel. Clipboard contents are never stored with the
+preferences. The panel edits a draft: **Done** in the mapping editor returns
+its edits to that draft, and **Apply** in the main panel commits all settings
+together. Closing either editor discards its unconfirmed edits. Manual clipboard
+actions and **Release all keys** run immediately using already-applied settings.
+
+The **Clipboard** switch enables both text directions or disables both. Expand
+**Advanced** to enable pasting to the host and copying from the host separately.
+The backend enforces these choices for each connection; they do not grant access
+to clipboard capabilities that the session did not already have. The bridge is
+available for unrestricted sessions on the native host or a local Sunshine host.
+New connections, including reconnects and standby transports, start with both
+directions closed. The backend advertises capabilities without sending clipboard
+contents; the active frontend then sends `clipboardconfig`. Only an enabled
+receive direction subscribes to host changes and requests the initial text.
+Old browser pages that do not send this configuration must be refreshed after a
+backend upgrade. There is no timeout that automatically enables synchronization.
+
+Copy and paste shortcuts follow the **host**, after key mapping: Command+C/V on
+macOS and Ctrl+C/V on Windows and Linux. A Windows Ctrl+V is not silently changed
+into Command+V on a Mac host. A mapped host paste shortcut that is not the
+browser's native paste shortcut requests browser clipboard access. If permission
+is denied, the host's existing clipboard is pasted and a notice explains how to
+use **Manual clipboard text** instead. That section also provides a user-initiated
+copy button when automatic browser clipboard writes are unavailable. Only plain
+text is supported, limited to 262,144 UTF-16 code units (not bytes). Empty manual
+text is not sent; whitespace-only text is valid.
+
+**Key mappings** opens a separate editor with **Source key** and **Target key**
+columns. Enter physical browser key codes such as `AltLeft`, `MetaLeft` or `KeyA`.
+An empty target ignores the source key. Duplicate sources, invalid codes and
+identical source/target pairs are rejected with an explanation. No mappings are
+installed by default. For a Windows client controlling a Mac, `AltLeft → MetaLeft` and `MetaLeft → AltLeft` are a useful configuration.
+Mappings apply to physical keyboard messages; on-screen host shortcut buttons
+and the client's stream-exit shortcuts retain their original meaning. Browsers
+cannot intercept every shortcut reserved by the client operating system.
+
+Changing mappings releases held input first. **Release all keys** also provides
+an explicit recovery action under the key mapping editor’s **Advanced** section
+if a browser or operating system swallows a release. Mapped modifier chords use
+physical key positions, including their letters, to preserve the requested
+modifiers on the host. A synthetic release during paste retains the observed
+left/right modifier identity for the next shortcut until the physical release.
+Older servers retain their existing clipboard protocol; direction filtering on
+those servers is client-side, and their legacy paste-shortcut behavior remains.
 
 ---
 

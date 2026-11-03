@@ -173,14 +173,16 @@ void MediaTrackRelay::setClipboardEnabled(bool enabled)
     // send itself is thread-safe. Auto-disconnected when the relay dies.
     connect(ClipboardBridge::instance(), &ClipboardBridge::hostTextChanged, this,
             [this](const QString& text) {
-                if (m_Stopping.load() || !m_Connected || !m_InputDc) return;
-                QJsonObject m;
-                m["type"] = "clipboard";
-                m["text"] = text;
-                QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
-                try {
-                    m_InputDc->send(std::string(j.constData(), j.size()));
-                } catch (const std::exception&) {}
+                m_ClipboardSettings.forwardHostText(text, [this](const QString& text) {
+                    if (m_Stopping.load() || !m_Connected || !m_InputDc) return;
+                    QJsonObject m;
+                    m["type"] = "clipboard";
+                    m["text"] = text;
+                    QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
+                    try {
+                        m_InputDc->send(std::string(j.constData(), j.size()));
+                    } catch (const std::exception&) {}
+                });
             });
 }
 
@@ -429,17 +431,17 @@ void MediaTrackRelay::createTracksAndChannels()
         if (m_InputDc) {
             m_InputDc->onOpen([this]() {
                 qInfo() << "[MediaTrackRelay] Input DataChannel open";
+                m_ClipboardSettings.reset();
+                if (m_ClipboardEnabled) ClipboardBridge::instance()->setSubscription(this, false);
                 m_Connected = true;
                 emit dataChannelsOpen();
 
                 if (m_ClipboardEnabled) {
-                    // Advertise clipboard sync, then push the current host
-                    // clipboard once so copy-before-connect pastes locally.
-                    static const char kCaps[] = "{\"type\":\"clipboardcaps\",\"available\":true}";
+                    // Only advertise capabilities; the client must configure directions first.
+                    const char* kCaps = ClipboardBridge::capabilitiesMessage();
                     try {
                         m_InputDc->send(std::string(kCaps));
                     } catch (const std::exception&) {}
-                    ClipboardBridge::instance()->requestAnnounce();
                 }
 
                 // Start periodic stats timer on the relay's own thread: this
@@ -457,8 +459,7 @@ void MediaTrackRelay::createTracksAndChannels()
                     },
                     Qt::QueuedConnection);
             });
-            m_InputDc->onClosed(
-                [this]() { qInfo() << "[MediaTrackRelay] Input DataChannel closed"; });
+            m_InputDc->onClosed([]() { qInfo() << "[MediaTrackRelay] Input DataChannel closed"; });
 
             m_InputDc->onMessage([this](const std::variant<rtc::binary, rtc::string>& msg) {
                 if (std::holds_alternative<rtc::string>(msg)) {
@@ -738,6 +739,17 @@ void MediaTrackRelay::onInputMessage(const std::string& message)
     // An invited player only gets what the owner ticked. Dropped in silence.
     if (!InputMsg::allowed(type, m_InputPolicy)) return;
 
+    if (m_ClipboardSettings.handleMessage(
+            type, msg, m_ClipboardEnabled,
+            [this](bool receive) {
+                ClipboardBridge::instance()->setSubscription(this, receive);
+                if (receive) ClipboardBridge::instance()->requestAnnounce();
+            },
+            [this](const QString& text, bool wrapCtrl) {
+                ClipboardBridge::instance()->pasteFromClient(m_Shim, text, wrapCtrl);
+            }))
+        return;
+
     if (type == "keydown" || type == "keyup") {
         bool down = (type == "keydown");
         const InputMsg::KeyPlan plan = InputMsg::resolveKey(msg, m_Shim->keyboardMode());
@@ -796,14 +808,6 @@ void MediaTrackRelay::onInputMessage(const std::string& message)
         // sent once per session on the browser's first real keyboard event.
         m_Shim->syncLockKeys(msg["numLock"].toBool(false), msg["capsLock"].toBool(false),
                              msg["scrollLock"].toBool(false));
-    } else if (type == "clipboardpaste") {
-        // Browser Ctrl/Cmd+V: commit the client text to the host clipboard,
-        // then inject the paste chord (main-thread hop keeps that order).
-        // Only meaningful when the streamed host is this machine.
-        if (m_ClipboardEnabled) {
-            ClipboardBridge::instance()->pasteFromClient(m_Shim, msg["text"].toString(),
-                                                         msg["injectCtrl"].toBool(false));
-        }
     } else if (type == "unblockinput") {
         // The way out of a closed input gate — native host only, full
         // reasoning in DataChannelRelay's handler.
@@ -1017,7 +1021,11 @@ void MediaTrackRelay::stop()
         return;
     }
 
-    if (m_Stopping.exchange(true)) {
+    const bool wasStopping = m_Stopping.exchange(true);
+    // Cleanup stays on the relay thread, not in an asynchronous RTC close callback.
+    m_ClipboardSettings.reset();
+    if (m_ClipboardEnabled) ClipboardBridge::instance()->setSubscription(this, false);
+    if (wasStopping) {
         qInfo() << "[MediaTrackRelay::stop] Already stopping, skip";
         return;
     }

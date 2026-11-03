@@ -43,6 +43,7 @@ void run_input_watchdog_tests();
 void run_keyboard_layout_tests();
 void run_native_capabilities_json_tests();
 void run_edition_tests();
+void run_clipboard_policy_tests();
 void run_router_port_core_tests();
 void run_logger_rotation_tests();
 
@@ -84,6 +85,7 @@ int main(int argc, char** argv)
     run_keyboard_layout_tests();
     run_native_capabilities_json_tests();
     run_edition_tests();
+    run_clipboard_policy_tests();
     run_router_port_core_tests();
     // Last: it repoints the Logger singleton at its own temp files.
     run_logger_rotation_tests();

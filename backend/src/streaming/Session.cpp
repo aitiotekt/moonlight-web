@@ -17,6 +17,7 @@
 
 #include "Session.h"
 #include "ClipboardBridge.h"
+#include "ClipboardPolicy.h"
 #include "HostAudioSink.h"
 #include "DataChannelRelay.h"
 #include "MediaTrackRelay.h"
@@ -614,7 +615,8 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         startEngine = [shim, params]() { shim->startConnection(params); };
     }
 
-    // Clipboard sync is only possible when the streamed host is this machine
+    // Native hosts have no network address. Clipboard sync also applies when
+    // the streamed GameStream host is this machine
     // (standard installer deployment: backend runs next to Sunshine) — the
     // backend clipboard is then the host's. For remote Sunshine hosts the
     // relay stays clipboard-silent and the browser keeps today's behavior.
@@ -623,7 +625,8 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
     // the address: the host's clipboard is an exfiltration channel, and it is
     // not a guest's to read.
     const bool hostIsSelf = ClipboardBridge::isSelfAddress(m_Host->activeAddress.address());
-    const bool clipboardLocal = hostIsSelf && m_InputPolicy.unrestricted();
+    const bool clipboardLocal = ClipboardPolicy::enabled(media.type == MediaType::NativeHost,
+                                                         hostIsSelf, m_InputPolicy.unrestricted());
     qInfo() << "[Session] Clipboard sync" << (clipboardLocal ? "enabled" : "disabled")
             << "(host address:" << m_Host->activeAddress.address()
             << ", restricted:" << !m_InputPolicy.unrestricted() << ")";

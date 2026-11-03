@@ -18,12 +18,15 @@
 #pragma once
 
 #include <QObject>
+#include <QSet>
+#include "ClipboardPolicy.h"
 #include <QString>
 
 class IMediaEngine;
+class QTimer;
 
 /// Bidirectional text clipboard bridge between the browser client and the
-/// host machine, active only when the streamed Sunshine host IS this machine
+/// host machine, active for the native host or a Sunshine host on this machine
 /// (the standard installer deployment) — the backend process then shares the
 /// host's clipboard and QClipboard is authoritative.
 ///
@@ -62,11 +65,16 @@ public:
     /// Unresolvable hostnames are treated as remote (no blocking DNS lookup).
     static bool isSelfAddress(const QString& address);
 
+    /// The target paste modifier is advertised consistently on all transports.
+    static const char* capabilitiesMessage();
+
     /// Thread-safe. Queue onto the main thread: commit 'text' to the host
     /// clipboard, then inject the paste chord (V down/up) through the shim.
-    /// wrapCtrl adds Ctrl down/up around the V for clients whose paste
-    /// modifier doesn't map to Ctrl on the host (macOS Cmd arrives as Win).
+    /// macOS always wraps V in Command; other targets retain the existing
+    /// wrapCtrl behavior for clients whose paste modifier is not Control.
     void pasteFromClient(IMediaEngine* engine, const QString& text, bool wrapCtrl);
+
+    void setSubscription(QObject* consumer, bool enabled);
 
     /// Thread-safe. Re-emit the current host clipboard text (initial sync
     /// when a client connects), even if unchanged since the last emission.
@@ -85,4 +93,8 @@ private:
     /// Last text written or observed — suppresses the dataChanged echo of our
     /// own setText() and redundant re-pushes of an unchanged clipboard.
     QString m_LastText;
+    QSet<QObject*> m_Subscribers;
+    QSet<QObject*> m_Consumers;
+    QTimer* m_PollTimer = nullptr;
+    qint64 m_ChangeCount = -1;
 };

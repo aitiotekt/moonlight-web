@@ -47,6 +47,14 @@ if [ -d "$QT_EXTRA_LIB_DIR" ]; then
 else
     macdeployqt "$APP" -no-codesign
 fi
+# Homebrew's SVG plugins omit their qtsvg rpath. Deploy that framework as an
+# explicit bundle executable so macdeployqt also rewrites its dependencies.
+if [ -d "$QT_EXTRA_LIB_DIR/QtSvg.framework" ] && \
+   [ ! -d "$APP/Contents/Frameworks/QtSvg.framework" ]; then
+    ditto "$QT_EXTRA_LIB_DIR/QtSvg.framework" "$APP/Contents/Frameworks/QtSvg.framework"
+    macdeployqt "$APP" -no-codesign -always-overwrite \
+        -executable="$APP/Contents/Frameworks/QtSvg.framework/Versions/A/QtSvg"
+fi
 # Derive the real minimum from ALL shipped Mach-O files, including Homebrew's
 # OpenSSL. Claiming the official package's minimum would be misleading here.
 python3 - <<'PY'
@@ -64,7 +72,8 @@ for path in (app / 'Contents').rglob('*'):
     for command in re.split(r'Load command \d+\n', headers):
         if not re.search(r'\bcmd LC_(?:BUILD_VERSION|VERSION_MIN_MACOSX)\b', command):
             continue
-        for version in re.findall(r'^\s+(?:minos|version) (\d+(?:\.\d+)+)', command, re.M):
+        field = 'minos' if 'cmd LC_BUILD_VERSION' in command else 'version'
+        for version in re.findall(r'^\s+' + field + r' (\d+(?:\.\d+)+)', command, re.M):
             minimum = max(minimum, tuple(map(int, version.split('.'))))
     deps = subprocess.check_output(['otool', '-L', str(path)], text=True).splitlines()[1:]
     identity = subprocess.run(['otool', '-D', str(path)], text=True, capture_output=True).stdout.splitlines()[1:]
@@ -74,6 +83,15 @@ for path in (app / 'Contents').rglob('*'):
             continue  # A dylib's own install name is not an imported dependency.
         if dep.startswith('/') and not dep.startswith(('/System/Library/', '/usr/lib/')):
             raise SystemExit(f'Non-relocatable dependency: {path}: {dep}')
+        candidates = []
+        if dep.startswith('@executable_path/'):
+            candidates = [app / 'Contents/MacOS' / dep[len('@executable_path/'):]]
+        elif dep.startswith('@loader_path/'):
+            candidates = [path.parent / dep[len('@loader_path/'):]]
+        elif dep.startswith('@rpath/'):
+            candidates = [app / 'Contents/Frameworks' / dep[len('@rpath/'):]]
+        if candidates and not any(candidate.is_file() for candidate in candidates):
+            raise SystemExit(f'Missing bundled dependency: {path}: {dep}')
 plistpath = app / 'Contents/Info.plist'
 with plistpath.open('rb') as f:
     plist = plistlib.load(f)

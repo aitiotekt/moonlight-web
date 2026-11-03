@@ -707,7 +707,9 @@ void RendezvousClient::onKeepAlive()
     // something to wait for.
     m_Socket.ping();
     ++m_PingsSent;
-    m_Watchdog.start();
+    // A later ping must not postpone the deadline of an unanswered one.
+    // Equal keep-alive and timeout intervals otherwise race on some Qt builds.
+    if (!m_Watchdog.isActive()) m_Watchdog.start();
 }
 
 void RendezvousClient::onPong(quint64 elapsed, const QByteArray& payload)

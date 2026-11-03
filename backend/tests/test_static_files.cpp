@@ -73,6 +73,17 @@ void run_static_files_tests()
     writeFile(root + "/blob.bin", "x");
     CHECK(h.serveFile("/blob.bin").contentType.startsWith("application/octet-stream"));
 
+#ifdef Q_OS_UNIX
+    // A root reached through an alias is valid, but a file symlink escaping
+    // that root must still be refused after canonicalization.
+    const QString alias = tmp.path() + "/web-alias";
+    CHECK(QFile::link(root, alias));
+    StaticFileHandler aliased(alias);
+    CHECK_EQ(aliased.serveFile("/app.js").statusCode, 200);
+    CHECK(QFile::link(tmp.path() + "/secret.txt", root + "/escape.txt"));
+    CHECK_EQ(aliased.serveFile("/escape.txt").statusCode, 403);
+#endif
+
     // Text assets are marked no-cache (iOS WebKit staleness fix); html/js/css.
     CHECK(h.serveFile("/index.html").headers.value("Cache-Control").contains("no-cache"));
     CHECK(h.serveFile("/app.js").headers.value("Cache-Control").contains("no-cache"));

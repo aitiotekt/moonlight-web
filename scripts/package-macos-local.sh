@@ -41,7 +41,12 @@ plist = dict(CFBundleExecutable='MoonlightWeb', CFBundleIdentifier='com.moonligh
 with (app / 'Contents/Info.plist').open('wb') as f:
     plistlib.dump(plist, f)
 PY
-macdeployqt "$APP"
+QT_EXTRA_LIB_DIR="${QT_EXTRA_LIB_DIR:-/opt/homebrew/lib}"
+if [ -d "$QT_EXTRA_LIB_DIR" ]; then
+    macdeployqt "$APP" -libpath="$QT_EXTRA_LIB_DIR" -no-codesign
+else
+    macdeployqt "$APP" -no-codesign
+fi
 # Derive the real minimum from ALL shipped Mach-O files, including Homebrew's
 # OpenSSL. Claiming the official package's minimum would be misleading here.
 python3 - <<'PY'
@@ -62,8 +67,11 @@ for path in (app / 'Contents').rglob('*'):
         for version in re.findall(r'^\s+(?:minos|version) (\d+(?:\.\d+)+)', command, re.M):
             minimum = max(minimum, tuple(map(int, version.split('.'))))
     deps = subprocess.check_output(['otool', '-L', str(path)], text=True).splitlines()[1:]
+    identity = subprocess.run(['otool', '-D', str(path)], text=True, capture_output=True).stdout.splitlines()[1:]
     for dep in deps:
         dep = dep.strip().split(' (', 1)[0]
+        if dep in identity:
+            continue  # A dylib's own install name is not an imported dependency.
         if dep.startswith('/') and not dep.startswith(('/System/Library/', '/usr/lib/')):
             raise SystemExit(f'Non-relocatable dependency: {path}: {dep}')
 plistpath = app / 'Contents/Info.plist'

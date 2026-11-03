@@ -85,9 +85,12 @@ QMap<QString, QString> StaticFileHandler::s_MimeTypes = {
 StaticFileHandler::StaticFileHandler(const QString& rootDir, const QString& version,
                                      QObject* parent)
     : QObject(parent)
-    , m_RootDir(QDir::cleanPath(rootDir))
+    , m_RootDir(QFileInfo(rootDir).canonicalFilePath())
     , m_Version(version.isEmpty() ? QStringLiteral(MW_VERSION) : version)
 {
+    // Compare canonical paths on both sides of the containment check. macOS
+    // aliases /var to /private/var, and a frontend root may itself be a symlink.
+    if (m_RootDir.isEmpty()) m_RootDir = QDir(rootDir).absolutePath();
     if (!m_RootDir.endsWith('/')) m_RootDir += '/';
 }
 

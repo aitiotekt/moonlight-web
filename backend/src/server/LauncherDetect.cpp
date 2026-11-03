@@ -38,7 +38,8 @@ Launcher steamBigPicture(const QString& iconPath)
 
 QString windowsPath(const QString& path)
 {
-    return QDir::toNativeSeparators(QDir::cleanPath(path.trimmed()));
+    // This helper describes Windows paths even in a cross-platform test run.
+    return QDir::cleanPath(QString(path.trimmed()).replace('\\', '/')).replace('/', '\\');
 }
 
 /// Joins @p dir and @p file with a backslash, the way Windows writes it.
